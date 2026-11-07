@@ -146,6 +146,7 @@ pub fn build(b: *std.Build) void {
         .name = project.exe_name[0 .. project.exe_name.len - 4], // 去 .exe
         .root_module = exe_mod,
     });
+    exe.subsystem = .windows; // GUI 子系统：运行不弹控制台窗口
     exe_mod.linkSystemLibrary("user32", .{});
     exe_mod.linkSystemLibrary("gdi32", .{});
     exe_mod.linkSystemLibrary("ole32", .{});
@@ -237,6 +238,7 @@ pub fn build(b: *std.Build) void {
         .name = project.exe_name[0 .. project.exe_name.len - 4],
         .root_module = rel_app_mod,
     });
+    rel_app.subsystem = .windows; // 分发产物无控制台窗口
     rel_app_mod.linkSystemLibrary("user32", .{});
     rel_app_mod.linkSystemLibrary("gdi32", .{});
     rel_app_mod.linkSystemLibrary("ole32", .{});

@@ -151,6 +151,8 @@ pub fn build(b: *std.Build) void {
         .name = "zilt-app",
         .root_module = exe_mod,
     });
+    // GUI 子系统：双击/安装后运行不弹出控制台窗口（日志仍写 zilt.log）
+    exe.subsystem = .windows;
 
     // Windows 系统库（Win32 extern 声明所需的导入库）
     exe_mod.linkSystemLibrary("user32", .{});
@@ -253,6 +255,7 @@ pub fn build(b: *std.Build) void {
         .name = "zilt-app",
         .root_module = rel_app_mod,
     });
+    rel_app.subsystem = .windows; // 分发产物无控制台窗口
     rel_app_mod.linkSystemLibrary("user32", .{});
     rel_app_mod.linkSystemLibrary("gdi32", .{});
     rel_app_mod.linkSystemLibrary("ole32", .{});

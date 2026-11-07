@@ -1,7 +1,8 @@
-﻿//! 项目元数据与前端工程配置——build.zig 与应用共用的单一配置源。
+//! 项目元数据与前端工程配置——build.zig 与应用共用的单一配置源。
 //! 纯数据（无模块依赖），build.zig 可直接 @import。
 
 pub const app_name = "Zilt";
+pub const publisher = "Zilt";
 pub const version = "0.1.6";
 pub const app_id = "app.zilt.desktop";
 pub const exe_name = "zilt-app.exe";
