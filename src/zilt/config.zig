@@ -34,7 +34,8 @@ pub const Config = struct {
     app_id: []const u8 = "app.zilt",
     dev: Dev = .{},
 
-    /// 系统托盘（Windows）。启用后支持 ctx.notify 与左键点击显示/隐藏窗口。
+    /// 系统托盘（Windows）。启用后支持左键点击显示/隐藏窗口；
+    /// ctx.notify 经 WinRT Toast 主通道发送（无需托盘），托盘气球仅作降级。
     tray: ?Tray = null,
     /// 点击关闭按钮时隐藏到托盘而非退出（需要 tray 启用）
     close_to_tray: bool = false,

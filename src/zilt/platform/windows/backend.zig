@@ -18,6 +18,7 @@ const win32 = @import("win32.zig");
 const wv2 = @import("webview2.zig");
 const loader = @import("loader.zig");
 const tray_mod = @import("tray.zig");
+const toast_mod = @import("toast.zig");
 const single_instance = @import("single_instance.zig");
 const menu_mod = @import("menu.zig");
 const hotkey_mod = @import("hotkey.zig");
@@ -80,6 +81,17 @@ pub fn run(comptime config: Config) !void {
         backend.dev_url = u;
         log.print("[dev] ZILT_DEV_URL={s}", .{u});
     }
+    // WinRT Toast 通知主通道（v0.1.5：气球降级；不要求 tray 启用）
+    blk: {
+        const exe = currentExePath(alloc) catch break :blk;
+        defer alloc.free(exe);
+        backend.toast = toast_mod.Toast.init(alloc, config.app_id, config.title, exe) catch |err| {
+            log.print("[toast] init failed: {s}（通知降级托盘气球）", .{@errorName(err)});
+            break :blk;
+        };
+        log.print("[toast] winrt ready (aumid={s})", .{config.app_id});
+    }
+
     if (win32.getEnvUtf8(alloc, "ZILT_DEV_PROXY")) |u| {
         backend.dev_proxy = u;
         // 反代模式优先生效（应用保持自身 origin；dev_url 仅作为 origin 白名单兜底无意义，忽略）
@@ -343,6 +355,8 @@ fn Backend(comptime config: Config) type {
         proxy_client: ?*std.http.Client = null,
         /// 压缩资产惰性解压缓存（key = asset path；UI 线程独占访问，无需锁）
         asset_cache: std.StringHashMapUnmanaged([]u8) = .empty,
+        /// WinRT Toast 通知主通道（气球为降级；不要求 tray 启用）
+        toast: ?toast_mod.Toast = null,
         quit_code: std.atomic.Value(u8) = .init(0),
 
         fn createWindow(self: *Self) !void {
@@ -824,6 +838,7 @@ fn Backend(comptime config: Config) type {
                 if (self.hwnd) |h| hotkey_mod.unregisterAll(h, hks);
             }
             if (self.tray) |*t| _ = t.remove();
+            if (self.toast) |*t| t.deinit();
             self.proxyClientReset();
             if (self.proxy_threaded) |t| {
                 t.deinit();
@@ -921,16 +936,24 @@ fn Backend(comptime config: Config) type {
                     return 0;
                 },
                 WM_ZILT_NOTIFY => {
-                    // 任意线程 notify → UI 线程投递托盘通知（所有权随消息转移）
+                    // 任意线程 notify → UI 线程投递（所有权随消息转移）
                     if (instance) |b| {
                         const ptr: [*]u8 = @ptrFromInt(@as(usize, @bitCast(lparam)));
                         const nb = unpackNotify(ptr);
                         defer b.allocator.free(ptr[0 .. 8 + nb.title.len + nb.body.len]);
-                        if (b.tray) |*t| {
-                            const ok = t.notify(nb.title, nb.body);
-                            log.print("[notify] sent (ok={})", .{ok});
-                        } else {
-                            log.print("[notify] dropped (tray not enabled)", .{});
+                        var sent = false;
+                        if (b.toast) |*t| {
+                            sent = t.send(nb.title, nb.body);
+                            if (sent) log.print("[notify] sent (winrt toast)", .{});
+                        }
+                        if (!sent) {
+                            // 降级：托盘气球（需 tray 启用）
+                            if (b.tray) |*t| {
+                                const ok = t.notify(nb.title, nb.body);
+                                log.print("[notify] sent (balloon fallback, ok={})", .{ok});
+                            } else {
+                                log.print("[notify] dropped (no toast, no tray)", .{});
+                            }
                         }
                     }
                     return 0;
