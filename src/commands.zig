@@ -113,6 +113,42 @@ pub fn saveFileDialog(ctx: Context, args: struct { default: []const u8 = "out.tx
 }
 
 /// 退出应用（菜单"退出"项的落点）。
+// ---- v0.1.5 对话框扩展 demo（模态；不进自动冒烟）----
+
+/// 文件夹选择（IFileDialog FOS_PICKFOLDERS）。
+pub fn pickFolderDemo(ctx: Context, args: struct {}) !struct { path: ?[]const u8 } {
+    _ = args;
+    const p = try ctx.pickFolder(ctx.allocator, .{ .title = "选择文件夹" });
+    return .{ .path = p };
+}
+
+/// 多选文件（FOS_ALLOWMULTISELECT）。
+pub fn pickFilesDemo(ctx: Context, args: struct {}) !struct { paths: ?[][]u8, count: usize } {
+    _ = args;
+    const ps = try ctx.pickFiles(ctx.allocator, .{ .title = "多选文件" });
+    return .{ .paths = ps, .count = if (ps) |x| x.len else 0 };
+}
+
+/// 颜色选择（ChooseColorW；返回 0xRRGGBB）。
+pub fn pickColorDemo(ctx: Context, args: struct {}) !struct { rgb: ?u32 } {
+    _ = args;
+    const c = try ctx.pickColor(.{ .default_rgb = 0x3B82F6 });
+    return .{ .rgb = c };
+}
+
+/// 字体选择（ChooseFontW）。
+pub fn pickFontDemo(ctx: Context, args: struct {}) !struct { name: ?[]const u8, size: i32, bold: bool } {
+    _ = args;
+    const f = try ctx.pickFont(ctx.allocator, .{ .title = "选择字体" });
+    return .{ .name = if (f) |x| x.name else null, .size = if (f) |x| x.size_points else 0, .bold = if (f) |x| x.bold else false };
+}
+
+/// 重启以应用已暂存的更新（stageUpdate 后调用；接力进程拉起新版）。
+pub fn restartAfterUpdate(ctx: Context, args: struct {}) !void {
+    _ = args;
+    ctx.restartToApply();
+}
+
 pub fn exitApp(ctx: Context, args: struct {}) !void {
     _ = args;
     ctx.quit(0);

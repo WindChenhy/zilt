@@ -86,5 +86,7 @@ pub const Config = struct {
         current_version: []const u8,
         /// 更新包内 exe 的文件名
         exe_name: []const u8 = "zilt-app.exe",
+        /// 暂存成功后自动重启应用（v0.1.5；false = 应用收到 updateStaged 事件后自行调 ctx.restartToApply）
+        auto_restart: bool = false,
     };
 };

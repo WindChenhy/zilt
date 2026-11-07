@@ -11,6 +11,42 @@ function setCheck(id, ok, note = '') {
   el.className = ok ? 'pass' : 'fail';
 }
 
+// ---- v0.1.5 对话框扩展 demo ----
+function showOut(text) {
+  const el = document.getElementById('out');
+  if (el) el.textContent = text;
+}
+
+async function pickFolderDemo() {
+  try {
+    const r = await window.zilt.invoke('pickFolderDemo', {});
+    showOut('文件夹: ' + (r.path ?? '已取消'));
+  } catch (e) { showOut('错误: ' + e); }
+}
+
+async function pickFilesDemo() {
+  try {
+    const r = await window.zilt.invoke('pickFilesDemo', {});
+    showOut('已选 ' + r.count + ' 个文件' + (r.paths ? ': ' + r.paths.join(' ; ') : ''));
+  } catch (e) { showOut('错误: ' + e); }
+}
+
+async function pickColorDemo() {
+  try {
+    const r = await window.zilt.invoke('pickColorDemo', {});
+    if (r.rgb == null) return showOut('颜色已取消');
+    showOut('颜色: #' + r.rgb.toString(16).padStart(6, '0'));
+  } catch (e) { showOut('错误: ' + e); }
+}
+
+async function pickFontDemo() {
+  try {
+    const r = await window.zilt.invoke('pickFontDemo', {});
+    if (r.name == null) return showOut('字体已取消');
+    showOut('字体: ' + r.name + ' ' + r.size + 'pt' + (r.bold ? ' bold' : ''));
+  } catch (e) { showOut('错误: ' + e); }
+}
+
 async function runChecks() {
   try {
     // 1. greet：嵌套返回字段

@@ -9,7 +9,7 @@ pub fn main() !void {
         .commands = app.commands,
         .events = app.events,
         .assets = &app.assets,
-        .title = "Zilt — v0.1.4 示例",
+        .title = "Zilt — v0.1.5 示例",
         .width = 960,
         .height = 700,
         .url = "https://zilt.app/index.html",

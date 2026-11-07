@@ -242,6 +242,35 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(sign);
 
+    // ---- 差分包生成（zilt-patch v1）----
+    const diff_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/diff_patch.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zilt", .module = zilt_mod },
+        },
+    });
+    const diff_exe = b.addExecutable(.{ .name = "zilt-diff", .root_module = diff_mod });
+    b.installArtifact(diff_exe);
+
+    // ---- 跨平台打包编排（msi/macos/appimage/deb/rpm/sign）----
+    const pack_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/pack.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zilt", .module = zilt_mod },
+            .{ .name = "app_meta", .module = app_meta_mod },
+        },
+    });
+    const pack_exe = b.addExecutable(.{ .name = "zilt-pack", .root_module = pack_mod });
+    b.installArtifact(pack_exe);
+    const pack_run = b.addRunArtifact(pack_exe);
+    pack_run.addArtifactArg(rel_app); // argv[1] = Release exe
+    const pack_step = b.step("pack", "Cross-platform packaging (ZILT_PACK_TARGET=msi|macos|appimage|deb|rpm|sign)");
+    pack_step.dependOn(&pack_run.step);
+
     // ---- init：项目模板创建 ----
     const init_mod = b.createModule(.{
         .root_source_file = b.path("src/tools/init.zig"),

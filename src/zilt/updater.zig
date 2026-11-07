@@ -21,6 +21,19 @@ pub const Manifest = struct {
     url: []const u8,
     sha256: []const u8,
     signature: []const u8,
+    /// 增量/差分包（v0.1.5）：from == 当前版本且基线校验通过时优先走差分，失败自动回退全量
+    patch: ?PatchInfo = null,
+};
+
+/// 差分包描述（zilt-patch v1 格式，见 patch.zig）。
+pub const PatchInfo = struct {
+    /// 基线版本（差分基线的应用版本）
+    from: []const u8,
+    /// 基线 exe 的 sha256（防基线漂移——不匹配则回退全量）
+    from_sha256: []const u8,
+    url: []const u8,
+    sha256: []const u8,
+    signature: []const u8,
 };
 
 pub const UpdateError = error{
@@ -122,8 +135,6 @@ pub fn downloadAndVerify(alloc: std.mem.Allocator, fetcher: Fetcher, m: Manifest
 ///   写 `<exe>.zilt-new` → 当前 exe 改名 `.zilt-old`（运行中允许改名）→ new 接管原名。
 /// 重启后生效；`cleanupOld` 在下次启动时清理备份。
 pub fn stageUpdate(alloc: std.mem.Allocator, exe_path: []const u8, exe_name_in_zip: []const u8, zip_bytes: []const u8) UpdateError!void {
-    const win32 = @import("platform/windows/win32.zig");
-
     // 兼容 zip 内目录前缀不固定
     const suffix = try std.fmt.allocPrint(alloc, "/{s}", .{exe_name_in_zip});
     defer alloc.free(suffix);
@@ -132,6 +143,12 @@ pub fn stageUpdate(alloc: std.mem.Allocator, exe_path: []const u8, exe_name_in_z
         else => return err,
     };
     defer alloc.free(new_exe);
+    return stageBytes(alloc, exe_path, new_exe);
+}
+
+/// 将新 exe 字节原子替换当前运行中的 exe（写 .zilt-new → 旧改名 .zilt-old → new 接管原名）。
+pub fn stageBytes(alloc: std.mem.Allocator, exe_path: []const u8, new_exe: []const u8) UpdateError!void {
+    const win32 = @import("platform/windows/win32.zig");
 
     const new_path = try std.fmt.allocPrint(alloc, "{s}.zilt-new", .{exe_path});
     defer alloc.free(new_path);
@@ -149,6 +166,40 @@ pub fn stageUpdate(alloc: std.mem.Allocator, exe_path: []const u8, exe_name_in_z
 
     if (win32.MoveFileExW(exe_w.ptr, old_w.ptr, win32.MOVEFILE_REPLACE_EXISTING) == 0) return error.ManifestInvalid;
     if (win32.MoveFileExW(new_w.ptr, exe_w.ptr, win32.MOVEFILE_REPLACE_EXISTING) == 0) return error.ManifestInvalid;
+}
+
+/// 重启触发标志：`<exe> --zilt-restart <target>`（helper 进程：等旧实例退出并释放
+/// 单实例互斥体后拉起 target；自身即当前 exe，在 zilt.run 最早期拦截，不创建窗口）。
+pub const restart_flag = "--zilt-restart";
+
+/// argv 中检测重启 helper 调用（返回 target 路径；非 helper 调用返回 null）。
+pub fn isRestartHelperCall(argv: []const []const u8) ?[]const u8 {
+    for (argv, 0..) |a, i| {
+        if (std.mem.eql(u8, a, restart_flag) and i + 1 < argv.len) return argv[i + 1];
+    }
+    return null;
+}
+
+/// helper：延迟等待旧实例退出（互斥体释放）→ 拉起新 exe → 退出。
+/// 子进程退出码 5（单实例冲突）时重试——旧实例尚未完全退出。
+pub fn runRestartHelper(alloc: std.mem.Allocator, target: []const u8) void {
+    _ = alloc;
+    const win32 = @import("platform/windows/win32.zig");
+    win32.Sleep(800);
+    var attempt: u32 = 0;
+    while (attempt < 5) : (attempt += 1) {
+        const pi = win32.spawnDetached(target, "") orelse {
+            @import("log.zig").print("[updater] restart helper: spawn failed", .{});
+            return;
+        };
+        _ = win32.WaitForSingleObject(pi.hProcess, 3000);
+        var code: u32 = 0;
+        _ = win32.GetExitCodeProcess(pi.hProcess, &code);
+        _ = win32.CloseHandle(pi.hProcess);
+        _ = win32.CloseHandle(pi.hThread);
+        if (code != 5) return; // 非单实例冲突 → 完成
+        win32.Sleep(400);
+    }
 }
 
 /// 启动时清理上次更新留下的备份。

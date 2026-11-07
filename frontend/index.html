@@ -49,6 +49,10 @@
       <h2>系统能力 / 更新器（v0.1.2）</h2>
       <div class="row">
         <button onclick="window.zilt.invoke('notifyMe',{title:'Zilt 通知',body:'来自 Zig 核心的系统通知（托盘气球 → Toast）'})">系统通知</button>
+        <button onclick="pickFolderDemo()">选择文件夹</button>
+        <button onclick="pickFilesDemo()">多选文件</button>
+        <button onclick="pickColorDemo()">颜色</button>
+        <button onclick="pickFontDemo()">字体</button>
         <button onclick="window.zilt.invoke('checkUpdate',{})">检查更新</button>
         <button onclick="window.zilt.invoke('installUpdate',{})">安装更新（staged）</button>
       </div>

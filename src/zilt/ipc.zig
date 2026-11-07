@@ -42,15 +42,59 @@ pub const FileDialogOptions = struct {
     default_name: []const u8 = "",
 };
 
+pub const FolderDialogOptions = struct {
+    title: []const u8 = "选择文件夹",
+};
+
+pub const ColorDialogOptions = struct {
+    title: []const u8 = "选择颜色",
+    /// 初始颜色（0xRRGGBB）
+    default_rgb: u32 = 0x3B82F6,
+    /// 展开自定义颜色区
+    full_open: bool = true,
+};
+
+pub const FontDialogOptions = struct {
+    title: []const u8 = "选择字体",
+    /// 初始颜色（0xRRGGBB；需 effects = true 才可见颜色下拉）
+    color_rgb: u32 = 0x000000,
+    effects: bool = true,
+};
+
+/// 字体选择结果。
+pub const FontChoice = struct {
+    name: []const u8,
+    /// 点大小（1/10 磅为单位的 iPointSize / 10）
+    size_points: i32,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikeout: bool,
+    color_rgb: u32,
+};
+
 pub const DialogRequest = union(enum) {
     message_box: MessageBoxOptions,
     open_file: FileDialogOptions,
     save_file: FileDialogOptions,
+    /// 文件夹选择（IFileDialog FOS_PICKFOLDERS；v0.1.5）
+    pick_folder: FolderDialogOptions,
+    /// 多选文件（FOS_ALLOWMULTISELECT；v0.1.5）
+    pick_files: FileDialogOptions,
+    /// 颜色选择（ChooseColorW；v0.1.5）
+    pick_color: ColorDialogOptions,
+    /// 字体选择（ChooseFontW；v0.1.5）
+    pick_font: FontDialogOptions,
 };
 
 pub const DialogResponse = union(enum) {
     button: Button,
     path: ?[]u8,
+    /// 多选文件（每个路径与外层切片均用请求的 allocator 分配）
+    paths: ?[][]u8,
+    /// RGB（0xRRGGBB）
+    color: ?u32,
+    font: ?FontChoice,
 };
 
 // ---------------------------------------------------------------------------
@@ -77,6 +121,8 @@ pub const Context = struct {
     dialog_fn: ?*const fn (backend: *anyopaque, alloc: std.mem.Allocator, req: DialogRequest) anyerror!DialogResponse = null,
     /// 自动更新器环境（config.update 存在时由后端组装）。null = 未配置。
     updater_env: ?updater.Env = null,
+    /// 重启以应用已暂存的更新（v0.1.5：分离接力进程拉起新 exe 后退出）。null = 不可用。
+    restart_fn: ?*const fn (backend: *anyopaque) void = null,
 
     /// 发送系统通知（Windows: 托盘气球 → Toast）。
     pub fn notify(self: Context, title: []const u8, body: []const u8) void {
@@ -112,6 +158,51 @@ pub const Context = struct {
             .path => |p| p,
             else => error.DialogNotAvailable,
         };
+    }
+
+    /// 选择文件夹（IFileDialog FOS_PICKFOLDERS；模态）。取消返回 null。
+    pub fn pickFolder(self: Context, alloc: std.mem.Allocator, opts: FolderDialogOptions) anyerror!?[]u8 {
+        const r = try (self.dialog_fn orelse return error.DialogNotAvailable)(self.backend, alloc, .{ .pick_folder = opts });
+        return switch (r) {
+            .path => |p| p,
+            else => error.DialogNotAvailable,
+        };
+    }
+
+    /// 多选文件（模态）。取消返回 null；路径按选择顺序排列。
+    pub fn pickFiles(self: Context, alloc: std.mem.Allocator, opts: FileDialogOptions) anyerror!?[][]u8 {
+        const r = try (self.dialog_fn orelse return error.DialogNotAvailable)(self.backend, alloc, .{ .pick_files = opts });
+        return switch (r) {
+            .paths => |ps| ps,
+            else => error.DialogNotAvailable,
+        };
+    }
+
+    /// 颜色选择（模态）。返回 0xRRGGBB；取消返回 null。
+    pub fn pickColor(self: Context, opts: ColorDialogOptions) anyerror!?u32 {
+        const r = try (self.dialog_fn orelse return error.DialogNotAvailable)(self.backend, self.allocator, .{ .pick_color = opts });
+        return switch (r) {
+            .color => |c| c,
+            else => error.DialogNotAvailable,
+        };
+    }
+
+    /// 字体选择（模态）。取消返回 null（字符串用传入的 allocator 分配）。
+    pub fn pickFont(self: Context, alloc: std.mem.Allocator, opts: FontDialogOptions) anyerror!?FontChoice {
+        const r = try (self.dialog_fn orelse return error.DialogNotAvailable)(self.backend, alloc, .{ .pick_font = opts });
+        return switch (r) {
+            .font => |f| f,
+            else => error.DialogNotAvailable,
+        };
+    }
+
+    /// 重启以应用已暂存的更新（stageUpdate 后调用；接力进程负责拉起新版本）。
+    pub fn restartToApply(self: Context) void {
+        if (self.restart_fn) |f| {
+            f(self.backend);
+        } else {
+            std.log.warn("[zilt] restartToApply ignored (restart_fn not wired)", .{});
+        }
     }
 
     /// 向前端发事件（payload 序列化为 JSON）。

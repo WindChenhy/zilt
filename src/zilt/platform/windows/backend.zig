@@ -19,10 +19,12 @@ const wv2 = @import("webview2.zig");
 const loader = @import("loader.zig");
 const tray_mod = @import("tray.zig");
 const toast_mod = @import("toast.zig");
+const patch = @import("../../patch.zig");
 const single_instance = @import("single_instance.zig");
 const menu_mod = @import("menu.zig");
 const hotkey_mod = @import("hotkey.zig");
 const dialog_mod = @import("dialog.zig");
+const dlgx = @import("dialog_ext.zig");
 
 const HRESULT = com.HRESULT;
 const WM_ZILT_EMIT: win32.UINT = win32.WM_APP + 1;
@@ -34,6 +36,25 @@ pub fn run(comptime config: Config) !void {
     const B = Backend(config);
     log.initFileLog("zilt.log");
     const alloc = std.heap.page_allocator;
+    var argc_v_n: i32 = 0;
+
+    // 重启接力拦截（v0.1.5）：`<exe> --zilt-restart <target>` 不进主流程，
+    // 等旧实例退出（互斥体释放）后拉起 target 即退出。
+    {
+        const argv_raw = win32.CommandLineToArgvW(win32.GetCommandLineW(), &argc_v_n);
+        if (argv_raw != null and argc_v_n > 0) {
+            defer _ = win32.LocalFree(@ptrCast(argv_raw));
+            const argv_list = try alloc.alloc([]const u8, @intCast(argc_v_n));
+            defer alloc.free(argv_list);
+            for (argv_list, 0..) |*a, i| {
+                a.* = std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(argv_raw.?[i])) catch "";
+            }
+            if (updater.isRestartHelperCall(argv_list)) |target| {
+                updater.runRestartHelper(alloc, target);
+                return; // helper 不进主流程
+            }
+        }
+    }
 
     // 单实例保护（第二实例立即以退出码 5 结束）
     if (config.single_instance) {
@@ -324,6 +345,7 @@ fn Backend(comptime config: Config) type {
         /// comptime 固化的配置切片（供 comptime 参数的反射函数使用）
         const menu_cfg: ?[]const Config.MenuItem = config.menu;
         const hotkey_cfg: ?[]const Config.Hotkey = config.hotkeys;
+        const update_cfg: ?Config.Update = config.update;
         const menu_leaf_count: usize = if (config.menu) |items| menu_mod.collectIds(items).len else 0;
         const hotkey_count: usize = if (config.hotkeys) |h| h.len else 0;
 
@@ -442,6 +464,10 @@ fn Backend(comptime config: Config) type {
                 .message_box => |o| return .{ .button = try dialog_mod.runMessageBox(alloc, hwnd, o) },
                 .open_file => |o| return .{ .path = try dialog_mod.runOpenFile(alloc, hwnd, o) },
                 .save_file => |o| return .{ .path = try dialog_mod.runSaveFile(alloc, hwnd, o) },
+                .pick_folder => |o| return .{ .path = try dlgx.runPickFolder(alloc, hwnd, o) },
+                .pick_files => |o| return .{ .paths = try dlgx.runPickFiles(alloc, hwnd, o) },
+                .pick_color => |o| return .{ .color = dlgx.runPickColor(o) },
+                .pick_font => |o| return .{ .font = try dlgx.runPickFont(alloc, hwnd, o) },
             }
         }
 
@@ -469,6 +495,12 @@ fn Backend(comptime config: Config) type {
             const self: *Self = @ptrCast(@alignCast(backend_ptr));
             self.quit_code.store(code, .monotonic);
             win32.PostQuitMessage(@intCast(code));
+        }
+
+        /// Context.restart_fn 入口（*anyopaque → 实例）。
+        fn restartToApplyDispatch(backend_ptr: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(backend_ptr));
+            restartToApplyImpl(self);
         }
 
         fn makeContext(self: *Self) ipc.Context {
@@ -542,6 +574,7 @@ fn Backend(comptime config: Config) type {
                 .notify_fn = notifyFromThread,
                 .dialog_fn = runDialog,
                 .updater_env = self.updater_env,
+                .restart_fn = restartToApplyDispatch,
             };
         }
 
@@ -1553,6 +1586,78 @@ fn buildUpdaterEnv(self: anytype, uc: anytype) !updater.Env {
     };
 }
 
+/// 重启以应用已暂存的更新：分离接力进程（同 exe --zilt-restart）等本进程退出后拉起新版。
+fn restartToApplyImpl(self: anytype) void {
+    const alloc = self.allocator;
+    const exe = currentExePath(alloc) catch {
+        log.print("[updater] restart: currentExePath failed", .{});
+        return;
+    };
+    defer alloc.free(exe);
+    const args = std.fmt.allocPrint(alloc, "--zilt-restart \"{s}\"", .{exe}) catch return;
+    defer alloc.free(args);
+    if (win32.spawnDetached(exe, args) == null) {
+        log.print("[updater] restart: spawn helper failed", .{});
+        return;
+    }
+    log.print("[updater] restart helper spawned -> quit(0)", .{});
+    self.quit_code.store(0, .monotonic);
+    win32.PostQuitMessage(0);
+}
+
+/// 差分更新路径（v0.1.5）：校验基线 → 下载/验签补丁 → 应用 → 复核全量 sha256+签名 → 暂存。
+/// 任一步失败返回 null（调用方回退全量下载）。
+fn tryPatchUpdate(self: anytype, p: *const updater.PatchInfo, m: *const updater.Manifest, env: *const updater.Env) ?[]u8 {
+    const alloc = self.allocator;
+    log.print("[updater] patch path: {s} -> {s}", .{ p.from, m.version });
+
+    const exe_path = currentExePath(alloc) catch return null;
+    defer alloc.free(exe_path);
+    const current = win32.readFileAlloc(alloc, exe_path) orelse return null;
+    defer alloc.free(current);
+
+    // 基线校验：当前 exe 必须与差分基线一致
+    const cur_hex = updater.sha256Hex(alloc, current) catch return null;
+    defer alloc.free(cur_hex);
+    if (!std.ascii.eqlIgnoreCase(cur_hex, p.from_sha256)) {
+        log.print("[updater] patch base mismatch -> full download", .{});
+        return null;
+    }
+
+    const patch_bytes = env.fetcher.fetchFn(env.fetcher.ctx, alloc, p.url) catch return null;
+    defer alloc.free(patch_bytes);
+    const patch_hex = updater.sha256Hex(alloc, patch_bytes) catch return null;
+    defer alloc.free(patch_hex);
+    if (!std.ascii.eqlIgnoreCase(patch_hex, p.sha256)) {
+        log.print("[updater] patch sha256 mismatch", .{});
+        return null;
+    }
+    updater.verifyArtifact(patch_bytes, p.signature, env.public_key) catch return null;
+
+    const new_bytes = patch.applyPatch(alloc, current, patch_bytes) catch |err| {
+        log.print("[updater] patch apply failed: {s}", .{@errorName(err)});
+        return null;
+    };
+    defer alloc.free(new_bytes);
+
+    // 结果复核：与 manifest 全量校验和/签名一致才接受
+    const new_hex = updater.sha256Hex(alloc, new_bytes) catch return null;
+    defer alloc.free(new_hex);
+    if (!std.ascii.eqlIgnoreCase(new_hex, m.sha256)) {
+        log.print("[updater] patched result sha256 != manifest -> full download", .{});
+        return null;
+    }
+    updater.verifyArtifact(new_bytes, m.signature, env.public_key) catch return null;
+
+    const out = alloc.dupe(u8, new_bytes) catch return null;
+    updater.stageBytes(alloc, exe_path, out) catch {
+        alloc.free(out);
+        return null;
+    };
+    log.print("[updater] patched & staged ok ({d} -> {d} bytes)", .{ current.len, new_bytes.len });
+    return out;
+}
+
 /// HTTP 下载（std.http.Client；每次调用独立 Threaded Io，更新流程低频可接受）。
 fn httpFetch(backend_ptr: *anyopaque, alloc: std.mem.Allocator, url: []const u8) anyerror![]u8 {
     _ = backend_ptr;
@@ -1593,21 +1698,40 @@ fn updaterFlow(self: anytype) void {
     log.print("[updater] update available: {s} (current {s})", .{ m.version, env.current_version });
     ctx.emit("updateInfo", .{ .version = m.version, .notes = m.notes });
 
-    const artifact = updater.downloadAndVerify(self.allocator, env.fetcher, m, env.public_key) catch |err| {
-        log.print("[updater] download/verify failed: {s}", .{@errorName(err)});
-        ctx.emit("updaterFailed", .{ .stage = "download", .err = @errorName(err) });
-        return;
-    };
-    defer self.allocator.free(artifact);
-    log.print("[updater] artifact verified ({d} bytes, sha256+ed25519)", .{artifact.len});
-
-    updater.stageUpdate(self.allocator, env.exe_path, env.exe_name, artifact) catch |err| {
-        log.print("[updater] stage failed: {s}", .{@errorName(err)});
-        ctx.emit("updaterFailed", .{ .stage = "stage", .err = @errorName(err) });
-        return;
-    };
+    // 差分优先（v0.1.5）：基线匹配且各校验通过 → 免全量下载；否则回退全量
+    var artifact: ?[]u8 = null;
+    var staged_by_patch = false;
+    if (m.patch) |*p| {
+        if (std.mem.eql(u8, p.from, env.current_version)) {
+            if (tryPatchUpdate(self, p, &m, &env)) |_| {
+                artifact = self.allocator.alloc(u8, 0) catch null; // 已暂存：零长度占位（defer 释放安全）
+                staged_by_patch = true;
+            } else {
+                log.print("[updater] patch path failed -> full download fallback", .{});
+            }
+        } else {
+            log.print("[updater] patch base {s} != current {s} -> full download", .{ p.from, env.current_version });
+        }
+    }
+    if (artifact == null) {
+        artifact = updater.downloadAndVerify(self.allocator, env.fetcher, m, env.public_key) catch |err| {
+            log.print("[updater] download/verify failed: {s}", .{@errorName(err)});
+            ctx.emit("updaterFailed", .{ .stage = "download", .err = @errorName(err) });
+            return;
+        };
+        log.print("[updater] artifact verified ({d} bytes, sha256+ed25519)", .{artifact.?.len});
+        updater.stageUpdate(self.allocator, env.exe_path, env.exe_name, artifact.?) catch |err| {
+            log.print("[updater] stage failed: {s}", .{@errorName(err)});
+            ctx.emit("updaterFailed", .{ .stage = "stage", .err = @errorName(err) });
+            return;
+        };
+    }
+    defer if (artifact) |a| self.allocator.free(a);
     log.print("[updater] staged ✓ {s} — restart to apply", .{m.version});
     ctx.emit("updateStaged", .{ .version = m.version });
+    if (@TypeOf(self.*).update_cfg != null and @TypeOf(self.*).update_cfg.?.auto_restart) {
+        restartToApplyImpl(self);
+    }
 }
 
 // ---------------------------------------------------------------------------

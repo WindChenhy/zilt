@@ -495,6 +495,32 @@ pub fn getEnvUtf8(alloc: std.mem.Allocator, name_u8: []const u8) ?[]u8 {
 pub extern "ole32" fn CoInitializeEx(pvReserved: ?*anyopaque, dwCoInit: u32) callconv(.c) HRESULT;
 pub extern "ole32" fn CoUninitialize() callconv(.c) void;
 pub extern "ole32" fn CoTaskMemFree(pv: ?*anyopaque) callconv(.c) void;
+
+pub extern "kernel32" fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *u32) callconv(.c) BOOL;
+pub extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) callconv(.c) u32;
+
+const DETACHED_PROCESS: u32 = 0x8;
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x1000000;
+
+/// 分离进程 spawn（更新重启接力用）：先尝试脱离 Job（dev 编排下 Job 会整树清理，
+/// 接力进程必须幸存）；不允许脱离则原样创建（生产环境无 Job，本就无影响）。
+pub fn spawnDetached(exe_path: []const u8, args: []const u8) ?PROCESS_INFORMATION {
+    const cl = std.fmt.allocPrintSentinel(std.heap.page_allocator, "\"{s}\" {s}", .{ exe_path, args }, 0) catch return null;
+    defer std.heap.page_allocator.free(cl);
+    const exe_w = std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, exe_path) catch return null;
+    defer std.heap.page_allocator.free(exe_w);
+    const cl_w = std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, cl) catch return null;
+    defer std.heap.page_allocator.free(cl_w);
+
+    var si = std.mem.zeroes(STARTUPINFOW);
+    si.cb = @sizeOf(STARTUPINFOW);
+    var pi = std.mem.zeroes(PROCESS_INFORMATION);
+    const flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB;
+    if (CreateProcessW(exe_w.ptr, cl_w.ptr, null, null, 0, flags, null, null, &si, &pi) != 0) return pi;
+    if (CreateProcessW(exe_w.ptr, cl_w.ptr, null, null, 0, DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, null, null, &si, &pi) != 0) return pi;
+    return null;
+}
 pub extern "ole32" fn CreateStreamOnHGlobal(hGlobal: ?*anyopaque, fDeleteOnRelease: BOOL, ppstm: *?*anyopaque) callconv(.c) HRESULT;
 
 // ---- advapi32 ----

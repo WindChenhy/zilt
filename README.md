@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.4（Windows 全栈 + 前端工程化 + Phase C 增强：绑定 + IPC 协议 + comptime 绑定生成 + 前端资产 codegen + dev/init 工具链 + 打包器 + 托盘/菜单/对话框/快捷键 + 自动更新器）**。路线图见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.1.5（Windows 全栈 + 前端工程化 + Phase C + 对话框/更新器/多平台打包扩展：绑定 + IPC 协议 + comptime 绑定生成 + 前端资产 codegen + dev/init 工具链 + 打包器 + 托盘/菜单/对话框/快捷键 + 自动更新器）**。路线图见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 ## 创建新项目（vue/react/svelte）
 
