@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Zilt — Phase 2 示例</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <h1>Zilt <span class="badge">Phase 2</span></h1>
+    <p class="sub">Zig WebView GUI 框架 · IPC 协议 / comptime 绑定 / dev 热重载</p>
+    <p class="sub" id="conn">连接中…</p>
+  </header>
+
+  <main>
+    <section>
+      <h2>自动化验证（冒烟测试）</h2>
+      <button id="btn-checks">运行全部检查</button>
+      <table id="checks">
+        <tr><td>invoke greet（返回嵌套字段）</td><td id="c-greet" class="pending">…</td></tr>
+        <tr><td>invoke add（数值往返）</td><td id="c-add" class="pending">…</td></tr>
+        <tr><td>invoke failNow（Promise reject 带错误名）</td><td id="c-fail" class="pending">…</td></tr>
+        <tr><td>invoke queryUser（可选/嵌套对象）</td><td id="c-user" class="pending">…</td></tr>
+        <tr><td>Zig→JS 事件 tick（后台线程 emit）</td><td id="c-event" class="pending">…</td></tr>
+        <tr><td>invoke setMode（枚举参数映射）</td><td id="c-mode" class="pending">…</td></tr>
+      </table>
+      <div id="out"></div>
+    </section>
+
+    <section>
+      <h2>手动互动</h2>
+      <div class="row">
+        <input id="name" value="Zilt" placeholder="名字">
+        <button onclick="greetInteractive()">greet</button>
+      </div>
+      <div class="row">
+        <input id="a" type="number" value="1.5" step="0.1"> +
+        <input id="b" type="number" value="2.5" step="0.1">
+        <button onclick="addInteractive()">add</button>
+      </div>
+      <div class="row">
+        <button onclick="window.zilt.invoke('startTicker',{count:5,interval_ms:300})">tick ×5</button>
+        <button onclick="window.zilt.invoke('stopTicker',{})">stop</button>
+        <span id="ticks" class="mono"></span>
+      </div>
+    </section>
+  </main>
+
+  <footer class="sub">
+    window.zilt v<span id="ver">?</span> · 由 Zig comptime 反射驱动的 IPC
+  </footer>
+  <script src="/app.js"></script>
+</body>
+</html>

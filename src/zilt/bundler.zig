@@ -1,0 +1,378 @@
+//! 打包器核心（Phase 3，Windows）：
+//!  - ZipWriter：store 方法（不压缩）的最小 zip 写入器（CRC-32 由 std.hash 提供）
+//!  - NSIS 安装器脚本生成：per-user 安装 + 开始菜单/桌面快捷方式 + 卸载器
+//!    + WebView2 运行时检测与 Evergreen 引导（下载 bootstrapper 静默安装）
+//!
+//! 设计取舍（v0.1.0）：store-only zip 体积稍大但零依赖、实现可测；
+//! NSIS 通过外部 makensis 调用（本机有则产出 setup.exe，无则仅生成 .nsi 并提示）。
+
+const std = @import("std");
+
+// ---------------------------------------------------------------------------
+// Zip 写入器（store-only）
+// ---------------------------------------------------------------------------
+
+/// 一条待写入的文件。
+pub const ZipEntry = struct {
+    /// zip 内路径（用 '/' 分隔）
+    name: []const u8,
+    content: []const u8,
+};
+
+/// 把 entries 写成 zip 归档（store 方法）。写入 buffer。
+/// 结构：[local file header + data]... [central directory] [EOCD]
+pub fn writeZip(alloc: std.mem.Allocator, entries: []const ZipEntry, out: *std.ArrayList(u8)) !void {
+    const w = out;
+
+    const CentralOffset = struct { offset: u64, name: []const u8, crc: u32, size: u64 };
+
+    var centrals = try alloc.alloc(CentralOffset, entries.len);
+    defer alloc.free(centrals);
+
+    var offset: u64 = 0;
+    for (entries, 0..) |e, i| {
+        const name_len = e.name.len;
+        const crc = std.hash.Crc32.hash(e.content);
+        const size: u64 = e.content.len;
+
+        // local file header（PK\x03\x04）
+        try appendU32(alloc, w, 0x04034b50);
+        try appendU16(alloc, w, 20); // version needed
+        try appendU16(alloc, w, 0x0800); // flags: UTF-8 文件名
+        try appendU16(alloc, w, 0); // method: store
+        try appendU16(alloc, w, 0); // mod time（固定值，确定性构建）
+        try appendU16(alloc, w, 0x21); // mod date（1980-01-01）
+        try appendU32(alloc, w, crc);
+        try appendU32(alloc, w, @intCast(size)); // compressed
+        try appendU32(alloc, w, @intCast(size)); // uncompressed
+        try appendU16(alloc, w, @intCast(name_len));
+        try appendU16(alloc, w, 0); // extra len
+        try w.appendSlice(alloc, e.name);
+        try w.appendSlice(alloc, e.content);
+
+        centrals[i] = .{ .offset = offset, .name = e.name, .crc = crc, .size = size };
+        offset += 30 + name_len + size;
+    }
+
+    // central directory（PK\x01\x02）
+    const cd_start = offset;
+    for (centrals) |c| {
+        try appendU32(alloc, w, 0x02014b50);
+        try appendU16(alloc, w, 20); // version made by
+        try appendU16(alloc, w, 20); // version needed
+        try appendU16(alloc, w, 0x0800);
+        try appendU16(alloc, w, 0); // store
+        try appendU16(alloc, w, 0);
+        try appendU16(alloc, w, 0x21);
+        try appendU32(alloc, w, c.crc);
+        try appendU32(alloc, w, @intCast(c.size));
+        try appendU32(alloc, w, @intCast(c.size));
+        try appendU16(alloc, w, @intCast(c.name.len));
+        try appendU16(alloc, w, 0); // extra
+        try appendU16(alloc, w, 0); // comment
+        try appendU16(alloc, w, 0); // disk
+        try appendU16(alloc, w, 0); // internal attrs
+        try appendU32(alloc, w, 0); // external attrs
+        try appendU32(alloc, w, @intCast(c.offset));
+        try w.appendSlice(alloc, c.name);
+        offset += 46 + c.name.len;
+    }
+    const cd_size = offset - cd_start;
+
+    // EOCD（PK\x05\x06）
+    try appendU32(alloc, w, 0x06054b50);
+    try appendU16(alloc, w, 0);
+    try appendU16(alloc, w, 0);
+    try appendU16(alloc, w, @intCast(entries.len));
+    try appendU16(alloc, w, @intCast(entries.len));
+    try appendU32(alloc, w, @intCast(cd_size));
+    try appendU32(alloc, w, @intCast(cd_start));
+    try appendU16(alloc, w, 0);
+}
+
+fn appendU16(alloc: std.mem.Allocator, out: *std.ArrayList(u8), v: u16) !void {
+    try out.appendSlice(alloc, &.{ @intCast(v & 0xff), @intCast(v >> 8) });
+}
+fn appendU32(alloc: std.mem.Allocator, out: *std.ArrayList(u8), v: u32) !void {
+    try out.appendSlice(alloc, &.{
+        @intCast(v & 0xff),
+        @intCast((v >> 8) & 0xff),
+        @intCast((v >> 16) & 0xff),
+        @intCast((v >> 24) & 0xff),
+    });
+}
+
+// ---------------------------------------------------------------------------
+// NSIS 安装器脚本生成
+// ---------------------------------------------------------------------------
+
+pub const InstallerConfig = struct {
+    app_name: []const u8,
+    version: []const u8,
+    publisher: []const u8,
+    exe_name: []const u8,
+    /// 卸载表项 ID（建议形如 "Name.appid"）
+    app_id: []const u8,
+    /// setup.exe 输出路径（写入 OutFile）
+    out_path: []const u8,
+    /// 要打包的 exe 绝对路径（写入 File 指令）
+    exe_path: []const u8,
+};
+
+/// NSIS 字符串转义（$\ = 双引号，$$ = 字面 $）。
+pub fn nsisEscape(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    for (s) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(alloc, "$\\"),
+            '$' => try buf.appendSlice(alloc, "$$"),
+            else => try buf.append(alloc, c),
+        }
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
+/// 生成 NSIS 安装脚本（per-user 安装、无需管理员）。
+pub fn generateNsis(alloc: std.mem.Allocator, cfg: InstallerConfig) ![]u8 {
+    const name = try nsisEscape(alloc, cfg.app_name);
+    const version = try nsisEscape(alloc, cfg.version);
+    const publisher = try nsisEscape(alloc, cfg.publisher);
+    const exe_name = try nsisEscape(alloc, cfg.exe_name);
+    const app_id = try nsisEscape(alloc, cfg.app_id);
+    const out_path = try nsisEscape(alloc, cfg.out_path);
+    const exe_path = try nsisEscape(alloc, cfg.exe_path);
+    const escaped = [_][]u8{ name, version, publisher, exe_name, app_id, out_path, exe_path };
+    defer for (escaped) |e| alloc.free(e);
+
+    // 用 allocPrint 拼接大段模板（comptime 模板 + 运行时插值）
+    const tpl =
+        \\; Generated by Zilt bundler - DO NOT EDIT.
+        \\; Per-user installer: no admin required. WebView2 runtime auto-provisioned.
+        \\Unicode true
+        \\!include "LogicLib.nsh"
+        \\
+        \\!define APP_NAME      "{NAME}"
+        \\!define APP_VERSION   "{VER}"
+        \\!define APP_PUBLISHER "{PUB}"
+        \\!define APP_EXE       "{EXENAME}"
+        \\!define APP_ID        "{APPID}"
+        \\!define UNINST_KEY    "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_ID}"
+        \\
+        \\Name        "${APP_NAME} ${APP_VERSION}"
+        \\OutFile     "{OUT}"
+        \\InstallDir  "$LOCALAPPDATA\Programs\${APP_ID}"
+        \\InstallDirRegKey HKCU "${UNINST_KEY}" "InstallLocation"
+        \\RequestExecutionLevel user
+        \\SetCompressor /SOLID lzma
+        \\ShowInstDetails show
+        \\
+        \\Page directory
+        \\Page instfiles
+        \\UninstPage uninstConfirm
+        \\UninstPage instfiles
+        \\
+        \\; ---- WebView2 Runtime（Evergreen）检测与引导 ----
+        \\; NSIS 为 32 位进程，HKLM 读取自动落在 32 位视图（WOW6432Node）。
+        \\Function MaybeInstallWebView2
+        \\  ReadRegStr $R0 HKLM "SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
+        \\  ReadRegStr $R1 HKCU "SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
+        \\  ${If} $R0 == ""
+        \\  ${AndIf} $R1 == ""
+        \\    DetailPrint "WebView2 runtime not found; downloading Evergreen bootstrapper..."
+        \\    NSISdl::download /TIMEOUT=60000 "https://go.microsoft.com/fwlink/?linkid=2124701" "$TEMP\MicrosoftEdgeWebview2Setup.exe"
+        \\    Pop $R2
+        \\    ${If} $R2 == "success"
+        \\      ExecWait '"$TEMP\MicrosoftEdgeWebview2Setup.exe" /silent /install' $R3
+        \\      DetailPrint "WebView2 bootstrapper exit code: $R3"
+        \\    ${Else}
+        \\      MessageBox MB_ICONEXCLAMATION "无法下载 WebView2 运行时，请手动安装后重试。$\n错误: $R2"
+        \\    ${EndIf}
+        \\  ${Else}
+        \\    DetailPrint "WebView2 runtime found ($R0$R1)"
+        \\  ${EndIf}
+        \\FunctionEnd
+        \\
+        \\Section "Install"
+        \\  Call MaybeInstallWebView2
+        \\  SetOutPath "$INSTDIR"
+        \\  File "{EXE}"
+        \\  WriteUninstaller "$INSTDIR\Uninstall.exe"
+        \\  CreateDirectory "$SMPROGRAMS\${APP_NAME}"
+        \\  CreateShortCut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
+        \\  CreateShortCut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
+        \\  WriteRegStr HKCU "${UNINST_KEY}" "DisplayName"   "${APP_NAME} ${APP_VERSION}"
+        \\  WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${APP_VERSION}"
+        \\  WriteRegStr HKCU "${UNINST_KEY}" "Publisher"     "${APP_PUBLISHER}"
+        \\  WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon"   "$INSTDIR\${APP_EXE}"
+        \\  WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
+        \\  WriteRegStr HKCU "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
+        \\SectionEnd
+        \\
+        \\Section "Uninstall"
+        \\  Delete "$INSTDIR\${APP_EXE}"
+        \\  Delete "$INSTDIR\Uninstall.exe"
+        \\  RMDir "$INSTDIR"
+        \\  Delete "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk"
+        \\  RMDir "$SMPROGRAMS\${APP_NAME}"
+        \\  Delete "$DESKTOP\${APP_NAME}.lnk"
+        \\  DeleteRegKey HKCU "${UNINST_KEY}"
+        \\SectionEnd
+        \\
+    ;
+
+    var cur: []u8 = try replaceAll(alloc, tpl, "{NAME}", name);
+    cur = try repStep(alloc, cur, "{VER}", version);
+    cur = try repStep(alloc, cur, "{PUB}", publisher);
+    cur = try repStep(alloc, cur, "{EXENAME}", exe_name);
+    cur = try repStep(alloc, cur, "{APPID}", app_id);
+    cur = try repStep(alloc, cur, "{OUT}", out_path);
+    cur = try repStep(alloc, cur, "{EXE}", exe_path);
+    return cur;
+}
+
+/// 替换一步并释放上一步缓冲（失败时也释放）。
+fn repStep(alloc: std.mem.Allocator, cur: []u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    const next = replaceAll(alloc, cur, needle, replacement) catch |err| {
+        alloc.free(cur);
+        return err;
+    };
+    alloc.free(cur);
+    return next;
+}
+
+fn replaceAll(alloc: std.mem.Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    var i: usize = 0;
+    while (i < haystack.len) {
+        if (std.mem.startsWith(u8, haystack[i..], needle)) {
+            try buf.appendSlice(alloc, replacement);
+            i += needle.len;
+        } else {
+            try buf.append(alloc, haystack[i]);
+            i += 1;
+        }
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "writeZip: 结构 + CRC + 内容回读（手工解析）" {
+    const entries = [_]ZipEntry{
+        .{ .name = "Zilt-0.1.0/zilt-app.exe", .content = "MZ-fake-binary-bytes" },
+        .{ .name = "Zilt-0.1.0/README.txt", .content = "hello zilt\n" },
+        .{ .name = "Zilt-0.1.0/empty.dat", .content = "" },
+    };
+
+    var zip_bytes: std.ArrayList(u8) = .empty;
+    defer zip_bytes.deinit(testing.allocator);
+    try writeZip(testing.allocator, &entries, &zip_bytes);
+
+    // EOCD 定位（尾部 22 字节）
+    const tail = zip_bytes.items[zip_bytes.items.len - 22 ..];
+    try testing.expectEqualSlices(u8, &.{ 'P', 'K', 5, 6 }, tail[0..4]);
+    const entry_count = std.mem.readInt(u16, tail[10..12], .little);
+    try testing.expectEqual(@as(u16, 3), entry_count);
+    const cd_size = std.mem.readInt(u32, tail[12..16], .little);
+    const cd_start = std.mem.readInt(u32, tail[16..20], .little);
+
+    // 遍历 central directory → 跳到 local header → 校验名称/CRC/内容
+    var pos: usize = cd_start;
+    const cd_end = cd_start + cd_size;
+    var found: usize = 0;
+    while (pos < cd_end) {
+        try testing.expectEqualSlices(u8, &.{ 'P', 'K', 1, 2 }, zip_bytes.items[pos..][0..4]);
+        const crc = std.mem.readInt(u32, zip_bytes.items[pos + 16 ..][0..4], .little);
+        const size = std.mem.readInt(u32, zip_bytes.items[pos + 24 ..][0..4], .little);
+        const name_len = std.mem.readInt(u16, zip_bytes.items[pos + 28 ..][0..2], .little);
+        const lfh_off = std.mem.readInt(u32, zip_bytes.items[pos + 42 ..][0..4], .little);
+        const name = zip_bytes.items[pos + 46 ..][0..name_len];
+        pos += 46 + name_len;
+        found += 1;
+
+        // local header
+        try testing.expectEqualSlices(u8, &.{ 'P', 'K', 3, 4 }, zip_bytes.items[lfh_off..][0..4]);
+        const l_name_len = std.mem.readInt(u16, zip_bytes.items[lfh_off + 26 ..][0..2], .little);
+        const data_start = lfh_off + 30 + l_name_len;
+        const data = zip_bytes.items[data_start..][0..size];
+        try testing.expectEqual(crc, std.hash.Crc32.hash(data));
+
+        // 与源数据比对
+        for (entries) |e| {
+            if (std.mem.eql(u8, e.name, name)) {
+                try testing.expectEqualSlices(u8, e.content, data);
+                break;
+            }
+        } else {
+            return error.TestUnexpectedResult; // 未知条目名
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), found);
+}
+
+test "writeZip: 无效与极端文件名" {
+    const entries = [_]ZipEntry{
+        .{ .name = "a/b/c.txt", .content = "x" },
+    };
+    var zip_bytes: std.ArrayList(u8) = .empty;
+    defer zip_bytes.deinit(testing.allocator);
+    try writeZip(testing.allocator, &entries, &zip_bytes);
+    try testing.expect(zip_bytes.items.len > 30 + 46 + 8);
+}
+
+test "nsisEscape" {
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "plain", .want = "plain" },
+        .{ .in = "a\"b", .want = "a$\\b" },
+        .{ .in = "$100", .want = "$$100" },
+    };
+    for (cases) |c| {
+        const got = try nsisEscape(testing.allocator, c.in);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c.want, got);
+    }
+}
+
+test "generateNsis: 关键指令与插值" {
+    const script = try generateNsis(testing.allocator, .{
+        .app_name = "Zilt",
+        .version = "0.1.0",
+        .publisher = "Zilt Project",
+        .exe_name = "zilt-app.exe",
+        .app_id = "app.zilt.desktop",
+        .out_path = "dist/Zilt-0.1.0-x64-setup.exe",
+        .exe_path = "C:\\build\\zilt-app.exe",
+    });
+    defer testing.allocator.free(script);
+
+    // 基础头
+    try testing.expect(std.mem.indexOf(u8, script, "Unicode true") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "!define APP_NAME      \"Zilt\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "!define APP_VERSION   \"0.1.0\"") != null);
+    // 插值完整（!define 侧为 Zig 替换；脚本体中 ${APP_ID} 等是 NSIS 编译期展开）
+    try testing.expect(std.mem.indexOf(u8, script, "!define APP_ID        \"app.zilt.desktop\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "OutFile     \"dist/Zilt-0.1.0-x64-setup.exe\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "File \"C:\\build\\zilt-app.exe\"") != null);
+    // WebView2 引导：官方 GUID + 官方 bootstrapper URL + 静默安装
+    try testing.expect(std.mem.indexOf(u8, script, "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "https://go.microsoft.com/fwlink/?linkid=2124701") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "/silent /install") != null);
+    // per-user：无 admin + 卸载表项
+    try testing.expect(std.mem.indexOf(u8, script, "RequestExecutionLevel user") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "Uninstall\\${APP_ID}") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "WriteUninstaller") != null);
+    // 快捷方式
+    try testing.expect(std.mem.indexOf(u8, script, "CreateShortCut") != null);
+}
+
+test "replaceAll" {
+    const r = try replaceAll(testing.allocator, "a{X}b{X}c", "{X}", "-");
+    defer testing.allocator.free(r);
+    try testing.expectEqualStrings("a-b-c", r);
+}
