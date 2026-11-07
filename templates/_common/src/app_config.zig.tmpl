@@ -6,3 +6,9 @@ pub const commands = @import("commands.zig");
 pub const events = @import("events.zig");
 
 pub const assets = @import("zilt_assets").assets;
+pub const security: zilt.security.Options = .{ .capabilities = &.{.{
+    .name = "main-local",
+    .commands = &.{"*"},
+    .events = &.{"*"},
+    .receive_events = &.{"*"},
+}} };

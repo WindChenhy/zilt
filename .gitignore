@@ -9,3 +9,5 @@ frontend/bindings/
 *.log
 
 .zilt-cache-assets/
+# 模板 init 回归生成的临时工程（含大量 vendored 文件，不纳入提交）
+_smoke_init/

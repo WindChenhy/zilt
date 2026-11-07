@@ -28,6 +28,23 @@ const dlgx = @import("dialog_ext.zig");
 const range_mod = @import("range.zig");
 const icon_mod = @import("icon.zig");
 const deep_link = @import("deep_link.zig");
+const security = @import("../../security.zig");
+const asset_routes = @import("../../asset_routes.zig");
+const app_data = @import("app_data.zig");
+const builtin = @import("../../builtin.zig");
+const shared_webview = @import("../../webview.zig");
+const shared_clipboard = @import("../../clipboard.zig");
+const shared_drag = @import("../../drag_drop.zig");
+const shared_notification = @import("../../notification.zig");
+const environment = @import("../../environment.zig");
+const webview_driver = @import("webview_driver.zig");
+const env_options = @import("environment_options.zig");
+const win_clipboard = @import("clipboard.zig");
+const win_drag = @import("drag_drop.zig");
+
+extern "user32" fn EnableWindow(win32.HWND, win32.BOOL) callconv(.c) win32.BOOL;
+extern "user32" fn IsWindowEnabled(win32.HWND) callconv(.c) win32.BOOL;
+extern "user32" fn IsZoomed(win32.HWND) callconv(.c) win32.BOOL;
 
 const HRESULT = com.HRESULT;
 const WM_ZILT_EMIT: win32.UINT = win32.WM_APP + 1;
@@ -36,12 +53,28 @@ const WM_ZILT_TRAY: win32.UINT = win32.WM_APP + 3;
 const WM_ZILT_WINCTL: win32.UINT = win32.WM_APP + 4;
 const WM_ZILT_NEWWIN: win32.UINT = win32.WM_APP + 5;
 const WM_ZILT_CLIP: win32.UINT = win32.WM_APP + 6;
+const WM_ZILT_ACTION: win32.UINT = win32.WM_APP + 7; // 统一能力动作 marshal（UI 线程）
+const WM_ZILT_WAKE: win32.UINT = win32.WM_APP + 8; // WebView driver 延迟派发
+const WM_ZILT_TOAST_EVENT: win32.UINT = win32.WM_APP + 9; // WinRT 线程 → UI 线程
+const WM_CLIPBOARDUPDATE: win32.UINT = 0x031D;
 const TRAY_MENU_BASE: u16 = 100;
+
+extern "shell32" fn ShellExecuteW(
+    hwnd: ?*anyopaque,
+    operation: ?[*:0]const u16,
+    file: [*:0]const u16,
+    parameters: ?[*:0]const u16,
+    directory: ?[*:0]const u16,
+    show_cmd: i32,
+) callconv(.c) usize;
+extern "ole32" fn OleInitialize(reserved: ?*anyopaque) callconv(.c) com.HRESULT;
+extern "ole32" fn OleUninitialize() callconv(.c) void;
 const SMOKE_ENV = "ZILT_SMOKE_TEST_MS";
 /// 内置默认图标（Zig 官方 logo，多尺寸 ICO）。config.icon 为 null 时使用。
 const default_icon_bytes = @embedFile("../../assets/zilt.ico");
 
 pub fn run(comptime config: Config) !void {
+    try security.validateHeaders(config.security);
     const B = Backend(config);
     log.initFileLog("zilt.log");
     const alloc = std.heap.page_allocator;
@@ -90,6 +123,10 @@ pub fn run(comptime config: Config) !void {
         return error.CoInitializeFailed;
     }
     defer _ = win32.CoUninitialize();
+    // OLE 拖放（v0.1.12）要求 OleInitialize 而不仅是 CoInitializeEx。
+    const ole_ok = com.succeeded(OleInitialize(null));
+    defer if (ole_ok) OleUninitialize();
+    if (!ole_ok) log.print("[ole] OleInitialize failed -> OLE drag/drop disabled", .{});
 
     var backend = try alloc.create(B);
     backend.* = .{ .allocator = alloc };
@@ -124,6 +161,8 @@ pub fn run(comptime config: Config) !void {
             log.print("[toast] init failed: {s}（通知降级托盘气球）", .{@errorName(err)});
             break :blk;
         };
+        // v0.1.12：Toast 按钮/输入/点击/关闭回调（WinRT 线程 → UI 线程 marshal）。
+        backend.toast.?.callback = .{ .context = backend, .function = B.onToastEvent };
         log.print("[toast] winrt ready (aumid={s})", .{config.app_id});
     }
 
@@ -171,6 +210,8 @@ pub fn run(comptime config: Config) !void {
         .background_color = config.background_color,
         .close_requested_event = config.close_requested_event,
         .icon = config.icon,
+        .label = "main",
+        .state_key = config.state_key,
     });
     if (config.visible) {
         _ = win32.ShowWindow(main.hwnd, win32.SW_SHOW);
@@ -187,19 +228,37 @@ pub fn run(comptime config: Config) !void {
         }
     }
 
-    var runtime = try loader.findRuntime(alloc);
-    log.print("[loader] runtime version: {s}", .{runtime.version});
+    // v0.1.10：运行时通道 / 固定版本目录 / UA / 语言 / 代理 / 浏览器参数。
+    var runtime = try loader.findRuntimeWithOptions(alloc, config.environment);
+    log.print("[loader] runtime version: {s} (channel={s})", .{ runtime.version, @tagName(config.environment.channel) });
     if (std.unicode.utf16LeToUtf8Alloc(alloc, runtime.dll_path)) |dll_u8| {
         defer alloc.free(dll_u8);
         log.print("[loader] dll: {s}", .{dll_u8});
     } else |_| {}
 
-    const udf = try buildUserDataFolder(alloc);
+    const udf = try buildUserDataFolder(alloc, config.app_id, config.migrate_legacy_profile);
+    log.print("[profile] {s}", .{udf.utf8});
     defer alloc.free(udf.utf8);
     defer alloc.free(udf.utf16);
 
+    var env_opts: ?*env_options.EnvironmentOptions = null;
+    const eo = config.environment;
+    if (eo.language != null or eo.proxy_server != null or eo.additional_browser_arguments != null or eo.channel != .evergreen or eo.browser_directory != null) {
+        env_opts = env_options.EnvironmentOptions.create(alloc, eo) catch |err| blk: {
+            log.print("[env] environment options unavailable: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (env_opts != null) log.print("[env] options applied (lang={s}, proxy={s}, args={s})", .{
+            if (eo.language) |v| v else "-",
+            if (eo.proxy_server) |v| v else "-",
+            if (eo.additional_browser_arguments) |v| v else "-",
+        });
+    }
+    defer if (env_opts) |o| o.dropRef();
+
     const env_handler = try B.EnvCompletedHandler.create(backend, main);
-    const hr_env = loader.createEnvironment(&runtime, udf.utf16.ptr, null, env_handler);
+    const env_opt_ptr: ?*anyopaque = if (env_opts) |o| @ptrCast(o) else null;
+    const hr_env = loader.createEnvironment(&runtime, udf.utf16.ptr, env_opt_ptr, env_handler);
     env_handler.dropRef();
     if (com.failed(hr_env)) {
         log.print("[fatal] createEnvironment failed hr=0x{x}", .{@as(u32, @bitCast(hr_env))});
@@ -225,6 +284,7 @@ pub fn run(comptime config: Config) !void {
     if (backend.watcher) |w| w.stopJoin();
     backend.watcher = null;
 
+    backend.saveAllStates();
     backend.cleanup();
     if (backend.quit_code.load(.monotonic) != 0) return error.AppFailed;
 }
@@ -277,15 +337,10 @@ fn forwardToRunning(alloc: std.mem.Allocator, class_name: []const u8, payload: [
 
 const UserDataFolder = struct { utf8: []u8, utf16: [:0]u16 };
 
-fn buildUserDataFolder(alloc: std.mem.Allocator) !UserDataFolder {
-    const temp = win32.getEnvUtf8(alloc, "TEMP") orelse try alloc.dupe(u8, "C:\\Windows\\Temp");
-    defer alloc.free(temp);
-    const dir = try std.fmt.allocPrint(alloc, "{s}\\zilt-app-webview2", .{temp});
-    const dir_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, dir);
-    defer alloc.free(dir_w);
-    _ = win32.CreateDirectoryW(dir_w.ptr, null);
-    const utf16 = try std.unicode.utf8ToUtf16LeAllocZ(alloc, dir);
-    return .{ .utf8 = dir, .utf16 = utf16 };
+fn buildUserDataFolder(alloc: std.mem.Allocator, app_id: []const u8, migrate: bool) !UserDataFolder {
+    const dir = try app_data.profileDirectory(alloc, app_id, migrate);
+    errdefer alloc.free(dir);
+    return .{ .utf8 = dir, .utf16 = try std.unicode.utf8ToUtf16LeAllocZ(alloc, dir) };
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +393,7 @@ fn windowStyleFor(opts: ipc.WindowOptions) win32.DWORD {
     } else if (!opts.decorations) {
         style |= win32.WS_THICKFRAME;
     }
+    if (opts.child) style = (style & ~(win32.WS_POPUP | win32.WS_CAPTION | win32.WS_SYSMENU | win32.WS_MINIMIZEBOX | win32.WS_MAXIMIZEBOX)) | 0x40000000;
     if (opts.visible) style |= win32.WS_VISIBLE;
     return style;
 }
@@ -500,6 +556,89 @@ fn requestHeaderUtf8(args: *wv2.ICoreWebView2WebResourceRequestedEventArgs, allo
 // Backend（按 Config 编译期实例化）
 // ---------------------------------------------------------------------------
 
+/// 同步等待 WebView 异步 action 的 completion（局部消息泵，避免 STA 死锁）。
+const SyncWait = struct {
+    alloc: std.mem.Allocator,
+    done: bool = false,
+    json: ?[]u8 = null,
+    err: ?anyerror = null,
+
+    fn callback(context: *anyopaque, result: anyerror![]const u8) void {
+        const self: *SyncWait = @ptrCast(@alignCast(context));
+        if (result) |json| {
+            self.json = self.alloc.dupe(u8, json) catch {
+                self.err = error.OutOfMemory;
+                self.done = true;
+                return;
+            };
+        } else |e| self.err = e;
+        self.done = true;
+    }
+};
+
+fn jsonString(alloc: std.mem.Allocator, value: ?[]const u8) ![]u8 {
+    return if (value) |v| std.json.Stringify.valueAlloc(alloc, v, .{}) else alloc.dupe(u8, "null");
+}
+
+fn appendFmt(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
+    const text = try std.fmt.allocPrint(alloc, fmt, args);
+    defer alloc.free(text);
+    try buf.appendSlice(alloc, text);
+}
+
+/// Toast 交互事件（WinRT 线程）→ UI 线程事件 JSON。纯函数，便于单测。
+fn toastEventJson(alloc: std.mem.Allocator, ev: shared_notification.Event) ![]u8 {
+    const tag = try jsonString(alloc, ev.tag);
+    defer alloc.free(tag);
+    const group = try jsonString(alloc, ev.group);
+    defer alloc.free(group);
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(alloc);
+    switch (ev.kind) {
+        .activated => |a| {
+            const args = try std.json.Stringify.valueAlloc(alloc, a.arguments, .{});
+            defer alloc.free(args);
+            try appendFmt(alloc, &body, "{{\"kind\":\"activated\",\"arguments\":{s},\"data_error\":{},\"user_input\":[", .{ args, a.data_error });
+            for (a.user_input, 0..) |ui, i| {
+                if (i != 0) try body.append(alloc, ',');
+                const id = try std.json.Stringify.valueAlloc(alloc, ui.id, .{});
+                defer alloc.free(id);
+                const value = try std.json.Stringify.valueAlloc(alloc, ui.value, .{});
+                defer alloc.free(value);
+                try appendFmt(alloc, &body, "{{\"id\":{s},\"value\":{s}}}", .{ id, value });
+            }
+            try body.appendSlice(alloc, "]}");
+        },
+        .dismissed => |reason| try appendFmt(alloc, &body, "{{\"kind\":\"dismissed\",\"reason\":\"{s}\"}}", .{@tagName(reason)}),
+        .failed => |code| try appendFmt(alloc, &body, "{{\"kind\":\"failed\",\"code\":{d}}}", .{code}),
+    }
+    return std.fmt.allocPrint(alloc, "{{\"tag\":{s},\"group\":{s},\"event\":{s}}}", .{ tag, group, body.items });
+}
+
+/// OLE 拖放的自定义格式名 + 载荷长度（不回传原始字节）。
+fn customFormatsJson(alloc: std.mem.Allocator, custom: []const shared_drag.CustomFormat) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    try buf.append(alloc, '[');
+    for (custom, 0..) |c, i| {
+        if (i != 0) try buf.append(alloc, ',');
+        const name = try std.json.Stringify.valueAlloc(alloc, c.name, .{});
+        defer alloc.free(name);
+        try appendFmt(alloc, &buf, "{{\"name\":{s},\"bytes\":{d}}}", .{ name, c.data.len });
+    }
+    try buf.append(alloc, ']');
+    return buf.toOwnedSlice(alloc);
+}
+
+fn openExternal(alloc: std.mem.Allocator, url: []const u8) void {
+    if (!security.isWebUrl(url)) return;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, url) catch return;
+    defer alloc.free(wide);
+    // operation=null → 系统默认（浏览器打开 https/http URL）
+    const rc = ShellExecuteW(null, null, wide.ptr, null, null, win32.SW_SHOW);
+    if (rc <= 32) log.print("[webview] ShellExecuteW failed ({d}) for {s}", .{ rc, url });
+}
+
 fn Backend(comptime config: Config) type {
     return struct {
         const Self = @This();
@@ -526,6 +665,17 @@ fn Backend(comptime config: Config) type {
             hwnd: win32.HWND = null,
             title: []u8,
             url: []u8,
+            label: []u8,
+            parent_id: ?u32 = null,
+            modal: bool = false,
+            child: bool = false,
+            modal_children: u32 = 0,
+            parent_was_enabled: bool = true,
+            menu: win32.HMENU = null,
+            menu_items: []const Config.MenuItem = &.{},
+            menu_arena: std.heap.ArenaAllocator,
+            state_key: ?[]const u8 = null,
+            normal_rect: win32.RECT = .{ .left = 0, .top = 0, .right = 900, .bottom = 640 },
             controller: ?*wv2.ICoreWebView2Controller = null,
             webview: ?*wv2.ICoreWebView2 = null,
             msg_handler: ?*MessageHandler = null,
@@ -548,6 +698,10 @@ fn Backend(comptime config: Config) type {
             owns_icons: bool = false,
             bg_brush: win32.HBRUSH = null,
             dpi: u32 = 96,
+            // ---- v0.1.9–v0.1.12 ----
+            driver: ?*webview_driver.Driver = null,
+            drop_target: ?*win_drag.DropTarget = null,
+            clipboard_listening: bool = false,
 
             fn updateBounds(self: *Window) void {
                 const controller = self.controller orelse return;
@@ -560,6 +714,10 @@ fn Backend(comptime config: Config) type {
             fn emitEventPayload(self: *Window, name: []const u8, payload: anytype) void {
                 if (!self.alive) return;
                 const b = self.backend;
+                // v0.1.11：声明了 capability 清单时，Zig→JS 事件同样受
+                // receive_events 约束（框架内部 "__" 事件不受限）。
+                if (config.security.capabilities.len != 0 and !std.mem.startsWith(u8, name, "__") and
+                    !security.allowed(config.security, config.url, b.dev_url, config.url, self.label, .receive_event, name)) return;
                 const payload_json = std.json.Stringify.valueAlloc(b.allocator, payload, .{}) catch return;
                 defer b.allocator.free(payload_json);
                 const msg = ipc.encodeEvent(b.allocator, name, payload_json) catch return;
@@ -584,6 +742,23 @@ fn Backend(comptime config: Config) type {
                 defer b.allocator.free(wide);
                 _ = webview.postWebMessageAsJson(wide.ptr);
             }
+
+            /// 渲染进程/浏览器进程崩溃后重建 WebView 前，释放旧 COM 引用。
+            fn releaseWebViewCom(self: *Window) void {
+                if (self.msg_handler) |h| h.dropRef();
+                if (self.res_handler) |h| h.dropRef();
+                if (self.nav_handler) |h| h.dropRef();
+                if (self.webview) |wv| _ = wv.lpVtbl.Release(wv);
+                if (self.controller) |c| {
+                    _ = c.lpVtbl.Close(c);
+                    _ = c.lpVtbl.Release(c);
+                }
+                self.webview = null;
+                self.msg_handler = null;
+                self.res_handler = null;
+                self.nav_handler = null;
+                self.controller = null;
+            }
         };
 
         allocator: std.mem.Allocator,
@@ -592,7 +767,6 @@ fn Backend(comptime config: Config) type {
         windows: std.ArrayListUnmanaged(*Window) = .empty,
         next_id: u32 = 1,
         env: ?*wv2.ICoreWebView2Environment = null,
-        main_menu: ?win32.HMENU = null,
         tray_menu: ?win32.HMENU = null,
         icon_big: win32.HICON = null,
         icon_small: win32.HICON = null,
@@ -656,14 +830,6 @@ fn Backend(comptime config: Config) type {
             };
             if (win32.RegisterClassExW(&wc) == 0) return error.RegisterClassFailed;
 
-            if (Self.menu_cfg) |items| {
-                if (menu_mod.buildWin32(self.allocator, items)) |m| {
-                    self.main_menu = m;
-                    log.print("[menu] built ({} leaf items)", .{Self.menu_leaf_count});
-                } else |err| {
-                    log.print("[menu] build failed: {s}", .{@errorName(err)});
-                }
-            }
             if (Self.tray_menu_cfg) |items| {
                 if (menu_mod.buildPopup(self.allocator, items, TRAY_MENU_BASE)) |m| {
                     self.tray_menu = m;
@@ -748,7 +914,38 @@ fn Backend(comptime config: Config) type {
 
         // ---- 窗口创建 / WebView 附加 ----
 
+        fn cloneMenu(alloc: std.mem.Allocator, items: []const Config.MenuItem) anyerror![]const Config.MenuItem {
+            if (items.len > 4096) return error.TooManyMenuItems;
+            const copy = try alloc.alloc(Config.MenuItem, items.len);
+            for (items, copy) |item, *dest| {
+                dest.* = .{
+                    .label = try alloc.dupe(u8, item.label),
+                    .id = if (item.id) |id| try alloc.dupe(u8, id) else null,
+                    .items = if (item.items) |children| try cloneMenu(alloc, children) else null,
+                };
+            }
+            return copy;
+        }
+
         fn createWindow(self: *Self, opts: ipc.WindowOptions) !*Window {
+            if (opts.width == 0 or opts.height == 0 or opts.width > 32767 or opts.height > 32767) return error.InvalidWindowSize;
+            if (opts.child and opts.modal) return error.InvalidWindowRelationship;
+            const parent = if (opts.parent) |id| self.windowById(if (id == 0) 1 else id) orelse return error.ParentNotFound else null;
+            if (parent) |p| { if (!p.alive) return error.ParentNotFound; }
+            if ((opts.child or opts.modal) and parent == null) return error.ParentRequired;
+            const label = if (opts.label) |name| try self.allocator.dupe(u8, name) else try std.fmt.allocPrint(self.allocator, "window-{d}", .{self.next_id});
+            errdefer self.allocator.free(label);
+            for (self.windows.items) |other| if (other.alive and std.mem.eql(u8, other.label, label)) return error.DuplicateWindowLabel;
+            var menu_arena = std.heap.ArenaAllocator.init(self.allocator);
+            errdefer menu_arena.deinit();
+            // v0.1.8：显式 state_key 优先；开启全局持久化时按窗口 label（≈ 窗口 id）保存。
+            const state_key = if (opts.state_key) |key|
+                try menu_arena.allocator().dupe(u8, key)
+            else if (config.persist_window_state)
+                try menu_arena.allocator().dupe(u8, label)
+            else
+                null;
+            const menu_items = try cloneMenu(menu_arena.allocator(), opts.menu orelse config.menu orelse &.{});
             const title = try self.allocator.dupe(u8, opts.title);
             errdefer self.allocator.free(title);
             const url = try self.allocator.dupe(u8, opts.url orelse config.url);
@@ -761,6 +958,13 @@ fn Backend(comptime config: Config) type {
                 .id = self.next_id,
                 .title = title,
                 .url = url,
+                .label = label,
+                .parent_id = if (parent) |p| p.id else null,
+                .modal = opts.modal,
+                .child = opts.child,
+                .menu_arena = menu_arena,
+                .menu_items = menu_items,
+                .state_key = state_key,
                 .min_width = opts.min_width,
                 .min_height = opts.min_height,
                 .max_width = opts.max_width,
@@ -776,7 +980,10 @@ fn Backend(comptime config: Config) type {
 
             const style = windowStyleFor(opts);
             const ex_style = windowExStyleFor(opts);
-            const has_menu = opts.decorations and self.main_menu != null;
+            const has_menu = opts.decorations and !opts.child and menu_items.len != 0;
+            if (has_menu) w.menu = try menu_mod.buildWin32(self.allocator, menu_items);
+            errdefer { if (w.menu) |menu| _ = win32.DestroyMenu(menu); }
+            try self.windows.ensureUnusedCapacity(self.allocator, 1);
 
             var rect = win32.RECT{
                 .left = 0,
@@ -795,7 +1002,7 @@ fn Backend(comptime config: Config) type {
                 opts.y orelse win32.CW_USEDEFAULT,
                 rect.right - rect.left,
                 rect.bottom - rect.top,
-                null,
+                if (parent) |p| p.hwnd else null,
                 null,
                 hinstance,
                 null,
@@ -804,8 +1011,9 @@ fn Backend(comptime config: Config) type {
             w.dpi = win32.GetDpiForWindow(w.hwnd);
 
             if (has_menu) {
-                if (win32.SetMenu(w.hwnd, self.main_menu.?) == 0) {
-                    log.print("[menu] SetMenu failed for window {d}", .{w.id});
+                if (win32.SetMenu(w.hwnd, w.menu) == 0) {
+                    _ = win32.DestroyWindow(w.hwnd);
+                    return error.AttachMenuFailed;
                 }
             }
 
@@ -836,13 +1044,36 @@ fn Backend(comptime config: Config) type {
             if (opts.always_on_top) {
                 _ = win32.SetWindowPos(w.hwnd, win32.HWND_TOPMOST, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
             }
-            win32.DragAcceptFiles(w.hwnd, 1);
+            // v0.1.12：OLE IDropTarget（含坐标/自定义格式）优先，失败回退 WM_DROPFILES。
+            if (win_drag.DropTarget.create(self.allocator, w.hwnd, w, Self.onDragEvent, config.drag_formats)) |target| {
+                w.drop_target = target;
+            } else |err| {
+                log.print("[drag] OLE drop target unavailable: {s} (fallback WM_DROPFILES)", .{@errorName(err)});
+            }
+            win32.DragAcceptFiles(w.hwnd, if (w.drop_target == null) 1 else 0);
+            if (config.clipboard_change_event) {
+                if (win_clipboard.startListening(w.hwnd)) |_| {
+                    w.clipboard_listening = true;
+                } else |err| {
+                    log.print("[clip] change listener unavailable: {s}", .{@errorName(err)});
+                }
+            }
 
-            try self.windows.append(self.allocator, w);
+            self.windows.appendAssumeCapacity(w);
             self.next_id += 1;
+            _ = win32.GetWindowRect(w.hwnd, &w.normal_rect);
+            if (opts.modal) {
+                const p = parent.?;
+                if (p.modal_children == 0) {
+                    p.parent_was_enabled = IsWindowEnabled(p.hwnd) != 0;
+                    _ = EnableWindow(p.hwnd, 0);
+                }
+                p.modal_children += 1;
+            }
             log.print("[win32] window #{d} created: \"{s}\" ({s}) decorations={} transparent={} topmost={} taskbar={} visible={}", .{
                 w.id, title, url, opts.decorations, opts.transparent, opts.always_on_top, !opts.skip_taskbar, opts.visible,
             });
+            self.restoreWindowState(w);
             return w;
         }
 
@@ -939,6 +1170,25 @@ fn Backend(comptime config: Config) type {
                 var token3: com.EventRegistrationToken = .{ .value = 0 };
                 const hr3c = webview.addNavigationCompleted(nh, &token3);
                 log.print("[webview] add_NavigationCompleted hr=0x{x}", .{@as(u32, @bitCast(hr3c))});
+            }
+
+            // v0.1.9/v0.1.10：WebView2 事件面 / Settings / 运行时 API / 下载 / 权限 / 崩溃恢复。
+            var wv_opts = config.webview;
+            wv_opts.origin = originOf(config.url);
+            if (webview_driver.attach(self.allocator, webview, controller, wv_opts, w, .{
+                .emit = driverEmit,
+                .navigation = driverNavigation,
+                .new_window = driverNewWindow,
+                .external = driverExternal,
+                .schedule = driverSchedule,
+                .recover = driverRecover,
+            })) |driver| {
+                w.driver = driver;
+                log.print("[webview] driver attached (devtools={}, downloads={}, new_window={s}, recover={})", .{
+                    wv_opts.settings.devtools, wv_opts.downloads.enabled, @tagName(wv_opts.new_window), wv_opts.recover_renderer,
+                });
+            } else |err| {
+                log.print("[webview] driver unavailable: {s} (legacy handlers remain)", .{@errorName(err)});
             }
 
             // 注入 zilt 运行时（window.zilt：invoke/emit/on + __reload）
@@ -1071,6 +1321,15 @@ fn Backend(comptime config: Config) type {
                 .spawn_window_fn = spawnWindowFromBackend,
                 .clipboard_write_fn = clipboardWriteFromBackend,
                 .clipboard_read_fn = clipboardReadFromBackend,
+                // ---- v0.1.9–v0.1.12 ----
+                .clipboard_read_data_fn = clipboardReadData,
+                .clipboard_write_data_fn = clipboardWriteData,
+                .start_drag_fn = startDragFiles,
+                .notification_show_fn = notificationShow,
+                .notification_update_fn = notificationUpdate,
+                .notification_status_fn = notificationStatus,
+                .webview_request_fn = webviewRequestAction,
+                .eval_async_fn = evalAsyncAction,
             };
         }
 
@@ -1140,15 +1399,27 @@ fn Backend(comptime config: Config) type {
         fn onWebMessage(w: *Window, args: *wv2.ICoreWebView2WebMessageReceivedEventArgs) void {
             const self = w.backend;
             // origin 校验：非允许来源的消息一律丢弃
+            var src_u8_owned: ?[]u8 = null;
+            defer if (src_u8_owned) |s| self.allocator.free(s);
+            var source_url: []const u8 = config.url;
             const src = args.getSource();
             defer if (src.value) |p| wv2.freeCoString(p);
             if (src.value) |p| {
-                const src_u8 = std.unicode.utf16LeToUtf8Alloc(self.allocator, std.mem.span(p)) catch return;
-                defer self.allocator.free(src_u8);
-                const origin = originOf(src_u8);
-                if (!originAllowed(self, origin)) {
-                    log.print("[ipc] dropped message from disallowed origin: {s}", .{origin});
-                    return;
+                src_u8_owned = std.unicode.utf16LeToUtf8Alloc(self.allocator, std.mem.span(p)) catch null;
+                if (src_u8_owned) |s| {
+                    source_url = s;
+                    const origin = originOf(s);
+                    if (!originAllowed(self, origin)) {
+                        log.print("[ipc] dropped message from disallowed origin: {s}", .{origin});
+                        return;
+                    }
+                    // v0.1.11 远程内容边界：isolation 下远程页面不得访问 IPC。
+                    const local = security.sameOrigin(origin, originOf(config.url)) or
+                        (if (self.dev_url) |u| security.sameOrigin(origin, originOf(u)) else false);
+                    if (config.security.isolation and !local) {
+                        log.print("[ipc] dropped isolated remote message: {s}", .{origin});
+                        return;
+                    }
                 }
             }
 
@@ -1162,6 +1433,8 @@ fn Backend(comptime config: Config) type {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
             const ctx = self.makeContextWith(w, arena.allocator());
+            // v0.1.11：只有声明了 capability 清单才强制（未声明保持 v0.1.7 兼容）。
+            const enforce_acl = config.security.capabilities.len != 0;
 
             var decoded = ipc.decode(self.allocator, raw_u8) catch return;
             defer decoded.deinit();
@@ -1178,16 +1451,38 @@ fn Backend(comptime config: Config) type {
                         return;
                     }
 
-                    const result_json = ipc.dispatch(config.commands, ctx, inv.method, inv.args_json) catch |err| {
-                        log.print("[ipc] invoke {s} failed: {s}", .{ inv.method, @errorName(err) });
-                        const rej = ipc.encodeReject(self.allocator, inv.id, @errorName(err)) catch return;
+                    if (enforce_acl and !security.allowed(config.security, config.url, self.dev_url, source_url, w.label, .command, inv.method)) {
+                        log.print("[acl] command '{s}' denied (window={s}, source={s})", .{ inv.method, w.label, source_url });
+                        const rej = ipc.encodeReject(self.allocator, inv.id, "PermissionDenied") catch return;
                         w.sendJson(rej);
                         return;
+                    }
+
+                    const result_json: []u8 = blk: {
+                        // v0.1.9–v0.1.12 框架内置命令（window.zilt.*）
+                        if (builtin.dispatch(ctx, inv.method, inv.args_json)) |builtin_result| {
+                            if (builtin_result) |json| break :blk json;
+                        } else |err| {
+                            log.print("[ipc] builtin {s} failed: {s}", .{ inv.method, @errorName(err) });
+                            const rej = ipc.encodeReject(self.allocator, inv.id, @errorName(err)) catch return;
+                            w.sendJson(rej);
+                            return;
+                        }
+                        break :blk ipc.dispatch(config.commands, ctx, inv.method, inv.args_json) catch |err| {
+                            log.print("[ipc] invoke {s} failed: {s}", .{ inv.method, @errorName(err) });
+                            const rej = ipc.encodeReject(self.allocator, inv.id, @errorName(err)) catch return;
+                            w.sendJson(rej);
+                            return;
+                        };
                     };
                     const resp = ipc.encodeResolve(self.allocator, inv.id, result_json) catch return;
                     w.sendJson(resp);
                 },
                 .event => |ev| {
+                    if (enforce_acl and !security.allowed(config.security, config.url, self.dev_url, source_url, w.label, .event, ev.name)) {
+                        log.print("[acl] event '{s}' denied (window={s})", .{ ev.name, w.label });
+                        return;
+                    }
                     const handled = ipc.dispatchEvent(config.events, ctx, ev.name, ev.payload_json);
                     if (!handled) log.print("[ipc] event '{s}' (no handler)", .{ev.name});
                 },
@@ -1215,9 +1510,315 @@ fn Backend(comptime config: Config) type {
             ok: bool = false,
         };
 
+        // ---- v0.1.8–v0.1.12：统一能力动作（任意线程 → UI 线程同步 marshal） ----
+
+        const Action = union(enum) {
+            clipboard_read: struct { alloc: std.mem.Allocator, format: shared_clipboard.Format, out: ?shared_clipboard.Data = null },
+            clipboard_write: shared_clipboard.Data,
+            start_drag: []const []const u8,
+            notification_show: shared_notification.Options,
+            notification_update: struct { tag: []const u8, group: ?[]const u8, progress: shared_notification.Progress },
+            notification_status: struct { status: shared_notification.Status = .enabled },
+            webview_request: struct { alloc: std.mem.Allocator, request: shared_webview.Request, out: ?[]u8 = null },
+            eval_async: struct { script: []const u8, completion: shared_webview.Completion },
+        };
+        const ActionReq = struct {
+            action: Action,
+            err: ?anyerror = null,
+        };
+
+        fn marshalAction(backend_ptr: *anyopaque, window_id: u32, req: *ActionReq) void {
+            const self: *Self = @ptrCast(@alignCast(backend_ptr));
+            const w = self.windowById(if (window_id == 0) 1 else window_id) orelse {
+                req.err = error.WindowNotFound;
+                return;
+            };
+            if (!w.alive) {
+                req.err = error.WindowClosed;
+                return;
+            }
+            _ = win32.SendMessageW(w.hwnd, WM_ZILT_ACTION, 0, @bitCast(@intFromPtr(req)));
+        }
+
+        fn clipboardReadData(backend_ptr: *anyopaque, window_id: u32, alloc: std.mem.Allocator, format: shared_clipboard.Format) anyerror!?shared_clipboard.Data {
+            var req = ActionReq{ .action = .{ .clipboard_read = .{ .alloc = alloc, .format = format } } };
+            marshalAction(backend_ptr, window_id, &req);
+            if (req.err) |e| return e;
+            return switch (req.action) {
+                .clipboard_read => |a| a.out,
+                else => unreachable,
+            };
+        }
+
+        fn clipboardWriteData(backend_ptr: *anyopaque, window_id: u32, data: shared_clipboard.Data) anyerror!void {
+            var req = ActionReq{ .action = .{ .clipboard_write = data } };
+            marshalAction(backend_ptr, window_id, &req);
+            if (req.err) |e| return e;
+        }
+
+        fn startDragFiles(backend_ptr: *anyopaque, window_id: u32, files: []const []const u8) anyerror!void {
+            var req = ActionReq{ .action = .{ .start_drag = files } };
+            marshalAction(backend_ptr, window_id, &req);
+            if (req.err) |e| return e;
+        }
+
+        fn notificationShow(backend_ptr: *anyopaque, window_id: u32, options: shared_notification.Options) anyerror!void {
+            var req = ActionReq{ .action = .{ .notification_show = options } };
+            marshalAction(backend_ptr, window_id, &req);
+            if (req.err) |e| return e;
+        }
+
+        fn notificationUpdate(backend_ptr: *anyopaque, window_id: u32, tag: []const u8, group: ?[]const u8, progress: shared_notification.Progress) anyerror!void {
+            var req = ActionReq{ .action = .{ .notification_update = .{ .tag = tag, .group = group, .progress = progress } } };
+            marshalAction(backend_ptr, window_id, &req);
+            if (req.err) |e| return e;
+        }
+
+        fn notificationStatus(backend_ptr: *anyopaque, window_id: u32) anyerror!shared_notification.Status {
+            var req = ActionReq{ .action = .{ .notification_status = .{} } };
+            marshalAction(backend_ptr, window_id, &req);
+            if (req.err) |e| return e;
+            return switch (req.action) {
+                .notification_status => |a| a.status,
+                else => unreachable,
+            };
+        }
+
+        fn webviewRequestAction(backend_ptr: *anyopaque, window_id: u32, alloc: std.mem.Allocator, request: shared_webview.Request) anyerror![]u8 {
+            var req = ActionReq{ .action = .{ .webview_request = .{ .alloc = alloc, .request = request } } };
+            marshalAction(backend_ptr, window_id, &req);
+            if (req.err) |e| return e;
+            return switch (req.action) {
+                .webview_request => |a| a.out orelse return error.WebViewNoResult,
+                else => unreachable,
+            };
+        }
+
+        fn evalAsyncAction(backend_ptr: *anyopaque, window_id: u32, script: []const u8, completion: shared_webview.Completion) anyerror!void {
+            var req = ActionReq{ .action = .{ .eval_async = .{ .script = script, .completion = completion } } };
+            marshalAction(backend_ptr, window_id, &req);
+            if (req.err) |e| return e;
+        }
+
+        fn runAction(self: *Self, w: *Window, req: *ActionReq) void {
+            switch (req.action) {
+                .clipboard_read => |*a| {
+                    a.out = win_clipboard.read(a.alloc, w.hwnd, a.format) catch |e| {
+                        req.err = e;
+                        return;
+                    };
+                },
+                .clipboard_write => |a| {
+                    win_clipboard.write(self.allocator, w.hwnd, a) catch |e| {
+                        req.err = e;
+                        return;
+                    };
+                },
+                .start_drag => |a| {
+                    win_drag.startDrag(self.allocator, w.hwnd, a) catch |e| {
+                        req.err = e;
+                        return;
+                    };
+                },
+                .notification_show => |a| {
+                    if (self.toast) |*t| {
+                        t.showOptions(a) catch |e| {
+                            req.err = e;
+                            return;
+                        };
+                    } else req.err = error.NotificationNotAvailable;
+                },
+                .notification_update => |a| {
+                    if (self.toast) |*t| {
+                        const options = shared_notification.Options{
+                            .title = "",
+                            .body = "",
+                            .tag = a.tag,
+                            .group = a.group,
+                            .progress = a.progress,
+                        };
+                        t.updateProgress(options) catch |e| {
+                            req.err = e;
+                            return;
+                        };
+                    } else req.err = error.NotificationNotAvailable;
+                },
+                .notification_status => |*a| {
+                    if (self.toast) |*t| {
+                        a.status = t.status() catch |e| {
+                            req.err = e;
+                            return;
+                        };
+                    } else req.err = error.NotificationNotAvailable;
+                },
+                .webview_request => |*a| {
+                    const d = w.driver orelse {
+                        req.err = error.WebViewNotAvailable;
+                        return;
+                    };
+                    a.out = runWebviewAction(d, a.alloc, a.request) catch |e| {
+                        req.err = e;
+                        return;
+                    };
+                },
+                .eval_async => |a| {
+                    const d = w.driver orelse {
+                        req.err = error.WebViewNotAvailable;
+                        return;
+                    };
+                    d.action(.{ .eval = .{ .script = a.script } }, a.completion) catch |e| {
+                        req.err = e;
+                        return;
+                    };
+                },
+            }
+        }
+
+        /// 同步返回 JSON：同步 action 的 completion 立即触发；异步 action 用
+        /// 局部消息泵驱动 STA 回调（不阻塞 UI 线程，也不会死锁 COM）。
+        fn runWebviewAction(d: *webview_driver.Driver, alloc: std.mem.Allocator, request: shared_webview.Request) ![]u8 {
+            var wait = SyncWait{ .alloc = alloc };
+            try d.action(request, .{ .context = &wait, .callback = SyncWait.callback });
+            while (!wait.done) {
+                var msg: win32.MSG = undefined;
+                if (win32.GetMessageW(&msg, null, 0, 0) <= 0) break;
+                _ = win32.TranslateMessage(&msg);
+                _ = win32.DispatchMessageW(&msg);
+            }
+            if (wait.err) |e| return e;
+            return wait.json orelse try alloc.dupe(u8, "null");
+        }
+
+        // ---- WebView2 driver 回调（v0.1.9/v0.1.10） ----
+
+        fn driverEmit(context: *anyopaque, name: []const u8, payload_json: []const u8) void {
+            const w: *Window = @ptrCast(@alignCast(context));
+            const msg = ipc.encodeEvent(w.backend.allocator, name, payload_json) catch return;
+            w.emitJsonUi(msg);
+        }
+
+        fn driverNavigation(context: *anyopaque, url: []const u8) shared_webview.NavigationPolicy {
+            const w: *Window = @ptrCast(@alignCast(context));
+            return switch (security.navigation(config.security, config.url, w.backend.dev_url, url)) {
+                .allow => .allow,
+                .system_browser => .external,
+                .deny => .deny,
+            };
+        }
+
+        fn driverExternal(context: *anyopaque, url: []const u8) void {
+            const w: *Window = @ptrCast(@alignCast(context));
+            openExternal(w.backend.allocator, url);
+        }
+
+        fn driverNewWindow(context: *anyopaque, url: []const u8) void {
+            const w: *Window = @ptrCast(@alignCast(context));
+            const self = w.backend;
+            const label = std.fmt.allocPrint(self.allocator, "webview-{d}", .{self.next_id}) catch return;
+            defer self.allocator.free(label);
+            const nw = self.createWindow(.{ .title = "Zilt Window", .url = url, .label = label }) catch |err| {
+                log.print("[webview] new window failed: {s}", .{@errorName(err)});
+                return;
+            };
+            _ = win32.ShowWindow(nw.hwnd, win32.SW_SHOW);
+            if (self.env != null) self.beginController(nw);
+            log.print("[webview] new window #{d} -> {s}", .{ nw.id, url });
+        }
+
+        fn driverSchedule(context: *anyopaque) void {
+            const w: *Window = @ptrCast(@alignCast(context));
+            _ = win32.PostMessageW(w.hwnd, WM_ZILT_WAKE, 0, 0);
+        }
+
+        fn driverRecover(context: *anyopaque) void {
+            const w: *Window = @ptrCast(@alignCast(context));
+            const self = w.backend;
+            log.print("[webview] browser process failed -> rebuild controller (window #{d})", .{w.id});
+            if (w.driver) |d| d.destroy();
+            w.driver = null;
+            w.releaseWebViewCom();
+            self.beginController(w);
+        }
+
+        // ---- 窗口状态持久化（v0.1.8） ----
+
+        fn saveWindowState(self: *Self, w: *Window) void {
+            const key = w.state_key orelse return;
+            var rc: win32.RECT = undefined;
+            if (win32.GetWindowRect(w.hwnd, &rc) == 0) return;
+            const width = rc.right - rc.left;
+            const height = rc.bottom - rc.top;
+            if (width <= 0 or height <= 0) return;
+            const state = app_data.State{
+                .x = rc.left,
+                .y = rc.top,
+                .width = @intCast(width),
+                .height = @intCast(height),
+                .maximized = win32.IsZoomed(w.hwnd) != 0,
+                .fullscreen = w.fullscreen,
+            };
+            app_data.save(self.allocator, config.app_id, key, state) catch |err| {
+                log.print("[state] save failed: {s}", .{@errorName(err)});
+                return;
+            };
+            log.print("[state] saved window #{d} ({s}) {d},{d} {d}x{d} max={} full={}", .{ w.id, key, state.x, state.y, state.width, state.height, state.maximized, state.fullscreen });
+        }
+
+        fn restoreWindowState(self: *Self, w: *Window) void {
+            const key = w.state_key orelse return;
+            const state = (app_data.load(self.allocator, config.app_id, key) catch |err| {
+                log.print("[state] load failed: {s}", .{@errorName(err)});
+                return;
+            }) orelse return;
+            if (state.width == 0 or state.height == 0) return;
+            _ = win32.SetWindowPos(w.hwnd, null, state.x, state.y, @intCast(state.width), @intCast(state.height), win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
+            if (state.maximized) _ = win32.ShowWindow(w.hwnd, win32.SW_MAXIMIZE);
+            if (state.fullscreen) _ = self.applyWindowCmd(w, .{ .fullscreen = true });
+            log.print("[state] restored window #{d} ({s}) {d},{d} {d}x{d} max={} full={}", .{ w.id, key, state.x, state.y, state.width, state.height, state.maximized, state.fullscreen });
+        }
+
+        fn saveAllStates(self: *Self) void {
+            for (self.windows.items) |w| if (w.alive) self.saveWindowState(w);
+        }
+
+        // ---- WinRT Toast / OLE 拖放事件（v0.1.12） ----
+
+        fn onToastEvent(context: ?*anyopaque, event: shared_notification.Event) void {
+            const p = context orelse return;
+            const self: *Self = @ptrCast(@alignCast(p));
+            const payload = toastEventJson(self.allocator, event) catch return;
+            defer self.allocator.free(payload);
+            const msg = ipc.encodeEvent(self.allocator, "notification", payload) catch return;
+            const w = self.mainWindow() orelse {
+                self.allocator.free(msg);
+                return;
+            };
+            if (win32.PostMessageW(w.hwnd, WM_ZILT_TOAST_EVENT, @intCast(msg.len), @bitCast(@intFromPtr(msg.ptr))) == 0) self.allocator.free(msg);
+        }
+
+        fn onDragEvent(context: ?*anyopaque, event: shared_drag.Event) void {
+            const p = context orelse return;
+            const w: *Window = @ptrCast(@alignCast(p));
+            const b = w.backend;
+            const files_json = std.json.Stringify.valueAlloc(b.allocator, event.files, .{}) catch return;
+            defer b.allocator.free(files_json);
+            const custom_json = customFormatsJson(b.allocator, event.custom) catch return;
+            defer b.allocator.free(custom_json);
+            const payload = std.fmt.allocPrint(b.allocator, "{{\"x\":{d},\"y\":{d},\"files\":{s},\"custom\":{s}}}", .{ event.x, event.y, files_json, custom_json }) catch return;
+            defer b.allocator.free(payload);
+            const name: []const u8 = switch (event.kind) {
+                .enter => "dragEnter",
+                .over => "dragOver",
+                .leave => "dragLeave",
+                .drop => "drop",
+            };
+            const msg = ipc.encodeEvent(b.allocator, name, payload) catch return;
+            w.emitJsonUi(msg);
+        }
+
         fn runWindowCmd(backend_ptr: *anyopaque, window_id: u32, cmd: ipc.WindowCmd) bool {
             const self: *Self = @ptrCast(@alignCast(backend_ptr));
-            const w = self.windowById(if (window_id == 0) 1 else window_id) orelse self.mainWindow() orelse return false;
+            const w = self.windowById(if (window_id == 0) 1 else window_id) orelse return false;
             if (!w.alive) return false;
             var req = WindowCmdReq{ .cmd = cmd };
             _ = win32.SendMessageW(w.hwnd, WM_ZILT_WINCTL, 0, @bitCast(@intFromPtr(&req)));
@@ -1273,8 +1874,9 @@ fn Backend(comptime config: Config) type {
                     return true;
                 },
                 .size => |sz| {
+                    if (sz.width == 0 or sz.height == 0 or sz.width > 32767 or sz.height > 32767) return false;
                     var rect = win32.RECT{ .left = 0, .top = 0, .right = @intCast(sz.width), .bottom = @intCast(sz.height) };
-                    _ = win32.AdjustWindowRect(&rect, win32.WS_OVERLAPPEDWINDOW, if (self.main_menu != null) 1 else 0);
+                    _ = win32.AdjustWindowRect(&rect, @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_STYLE)), if (w.menu != null) 1 else 0);
                     _ = win32.SetWindowPos(w.hwnd, null, 0, 0, rect.right - rect.left, rect.bottom - rect.top, win32.SWP_NOMOVE | win32.SWP_NOZORDER);
                     return true;
                 },
@@ -1503,41 +2105,46 @@ fn Backend(comptime config: Config) type {
             var range_end: u64 = 0;
             var range_total: u64 = 0;
 
-            const app_origin = originOf(config.url);
-            if (std.mem.startsWith(u8, uri_u8, app_origin)) {
-                var path = uri_u8[app_origin.len..];
-                if (std.mem.indexOfScalar(u8, path, '?')) |q| path = path[0..q];
-                if (path.len == 0 or std.mem.eql(u8, path, "/")) path = "/index.html";
+            if (security.sameOrigin(uri_u8, config.url)) {
+                const authority_start = (std.mem.indexOf(u8, uri_u8, "://") orelse return) + 3;
+                const path_start = if (std.mem.indexOfAny(u8, uri_u8[authority_start..], "/?#")) |i| authority_start + i else uri_u8.len;
+                const raw_path = uri_u8[path_start..];
+                const path = asset_routes.decodePath(self.allocator, if (raw_path.len == 0 or raw_path[0] != '/') "/" else raw_path) catch return;
+                defer self.allocator.free(path);
+                var resource_context: u32 = 0;
+                _ = args.lpVtbl.get_ResourceContext(args, &resource_context);
+                var candidates = asset_routes.Candidates.init(self.allocator, path, resource_context == 1) catch return;
+                defer candidates.deinit();
 
                 if (self.dev_proxy) |base| {
-                    self.serveFromProxy(base, uri_u8[app_origin.len..], path, &body, &content_type, &status, &owned, &owned_ct, &etag);
-                } else if (self.dev_dir) |dir| {
-                    var ct: []const u8 = undefined;
-                    if (self.serveFromDir(dir, path, &owned, &ct)) {
-                        body = owned.?;
-                        content_type = ct;
-                        status = 200;
-                        etag = etagOf(body.?);
-                    }
+                    self.serveFromProxy(base, raw_path, path, &body, &content_type, &status, &owned, &owned_ct, &etag);
                 } else {
-                    for (config.assets) |asset| {
-                        if (std.mem.eql(u8, asset.path, path)) {
-                            switch (asset.encoding) {
-                                .identity => body = asset.content,
-                                .gzip => {
-                                    if (self.assetDecompress(path, asset.content)) |raw| {
-                                        body = raw;
-                                        from_gz_store = true;
-                                    } else {
-                                        log.print("[assets] gzip decompress failed: {s}", .{path});
-                                        continue;
-                                    }
-                                },
+                    routes: for (candidates.paths) |candidate| {
+                        const route = candidate orelse continue;
+                        if (self.dev_dir) |dir| {
+                            var ct: []const u8 = undefined;
+                            if (self.serveFromDir(dir, route, &owned, &ct)) {
+                                body = owned.?;
+                                content_type = ct;
+                                status = 200;
+                                etag = etagOf(body.?);
+                                break;
                             }
-                            etag = etagOf(body.?);
-                            content_type = contentTypeOf(path);
-                            status = 200;
-                            break;
+                        } else {
+                            for (config.assets) |asset| {
+                                if (!std.mem.eql(u8, asset.path, route)) continue;
+                                switch (asset.encoding) {
+                                    .identity => body = asset.content,
+                                    .gzip => {
+                                        body = self.assetDecompress(route, asset.content) orelse continue;
+                                        from_gz_store = true;
+                                    },
+                                }
+                                etag = etagOf(body.?);
+                                content_type = contentTypeOf(route);
+                                status = 200;
+                                break :routes;
+                            }
                         }
                     }
                 }
@@ -1597,31 +2204,46 @@ fn Backend(comptime config: Config) type {
             const reason_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, reason) catch return;
             defer self.allocator.free(reason_w);
 
-            // 实测（docs/reference §G.7）：custom scheme 响应头对模块脚本走严格 MIME
-            // 校验——服务字节恒为 identity；ETag 仅出现在 304。
-            const headers = blk: {
-                if (status == 304) {
-                    break :blk std.fmt.allocPrint(self.allocator, "Content-Type: {s}\r\nETag: {s}", .{ content_type, etag.? }) catch return;
-                }
-                if (status == 206) {
-                    break :blk std.fmt.allocPrint(self.allocator, "Content-Type: {s}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {d}-{d}/{d}", .{ content_type, range_start, range_end, range_total }) catch return;
-                }
-                if (status == 416) {
-                    break :blk std.fmt.allocPrint(self.allocator, "Content-Type: text/plain; charset=utf-8\r\nAccept-Ranges: bytes\r\nContent-Range: bytes */{d}", .{range_total}) catch return;
-                }
-                break :blk std.fmt.allocPrint(self.allocator, "Content-Type: {s}\r\nAccept-Ranges: bytes", .{content_type}) catch return;
-            };
+            const headers = std.fmt.allocPrint(self.allocator, "Content-Type: {s}", .{content_type}) catch return;
             defer self.allocator.free(headers);
             const headers_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, headers) catch return;
             defer self.allocator.free(headers_w);
 
             const stream = streamFromBytes(body.?) orelse return;
+            const stream_unknown: *com.IUnknown = @ptrCast(@alignCast(stream));
+            defer _ = stream_unknown.lpVtbl.Release(stream_unknown);
             const r = env.createWebResourceResponse(stream, status, reason_w.ptr, headers_w.ptr);
             if (com.succeeded(r.hr) and r.response != null) {
-                _ = args.putResponse(r.response.?);
+                const response = r.response.?;
+                defer _ = response.lpVtbl.Release(response);
+                var response_headers: ?*wv2.ICoreWebView2HttpResponseHeaders = null;
+                if (com.failed(response.lpVtbl.get_Headers(response, &response_headers))) return;
+                const h = response_headers orelse return;
+                defer _ = h.lpVtbl.Release(h);
+                self.appendHeader(h, "Accept-Ranges", "bytes") catch return;
+                if (etag) |e| self.appendHeader(h, "ETag", &e) catch return;
+                if (status == 206 or status == 416) {
+                    const value = if (status == 206)
+                        std.fmt.allocPrint(self.allocator, "bytes {d}-{d}/{d}", .{range_start, range_end, range_total}) catch return
+                    else
+                        std.fmt.allocPrint(self.allocator, "bytes */{d}", .{range_total}) catch return;
+                    defer self.allocator.free(value);
+                    self.appendHeader(h, "Content-Range", value) catch return;
+                }
+                if (config.security.csp) |csp| self.appendHeader(h, "Content-Security-Policy", csp) catch return;
+                for (config.security.headers) |header| self.appendHeader(h, header.name, header.value) catch return;
+                _ = args.putResponse(response);
             } else {
                 log.print("[assets] createWebResourceResponse failed hr=0x{x}", .{@as(u32, @bitCast(r.hr))});
             }
+        }
+
+        fn appendHeader(self: *Self, headers: *wv2.ICoreWebView2HttpResponseHeaders, name: []const u8, value: []const u8) !void {
+            const name_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, name);
+            defer self.allocator.free(name_w);
+            const value_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, value);
+            defer self.allocator.free(value_w);
+            if (com.failed(headers.lpVtbl.AppendHeader(headers, name_w.ptr, value_w.ptr))) return error.ResponseHeaderFailed;
         }
 
         /// 压缩资产解压（惰性 + 进程内缓存；UI 线程独占，无锁）。
@@ -1757,6 +2379,13 @@ fn Backend(comptime config: Config) type {
 
         /// 释放窗口的 COM/GDI 资源（窗口关闭 / 应用退出共用；幂等）。
         fn releaseWindowCom(w: *Window) void {
+            // driver.destroy 必须早于 controller.Close / 上下文释放。
+            if (w.driver) |d| d.destroy();
+            w.driver = null;
+            if (w.drop_target) |t| t.destroy();
+            w.drop_target = null;
+            if (w.clipboard_listening) win_clipboard.stopListening(w.hwnd);
+            w.clipboard_listening = false;
             if (w.webview) |wv| _ = wv.lpVtbl.Release(wv);
             if (w.msg_handler) |h| h.dropRef();
             if (w.res_handler) |h| h.dropRef();
@@ -1802,15 +2431,17 @@ fn Backend(comptime config: Config) type {
                 }
                 self.asset_cache.deinit(self.allocator);
             }
+            for (self.windows.items) |w| if (w.alive) { _ = win32.DestroyWindow(w.hwnd); };
             for (self.windows.items) |w| {
                 releaseWindowCom(w);
                 self.allocator.free(w.title);
                 self.allocator.free(w.url);
+                self.allocator.free(w.label);
+                w.menu_arena.deinit();
                 self.allocator.destroy(w);
             }
             self.windows.deinit(self.allocator);
             if (self.env) |e| _ = e.lpVtbl.Release(e);
-            if (self.main_menu) |hm| _ = win32.DestroyMenu(hm);
             if (self.tray_menu) |hm| _ = win32.DestroyMenu(hm);
             if (self.tray_icon) |ic| _ = win32.DestroyIcon(ic);
             if (self.icon_small) |ic| _ = win32.DestroyIcon(ic);
@@ -1942,8 +2573,32 @@ fn Backend(comptime config: Config) type {
                     if (instance) |b| {
                         var closed_id: u32 = 0;
                         if (b.windowOfHwnd(hwnd)) |w| {
+                            // v0.1.8 状态持久化 + v0.1.9–v0.1.12 资源清理
+                            b.saveWindowState(w);
+                            if (w.driver) |d| d.destroy();
+                            w.driver = null;
+                            if (w.drop_target) |t| t.destroy();
+                            w.drop_target = null;
+                            if (w.clipboard_listening) win_clipboard.stopListening(w.hwnd);
+                            w.clipboard_listening = false;
                             w.alive = false;
                             closed_id = w.id;
+                            for (b.windows.items) |dependent| {
+                                if (dependent.alive and dependent.parent_id == w.id) _ = win32.DestroyWindow(dependent.hwnd);
+                            }
+                            if (w.modal) {
+                                if (w.parent_id) |parent_id| {
+                                    if (b.windowById(parent_id)) |parent| {
+                                        parent.modal_children -= 1;
+                                        if (parent.alive and parent.modal_children == 0 and parent.parent_was_enabled) {
+                                            _ = EnableWindow(parent.hwnd, 1);
+                                            _ = win32.SetForegroundWindow(parent.hwnd);
+                                        }
+                                    }
+                                }
+                            }
+                            // Attached menus are destroyed by DestroyWindow, not by COM teardown.
+                            w.menu = null;
                             releaseWindowCom(w);
                         }
                         // 通知其余窗口
@@ -1969,13 +2624,11 @@ fn Backend(comptime config: Config) type {
                 },
                 win32.WM_COMMAND => {
                     if (instance) |b| {
-                        if (b.windowOfHwnd(hwnd) != null) {
+                        if (b.windowOfHwnd(hwnd)) |w| {
                             const mid: u16 = @intCast(wparam & 0xffff);
-                            if (Self.menu_cfg) |items| {
-                                if (menu_mod.idFromIndex(items, mid)) |id| {
-                                    log.print("[menu] {s}", .{id});
-                                    b.windowOfHwnd(hwnd).?.emitEventPayload("menu", .{ .id = id });
-                                }
+                            if (menu_mod.idFromPopup(w.menu_items, 0, mid)) |id| {
+                                log.print("[menu] {s}", .{id});
+                                w.emitEventPayload("menu", .{ .id = id });
                             }
                         }
                     }
@@ -2054,7 +2707,7 @@ fn Backend(comptime config: Config) type {
                         const w = b.createWindow(req.opts) catch null;
                         if (w) |nw| {
                             req.id = nw.id;
-                            _ = win32.ShowWindow(nw.hwnd, win32.SW_SHOW);
+                            if (req.opts.visible) _ = win32.ShowWindow(nw.hwnd, win32.SW_SHOW);
                             if (b.env != null) b.beginController(nw);
                         }
                     }
@@ -2069,6 +2722,46 @@ fn Backend(comptime config: Config) type {
                             req.ok = b.setClipboardText(w, text);
                         } else if (req.read) {
                             req.out = b.getClipboardText(w, req.alloc);
+                        }
+                    }
+                    return 0;
+                },
+                WM_CLIPBOARDUPDATE => {
+                    if (instance) |b| {
+                        if (b.windowOfHwnd(hwnd)) |w| w.emitEventPayload("clipboardChanged", .{});
+                    }
+                    return 0;
+                },
+                WM_ZILT_WAKE => {
+                    if (instance) |b| {
+                        if (b.windowOfHwnd(hwnd)) |w| {
+                            if (w.driver) |d| d.dispatchDeferred() catch |err| {
+                                log.print("[webview] deferred dispatch failed: {s}", .{@errorName(err)});
+                            };
+                        }
+                    }
+                    return 0;
+                },
+                WM_ZILT_ACTION => {
+                    if (instance) |b| {
+                        const raw: usize = @bitCast(lparam);
+                        const req: *ActionReq = @ptrCast(@alignCast(@as(*anyopaque, @ptrFromInt(raw))));
+                        const w = b.windowOfHwnd(hwnd) orelse {
+                            req.err = error.WindowNotFound;
+                            return 0;
+                        };
+                        b.runAction(w, req);
+                    }
+                    return 0;
+                },
+                WM_ZILT_TOAST_EVENT => {
+                    if (instance) |b| {
+                        const len: usize = @intCast(wparam);
+                        const ptr: [*]u8 = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                        if (b.windowOfHwnd(hwnd)) |w| {
+                            w.emitJsonUi(ptr[0..len]);
+                        } else {
+                            b.allocator.free(ptr[0..len]);
                         }
                     }
                     return 0;
@@ -2327,8 +3020,20 @@ fn Backend(comptime config: Config) type {
             fn invoke(self_: *anyopaque, error_code: HRESULT, controller: ?*wv2.ICoreWebView2Controller) callconv(.c) HRESULT {
                 const self: *ControllerCompletedHandler = @ptrCast(@alignCast(self_));
                 if (com.failed(error_code) or controller == null) {
+                    // 窗口在异步 controller 创建期间被关闭属于正常生命周期
+                    // （如前端 create→close 的冒烟），不得终止整个应用。
+                    if (!self.window.alive or self.window.hwnd == null) {
+                        log.print("[webview] controller callback for closed window ignored hr=0x{x}", .{@as(u32, @bitCast(error_code))});
+                        return com.S_OK;
+                    }
                     log.print("[fatal] Controller create failed hr=0x{x}", .{@as(u32, @bitCast(error_code))});
+                    self.backend.quit_code.store(4, .monotonic);
                     win32.PostQuitMessage(4);
+                    return com.S_OK;
+                }
+                if (!self.window.alive or self.window.hwnd == null) {
+                    _ = controller.?.lpVtbl.Release(controller.?);
+                    log.print("[webview] controller ready for closed window -> released", .{});
                     return com.S_OK;
                 }
                 self.backend.onControllerReady(self.window, controller.?);
@@ -2823,4 +3528,70 @@ test "joinProxyUrl: 去尾斜杠 + 保留 query" {
     try testing.expectEqualStrings("http://localhost:5173/", up2);
     const up3 = try joinProxyUrl(alloc, "http://localhost:5173///", "/src/main.ts?import");
     try testing.expectEqualStrings("http://localhost:5173/src/main.ts?import", up3);
+}
+
+// ---- v0.1.9–v0.1.12 接线层测试 ----
+
+test "toastEventJson: activation includes arguments and user input" {
+    const inputs = [_]shared_notification.UserInput{.{ .id = "note", .value = "hello" }};
+    const json = try toastEventJson(testing.allocator, .{
+        .tag = "job-1",
+        .group = "jobs",
+        .kind = .{ .activated = .{ .arguments = "open", .user_input = &inputs } },
+    });
+    defer testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqualStrings("job-1", obj.get("tag").?.string);
+    try testing.expectEqualStrings("jobs", obj.get("group").?.string);
+    const event = obj.get("event").?.object;
+    try testing.expectEqualStrings("activated", event.get("kind").?.string);
+    try testing.expectEqualStrings("open", event.get("arguments").?.string);
+    try testing.expectEqual(@as(usize, 1), event.get("user_input").?.array.items.len);
+    try testing.expectEqualStrings("hello", event.get("user_input").?.array.items[0].object.get("value").?.string);
+}
+
+test "toastEventJson: dismissal and failure keep their payloads" {
+    const dismissed = try toastEventJson(testing.allocator, .{ .kind = .{ .dismissed = .user_canceled } });
+    defer testing.allocator.free(dismissed);
+    const d = try std.json.parseFromSlice(std.json.Value, testing.allocator, dismissed, .{});
+    defer d.deinit();
+    try testing.expectEqualStrings("null", @tagName(std.meta.activeTag(d.value.object.get("tag").?)));
+    const event = d.value.object.get("event").?.object;
+    try testing.expectEqualStrings("dismissed", event.get("kind").?.string);
+    try testing.expectEqualStrings("user_canceled", event.get("reason").?.string);
+    const failed = try toastEventJson(testing.allocator, .{ .kind = .{ .failed = -2147024809 } });
+    defer testing.allocator.free(failed);
+    const f = try std.json.parseFromSlice(std.json.Value, testing.allocator, failed, .{});
+    defer f.deinit();
+    try testing.expectEqualStrings("failed", f.value.object.get("event").?.object.get("kind").?.string);
+}
+
+test "customFormatsJson reports names and bounded lengths" {
+    const formats = [_]shared_drag.CustomFormat{
+        .{ .name = "ZiltDemoFormat", .data = "abc" },
+        .{ .name = "Second", .data = "" },
+    };
+    const json = try customFormatsJson(testing.allocator, &formats);
+    defer testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+    try testing.expectEqualStrings("ZiltDemoFormat", parsed.value.array.items[0].object.get("name").?.string);
+    try testing.expectEqual(@as(i64, 3), parsed.value.array.items[0].object.get("bytes").?.integer);
+}
+
+test "SyncWait completion copies JSON and propagates errors" {
+    var wait = SyncWait{ .alloc = testing.allocator };
+    SyncWait.callback(&wait, "{\"factor\":1}");
+    try testing.expect(wait.done);
+    try testing.expect(wait.err == null);
+    try testing.expectEqualStrings("{\"factor\":1}", wait.json.?);
+    testing.allocator.free(wait.json.?);
+    var failed = SyncWait{ .alloc = testing.allocator };
+    SyncWait.callback(&failed, error.JavaScriptException);
+    try testing.expect(failed.done);
+    try testing.expectEqual(error.JavaScriptException, failed.err.?);
+    try testing.expect(failed.json == null);
 }

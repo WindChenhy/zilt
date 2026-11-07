@@ -6,7 +6,17 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.7（Windows 全栈 + 前端工程化 + 窗口模型/窗口事件/多窗口/托盘/剪贴板/拖放/深链接/Range：绑定 + IPC 协议 + comptime 绑定生成 + 前端资产 codegen + dev/init 工具链 + 打包器 + 自动更新器）**。路线图见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.1.12（Windows 全栈 + 前端工程化 + 多窗口进阶/状态持久化/数据目录隔离/导航策略 + WebView2 事件面/Settings/环境选项 + capability ACL/前端运行时 API + 剪贴板/拖放/通知交互）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
+v0.1.8–v0.1.12 新增（2026-11-08，均已实现、验证并提交）：
+
+- **v0.1.8**：父子/模态窗口、每窗口独立菜单、窗口状态持久化、`%LOCALAPPDATA%\<app_id>\WebView2` 数据隔离（含旧目录迁移）、SPA 路由回退、CSP/自定义响应头、导航白名单与外部链接策略
+- **v0.1.9**：`ctx.eval` / `ctx.evalAsync`（Promise 语义）、导航事件、`NewWindowRequested` 三策略、权限请求、下载管理、渲染进程崩溃自动恢复
+- **v0.1.10**：Settings 开关（DevTools release 默认关）、运行时 WebView API（reload/zoom/print/cookies/history/clearStorage…）、环境选项（UA/语言/代理/浏览器参数/运行时通道）
+- **v0.1.11**：`window.zilt.window` 全量窗口 API、capability ACL（构建期生成 `capabilities.json`、运行时强制、未授权返回 `PermissionDenied`）、远程内容边界与隔离模式
+- **v0.1.12**：剪贴板多格式（文本/图片/HTML/文件）+ 变化监听、OLE `IDropTarget` 拖放（含坐标与自定义格式）+ 文件拖出、Toast 交互（按钮/输入/进度/点击深链/分组/状态查询）
+- 前端运行时新增 `window.zilt.eval` / `webview` / `clipboard` / `drag` / `notification`；Zig 侧对应 `zilt.Context` 方法
+- **验收**：单元测试 129/129；`zig build` / `zig build gen` / 模板 init→build→test 回归全通过；GUI 冒烟 18 项 `ALL CHECKS PASSED`（exit 0）
 
 v0.1.7 新增：
 
@@ -41,7 +51,7 @@ ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=my-app zig build init
 ```sh
 zig build gen      # 生成前端 TS 绑定（frontend/bindings/zilt.ts）
 zig build run      # 启动示例应用（embedded 模式）
-zig build test    # 单元测试（90 个 test 块：协议/更新器/打包器/系统能力/前端 codegen/模板/图标/深链接/Range/窗口模型）
+zig build test    # 单元测试（129/129：协议/更新器/打包器/系统能力/codegen/模板/图标/深链接/Range/窗口模型/安全 ACL/SPA 回退/WebView2 驱动 ABI/剪贴板编解码/OLE 拖放/Toast/能力清单/内置命令）
 ```
 
 dev 模式：
@@ -65,12 +75,18 @@ zig build bundle --release=safe   # dist/Zilt-<ver>-x64.zip + -setup.exe（便�
 Windows 构建已设 `subsystem = .windows`：双击/安装后不会弹出 cmd 窗口；运行日志写入
 `zilt.log`。exe 图标默认内置 Zig logo，自定义见 `project.zig` 的 `icon` 字段。
 
-GUI 冒烟测试：
+GUI 冒烟测试（18 项前端检查 + Zig 侧 `smokeResult` 断言，日志 `ALL CHECKS PASSED` 且 exit 0）：
 
 ```sh
-ZILT_SMOKE_TEST_MS=15000 ZILT_SMOKE_EXIT=1 zig-out/bin/zilt-app.exe && echo PASS
+zig build                            # 生成 frontend/bindings/capabilities.json 并嵌入资产
+zig build                            # 内容寻址资产表重算，确保 capability 清单进入 exe
+ZILT_SMOKE_TEST_MS=30000 ZILT_SMOKE_EXIT=1 zig-out/bin/zilt-app.exe && echo PASS
 ZILT_SMOKE_MULTI=12 ZILT_SMOKE_TEST_MS=12000 zig-out/bin/zilt-app.exe   # 多窗口 E2E（3s 后自动关第二窗）
 ```
+
+`zig build capabilities` 可单独生成权限清单；`zig build gen` 同时刷新 TS 绑定与清单。
+纯交互能力（真实拖入/拖出、Toast 按钮点击、CSP 拦截内联脚本、杀渲染进程）由
+`zig build test` 的离线单测与 `notificationInteractiveDemo` / `dragStartDemo` 等命令复现。
 
 ## 写一个命令
 

@@ -13,6 +13,11 @@
 
 const std = @import("std");
 const updater = @import("updater.zig");
+const clipboard = @import("clipboard.zig");
+const notification = @import("notification.zig");
+const webview = @import("webview.zig");
+
+pub const EvalCallback = @FieldType(webview.Completion, "callback");
 
 // ---------------------------------------------------------------------------
 // 原生对话框（平台后端实现；Context 暴露类型安全接口）
@@ -102,6 +107,12 @@ pub const DialogResponse = union(enum) {
 // ---------------------------------------------------------------------------
 
 pub const WindowOptions = struct {
+    label: ?[]const u8 = null,
+    parent: ?u32 = null,
+    modal: bool = false,
+    child: bool = false,
+    menu: ?[]const @import("config.zig").Config.MenuItem = null,
+    state_key: ?[]const u8 = null,
     title: []const u8 = "Zilt Window",
     width: u32 = 900,
     height: u32 = 640,
@@ -189,6 +200,57 @@ pub const Context = struct {
     clipboard_write_fn: ?*const fn (backend: *anyopaque, text: []const u8) bool = null,
     /// 剪贴板读文本（调用方 allocator 分配；无文本 null）。
     clipboard_read_fn: ?*const fn (backend: *anyopaque, alloc: std.mem.Allocator) ?[]u8 = null,
+
+    /// Returned clipboard data and JSON belong to the supplied allocator.
+    clipboard_read_data_fn: ?*const fn (backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator, format: clipboard.Format) anyerror!?clipboard.Data = null,
+    clipboard_write_data_fn: ?*const fn (backend: *anyopaque, window_id: u32, data: clipboard.Data) anyerror!void = null,
+    start_drag_fn: ?*const fn (backend: *anyopaque, window_id: u32, files: []const []const u8) anyerror!void = null,
+    notification_show_fn: ?*const fn (backend: *anyopaque, window_id: u32, options: notification.Options) anyerror!void = null,
+    notification_update_fn: ?*const fn (backend: *anyopaque, window_id: u32, tag: []const u8, group: ?[]const u8, progress: notification.Progress) anyerror!void = null,
+    notification_status_fn: ?*const fn (backend: *anyopaque, window_id: u32) anyerror!notification.Status = null,
+    webview_request_fn: ?*const fn (backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator, request: webview.Request) anyerror![]u8 = null,
+    /// Backend copies script before returning; completion JSON is borrowed.
+    eval_async_fn: ?*const fn (backend: *anyopaque, window_id: u32, script: []const u8, completion: webview.Completion) anyerror!void = null,
+
+    pub fn clipboardRead(self: Context, format: clipboard.Format) !?clipboard.Data {
+        return (self.clipboard_read_data_fn orelse return error.ClipboardNotAvailable)(self.backend, self.window_id, self.allocator, format);
+    }
+
+    pub fn clipboardWrite(self: Context, data: clipboard.Data) !void {
+        return (self.clipboard_write_data_fn orelse return error.ClipboardNotAvailable)(self.backend, self.window_id, data);
+    }
+
+    pub fn startDrag(self: Context, files: []const []const u8) !void {
+        return (self.start_drag_fn orelse return error.DragNotAvailable)(self.backend, self.window_id, files);
+    }
+
+    pub fn notificationShow(self: Context, options: notification.Options) !void {
+        return (self.notification_show_fn orelse return error.NotificationNotAvailable)(self.backend, self.window_id, options);
+    }
+
+    pub fn notificationUpdate(self: Context, tag: []const u8, group: ?[]const u8, progress: notification.Progress) !void {
+        return (self.notification_update_fn orelse return error.NotificationNotAvailable)(self.backend, self.window_id, tag, group, progress);
+    }
+
+    pub fn notificationStatus(self: Context) !notification.Status {
+        return (self.notification_status_fn orelse return error.NotificationNotAvailable)(self.backend, self.window_id);
+    }
+
+    /// Returns owned JSON. The backend may return WouldBlock on the UI thread.
+    pub fn webviewRequest(self: Context, request: webview.Request) ![]u8 {
+        return (self.webview_request_fn orelse return error.WebViewNotAvailable)(self.backend, self.window_id, self.allocator, request);
+    }
+
+    pub fn eval(self: Context, script: []const u8) ![]u8 {
+        return self.webviewRequest(.{ .eval = .{ .script = script } });
+    }
+
+    /// If submission returns an error, no callback is owed. Otherwise completion
+    /// runs exactly once (possibly inline), including action errors. Keep context
+    /// alive until completion; its JSON is borrowed only for the callback.
+    pub fn evalAsync(self: Context, script: []const u8, context: *anyopaque, completion: EvalCallback) !void {
+        return (self.eval_async_fn orelse return error.WebViewNotAvailable)(self.backend, self.window_id, script, .{ .context = context, .callback = completion });
+    }
 
     /// 发送系统通知（Windows: 托盘气球 → Toast）。
     pub fn notify(self: Context, title: []const u8, body: []const u8) void {
@@ -457,7 +519,7 @@ pub fn decode(gpa: std.mem.Allocator, raw: []const u8) !Decoded {
 
     if (std.mem.eql(u8, kind.string, "invoke")) {
         const id_v = obj.get("id") orelse return .{ .arena = arena, .msg = .ignore };
-        if (id_v != .integer) return .{ .arena = arena, .msg = .ignore };
+        if (id_v != .integer or id_v.integer < 0) return .{ .arena = arena, .msg = .ignore };
         const method_v = obj.get("method") orelse return .{ .arena = arena, .msg = .ignore };
         if (method_v != .string) return .{ .arena = arena, .msg = .ignore };
         const args_v = obj.get("args") orelse std.json.Value{ .null = {} };
@@ -654,6 +716,10 @@ pub const runtime_js =
     \\      if (ls) for (const cb of ls) { try { cb(m.payload); } catch (err) { console.error('[zilt] listener error', err); } }
     \\    }
     \\  });
+    \\  const evalWaiters = new Map();
+    \\  let evalId = 1;
+    \\  const builtin = (method, args) => window.zilt.invoke(method, args ?? {});
+    \\  const winApi = (action, extra) => builtin('__zilt.window', Object.assign({ action }, extra ?? {}));
     \\  window.zilt = {
     \\    invoke: (method, args) => new Promise((resolve, reject) => {
     \\      const id = nextId++;
@@ -666,9 +732,71 @@ pub const runtime_js =
     \\      ls.push(cb);
     \\      listeners.set(name, ls);
     \\    },
-    \\    startDragging: () => window.zilt.invoke('__zilt.startDragging', {}),
-    \\    version: '0.1.7',
+    \\    startDragging: () => builtin('__zilt.startDragging', {}),
+    \\    // v0.1.11: window.zilt.window
+    \\    window: {
+    \\      create: (opts) => winApi('create', opts),
+    \\      close: (id) => winApi('close', { window_id: id }),
+    \\      show: (id) => winApi('show', { window_id: id }),
+    \\      hide: (id) => winApi('hide', { window_id: id }),
+    \\      minimize: (id) => winApi('minimize', { window_id: id }),
+    \\      maximize: (id) => winApi('maximize', { window_id: id }),
+    \\      restore: (id) => winApi('restore', { window_id: id }),
+    \\      fullscreen: (enabled, id) => winApi('fullscreen', { enabled, window_id: id }),
+    \\      setSize: (width, height, id) => winApi('setSize', { width, height, window_id: id }),
+    \\      setPosition: (x, y, id) => winApi('setPosition', { x, y, window_id: id }),
+    \\      setTitle: (title, id) => winApi('setTitle', { title, window_id: id }),
+    \\      alwaysOnTop: (enabled, id) => winApi('alwaysOnTop', { enabled, window_id: id }),
+    \\      skipTaskbar: (enabled, id) => winApi('skipTaskbar', { enabled, window_id: id }),
+    \\      focus: (id) => winApi('focus', { window_id: id }),
+    \\      startDragging: (id) => winApi('startDragging', { window_id: id }),
+    \\    },
+    \\    // v0.1.9: eval returns a Promise resolved by __zilt.evalResult
+    \\    eval: (script) => new Promise((resolve, reject) => {
+    \\      const id = evalId++;
+    \\      evalWaiters.set(id, { resolve, reject });
+    \\      builtin('__zilt.eval', { script, id }).catch((err) => {
+    \\        evalWaiters.delete(id);
+    \\        reject(err);
+    \\      });
+    \\    }),
+    \\    // v0.1.10: runtime WebView API
+    \\    webview: {
+    \\      reload: () => builtin('__zilt.webview', { action: 'reload' }),
+    \\      stop: () => builtin('__zilt.webview', { action: 'stop' }),
+    \\      zoom: (factor) => builtin('__zilt.webview', { action: 'zoom', zoom: factor }),
+    \\      getZoom: () => builtin('__zilt.webview', { action: 'getZoom' }),
+    \\      history: () => builtin('__zilt.webview', { action: 'history' }),
+    \\      back: () => builtin('__zilt.webview', { action: 'back' }),
+    \\      forward: () => builtin('__zilt.webview', { action: 'forward' }),
+    \\      devtools: () => builtin('__zilt.webview', { action: 'devtools' }),
+    \\      print: (kind) => builtin('__zilt.webview', { action: 'print', kind: kind ?? 'browser' }),
+    \\      cancelDownload: (id) => builtin('__zilt.webview', { action: 'cancelDownload', download_id: id }),
+    \\      clearStorage: () => builtin('__zilt.webview', { action: 'clearStorage' }),
+    \\      getCookies: (url) => builtin('__zilt.webview', { action: 'cookies.get', url }),
+    \\      clearCookies: (origin) => builtin('__zilt.webview', { action: 'cookies.clear', url: origin }),
+    \\    },
+    \\    // v0.1.12: clipboard / drag / notifications
+    \\    clipboard: {
+    \\      read: (format) => builtin('__zilt.clipboard', { action: 'read', format: format ?? 'text' }),
+    \\      writeText: (text) => builtin('__zilt.clipboard', { action: 'write', format: 'text', text }),
+    \\      writeHtml: (html) => builtin('__zilt.clipboard', { action: 'write', format: 'html', html }),
+    \\      writeFiles: (files) => builtin('__zilt.clipboard', { action: 'write', format: 'files', files }),
+    \\    },
+    \\    drag: { start: (files) => builtin('__zilt.drag', { action: 'start', files }) },
+    \\    notification: {
+    \\      show: (opts) => builtin('__zilt.notification', Object.assign({ action: 'show' }, opts ?? {})),
+    \\      update: (opts) => builtin('__zilt.notification', Object.assign({ action: 'update' }, opts ?? {})),
+    \\      status: () => builtin('__zilt.notification', { action: 'status' }),
+    \\    },
+    \\    version: '0.1.12',
     \\  };
+    \\  window.zilt.on('__zilt.evalResult', (p) => {
+    \\    const w = evalWaiters.get(p.id);
+    \\    if (!w) return;
+    \\    evalWaiters.delete(p.id);
+    \\    if (p.ok) w.resolve(p.result); else w.reject(new Error(p.error));
+    \\  });
     \\  // 自定义标题栏：标记 data-zilt-drag-region 的元素可拖动窗口（按钮/输入除外）
     \\  document.addEventListener('mousedown', (e) => {
     \\    if (e.button !== 0) return;

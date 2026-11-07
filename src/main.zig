@@ -9,10 +9,25 @@ pub fn main() !void {
         .commands = app.commands,
         .events = app.events,
         .assets = &app.assets,
-        .title = "Zilt — v0.1.7 示例",
+        .security = app.security,
+        .title = "Zilt — v0.1.12 示例",
         .width = 960,
         .height = 700,
         .url = "https://zilt.app/index.html",
+        // v0.1.8：按窗口 label 持久化位置/尺寸/最大化/全屏；独立 WebView2 数据目录
+        .persist_window_state = true,
+        // v0.1.9/v0.1.10：WebView2 事件面 + Settings + 下载/权限 + 运行时 API
+        .webview = .{
+            .new_window = .new_window,
+            .permissions = .{ .clipboard = .allow, .notifications = .allow },
+            .downloads = .{ .enabled = true, .show_dialog = false },
+            .recover_renderer = true,
+        },
+        // v0.1.10：环境选项（UA/语言/代理/浏览器参数/通道）默认关闭，可按需开启
+        .environment = .{},
+        // v0.1.12：剪贴板变化事件 + OLE 自定义拖放格式
+        .clipboard_change_event = true,
+        .drag_formats = &.{"ZiltDemoFormat"},
         // 系统能力（Windows）
         // 图标：项目未指定 → 使用内置 Zig 官方图标（窗口/托盘/exe 资源）
         .tray = .{

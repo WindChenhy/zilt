@@ -182,6 +182,84 @@ async function runChecks() {
     // 11. 系统通知（托盘气球 → Toast；冒烟断言走 Zig 日志）
     await window.zilt.invoke('notifyMe', { title: 'Zilt 冒烟', body: '系统通知链路验证' });
 
+    // 12. v0.1.11 window.zilt.window：创建并关闭子窗口
+    try {
+      const apiOk = typeof window.zilt.window.create === 'function' && typeof window.zilt.window.setSize === 'function';
+      const created = await window.zilt.window.create({ title: 'Zilt v0.1.11 冒烟', width: 320, height: 240, label: 'smoke-' + Date.now() });
+      const childOk = !!created && created.id > 1;
+      if (childOk) {
+        await sleep(600); // 等 controller 异步创建完成，再走正常关闭路径
+        await window.zilt.window.close(created.id);
+      }
+      setCheck('c-windowapi', apiOk && childOk, JSON.stringify(created));
+    } catch (e) { setCheck('c-windowapi', false, String(e)); }
+
+    // 13. v0.1.9 eval Promise（异步 completion 回传）
+    try {
+      const v = await window.zilt.eval('1 + 41');
+      setCheck('c-eval', v === 42, JSON.stringify(v));
+    } catch (e) { setCheck('c-eval', false, String(e)); }
+
+    // 14. v0.1.10 运行时 WebView API（缩放回读）
+    try {
+      const z = await window.zilt.webview.getZoom();
+      setCheck('c-webview', !!z && typeof z.factor === 'number' && z.factor > 0, JSON.stringify(z));
+    } catch (e) { setCheck('c-webview', false, String(e)); }
+
+    // 15. v0.1.11 capability 清单随构建生成并嵌入资产
+    try {
+      const res = await fetch('/bindings/capabilities.json');
+      const cap = await res.json();
+      const ok = res.status === 200 && Array.isArray(cap.capabilities) && cap.capabilities.length >= 1 &&
+                 Array.isArray(cap.deny_commands) && cap.deny_commands.includes('blockedDemo');
+      setCheck('c-capability', ok, JSON.stringify(cap));
+    } catch (e) { setCheck('c-capability', false, String(e)); }
+
+    // 16. v0.1.12 剪贴板多格式（text / html 读写）
+    try {
+      await window.zilt.clipboard.writeText('zilt-v0.1.12-smoke');
+      const text = await window.zilt.clipboard.read('text');
+      await window.zilt.clipboard.writeHtml('<b>zilt-html</b>');
+      const html = await window.zilt.clipboard.read('html');
+      setCheck('c-clipmulti', text === 'zilt-v0.1.12-smoke' && typeof html === 'string' && html.includes('zilt-html'), `${text} / ${html}`);
+    } catch (e) { setCheck('c-clipmulti', false, String(e)); }
+
+    // 17. v0.1.12 通知权限/状态查询
+    try {
+      const st = await window.zilt.notification.status();
+      setCheck('c-notification', !!st && typeof st.status === 'string', JSON.stringify(st));
+    } catch (e) { setCheck('c-notification', false, String(e)); }
+
+    // 18. v0.1.11 ACL：显式拒绝名单中的命令必须返回 PermissionDenied
+    try {
+      let denied = false;
+      try { await window.zilt.invoke('blockedDemo', {}); }
+      catch (e) { denied = String(e.message).includes('PermissionDenied'); }
+      setCheck('c-acl', denied, denied ? 'PermissionDenied' : 'not denied');
+    } catch (e) { setCheck('c-acl', false, String(e)); }
+
+    // 19. v0.1.8 SPA History 路由回退：/account/settings 应以 document context 命中 index.html
+    // sandbox 只开 allow-same-origin（不执行脚本），避免 iframe 内再次触发 runChecks。
+    try {
+      const spaOk = await Promise.race([
+        new Promise((resolve) => {
+          const frame = document.createElement('iframe');
+          frame.setAttribute('sandbox', 'allow-same-origin');
+          frame.style.display = 'none';
+          frame.onload = () => {
+            const html = frame.contentDocument ? frame.contentDocument.documentElement.innerHTML : '';
+            frame.remove();
+            resolve(html.includes('id="checks"'));
+          };
+          frame.onerror = () => { frame.remove(); resolve(false); };
+          frame.src = '/account/settings';
+          document.body.appendChild(frame);
+        }),
+        sleep(3000).then(() => false),
+      ]);
+      setCheck('c-spa', spaOk, spaOk ? 'index.html fallback' : 'no fallback');
+    } catch (e) { setCheck('c-spa', false, String(e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -196,6 +274,14 @@ async function runChecks() {
       win: $('c-win').className === 'pass',
       range: $('c-range').className === 'pass',
       winevent: $('c-winevent').className === 'pass',
+      windowapi: $('c-windowapi').className === 'pass',
+      eval: $('c-eval').className === 'pass',
+      webview: $('c-webview').className === 'pass',
+      capability: $('c-capability').className === 'pass',
+      clipmulti: $('c-clipmulti').className === 'pass',
+      notification: $('c-notification').className === 'pass',
+      acl: $('c-acl').className === 'pass',
+      spa: $('c-spa').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

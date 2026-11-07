@@ -15,6 +15,13 @@ pub const pack_formats = @import("pack_formats.zig");
 pub const Config = @import("config.zig").Config;
 pub const Asset = @import("config.zig").Asset;
 pub const Context = ipc.Context;
+pub const security = @import("security.zig");
+pub const builtin_commands = @import("builtin.zig");
+pub const webview = @import("webview.zig");
+pub const environment = @import("environment.zig");
+pub const clipboard = @import("clipboard.zig");
+pub const drag_drop = @import("drag_drop.zig");
+pub const notification = @import("notification.zig");
 
 /// 平台模块（Windows 后端内部使用；用户一般无需直接接触）
 pub const platform_windows = @import("platform/windows/mod.zig");
@@ -28,6 +35,14 @@ pub fn run(comptime config: Config) !void {
 }
 
 test {
+    _ = @import("security.zig");
+    _ = @import("asset_routes.zig");
+    _ = @import("builtin.zig");
+    _ = @import("webview.zig");
+    _ = @import("environment.zig");
+    _ = @import("clipboard.zig");
+    _ = @import("drag_drop.zig");
+    _ = @import("notification.zig");
     _ = @import("ipc.zig");
     _ = @import("bindings.zig");
     _ = @import("bundler.zig");

@@ -57,6 +57,22 @@ pub const Config = struct {
     /// 应用 ID（单实例互斥体名等）
     app_id: []const u8 = "app.zilt",
     dev: Dev = .{},
+    /// CSP / 导航白名单 / capability ACL / 远程内容边界（v0.1.8 + v0.1.11）
+    security: @import("security.zig").Options = .{},
+    /// WebView 引擎选项：事件面、Settings、下载、权限、渲染进程恢复（v0.1.9/v0.1.10）
+    webview: @import("webview.zig").Options = .{},
+    /// WebView2 环境选项：UA / 语言 / 代理 / 浏览器参数 / 运行时通道（v0.1.10）
+    environment: @import("environment.zig").Options = .{},
+    /// 主窗口状态持久化键（null = 不持久化；与 persist_window_state 配合按窗口 label 保存）
+    state_key: ?[]const u8 = null,
+    /// 所有窗口按 label 持久化位置/尺寸/最大化/全屏（v0.1.8）
+    persist_window_state: bool = false,
+    /// 迁移旧的 %TEMP%\zilt-app-webview2 共享数据目录（v0.1.8）
+    migrate_legacy_profile: bool = false,
+    /// 监听系统剪贴板变化并发 clipboardChanged 事件（v0.1.12）
+    clipboard_change_event: bool = false,
+    /// OLE 拖放自定义格式名（v0.1.12）
+    drag_formats: []const []const u8 = &.{},
 
     /// 系统托盘（Windows）。启用后支持左键点击显示/隐藏窗口；
     /// ctx.notify 经 WinRT Toast 主通道发送（无需托盘），托盘气球仅作降级。

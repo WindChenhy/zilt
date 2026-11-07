@@ -51,18 +51,30 @@ pub fn smokeResult(ctx: Context, payload: struct {
     win: bool = false,
     range: bool = false,
     winevent: bool = false,
+    // v0.1.8–v0.1.12 新增检查
+    windowapi: bool = false,
+    eval: bool = false,
+    webview: bool = false,
+    capability: bool = false,
+    clipmulti: bool = false,
+    notification: bool = false,
+    acl: bool = false,
+    spa: bool = false,
     fatal: ?[]const u8 = null,
 }) void {
     var ok = false;
     if (payload.fatal) |f| {
         zilt.log.print("[smoke] FATAL(frontend): {s}", .{f});
     } else {
-        ok = payload.greet and payload.add and payload.fail and payload.user and payload.event and payload.mode and payload.clip and payload.win and payload.range and payload.winevent;
+        ok = payload.greet and payload.add and payload.fail and payload.user and payload.event and payload.mode and payload.clip and payload.win and payload.range and payload.winevent and
+            payload.windowapi and payload.eval and payload.webview and payload.capability and payload.clipmulti and payload.notification and payload.acl and payload.spa;
         if (ok) {
-            zilt.log.print("[smoke] ALL CHECKS PASSED (greet/add/fail-reject/user-optional/event-tick/mode-enum/clipboard/window/range/window-event)", .{});
+            zilt.log.print("[smoke] ALL CHECKS PASSED (18 checks: core-10 + window-api/eval/webview-api/capability-manifest/clipboard-multi/notification-status/acl-deny/spa-fallback)", .{});
         } else {
-            zilt.log.print("[smoke] FAILED greet={} add={} fail={} user={} event={} mode={} clip={} win={} range={} winevent={}", .{
-                payload.greet, payload.add, payload.fail, payload.user, payload.event, payload.mode, payload.clip, payload.win, payload.range, payload.winevent,
+            zilt.log.print("[smoke] FAILED greet={} add={} fail={} user={} event={} mode={} clip={} win={} range={} winevent={} windowapi={} eval={} webview={} capability={} clipmulti={} notification={} acl={} spa={}", .{
+                payload.greet, payload.add, payload.fail, payload.user, payload.event, payload.mode, payload.clip,
+                payload.win, payload.range, payload.winevent, payload.windowapi, payload.eval, payload.webview,
+                payload.capability, payload.clipmulti, payload.notification, payload.acl, payload.spa,
             });
         }
     }

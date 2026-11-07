@@ -198,6 +198,23 @@ pub fn build(b: *std.Build) void {
     const gen_step = b.step("gen", "Generate frontend TS bindings");
     gen_step.dependOn(&gen_run.step);
 
+    // ---- capability 清单（v0.1.11）：构建时由编译期 security 配置生成 ----
+    const cap_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/gen_capabilities.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zilt", .module = zilt_mod },
+            .{ .name = "app_config", .module = app_config_mod },
+        },
+    });
+    const cap_exe = b.addExecutable(.{ .name = "zilt-gen-capabilities", .root_module = cap_mod });
+    const cap_run = b.addRunArtifact(cap_exe);
+    const cap_step = b.step("capabilities", "Generate the runtime capability manifest");
+    cap_step.dependOn(&cap_run.step);
+    gen_step.dependOn(&cap_run.step);
+    b.getInstallStep().dependOn(&cap_run.step);
+
     // ---- dev：spawn dev 命令 → TCP 等待 → 应用直连 devUrl（HMR） ----
     const dev_mod = b.createModule(.{
         .root_source_file = b.path("src/tools/dev.zig"),
@@ -232,6 +249,10 @@ pub fn build(b: *std.Build) void {
     const tools_test_mod = b.createModule(.{
         .root_source_file = b.path("src/tools/tests.zig"),
         .target = target,
+        .imports = &.{
+            .{ .name = "zilt", .module = zilt_mod },
+            .{ .name = "app_config", .module = app_config_mod },
+        },
     });
     const tools_tests = b.addTest(.{ .root_module = tools_test_mod });
     const run_tools_tests = b.addRunArtifact(tools_tests);

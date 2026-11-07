@@ -355,3 +355,64 @@ fn installMain(state: *InstallCtx) void {
 }
 
 const InstallCtx = struct { ctx: Context, env: zilt.updater.Env };
+
+// ---- v0.1.9–v0.1.12 能力验证命令 ----
+
+/// ctx.eval：Zig → JS 同步求值（JSON 结果）。
+pub fn evalDemo(ctx: Context, args: struct { script: []const u8 = "1 + 1" }) !struct { result: []const u8 } {
+    return .{ .result = try ctx.eval(args.script) };
+}
+
+/// v0.1.10：运行时 WebView API（缩放设置 + 回读）。
+pub fn webviewZoomDemo(ctx: Context, args: struct { factor: f64 = 1.0 }) !struct { ok: bool, zoom: []const u8 } {
+    const applied = try ctx.webviewRequest(.{ .zoom = args.factor });
+    defer ctx.allocator.free(applied);
+    return .{ .ok = true, .zoom = try ctx.webviewRequest(.get_zoom) };
+}
+
+/// v0.1.12：剪贴板多格式写入 + 读回（Zig Context API）。
+pub fn clipboardMultiDemo(ctx: Context, args: struct { text: []const u8 = "zilt-v0.1.12" }) !struct { ok: bool, read_back: ?[]const u8 } {
+    try ctx.clipboardWrite(.{ .text = args.text });
+    var read_back: ?[]const u8 = null;
+    if (try ctx.clipboardRead(.text)) |data| {
+        defer zilt.builtin_commands.freeClipboard(ctx.allocator, data);
+        switch (data) {
+            .text => |t| read_back = try ctx.allocator.dupe(u8, t),
+            else => {},
+        }
+    }
+    return .{ .ok = read_back != null, .read_back = read_back };
+}
+
+/// v0.1.12：通知交互（按钮/输入/进度/点击深链/替换分组）。
+pub fn notificationInteractiveDemo(ctx: Context, args: struct {
+    title: []const u8 = "Zilt v0.1.12",
+    body: []const u8 = "交互通知",
+}) !void {
+    const actions = [_]zilt.notification.Action{
+        .{ .title = "打开应用", .arguments = "open", .launch = "zilt://notification?action=open" },
+        .{ .title = "稍后", .arguments = "later" },
+    };
+    try ctx.notificationShow(.{
+        .title = args.title,
+        .body = args.body,
+        .tag = "demo-progress",
+        .group = "demo",
+        .launch = "zilt://notification?action=body",
+        .actions = &actions,
+        .input = .{ .id = "note", .placeholder = "输入备注", .title = "备注" },
+        .progress = .{ .value = 0.5, .value_string = "50%", .status = "下载中" },
+    });
+}
+
+/// v0.1.12：通知权限/状态查询。
+pub fn notificationStatusDemo(ctx: Context, args: struct {}) !struct { status: []const u8 } {
+    _ = args;
+    return .{ .status = @tagName(try ctx.notificationStatus()) };
+}
+
+/// v0.1.12：文件拖出（OLE DoDragDrop；交互命令，冒烟中不调用）。
+pub fn dragStartDemo(ctx: Context, args: struct { file: []const u8 }) !void {
+    const files = [_][]const u8{args.file};
+    try ctx.startDrag(&files);
+}

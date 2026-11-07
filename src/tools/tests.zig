@@ -3,4 +3,5 @@
 test {
     _ = @import("frontend_codegen.zig");
     _ = @import("init.zig");
+    _ = @import("gen_capabilities.zig");
 }

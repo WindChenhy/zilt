@@ -422,6 +422,20 @@ pub const ICoreWebView2HttpRequestHeaders = extern struct {
     }
 };
 
+pub const ICoreWebView2HttpResponseHeaders = extern struct {
+    lpVtbl: *const VTable,
+    pub const VTable = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2HttpResponseHeaders, *const com.GUID, *?*anyopaque) callconv(.c) HRESULT,
+        AddRef: *const fn (*ICoreWebView2HttpResponseHeaders) callconv(.c) u32,
+        Release: *const fn (*ICoreWebView2HttpResponseHeaders) callconv(.c) u32,
+        AppendHeader: *const fn (*ICoreWebView2HttpResponseHeaders, LPCWSTR, LPCWSTR) callconv(.c) HRESULT,
+        Contains: *const fn (*ICoreWebView2HttpResponseHeaders, LPCWSTR, *BOOL) callconv(.c) HRESULT,
+        GetHeader: *const fn (*ICoreWebView2HttpResponseHeaders, LPCWSTR, *?LPWSTR) callconv(.c) HRESULT,
+        GetHeaders: *const fn (*ICoreWebView2HttpResponseHeaders, LPCWSTR, *?*anyopaque) callconv(.c) HRESULT,
+        GetIterator: *const fn (*ICoreWebView2HttpResponseHeaders, *?*anyopaque) callconv(.c) HRESULT,
+    };
+};
+
 pub const ICoreWebView2WebResourceResponse = extern struct {
     lpVtbl: *const VTable,
 
@@ -431,7 +445,7 @@ pub const ICoreWebView2WebResourceResponse = extern struct {
         Release: *const fn (*ICoreWebView2WebResourceResponse) callconv(.c) u32,
         get_Content: *const fn (*ICoreWebView2WebResourceResponse, *?*IStream) callconv(.c) HRESULT,
         put_Content: *const fn (*ICoreWebView2WebResourceResponse, ?*IStream) callconv(.c) HRESULT,
-        get_Headers: *const fn (*ICoreWebView2WebResourceResponse, *?*anyopaque) callconv(.c) HRESULT,
+        get_Headers: *const fn (*ICoreWebView2WebResourceResponse, *?*ICoreWebView2HttpResponseHeaders) callconv(.c) HRESULT,
         get_StatusCode: *const fn (*ICoreWebView2WebResourceResponse, *c_int) callconv(.c) HRESULT,
         put_StatusCode: *const fn (*ICoreWebView2WebResourceResponse, c_int) callconv(.c) HRESULT,
         get_ReasonPhrase: *const fn (*ICoreWebView2WebResourceResponse, *?LPWSTR) callconv(.c) HRESULT,
