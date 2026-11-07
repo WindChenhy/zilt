@@ -60,7 +60,14 @@ pub fn generateTs(comptime Commands: type, comptime Events: type) []const u8 {
             .{ .name = "trayMenu", .ts = "{ id: string }" },
             .{ .name = "dropFiles", .ts = "{ files: string[] }" },
             .{ .name = "deepLink", .ts = "{ url?: string; files: string[] }" },
-            .{ .name = "windowClosed", .ts = "{ id: number }" },
+            .{ .name = "windowMoved", .ts = "{ id: number; x: number; y: number }" },
+            .{ .name = "windowResized", .ts = "{ id: number; width: number; height: number }" },
+            .{ .name = "windowFocus", .ts = "{ id: number }" },
+            .{ .name = "windowBlur", .ts = "{ id: number }" },
+            .{ .name = "windowThemeChanged", .ts = "{ id: number; theme: string }" },
+            .{ .name = "windowScaleFactorChanged", .ts = "{ id: number; scale_factor: number; dpi: number }" },
+            .{ .name = "windowCloseRequested", .ts = "{ id: number }" },
+            .{ .name = "windowDestroyed", .ts = "{ id: number }" },
         };
         for (builtins) |b| {
             if (hasEvent(Events, b.name)) continue;

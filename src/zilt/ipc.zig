@@ -107,6 +107,32 @@ pub const WindowOptions = struct {
     height: u32 = 640,
     /// 完整 URL（如 "https://zilt.app/second.html"）；null = 应用主 URL
     url: ?[]const u8 = null,
+    /// 初始位置（null = 系统默认）
+    x: ?i32 = null,
+    y: ?i32 = null,
+    /// 创建时是否可见（false = 隐藏创建，后续 show）
+    visible: bool = true,
+    /// 是否可调整大小
+    resizable: bool = true,
+    /// 是否带原生标题栏/边框
+    decorations: bool = true,
+    /// WebView 背景透明（桌面透出）
+    transparent: bool = false,
+    /// 置顶
+    always_on_top: bool = false,
+    /// 从任务栏/Alt-Tab 隐藏
+    skip_taskbar: bool = false,
+    /// 最小/最大窗口尺寸（外层像素，null = 不限）
+    min_width: ?u32 = null,
+    min_height: ?u32 = null,
+    max_width: ?u32 = null,
+    max_height: ?u32 = null,
+    /// WebView 默认背景色（0xRRGGBB；null = 白色）
+    background_color: ?u32 = null,
+    /// 关闭前发 windowCloseRequested，由前端调用 windowClose 才真正关闭
+    close_requested_event: bool = false,
+    /// 每窗口图标（资产路径；null = 应用默认图标）
+    icon: ?[]const u8 = null,
 };
 
 pub const WindowCmd = union(enum) {
@@ -121,6 +147,9 @@ pub const WindowCmd = union(enum) {
     hide,
     focus,
     close,
+    start_dragging,
+    always_on_top: bool,
+    skip_taskbar: bool,
 };
 
 // ---------------------------------------------------------------------------
@@ -281,6 +310,16 @@ pub const Context = struct {
     }
     pub fn windowClose(self: Context) void {
         _ = self.winCmd(.close);
+    }
+    /// 拖动当前窗口（自定义标题栏用；阻塞到拖动结束）。
+    pub fn windowStartDragging(self: Context) void {
+        _ = self.winCmd(.start_dragging);
+    }
+    pub fn windowSetAlwaysOnTop(self: Context, on: bool) void {
+        _ = self.winCmd(.{ .always_on_top = on });
+    }
+    pub fn windowSetSkipTaskbar(self: Context, skip: bool) void {
+        _ = self.winCmd(.{ .skip_taskbar = skip });
     }
 
     /// 新建窗口（title/width/height/url）。失败返回 error.WindowCreateFailed。
@@ -627,8 +666,16 @@ pub const runtime_js =
     \\      ls.push(cb);
     \\      listeners.set(name, ls);
     \\    },
-    \\    version: '0.1.6',
+    \\    startDragging: () => window.zilt.invoke('__zilt.startDragging', {}),
+    \\    version: '0.1.7',
     \\  };
+    \\  // 自定义标题栏：标记 data-zilt-drag-region 的元素可拖动窗口（按钮/输入除外）
+    \\  document.addEventListener('mousedown', (e) => {
+    \\    if (e.button !== 0) return;
+    \\    if (e.target.closest && e.target.closest('button,input,textarea,select,a')) return;
+    \\    const region = e.target.closest ? e.target.closest('[data-zilt-drag-region]') : null;
+    \\    if (region) { e.preventDefault(); window.zilt.startDragging(); }
+    \\  });
     \\  window.zilt.on('__reload', () => window.location.reload());
     \\})();
     \\

@@ -25,6 +25,7 @@ pub const HMENU = ?*anyopaque;
 pub const HICON = ?*anyopaque;
 pub const HCURSOR = ?*anyopaque;
 pub const HBRUSH = ?*anyopaque;
+pub const HDC = ?*anyopaque;
 pub const HANDLE = *anyopaque;
 pub const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
 
@@ -40,6 +41,13 @@ pub const COLOR_WINDOW: usize = 5;
 
 pub const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF0000;
 pub const WS_VISIBLE: DWORD = 0x10000000;
+pub const WS_THICKFRAME: DWORD = 0x00040000;
+pub const WS_CAPTION: DWORD = 0x00C00000;
+pub const WS_MINIMIZEBOX: DWORD = 0x00020000;
+pub const WS_MAXIMIZEBOX: DWORD = 0x00010000;
+pub const WS_SYSMENU: DWORD = 0x00080000;
+pub const WS_EX_TOOLWINDOW: DWORD = 0x00000080;
+pub const WS_EX_NOREDIRECTIONBITMAP: DWORD = 0x00200000;
 pub const CW_USEDEFAULT: i32 = @bitCast(@as(u32, 0x80000000));
 
 pub const SW_SHOW: i32 = 5;
@@ -47,20 +55,31 @@ pub const SW_HIDE: i32 = 0;
 
 pub const WM_NULL: UINT = 0x0000;
 pub const WM_DESTROY: UINT = 0x0002;
+pub const WM_MOVE: UINT = 0x0003;
 pub const WM_SIZE: UINT = 0x0005;
+pub const WM_SETFOCUS: UINT = 0x0007;
+pub const WM_KILLFOCUS: UINT = 0x0008;
 pub const WM_CLOSE: UINT = 0x0010;
+pub const WM_SETTINGCHANGE: UINT = 0x001A;
+pub const WM_GETMINMAXINFO: UINT = 0x0024;
 pub const WM_QUIT: UINT = 0x0012;
 pub const WM_COPYDATA: UINT = 0x004A;
+pub const WM_ERASEBKGND: UINT = 0x0014;
 pub const WM_SETICON: UINT = 0x0080;
+pub const WM_NCLBUTTONDOWN: UINT = 0x00A1;
 pub const WM_TIMER: UINT = 0x0113;
 pub const WM_DROPFILES: UINT = 0x0233;
+pub const WM_DPICHANGED: UINT = 0x02E0;
+pub const WM_THEMECHANGED: UINT = 0x031A;
 pub const WM_APP: UINT = 0x8000;
+pub const HTCAPTION: usize = 2;
 
 // 窗口控制
 pub const SW_MINIMIZE: i32 = 6;
 pub const SW_MAXIMIZE: i32 = 3;
 pub const SW_RESTORE: i32 = 9;
 pub const GWL_STYLE: i32 = -16;
+pub const GWL_EXSTYLE: i32 = -20;
 pub const WS_POPUP: DWORD = 0x80000000;
 pub const SWP_NOSIZE: UINT = 0x0001;
 pub const SWP_NOMOVE: UINT = 0x0002;
@@ -70,6 +89,9 @@ pub const SWP_SHOWWINDOW: UINT = 0x0040;
 pub const ICON_SMALL: UINT = 0;
 pub const ICON_BIG: UINT = 1;
 pub const LR_DEFAULTCOLOR: UINT = 0x0000;
+pub const HWND_TOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+pub const HWND_NOTOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
+pub const SWP_NOACTIVATE: UINT = 0x0010;
 pub const SM_CXSCREEN: i32 = 0;
 pub const SM_CYSCREEN: i32 = 1;
 pub const SM_CXICON: i32 = 11;
@@ -146,6 +168,7 @@ pub const GMEM_MOVEABLE: UINT = 0x0002;
 pub const COINIT_APARTMENTTHREADED: u32 = 0x2;
 
 pub const RRF_RT_REG_SZ: DWORD = 0x00000002;
+pub const RRF_RT_REG_DWORD: DWORD = 0x00000010;
 
 /// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2（伪句柄 -4）
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: *anyopaque =
@@ -189,6 +212,14 @@ pub const MSG = extern struct {
     lParam: LPARAM,
     time: DWORD,
     pt: POINT,
+};
+
+pub const MINMAXINFO = extern struct {
+    ptReserved: POINT,
+    ptMaxSize: POINT,
+    ptMaxPosition: POINT,
+    ptMinTrackSize: POINT,
+    ptMaxTrackSize: POINT,
 };
 
 pub const COPYDATASTRUCT = extern struct {
@@ -245,6 +276,12 @@ pub extern "user32" fn CreateIconFromResourceEx(presbits: [*]u8, dwResSize: DWOR
 pub extern "user32" fn DestroyIcon(hIcon: HICON) callconv(.c) BOOL;
 pub extern "user32" fn IsIconic(hWnd: HWND) callconv(.c) BOOL;
 pub extern "user32" fn IsZoomed(hWnd: HWND) callconv(.c) BOOL;
+pub extern "user32" fn ReleaseCapture() callconv(.c) BOOL;
+pub extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.c) UINT;
+pub extern "user32" fn FillRect(hdc: HDC, lprc: *const RECT, hbr: HBRUSH) callconv(.c) i32;
+pub extern "user32" fn InvalidateRect(hWnd: HWND, lpRect: ?*const RECT, bErase: BOOL) callconv(.c) BOOL;
+pub extern "gdi32" fn CreateSolidBrush(color: DWORD) callconv(.c) HBRUSH;
+pub extern "gdi32" fn DeleteObject(ho: ?*anyopaque) callconv(.c) BOOL;
 
 // ---- 剪贴板（user32）----
 

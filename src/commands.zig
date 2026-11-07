@@ -157,15 +157,67 @@ pub fn newWindowDemo(ctx: Context, args: struct {
     width: u32 = 720,
     height: u32 = 500,
     path: []const u8 = "/second.html",
+    x: ?i32 = null,
+    y: ?i32 = null,
+    visible: bool = true,
+    resizable: bool = true,
+    decorations: bool = true,
+    transparent: bool = false,
+    always_on_top: bool = false,
+    skip_taskbar: bool = false,
+    min_width: ?u32 = null,
+    min_height: ?u32 = null,
+    max_width: ?u32 = null,
+    max_height: ?u32 = null,
+    background_color: ?u32 = null,
+    close_requested_event: bool = false,
+    icon_path: ?[]const u8 = null,
 }) !struct { id: u32 } {
     const url = try std.fmt.allocPrint(ctx.allocator, "https://zilt.app{s}", .{args.path});
-    const id = try ctx.newWindow(.{ .title = args.title, .width = args.width, .height = args.height, .url = url });
+    const id = try ctx.newWindow(.{
+        .title = args.title,
+        .width = args.width,
+        .height = args.height,
+        .url = url,
+        .x = args.x,
+        .y = args.y,
+        .visible = args.visible,
+        .resizable = args.resizable,
+        .decorations = args.decorations,
+        .transparent = args.transparent,
+        .always_on_top = args.always_on_top,
+        .skip_taskbar = args.skip_taskbar,
+        .min_width = args.min_width,
+        .min_height = args.min_height,
+        .max_width = args.max_width,
+        .max_height = args.max_height,
+        .background_color = args.background_color,
+        .close_requested_event = args.close_requested_event,
+        .icon = args.icon_path,
+    });
     return .{ .id = id };
 }
 
 /// 窗口控制（作用于当前调用窗口）。
 pub fn windowControlDemo(ctx: Context, args: struct {
-    action: enum { minimize, maximize, restore, fullscreen_on, fullscreen_off, show, hide, focus, close, set_title, set_size, set_position },
+    action: enum {
+        minimize,
+        maximize,
+        restore,
+        fullscreen_on,
+        fullscreen_off,
+        show,
+        hide,
+        focus,
+        close,
+        set_title,
+        set_size,
+        set_position,
+        always_on_top,
+        not_always_on_top,
+        skip_taskbar,
+        show_taskbar,
+    },
     title: []const u8 = "Zilt 窗口",
     width: u32 = 960,
     height: u32 = 700,
@@ -185,6 +237,10 @@ pub fn windowControlDemo(ctx: Context, args: struct {
         .set_title => ctx.windowSetTitle(args.title),
         .set_size => ctx.windowSetSize(args.width, args.height),
         .set_position => ctx.windowSetPosition(args.x, args.y),
+        .always_on_top => ctx.windowSetAlwaysOnTop(true),
+        .not_always_on_top => ctx.windowSetAlwaysOnTop(false),
+        .skip_taskbar => ctx.windowSetSkipTaskbar(true),
+        .show_taskbar => ctx.windowSetSkipTaskbar(false),
     }
     return .{ .ok = true };
 }

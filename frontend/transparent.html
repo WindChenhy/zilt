@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Zilt 透明无边框窗口</title>
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; height: 100%; overflow: hidden;
+    font-family: "Segoe UI", system-ui, sans-serif; color: #e2e8f0; }
+  .card { box-sizing: border-box; height: 100vh; display: flex; flex-direction: column;
+    background: rgba(15, 23, 42, 0.86); border: 1px solid rgba(148, 163, 184, 0.35);
+    border-radius: 16px; overflow: hidden; backdrop-filter: blur(12px); }
+  .titlebar { display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px; background: rgba(37, 99, 235, 0.35); cursor: move; }
+  .titlebar h1 { margin: 0; font-size: 14px; font-weight: 600; }
+  .titlebar .tag { font-size: 11px; color: #93c5fd; }
+  .body { padding: 16px; font-size: 13px; color: #cbd5e1; }
+  .body p { margin: 6px 0; }
+  .row { margin-top: 12px; }
+  button { background: #2563eb; color: #fff; border: 0; border-radius: 8px;
+    padding: 7px 12px; margin-right: 6px; cursor: pointer; }
+  button:hover { background: #1d4ed8; }
+  .mono { font-family: Consolas, monospace; color: #7dd3fc; margin-top: 10px; min-height: 18px; font-size: 12px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="titlebar" data-zilt-drag-region>
+      <h1>Zilt 透明无边框窗口</h1>
+      <span class="tag">拖动我 · Alt+F4 触发关闭请求</span>
+    </div>
+    <div class="body">
+      <p>WebView 背景透明，窗口无原生边框；标题栏通过 <code>data-zilt-drag-region</code> 拖动。</p>
+      <p>本窗口启用了 <code>close_requested_event</code>：Alt+F4 先发 <code>windowCloseRequested</code>，
+        前端确认后调用 <code>windowControlDemo close</code>。</p>
+      <div class="row">
+        <button onclick="window.zilt.invoke('windowControlDemo',{action:'always_on_top'})">置顶</button>
+        <button onclick="window.zilt.invoke('windowControlDemo',{action:'not_always_on_top'})">取消置顶</button>
+        <button onclick="window.zilt.invoke('windowControlDemo',{action:'skip_taskbar'})">隐藏任务栏</button>
+        <button onclick="window.zilt.invoke('windowControlDemo',{action:'close'})">立即关闭</button>
+      </div>
+      <div id="ev" class="mono"></div>
+    </div>
+  </div>
+  <script src="/transparent.js"></script>
+</body>
+</html>

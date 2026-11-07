@@ -2,13 +2,13 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>Zilt — v0.1.6 示例</title>
+<title>Zilt — v0.1.7 示例</title>
 <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <header>
-    <h1>Zilt <span class="badge">v0.1.6</span></h1>
-    <p class="sub">Zig WebView GUI 框架 · 多窗口 / 窗口控制 / 剪贴板 / 拖放 / 深链接</p>
+    <h1>Zilt <span class="badge">v0.1.7</span></h1>
+    <p class="sub">Zig WebView GUI 框架 · 多窗口 / 窗口事件 / 剪贴板 / 拖放 / 深链接</p>
     <p class="sub" id="conn">连接中…</p>
   </header>
 
@@ -25,6 +25,7 @@
         <tr><td>invoke setMode（枚举参数映射）</td><td id="c-mode" class="pending">…</td></tr>
         <tr><td>剪贴板往返（v0.1.6）</td><td id="c-clip" class="pending">…</td></tr>
         <tr><td>窗口标题设置（v0.1.6）</td><td id="c-win" class="pending">…</td></tr>
+        <tr><td>窗口事件 windowResized（v0.1.7）</td><td id="c-winevent" class="pending">…</td></tr>
         <tr><td>Range/206 资产分块（v0.1.6）</td><td id="c-range" class="pending">…</td></tr>
       </table>
       <div id="out"></div>
@@ -95,6 +96,20 @@
       </div>
       <div id="winout" class="mono"></div>
       <p class="sub">把文件拖进窗口 → dropFiles 事件；从外部打开 zilt://… 或 .zilt 文件、再启动一次 exe（第二实例）→ deepLink 事件。</p>
+    </section>
+
+    <section>
+      <h2>窗口模型 / 窗口事件（v0.1.7）</h2>
+      <div class="row">
+        <button onclick="newFramelessWindow()">无边框窗口</button>
+        <button onclick="newTransparentWindow()">透明无边框窗口</button>
+        <button onclick="newTopmostWindow()">置顶窗口</button>
+        <button onclick="newSkipTaskbarWindow()">隐藏任务栏窗口</button>
+        <button onclick="newHiddenWindow()">隐藏创建（加载后显示）</button>
+      </div>
+      <p class="sub">窗口移动/缩放/焦点/主题/DPI/关闭请求事件见上方输出；
+        透明窗口标题栏标记 <code>data-zilt-drag-region</code> 可拖动，Alt+F4 触发
+        <code>windowCloseRequested</code> 后由前端确认关闭。</p>
     </section>
   </main>
 

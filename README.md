@@ -6,13 +6,20 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.6（Windows 全栈 + 前端工程化 + 多窗口/窗口控制/托盘菜单/剪贴板/拖放/深链接/Range：绑定 + IPC 协议 + comptime 绑定生成 + 前端资产 codegen + dev/init 工具链 + 打包器 + 托盘/菜单/对话框/快捷键 + 自动更新器）**。路线图见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.1.7（Windows 全栈 + 前端工程化 + 窗口模型/窗口事件/多窗口/托盘/剪贴板/拖放/深链接/Range：绑定 + IPC 协议 + comptime 绑定生成 + 前端资产 codegen + dev/init 工具链 + 打包器 + 自动更新器）**。路线图见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
+v0.1.7 新增：
+
+- **窗口模型**：透明 / 无边框 / 置顶 / 隐藏任务栏 / 初始位置与尺寸 / 最小最大尺寸 / 创建时隐藏 / 背景色 / 每窗口图标
+- **窗口事件**：moved / resized / focus / blur / themeChanged / scaleFactorChanged / closeRequested / destroyed
+- **自定义标题栏**：`data-zilt-drag-region` + `window.zilt.startDragging()`（无边框窗口可拖动）
+- **关闭请求**：`close_requested_event` 开启后由前端确认 `windowClose`
 
 v0.1.6 新增：
 
 - **默认 Zig 官方图标**：内置多尺寸 `zilt.ico`（窗口/托盘/exe 资源共用，无需配置）；
   `project.icon` 可自定义 exe 图标，`Config.icon` / `Tray.icon` 可自定义运行时图标
-- **多窗口**：`ctx.newWindow(...)`、每窗口独立 IPC/事件路由、`ctx.emitTo(window_id, ...)`、`windowClosed` 事件
+- **多窗口**：`ctx.newWindow(...)`、每窗口独立 IPC/事件路由、`ctx.emitTo(window_id, ...)`、`windowDestroyed` 事件（v0.1.7 由 windowClosed 更名）
 - **窗口控制**：标题/最小化/最大化/还原/全屏/尺寸/位置/显隐/聚焦/关闭（任意线程安全）
 - **托盘右键菜单**：`Config.Tray.menu` → `trayMenu` 事件
 - **剪贴板 + 文件拖放**：`ctx.clipboardWriteText/ReadText`、`dropFiles` 事件
@@ -34,7 +41,7 @@ ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=my-app zig build init
 ```sh
 zig build gen      # 生成前端 TS 绑定（frontend/bindings/zilt.ts）
 zig build run      # 启动示例应用（embedded 模式）
-zig build test    # 单元测试（87 个 test 块：协议/更新器/打包器/系统能力/前端 codegen/模板/图标/深链接/Range）
+zig build test    # 单元测试（90 个 test 块：协议/更新器/打包器/系统能力/前端 codegen/模板/图标/深链接/Range/窗口模型）
 ```
 
 dev 模式：

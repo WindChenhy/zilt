@@ -50,18 +50,19 @@ pub fn smokeResult(ctx: Context, payload: struct {
     clip: bool = false,
     win: bool = false,
     range: bool = false,
+    winevent: bool = false,
     fatal: ?[]const u8 = null,
 }) void {
     var ok = false;
     if (payload.fatal) |f| {
         zilt.log.print("[smoke] FATAL(frontend): {s}", .{f});
     } else {
-        ok = payload.greet and payload.add and payload.fail and payload.user and payload.event and payload.mode and payload.clip and payload.win and payload.range;
+        ok = payload.greet and payload.add and payload.fail and payload.user and payload.event and payload.mode and payload.clip and payload.win and payload.range and payload.winevent;
         if (ok) {
-            zilt.log.print("[smoke] ALL CHECKS PASSED (greet/add/fail-reject/user-optional/event-tick/mode-enum/clipboard/window/range)", .{});
+            zilt.log.print("[smoke] ALL CHECKS PASSED (greet/add/fail-reject/user-optional/event-tick/mode-enum/clipboard/window/range/window-event)", .{});
         } else {
-            zilt.log.print("[smoke] FAILED greet={} add={} fail={} user={} event={} mode={} clip={} win={} range={}", .{
-                payload.greet, payload.add, payload.fail, payload.user, payload.event, payload.mode, payload.clip, payload.win, payload.range,
+            zilt.log.print("[smoke] FAILED greet={} add={} fail={} user={} event={} mode={} clip={} win={} range={} winevent={}", .{
+                payload.greet, payload.add, payload.fail, payload.user, payload.event, payload.mode, payload.clip, payload.win, payload.range, payload.winevent,
             });
         }
     }

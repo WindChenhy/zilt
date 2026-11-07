@@ -138,6 +138,45 @@ pub const ICoreWebView2Controller = extern struct {
         const hr = self.lpVtbl.get_CoreWebView2(self, &webview);
         return .{ .hr = hr, .webview = webview };
     }
+
+    /// ICoreWebView2Controller2（DefaultBackgroundColor：透明/背景色）。
+    pub fn getController2(self: *ICoreWebView2Controller) ?*ICoreWebView2Controller2 {
+        var out: ?*anyopaque = null;
+        const hr = self.lpVtbl.QueryInterface(self, &IID_Controller2, &out);
+        if (com.failed(hr) or out == null) return null;
+        return @ptrCast(@alignCast(out.?));
+    }
+};
+
+pub const IID_Controller2: com.GUID = .parse("{c979903e-d4ca-4228-92eb-47ee3fa96eab}");
+
+/// COREWVIEW2_COLOR（IDL 字段序 A,R,G,B；整体 4 字节按值传递）。
+pub const Color = extern struct {
+    a: u8,
+    r: u8,
+    g: u8,
+    b: u8,
+};
+
+/// ICoreWebView2Controller2：在 Controller 的 26 个槽后追加
+/// get_DefaultBackgroundColor / put_DefaultBackgroundColor。
+pub const ICoreWebView2Controller2 = extern struct {
+    lpVtbl: *const VTable,
+
+    pub const VTable = extern struct {
+        base: [26]?*const anyopaque,
+        get_DefaultBackgroundColor: *const fn (*ICoreWebView2Controller2, *Color) callconv(.c) HRESULT,
+        put_DefaultBackgroundColor: *const fn (*ICoreWebView2Controller2, Color) callconv(.c) HRESULT,
+    };
+
+    pub fn putDefaultBackgroundColor(self: *ICoreWebView2Controller2, color: Color) HRESULT {
+        return self.lpVtbl.put_DefaultBackgroundColor(self, color);
+    }
+
+    pub fn release(self: *ICoreWebView2Controller2) void {
+        const f: *const fn (*ICoreWebView2Controller2) callconv(.c) u32 = @ptrCast(self.lpVtbl.base[2] orelse return);
+        _ = f(self);
+    }
 };
 
 // ============================== ICoreWebView2Settings ==============================

@@ -156,9 +156,26 @@ pub fn run(comptime config: Config) !void {
         .width = config.width,
         .height = config.height,
         .url = config.url,
+        .x = config.x,
+        .y = config.y,
+        .visible = config.visible,
+        .resizable = config.resizable,
+        .decorations = config.decorations,
+        .transparent = config.transparent,
+        .always_on_top = config.always_on_top,
+        .skip_taskbar = config.skip_taskbar,
+        .min_width = config.min_width,
+        .min_height = config.min_height,
+        .max_width = config.max_width,
+        .max_height = config.max_height,
+        .background_color = config.background_color,
+        .close_requested_event = config.close_requested_event,
+        .icon = config.icon,
     });
-    _ = win32.ShowWindow(main.hwnd, win32.SW_SHOW);
-    _ = win32.UpdateWindow(main.hwnd);
+    if (config.visible) {
+        _ = win32.ShowWindow(main.hwnd, win32.SW_SHOW);
+        _ = win32.UpdateWindow(main.hwnd);
+    }
     log.print("[win32] window created: \"{s}\" {d}x{d}", .{ config.title, config.width, config.height });
 
     // 全局快捷键（编译期校验 key 合法性）
@@ -307,6 +324,66 @@ pub fn contentTypeOf(path: []const u8) []const u8 {
 fn clampIconPx(metric: i32, fallback: u32) u32 {
     if (metric <= 0 or metric > 256) return fallback;
     return @intCast(metric);
+}
+
+/// 窗口样式（纯函数，单测覆盖）。
+fn windowStyleFor(opts: ipc.WindowOptions) win32.DWORD {
+    var style: win32.DWORD = if (opts.decorations)
+        win32.WS_OVERLAPPEDWINDOW
+    else
+        win32.WS_POPUP | win32.WS_SYSMENU | win32.WS_MINIMIZEBOX | win32.WS_MAXIMIZEBOX;
+
+    if (!opts.resizable) {
+        style &= ~(win32.WS_THICKFRAME | win32.WS_MAXIMIZEBOX);
+    } else if (!opts.decorations) {
+        style |= win32.WS_THICKFRAME;
+    }
+    if (opts.visible) style |= win32.WS_VISIBLE;
+    return style;
+}
+
+/// 扩展样式：任务栏隐藏 / 透明合成。
+fn windowExStyleFor(opts: ipc.WindowOptions) win32.DWORD {
+    var ex: win32.DWORD = 0;
+    if (opts.skip_taskbar) ex |= win32.WS_EX_TOOLWINDOW;
+    if (opts.transparent) ex |= win32.WS_EX_NOREDIRECTIONBITMAP;
+    return ex;
+}
+
+/// 0xRRGGBB → COLORREF（0x00BBGGRR）。
+fn colorRefOf(rgb: u32) win32.DWORD {
+    const r = (rgb >> 16) & 0xff;
+    const g = (rgb >> 8) & 0xff;
+    const b = rgb & 0xff;
+    return @intCast((b << 16) | (g << 8) | r);
+}
+
+/// Windows 应用主题：true = 浅色（AppsUseLightTheme）。
+fn appsUseLightTheme() bool {
+    var value: u32 = 1;
+    var size: win32.DWORD = 4;
+    // 直接 RegGetValueW 需要完整子键；用 page allocator 构造宽字符。
+    const alloc = std.heap.page_allocator;
+    const sub_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize") catch return true;
+    defer alloc.free(sub_w);
+    const val_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, "AppsUseLightTheme") catch return true;
+    defer alloc.free(val_w);
+    const hr = win32.RegGetValueW(win32.HKEY_CURRENT_USER, sub_w.ptr, val_w.ptr, win32.RRF_RT_REG_DWORD, null, &value, &size);
+    if (com.failed(hr)) return true;
+    return value != 0;
+}
+
+fn themeName() []const u8 {
+    return if (appsUseLightTheme()) "light" else "dark";
+}
+
+/// WM_SETTINGCHANGE 的 lParam 是否为主题变更（UTF-16 "ImmersiveColorSet"）。
+fn isImmersiveColorSet(lparam: win32.LPARAM) bool {
+    if (lparam == 0) return false;
+    const addr: usize = @bitCast(lparam);
+    const ptr: [*:0]const u16 = @ptrCast(@alignCast(@as(*anyopaque, @ptrFromInt(addr))));
+    const s = std.mem.span(ptr);
+    return std.mem.eql(u16, s, &[_]u16{ 'I', 'm', 'm', 'e', 'r', 's', 'i', 'v', 'e', 'C', 'o', 'l', 'o', 'r', 'S', 'e', 't' });
 }
 
 fn streamFromBytes(bytes: []const u8) ?*wv2.IStream {
@@ -458,6 +535,19 @@ fn Backend(comptime config: Config) type {
             fullscreen: bool = false,
             saved_style: i32 = 0,
             saved_rect: win32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+            // ---- v0.1.7 窗口模型 ----
+            min_width: ?u32 = null,
+            min_height: ?u32 = null,
+            max_width: ?u32 = null,
+            max_height: ?u32 = null,
+            background_color: ?u32 = null,
+            transparent: bool = false,
+            close_requested_events: bool = false,
+            icon_big: win32.HICON = null,
+            icon_small: win32.HICON = null,
+            owns_icons: bool = false,
+            bg_brush: win32.HBRUSH = null,
+            dpi: u32 = 96,
 
             fn updateBounds(self: *Window) void {
                 const controller = self.controller orelse return;
@@ -671,11 +761,22 @@ fn Backend(comptime config: Config) type {
                 .id = self.next_id,
                 .title = title,
                 .url = url,
+                .min_width = opts.min_width,
+                .min_height = opts.min_height,
+                .max_width = opts.max_width,
+                .max_height = opts.max_height,
+                .background_color = opts.background_color,
+                .transparent = opts.transparent,
+                .close_requested_events = opts.close_requested_event,
             };
 
             const hinstance = win32.GetModuleHandleW(null);
             const title_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, title);
             defer self.allocator.free(title_w);
+
+            const style = windowStyleFor(opts);
+            const ex_style = windowExStyleFor(opts);
+            const has_menu = opts.decorations and self.main_menu != null;
 
             var rect = win32.RECT{
                 .left = 0,
@@ -683,15 +784,15 @@ fn Backend(comptime config: Config) type {
                 .right = @intCast(opts.width),
                 .bottom = @intCast(opts.height),
             };
-            _ = win32.AdjustWindowRect(&rect, win32.WS_OVERLAPPEDWINDOW, 0);
+            _ = win32.AdjustWindowRect(&rect, style, if (has_menu) 1 else 0);
 
             w.hwnd = win32.CreateWindowExW(
-                0,
+                ex_style,
                 self.class_w.ptr,
                 title_w.ptr,
-                win32.WS_OVERLAPPEDWINDOW | win32.WS_VISIBLE,
-                win32.CW_USEDEFAULT,
-                win32.CW_USEDEFAULT,
+                style,
+                opts.x orelse win32.CW_USEDEFAULT,
+                opts.y orelse win32.CW_USEDEFAULT,
                 rect.right - rect.left,
                 rect.bottom - rect.top,
                 null,
@@ -700,20 +801,48 @@ fn Backend(comptime config: Config) type {
                 null,
             ) orelse return error.CreateWindowFailed;
 
-            if (self.main_menu) |hm| {
-                if (win32.SetMenu(w.hwnd, hm) == 0) log.print("[menu] SetMenu failed for window {d}", .{w.id});
+            w.dpi = win32.GetDpiForWindow(w.hwnd);
+
+            if (has_menu) {
+                if (win32.SetMenu(w.hwnd, self.main_menu.?) == 0) {
+                    log.print("[menu] SetMenu failed for window {d}", .{w.id});
+                }
             }
-            if (self.icon_big) |ic| {
+
+            // 每窗口图标（opts.icon）或应用默认图标
+            w.icon_big = self.icon_big;
+            w.icon_small = self.icon_small;
+            if (opts.icon) |path| {
+                const cx_big = clampIconPx(win32.GetSystemMetrics(win32.SM_CXICON), 32);
+                const cx_small = clampIconPx(win32.GetSystemMetrics(win32.SM_CXSMICON), 16);
+                const ib = self.makeIcon(path, cx_big, cx_big);
+                const is = self.makeIcon(path, cx_small, cx_small);
+                if (ib != null and is != null) {
+                    w.icon_big = ib;
+                    w.icon_small = is;
+                    w.owns_icons = true;
+                } else {
+                    if (ib) |h| _ = win32.DestroyIcon(h);
+                    if (is) |h| _ = win32.DestroyIcon(h);
+                }
+            }
+            if (w.icon_big) |ic| {
                 _ = win32.SendMessageW(w.hwnd, win32.WM_SETICON, win32.ICON_BIG, @bitCast(@intFromPtr(ic)));
             }
-            if (self.icon_small) |ic| {
+            if (w.icon_small) |ic| {
                 _ = win32.SendMessageW(w.hwnd, win32.WM_SETICON, win32.ICON_SMALL, @bitCast(@intFromPtr(ic)));
+            }
+
+            if (opts.always_on_top) {
+                _ = win32.SetWindowPos(w.hwnd, win32.HWND_TOPMOST, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
             }
             win32.DragAcceptFiles(w.hwnd, 1);
 
             try self.windows.append(self.allocator, w);
             self.next_id += 1;
-            log.print("[win32] window #{d} created: \"{s}\" ({s})", .{ w.id, title, url });
+            log.print("[win32] window #{d} created: \"{s}\" ({s}) decorations={} transparent={} topmost={} taskbar={} visible={}", .{
+                w.id, title, url, opts.decorations, opts.transparent, opts.always_on_top, !opts.skip_taskbar, opts.visible,
+            });
             return w;
         }
 
@@ -748,6 +877,36 @@ fn Backend(comptime config: Config) type {
             const webview = wv_result.webview.?;
             w.webview = webview;
             log.print("[webview] core webview attached (window #{d})", .{w.id});
+
+            // v0.1.7：透明/自定义背景（ICoreWebView2Controller2）
+            if (w.transparent or w.background_color != null) {
+                if (controller.getController2()) |c2| {
+                    const col: wv2.Color = if (w.transparent)
+                        .{ .a = 0, .r = 0, .g = 0, .b = 0 }
+                    else blk: {
+                        const rgb = w.background_color.?;
+                        break :blk .{
+                            .a = 255,
+                            .r = @intCast((rgb >> 16) & 0xff),
+                            .g = @intCast((rgb >> 8) & 0xff),
+                            .b = @intCast(rgb & 0xff),
+                        };
+                    };
+                    const hr_bg = c2.putDefaultBackgroundColor(col);
+                    c2.release();
+                    log.print("[webview] default background set (a={d}, hr=0x{x})", .{ col.a, @as(u32, @bitCast(hr_bg)) });
+                } else {
+                    log.print("[webview] Controller2 unavailable -> transparent/background ignored", .{});
+                    if (w.transparent) {
+                        // 降级：移除无重定向位图，恢复窗口底色（避免整窗不可见）
+                        w.transparent = false;
+                        const cur: win32.DWORD = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_EXSTYLE));
+                        _ = win32.SetWindowLongW(w.hwnd, win32.GWL_EXSTYLE, @bitCast(cur & ~win32.WS_EX_NOREDIRECTIONBITMAP));
+                        _ = win32.SetWindowPos(w.hwnd, null, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOZORDER | win32.SWP_FRAMECHANGED);
+                        _ = win32.InvalidateRect(w.hwnd, null, 1);
+                    }
+                }
+            }
 
             // IPC sink
             w.msg_handler = MessageHandler.create(w) catch null;
@@ -816,7 +975,38 @@ fn Backend(comptime config: Config) type {
                 self.watcher = Watcher.start(self.allocator, self.makeContextWith(w, self.allocator), dir);
             }
 
-            // 多窗口 E2E（ZILT_SMOKE_MULTI=1）：启动后自动开第二个窗口
+            // 窗口模型 E2E（ZILT_SMOKE_FRAME=1 无边框 / 2 透明 / 3 置顶 / 4 隐藏任务栏）
+            if (win32.getEnvUtf8(self.allocator, "ZILT_SMOKE_FRAME")) |v| {
+                defer self.allocator.free(v);
+                if (v.len > 0) {
+                    const base = originOf(config.url);
+                    const path = if (v[0] == '2') "/transparent.html" else "/second.html";
+                    const url = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, path }) catch return;
+                    defer self.allocator.free(url);
+                    var opts = ipc.WindowOptions{
+                        .title = "Zilt 窗口模型 E2E",
+                        .width = 560,
+                        .height = 400,
+                        .url = url,
+                    };
+                    switch (v[0]) {
+                        '1' => opts.decorations = false,
+                        '2' => {
+                            opts.decorations = false;
+                            opts.transparent = true;
+                            opts.close_requested_event = true;
+                        },
+                        '3' => opts.always_on_top = true,
+                        '4' => opts.skip_taskbar = true,
+                        else => {},
+                    }
+                    if (self.createWindow(opts)) |nw| {
+                        _ = win32.ShowWindow(nw.hwnd, win32.SW_SHOW);
+                        self.beginController(nw);
+                        log.print("[frame] window #{d} created (mode={c})", .{ nw.id, v[0] });
+                    } else |_| {}
+                }
+            }
             if (win32.getEnvUtf8(self.allocator, "ZILT_SMOKE_MULTI")) |v| {
                 defer self.allocator.free(v);
                 if (v.len > 0 and v[0] == '1') {
@@ -978,6 +1168,16 @@ fn Backend(comptime config: Config) type {
             switch (decoded.msg) {
                 .invoke => |inv| {
                     log.print("[ipc] invoke {s} (id={d}, window={d})", .{ inv.method, inv.id, w.id });
+
+                    // 框架内置：自定义标题栏拖动（runtime_js 的 data-zilt-drag-region）
+                    if (std.mem.eql(u8, inv.method, "__zilt.startDragging")) {
+                        const ok = runWindowCmd(w.backend, w.id, .start_dragging);
+                        const result_json = if (ok) "true" else "false";
+                        const resp = ipc.encodeResolve(self.allocator, inv.id, result_json) catch return;
+                        w.sendJson(resp);
+                        return;
+                    }
+
                     const result_json = ipc.dispatch(config.commands, ctx, inv.method, inv.args_json) catch |err| {
                         log.print("[ipc] invoke {s} failed: {s}", .{ inv.method, @errorName(err) });
                         const rej = ipc.encodeReject(self.allocator, inv.id, @errorName(err)) catch return;
@@ -1099,6 +1299,26 @@ fn Backend(comptime config: Config) type {
                     _ = win32.DestroyWindow(w.hwnd);
                     return true;
                 },
+                .start_dragging => {
+                    _ = win32.ReleaseCapture();
+                    _ = win32.SendMessageW(w.hwnd, win32.WM_NCLBUTTONDOWN, win32.HTCAPTION, 0);
+                    return true;
+                },
+                .always_on_top => |on| {
+                    _ = win32.SetWindowPos(w.hwnd, if (on) win32.HWND_TOPMOST else win32.HWND_NOTOPMOST, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
+                    return true;
+                },
+                .skip_taskbar => |skip| {
+                    var ex: win32.DWORD = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_EXSTYLE));
+                    if (skip) {
+                        ex |= win32.WS_EX_TOOLWINDOW;
+                    } else {
+                        ex &= ~win32.WS_EX_TOOLWINDOW;
+                    }
+                    _ = win32.SetWindowLongW(w.hwnd, win32.GWL_EXSTYLE, @bitCast(ex));
+                    _ = win32.SetWindowPos(w.hwnd, null, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOZORDER | win32.SWP_FRAMECHANGED);
+                    return true;
+                },
             }
         }
 
@@ -1205,6 +1425,15 @@ fn Backend(comptime config: Config) type {
         fn emitLaunch(self: *Self, launch: *deep_link.Launch) void {
             const w = self.mainWindow() orelse return;
             w.emitEventPayload("deepLink", .{ .url = launch.url, .files = launch.files });
+        }
+
+        /// 应用主题变化广播（每个窗口一条事件）。
+        fn emitThemeAll(self: *Self) void {
+            const theme = themeName();
+            log.print("[theme] changed -> {s}", .{theme});
+            for (self.windows.items) |w| {
+                if (w.alive) w.emitEventPayload("windowThemeChanged", .{ .id = w.id, .theme = theme });
+            }
         }
 
         fn emitPendingLaunch(self: *Self) void {
@@ -1526,7 +1755,7 @@ fn Backend(comptime config: Config) type {
             return true;
         }
 
-        /// 释放窗口的 COM 资源（窗口关闭 / 应用退出共用；幂等）。
+        /// 释放窗口的 COM/GDI 资源（窗口关闭 / 应用退出共用；幂等）。
         fn releaseWindowCom(w: *Window) void {
             if (w.webview) |wv| _ = wv.lpVtbl.Release(wv);
             if (w.msg_handler) |h| h.dropRef();
@@ -1536,11 +1765,20 @@ fn Backend(comptime config: Config) type {
                 _ = c.lpVtbl.Close(c);
                 _ = c.lpVtbl.Release(c);
             }
+            if (w.owns_icons) {
+                if (w.icon_big) |ic| _ = win32.DestroyIcon(ic);
+                if (w.icon_small) |ic| _ = win32.DestroyIcon(ic);
+            }
+            if (w.bg_brush) |br| _ = win32.DeleteObject(br);
             w.webview = null;
             w.msg_handler = null;
             w.res_handler = null;
             w.nav_handler = null;
             w.controller = null;
+            w.icon_big = null;
+            w.icon_small = null;
+            w.owns_icons = false;
+            w.bg_brush = null;
         }
 
         fn cleanup(self: *Self) void {
@@ -1586,11 +1824,102 @@ fn Backend(comptime config: Config) type {
 
         fn wndProc(hwnd: win32.HWND, msg: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.c) win32.LRESULT {
             switch (msg) {
-                win32.WM_SIZE => {
+                win32.WM_MOVE => {
                     if (instance) |b| {
-                        if (b.windowOfHwnd(hwnd)) |w| w.updateBounds();
+                        if (b.windowOfHwnd(hwnd)) |w| {
+                            var rc: win32.RECT = undefined;
+                            if (win32.GetWindowRect(hwnd, &rc) != 0) {
+                                w.emitEventPayload("windowMoved", .{ .id = w.id, .x = rc.left, .y = rc.top });
+                            }
+                        }
                     }
                     return 0;
+                },
+                win32.WM_SIZE => {
+                    if (instance) |b| {
+                        if (b.windowOfHwnd(hwnd)) |w| {
+                            w.updateBounds();
+                            var rc: win32.RECT = undefined;
+                            if (win32.GetClientRect(hwnd, &rc) != 0) {
+                                w.emitEventPayload("windowResized", .{ .id = w.id, .width = rc.right, .height = rc.bottom });
+                            }
+                        }
+                    }
+                    return 0;
+                },
+                win32.WM_SETFOCUS => {
+                    if (instance) |b| {
+                        if (b.windowOfHwnd(hwnd)) |w| w.emitEventPayload("windowFocus", .{ .id = w.id });
+                    }
+                    return 0;
+                },
+                win32.WM_KILLFOCUS => {
+                    if (instance) |b| {
+                        if (b.windowOfHwnd(hwnd)) |w| w.emitEventPayload("windowBlur", .{ .id = w.id });
+                    }
+                    return 0;
+                },
+                win32.WM_GETMINMAXINFO => {
+                    if (instance) |b| {
+                        if (b.windowOfHwnd(hwnd)) |w| {
+                            if (lparam != 0) {
+                                const mmi: *win32.MINMAXINFO = @ptrCast(@alignCast(@as(*anyopaque, @ptrFromInt(@as(usize, @bitCast(lparam))))));
+                                if (w.min_width) |mw| mmi.ptMinTrackSize.x = @intCast(mw);
+                                if (w.min_height) |mh| mmi.ptMinTrackSize.y = @intCast(mh);
+                                if (w.max_width) |mw| mmi.ptMaxTrackSize.x = @intCast(mw);
+                                if (w.max_height) |mh| mmi.ptMaxTrackSize.y = @intCast(mh);
+                            }
+                        }
+                    }
+                    return 0;
+                },
+                win32.WM_ERASEBKGND => {
+                    if (instance) |b| {
+                        if (b.windowOfHwnd(hwnd)) |w| {
+                            if (w.transparent) return 1;
+                            if (w.background_color) |rgb| {
+                                if (w.bg_brush == null) w.bg_brush = win32.CreateSolidBrush(colorRefOf(rgb));
+                                if (w.bg_brush) |br| {
+                                    var rc: win32.RECT = undefined;
+                                    if (win32.GetClientRect(hwnd, &rc) != 0) {
+                                        const hdc: win32.HDC = @ptrFromInt(wparam);
+                                        _ = win32.FillRect(hdc, &rc, br);
+                                    }
+                                    return 1;
+                                }
+                            }
+                        }
+                    }
+                },
+                win32.WM_DPICHANGED => {
+                    if (instance) |b| {
+                        if (b.windowOfHwnd(hwnd)) |w| {
+                            const new_dpi: u32 = @intCast(wparam & 0xffff);
+                            if (lparam != 0) {
+                                const rc: *const win32.RECT = @ptrCast(@alignCast(@as(*anyopaque, @ptrFromInt(@as(usize, @bitCast(lparam))))));
+                                _ = win32.SetWindowPos(hwnd, null, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
+                            }
+                            w.dpi = new_dpi;
+                            w.updateBounds();
+                            log.print("[window] #{d} dpi -> {d} (scale {d:.2})", .{ w.id, new_dpi, @as(f64, @floatFromInt(new_dpi)) / 96.0 });
+                            w.emitEventPayload("windowScaleFactorChanged", .{
+                                .id = w.id,
+                                .scale_factor = @as(f64, @floatFromInt(new_dpi)) / 96.0,
+                                .dpi = new_dpi,
+                            });
+                        }
+                    }
+                    return 0;
+                },
+                win32.WM_THEMECHANGED => {
+                    if (instance) |b| b.emitThemeAll();
+                    return 0;
+                },
+                win32.WM_SETTINGCHANGE => {
+                    if (isImmersiveColorSet(lparam)) {
+                        if (instance) |b| b.emitThemeAll();
+                        return 0;
+                    }
                 },
                 win32.WM_CLOSE => {
                     if (instance) |b| {
@@ -1599,6 +1928,11 @@ fn Backend(comptime config: Config) type {
                                 _ = win32.ShowWindow(hwnd, win32.SW_HIDE);
                                 log.print("[tray] window hidden to tray", .{});
                                 return 0;
+                            }
+                            if (w.close_requested_events) {
+                                log.print("[window] close requested (window #{d})", .{w.id});
+                                w.emitEventPayload("windowCloseRequested", .{ .id = w.id });
+                                return 0; // 前端调用 windowClose 才真正销毁
                             }
                         }
                     }
@@ -1615,7 +1949,7 @@ fn Backend(comptime config: Config) type {
                         // 通知其余窗口
                         for (b.windows.items) |other| {
                             if (other.alive and other.id != closed_id) {
-                                other.emitEventPayload("windowClosed", .{ .id = closed_id });
+                                other.emitEventPayload("windowDestroyed", .{ .id = closed_id });
                             }
                         }
                         if (b.aliveCount() == 0) win32.PostQuitMessage(0);
@@ -2171,6 +2505,37 @@ test "contentTypeOf: 扩展名映射" {
     try testing.expectEqualStrings("application/json", contentTypeOf("a/b/data.json"));
     try testing.expectEqualStrings("application/octet-stream", contentTypeOf("/x.bin"));
     try testing.expectEqualStrings("application/octet-stream", contentTypeOf("/noext"));
+}
+
+test "windowStyleFor: 装饰/可缩放/可见组合" {
+    const def = windowStyleFor(.{});
+    try testing.expect((def & win32.WS_OVERLAPPEDWINDOW) != 0);
+    try testing.expect((def & win32.WS_VISIBLE) != 0);
+    try testing.expect((def & win32.WS_THICKFRAME) != 0);
+
+    const hidden = windowStyleFor(.{ .visible = false });
+    try testing.expect((hidden & win32.WS_VISIBLE) == 0);
+
+    const fixed = windowStyleFor(.{ .resizable = false });
+    try testing.expect((fixed & win32.WS_THICKFRAME) == 0);
+    try testing.expect((fixed & win32.WS_MAXIMIZEBOX) == 0);
+
+    const frameless = windowStyleFor(.{ .decorations = false });
+    try testing.expect((frameless & win32.WS_CAPTION) == 0);
+    try testing.expect((frameless & win32.WS_POPUP) != 0);
+    try testing.expect((frameless & win32.WS_THICKFRAME) != 0); // 无边框仍可缩放
+}
+
+test "windowExStyleFor: 任务栏隐藏 / 透明" {
+    try testing.expectEqual(@as(win32.DWORD, 0), windowExStyleFor(.{}));
+    try testing.expect((windowExStyleFor(.{ .skip_taskbar = true }) & win32.WS_EX_TOOLWINDOW) != 0);
+    try testing.expect((windowExStyleFor(.{ .transparent = true }) & win32.WS_EX_NOREDIRECTIONBITMAP) != 0);
+}
+
+test "colorRefOf: 0xRRGGBB -> 0x00BBGGRR" {
+    try testing.expectEqual(@as(win32.DWORD, 0x00332211), colorRefOf(0x112233));
+    try testing.expectEqual(@as(win32.DWORD, 0x00000000), colorRefOf(0x000000));
+    try testing.expectEqual(@as(win32.DWORD, 0x00ffffff), colorRefOf(0xffffff));
 }
 
 // ---------------------------------------------------------------------------

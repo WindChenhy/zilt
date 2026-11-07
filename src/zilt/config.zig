@@ -25,6 +25,30 @@ pub const Config = struct {
     title: [:0]const u8 = "Zilt App",
     width: u32 = 900,
     height: u32 = 640,
+    /// 初始位置（null = 系统默认）
+    x: ?i32 = null,
+    y: ?i32 = null,
+    /// 创建时是否可见
+    visible: bool = true,
+    /// 是否可调整大小
+    resizable: bool = true,
+    /// 是否带原生标题栏/边框
+    decorations: bool = true,
+    /// WebView 背景透明（桌面透出）
+    transparent: bool = false,
+    /// 窗口置顶
+    always_on_top: bool = false,
+    /// 从任务栏/Alt-Tab 隐藏
+    skip_taskbar: bool = false,
+    /// 最小/最大窗口尺寸（外层像素）
+    min_width: ?u32 = null,
+    min_height: ?u32 = null,
+    max_width: ?u32 = null,
+    max_height: ?u32 = null,
+    /// WebView 默认背景色（0xRRGGBB；null = 白色）
+    background_color: ?u32 = null,
+    /// 主窗口关闭前发 windowCloseRequested（需前端调用 windowClose 才关闭）
+    close_requested_event: bool = false,
 
     /// 应用 URL（embedded 模式）；约定 origin 由它推导（如 https://zilt.app）
     url: []const u8 = "https://zilt.app/index.html",
