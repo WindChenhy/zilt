@@ -8,6 +8,9 @@
         "build.zig.zon",
         "README.md",
         "docs",
+        "frontend",
+        "scripts",
         "src",
+        "templates",
     },
 }

@@ -1,0 +1,35 @@
+# {{APP_NAME}}
+
+由 [Zilt](https://github.com/) 创建（模板：{{TEMPLATE}}）——基于系统 WebView 的 Zig GUI 框架。
+
+## 常用命令
+
+| 命令 | 说明 |
+|---|---|
+| `cd frontend && npm install` | 安装前端依赖（首次；vanilla 模板无需） |
+| `zig build frontend` | 构建前端 |
+| `zig build run` | 运行（前端资产已嵌入 exe） |
+| `zig build dev` | 开发：启动前端 dev server + 应用直连（HMR） |
+| `zig build gen` | 重新生成 TS 绑定（frontend/bindings/zilt.ts） |
+| `zig build test` | 单元测试 |
+| `zig build bundle` | 打包 dist/（便携 zip + NSIS 安装器） |
+
+## 结构
+
+```
+src/zilt/        Zilt 框架（vendored，随项目自包含）
+src/main.zig     应用入口（窗口/托盘/菜单/快捷键配置）
+src/commands.zig JS→Zig 命令（每个 pub fn 自动生成 TS 绑定）
+src/events.zig   Zig→JS / JS→Zig 事件处理器
+frontend/        前端工程（框架模板）
+frontend/bindings/  生成的 TS 绑定（zig build gen）
+```
+
+## 前端调用 Zig
+
+```ts
+// 直接使用注入的运行时
+const g = await window.zilt.invoke('greet', { name: 'Zilt' });
+// 或使用类型化绑定（zig build gen 后）
+import { greet } from './bindings/zilt';
+```

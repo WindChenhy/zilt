@@ -1,0 +1,31 @@
+//! JS→Zig 命令：每个 pub fn 自动生成 TS 绑定（zig build gen）。
+
+const std = @import("std");
+const zilt = @import("zilt");
+const Context = zilt.Context;
+
+pub fn greet(ctx: Context, args: struct { name: []const u8 }) !struct { message: []const u8 } {
+    return .{ .message = try std.fmt.allocPrint(ctx.allocator, "Hello, {s}! (from Zig)", .{args.name}) };
+}
+
+pub fn pingBackend(_: Context, args: struct {}) !struct { pong: bool } {
+    _ = args;
+    return .{ .pong = true };
+}
+
+/// 系统通知（托盘气球 → Windows Toast）。
+pub fn notifyMe(ctx: Context, args: struct { title: []const u8, body: []const u8 }) !void {
+    ctx.notify(args.title, args.body);
+}
+
+/// 打开文件对话框（模态）。
+pub fn pickFile(ctx: Context, args: struct {}) !struct { path: ?[]const u8 } {
+    _ = args;
+    const p = try ctx.openFile(ctx.allocator, .{ .title = "选择文件" });
+    return .{ .path = p };
+}
+
+pub fn exitApp(ctx: Context, args: struct {}) !void {
+    _ = args;
+    ctx.quit(0);
+}

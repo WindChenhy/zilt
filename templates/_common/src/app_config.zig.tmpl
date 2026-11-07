@@ -1,0 +1,8 @@
+//! 应用配置（命令/事件/内嵌资产）。资产表由 build.zig codegen 从 frontend dist 生成。
+
+const zilt = @import("zilt");
+
+pub const commands = @import("commands.zig");
+pub const events = @import("events.zig");
+
+pub const assets = @import("zilt_assets").assets;

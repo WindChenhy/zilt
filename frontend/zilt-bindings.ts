@@ -40,8 +40,41 @@ export async function setMode(args: { mode: "fast" | "slow" }): Promise<{ applie
   return window.zilt.invoke("setMode", args ?? {}) as Promise<{ applied: string }>;
 }
 
+export async function notifyMe(args: { title: string; body: string }): Promise<void> {
+  await window.zilt.invoke("notifyMe", args ?? {});
+}
+
+export async function alertBox(args: { text: string; title?: string; yes_no?: boolean }): Promise<{ clicked: string }> {
+  return window.zilt.invoke("alertBox", args ?? {}) as Promise<{ clicked: string }>;
+}
+
+export async function pickFile(args: { }): Promise<{ path?: string }> {
+  return window.zilt.invoke("pickFile", args ?? {}) as Promise<{ path?: string }>;
+}
+
+export async function saveFileDialog(args: { default?: string }): Promise<{ path?: string }> {
+  return window.zilt.invoke("saveFileDialog", args ?? {}) as Promise<{ path?: string }>;
+}
+
+export async function exitApp(args: { }): Promise<void> {
+  await window.zilt.invoke("exitApp", args ?? {});
+}
+
+export async function checkUpdate(args: { }): Promise<void> {
+  await window.zilt.invoke("checkUpdate", args ?? {});
+}
+
+export async function installUpdate(args: { }): Promise<void> {
+  await window.zilt.invoke("installUpdate", args ?? {});
+}
+
 export type ZiltEventPayloads = {
   "frontendLog": { msg: string },
+  "menu": { id: string },
+  "hotkey": { id: string },
+  "updateInfo": { version: string; notes?: string },
+  "updateStaged": { version: string },
+  "updaterFailed": { stage: string; err: string },
   "smokeResult": { greet?: boolean; add?: boolean; fail?: boolean; user?: boolean; event?: boolean; mode?: boolean; fatal?: string },
   "__reload": null,
 };

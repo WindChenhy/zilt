@@ -1,6 +1,5 @@
-//! 应用元数据（打包器与未来 CLI 共用）。
-pub const app_name = "Zilt";
-pub const version = "0.1.1";
-pub const publisher = "Zilt Project";
-pub const exe_name = "zilt-app.exe";
-pub const app_id = "app.zilt.desktop";
+//! 打包器元数据（从 project.zig 派生——单一配置源）。
+pub const app_name = @import("project.zig").app_name;
+pub const version = @import("project.zig").version;
+pub const app_id = @import("project.zig").app_id;
+pub const exe_name = @import("project.zig").exe_name;

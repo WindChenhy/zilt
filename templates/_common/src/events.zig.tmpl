@@ -1,0 +1,8 @@
+//! JS→Zig 事件处理器。
+
+const zilt = @import("zilt");
+const Context = zilt.Context;
+
+pub fn frontendLog(_: Context, payload: struct { msg: []const u8 }) void {
+    zilt.log.print("[frontend] {s}", .{payload.msg});
+}

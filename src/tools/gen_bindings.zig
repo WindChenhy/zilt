@@ -5,13 +5,20 @@ const std = @import("std");
 const zilt = @import("zilt");
 const app = @import("app_config");
 
-const OUTPUT_PATH = "src/frontend/zilt-bindings.ts";
+const OUTPUT_PATH = "frontend/bindings/zilt.ts";
 
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
 
     const ts = comptime zilt.bindings.generateTs(app.commands, app.events);
 
+    // 确保输出目录存在（frontend/bindings）
+    if (std.mem.lastIndexOfScalar(u8, OUTPUT_PATH, '/')) |slash| {
+        const dir = OUTPUT_PATH[0..slash];
+        const dir_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, dir);
+        defer alloc.free(dir_w);
+        _ = zilt.platform_windows.win32.CreateDirectoryW(dir_w.ptr, null);
+    }
     const path_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, OUTPUT_PATH);
     defer alloc.free(path_w);
 

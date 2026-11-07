@@ -1,0 +1,21 @@
+//! {{APP_NAME}} — 应用入口（Zilt 框架）
+
+const std = @import("std");
+const zilt = @import("zilt");
+const app = @import("app_config");
+const project = @import("project.zig");
+
+pub fn main() !void {
+    try zilt.run(.{
+        .commands = app.commands,
+        .events = app.events,
+        .assets = &app.assets,
+        .title = project.app_name,
+        .width = 1000,
+        .height = 700,
+        .url = "https://zilt.app/index.html",
+        .tray = .{ .tooltip = project.app_name },
+        .close_to_tray = true,
+        .single_instance = true,
+    });
+}

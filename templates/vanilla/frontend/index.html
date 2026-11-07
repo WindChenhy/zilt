@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>{{APP_NAME}}</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <h1>{{APP_NAME}}</h1>
+  <p class="sub">Zilt · vanilla 前端 · 纯 Zig 后端</p>
+  <button onclick="greet()">greet → Zig</button>
+  <button onclick="window.zilt.invoke('notifyMe',{title:'{{APP_NAME}}',body:'来自 Zig 的系统通知'})">系统通知</button>
+  <button onclick="window.zilt.invoke('pickFile',{}).then(r=>show(r.path||'已取消'))">打开文件…</button>
+  <div id="out" class="mono"></div>
+  <script src="/main.js"></script>
+</body>
+</html>

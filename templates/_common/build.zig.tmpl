@@ -1,0 +1,201 @@
+const std = @import("std");
+const project = @import("src/project.zig");
+const codegen = @import("src/tools/frontend_codegen.zig");
+
+pub fn build(b: *std.Build) void {
+    // 默认 windows-gnu：Zig 自带 MinGW 导入库，无 MSVC 也能构建
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .abi = .gnu },
+    });
+    const optimize = b.standardOptimizeOption(.{});
+
+    const zilt_mod = b.addModule("zilt", .{
+        .root_source_file = b.path("src/zilt/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // ---- 前端资产 codegen：遍历 dist → 生成 zilt-assets 模块 ----
+    const frontend = project.frontend;
+    const dist = frontend.dist;
+    const wf = b.addWriteFiles();
+    const files = codegen.collectFiles(b.allocator, dist, &codegen.default_excludes) catch blk: {
+        std.log.warn("[zilt] 前端 dist 遍历失败：资产表为空——先运行 `zig build frontend`", .{});
+        break :blk &[_][]const u8{};
+    };
+    const generated = codegen.generateAssetsZig(b.allocator, files) catch @panic("assets codegen OOM");
+    _ = wf.add("zilt-assets/assets.zig", generated);
+    for (files) |rel| {
+        const fs_rel = codegen.fsJoin(b.allocator, dist, rel) catch unreachable;
+        _ = wf.addCopyFile(b.path(fs_rel), codegen.fsJoin(b.allocator, "zilt-assets/payload", rel) catch unreachable);
+    }
+    const assets_mod = b.createModule(.{
+        .root_source_file = wf.getDirectory().path(b, "zilt-assets/assets.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zilt", .module = zilt_mod },
+        },
+    });
+    const assets_step = b.step("assets", "Regenerate embedded assets table");
+    assets_step.dependOn(&wf.step);
+
+    const app_config_mod = b.createModule(.{
+        .root_source_file = b.path("src/app_config.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zilt", .module = zilt_mod },
+            .{ .name = "zilt_assets", .module = assets_mod },
+        },
+    });
+
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zilt", .module = zilt_mod },
+            .{ .name = "app_config", .module = app_config_mod },
+        },
+    });
+
+    const exe = b.addExecutable(.{
+        .name = project.exe_name[0 .. project.exe_name.len - 4], // 去 .exe
+        .root_module = exe_mod,
+    });
+    exe_mod.linkSystemLibrary("user32", .{});
+    exe_mod.linkSystemLibrary("gdi32", .{});
+    exe_mod.linkSystemLibrary("ole32", .{});
+    exe_mod.linkSystemLibrary("advapi32", .{});
+    exe_mod.linkSystemLibrary("comdlg32", .{});
+
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    const run_step = b.step("run", "Run the app");
+    run_step.dependOn(&run_cmd.step);
+
+    // ---- 前端构建（build_command；vanilla/htmx 无构建步骤则 no-op） ----
+    const frontend_step = b.step("frontend", "Build the frontend (project.frontend.build_command)");
+    if (frontend.build_command) |cmd| {
+        const fr = b.addSystemCommand(&.{ "cmd", "/C", cmd });
+        fr.setCwd(b.path(frontend.dir));
+        frontend_step.dependOn(&fr.step);
+    } else {
+        frontend_step.dependOn(assets_step);
+    }
+
+    // ---- TS 绑定生成 → frontend/bindings/zilt.ts ----
+    const gen_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/gen_bindings.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zilt", .module = zilt_mod },
+            .{ .name = "app_config", .module = app_config_mod },
+        },
+    });
+    const gen_exe = b.addExecutable(.{
+        .name = "zilt-gen-bindings",
+        .root_module = gen_mod,
+    });
+    const gen_run = b.addRunArtifact(gen_exe);
+    const gen_step = b.step("gen", "Generate frontend TS bindings");
+    gen_step.dependOn(&gen_run.step);
+
+    // ---- dev：spawn dev 命令 → TCP 等待 → 应用直连 devUrl（HMR） ----
+    const dev_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/dev.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dev_mod.linkSystemLibrary("ws2_32", .{});
+    dev_mod.linkSystemLibrary("shell32", .{});
+    const dev_exe = b.addExecutable(.{
+        .name = "zilt-dev",
+        .root_module = dev_mod,
+    });
+    const dev_run = b.addRunArtifact(dev_exe);
+    dev_run.addArtifactArg(exe);
+    dev_run.addArg(frontend.dev_command orelse "-");
+    dev_run.addArg(frontend.dev_url orelse "-");
+    dev_run.addArg(std.fmt.allocPrint(b.allocator, "{d}", .{frontend.wait_timeout_secs}) catch "90");
+    dev_run.addArg(frontend.dir);
+    dev_run.step.dependOn(&gen_run.step);
+    dev_run.step.dependOn(b.getInstallStep());
+    const dev_step = b.step("dev", "Run frontend dev server + app (HMR)");
+    dev_step.dependOn(&dev_run.step);
+
+    // ---- 单元测试 ----
+    const unit_tests = b.addTest(.{ .root_module = zilt_mod });
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_unit_tests.step);
+
+    // ---- 打包器（exe → dist/ 便携 zip + NSIS 安装器） ----
+    const app_meta_mod = b.createModule(.{
+        .root_source_file = b.path("src/app_meta.zig"),
+    });
+
+    const rel_app_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .imports = &.{
+            .{ .name = "zilt", .module = zilt_mod },
+            .{ .name = "app_config", .module = app_config_mod },
+        },
+    });
+    const rel_app = b.addExecutable(.{
+        .name = project.exe_name[0 .. project.exe_name.len - 4],
+        .root_module = rel_app_mod,
+    });
+    rel_app_mod.linkSystemLibrary("user32", .{});
+    rel_app_mod.linkSystemLibrary("gdi32", .{});
+    rel_app_mod.linkSystemLibrary("ole32", .{});
+    rel_app_mod.linkSystemLibrary("advapi32", .{});
+    rel_app_mod.linkSystemLibrary("comdlg32", .{});
+
+    const bundle_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/bundle.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zilt", .module = zilt_mod },
+            .{ .name = "app_meta", .module = app_meta_mod },
+        },
+    });
+    bundle_mod.linkSystemLibrary("shell32", .{});
+    const bundle_exe = b.addExecutable(.{
+        .name = "zilt-bundle",
+        .root_module = bundle_mod,
+    });
+    const bundle_run = b.addRunArtifact(bundle_exe);
+    bundle_run.addArtifactArg(rel_app);
+    const bundle_step = b.step("bundle", "Package distributables into dist/");
+    bundle_step.dependOn(&bundle_run.step);
+
+    // ---- 更新签名工具 ----
+    const keygen = b.addExecutable(.{
+        .name = "zilt-keygen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/gen_keys.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    keygen.root_module.linkSystemLibrary("bcrypt", .{});
+    b.installArtifact(keygen);
+
+    const sign = b.addExecutable(.{
+        .name = "zilt-sign",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/sign_update.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(sign);
+}

@@ -1,0 +1,15 @@
+//! 项目元数据与前端工程配置（Vue + Vite）。
+
+pub const app_name = "{{APP_NAME}}";
+pub const version = "{{VERSION}}";
+pub const app_id = "{{APP_ID}}";
+pub const exe_name = "app.exe";
+
+pub const frontend = .{
+    .dir = "frontend",
+    .dist = "frontend/dist",
+    .dev_command = @as(?[]const u8, "npm run dev"),
+    .dev_url = @as(?[]const u8, "http://localhost:1420"),
+    .build_command = @as(?[]const u8, "npm run build"),
+    .wait_timeout_secs = 90,
+};

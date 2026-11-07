@@ -1,0 +1,23 @@
+//! 项目元数据与前端工程配置——build.zig 与应用共用的单一配置源。
+//! 纯数据（无模块依赖），build.zig 可直接 @import。
+
+pub const app_name = "Zilt";
+pub const version = "0.1.2";
+pub const app_id = "app.zilt.desktop";
+pub const exe_name = "zilt-app.exe";
+
+// 前端工程配置（语义对齐 Tauri build 四件套，见 docs/research/frontend-integration.md §4.1）
+pub const frontend = .{
+    // 前端工程目录（package.json 所在处；build_command 的 cwd）
+    .dir = "frontend",
+    // 构建产物目录（嵌入来源；vanilla/htmx 无构建步骤时 = dir）
+    .dist = "frontend",
+    // dev 模式启动命令（如 "npm run dev"；null = 不 spawn，用 Dev.dir 轮询热重载）
+    .dev_command = @as(?[]const u8, null),
+    // dev server 地址（设置则 dev 模式直连，HMR 由 dev server 承担）
+    .dev_url = @as(?[]const u8, null),
+    // 生产构建命令（如 "npm run build"；null = 无需构建）
+    .build_command = @as(?[]const u8, null),
+    // 等待 dev_url 就绪超时（秒）
+    .wait_timeout_secs = 90,
+};

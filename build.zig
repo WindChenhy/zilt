@@ -1,4 +1,6 @@
 const std = @import("std");
+const project = @import("src/project.zig");
+const codegen = @import("src/tools/frontend_codegen.zig");
 
 pub fn build(b: *std.Build) void {
     // 默认 windows-gnu：Zig 自带 MinGW 导入库，无 MSVC 的机器也能开箱构建。
@@ -14,6 +16,32 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ---- 前端资产 codegen：遍历 dist → 生成 zilt-assets 模块 ----
+    // （eager 执行：每次 zig build 都重新枚举，排序保证生成内容稳定 → 缓存友好）
+    const frontend = project.frontend;
+    const dist = frontend.dist;
+    const wf = b.addWriteFiles();
+    const files = codegen.collectFiles(b.allocator, dist, &codegen.default_excludes) catch blk: {
+        std.log.warn("[zilt] 前端 dist 遍历失败：资产表为空——先运行 `zig build frontend`", .{});
+        break :blk &[_][]const u8{};
+    };
+    const generated = codegen.generateAssetsZig(b.allocator, files) catch @panic("assets codegen OOM");
+    _ = wf.add("zilt-assets/assets.zig", generated);
+    for (files) |rel| {
+        const fs_rel = codegen.fsJoin(b.allocator, dist, rel) catch unreachable;
+        _ = wf.addCopyFile(b.path(fs_rel), codegen.fsJoin(b.allocator, "zilt-assets/payload", rel) catch unreachable);
+    }
+    const assets_mod = b.createModule(.{
+        .root_source_file = wf.getDirectory().path(b, "zilt-assets/assets.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zilt", .module = zilt_mod },
+        },
+    });
+    const assets_step = b.step("assets", "Regenerate embedded assets table");
+    assets_step.dependOn(&wf.step);
+
     // 应用配置（命令/事件/资产）——主程序与 gen 工具共用
     const app_config_mod = b.createModule(.{
         .root_source_file = b.path("src/app_config.zig"),
@@ -21,6 +49,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "zilt", .module = zilt_mod },
+            .{ .name = "zilt_assets", .module = assets_mod },
         },
     });
 
@@ -45,7 +74,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.linkSystemLibrary("gdi32", .{});
     exe_mod.linkSystemLibrary("ole32", .{});
     exe_mod.linkSystemLibrary("advapi32", .{});
-    exe_mod.linkSystemLibrary("comdlg32", .{}); // 对话框
+    exe_mod.linkSystemLibrary("comdlg32", .{});
 
     b.installArtifact(exe);
 
@@ -54,7 +83,17 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the demo app");
     run_step.dependOn(&run_cmd.step);
 
-    // 绑定生成：zig build gen → src/frontend/zilt-bindings.ts
+    // ---- 前端构建（build_command；vanilla 无构建步骤 → no-op） ----
+    const frontend_step = b.step("frontend", "Build the frontend (project.frontend.build_command)");
+    if (frontend.build_command) |cmd| {
+        const fr = b.addSystemCommand(&.{ "cmd", "/C", cmd });
+        fr.setCwd(b.path(frontend.dir));
+        frontend_step.dependOn(&fr.step);
+    } else {
+        frontend_step.dependOn(assets_step);
+    }
+
+    // ---- TS 绑定生成 → frontend/bindings/zilt.ts ----
     const gen_mod = b.createModule(.{
         .root_source_file = b.path("src/tools/gen_bindings.zig"),
         .target = target,
@@ -72,13 +111,45 @@ pub fn build(b: *std.Build) void {
     const gen_step = b.step("gen", "Generate frontend TS bindings");
     gen_step.dependOn(&gen_run.step);
 
-    // 单元测试（ipc 协议/分发 + 绑定 codegen + 打包器）
+    // ---- dev：spawn dev 命令 → TCP 等待 → 应用直连 devUrl（HMR） ----
+    const dev_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/dev.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dev_mod.linkSystemLibrary("ws2_32", .{});
+    dev_mod.linkSystemLibrary("shell32", .{});
+    const dev_exe = b.addExecutable(.{
+        .name = "zilt-dev",
+        .root_module = dev_mod,
+    });
+    const dev_run = b.addRunArtifact(dev_exe);
+    dev_run.addArtifactArg(exe);
+    dev_run.addArg(frontend.dev_command orelse "-");
+    dev_run.addArg(frontend.dev_url orelse "-");
+    dev_run.addArg(std.fmt.allocPrint(b.allocator, "{d}", .{frontend.wait_timeout_secs}) catch "90");
+    dev_run.addArg(frontend.dir);
+
+    dev_run.step.dependOn(&gen_run.step);
+    dev_run.step.dependOn(b.getInstallStep());
+    const dev_step = b.step("dev", "Run frontend dev server + app (HMR)");
+    dev_step.dependOn(&dev_run.step);
+
+    // ---- 单元测试（框架 + 工具） ----
     const unit_tests = b.addTest(.{ .root_module = zilt_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    // Phase 3: 打包 —— zig build bundle → dist/（便携 zip + NSIS 安装器）
+    const tools_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/tests.zig"),
+        .target = target,
+    });
+    const tools_tests = b.addTest(.{ .root_module = tools_test_mod });
+    const run_tools_tests = b.addRunArtifact(tools_tests);
+    test_step.dependOn(&run_tools_tests.step);
+
+    // ---- 打包器（exe → dist/ 便携 zip + NSIS 安装器） ----
     const app_meta_mod = b.createModule(.{
         .root_source_file = b.path("src/app_meta.zig"),
     });
@@ -121,7 +192,7 @@ pub fn build(b: *std.Build) void {
     const bundle_step = b.step("bundle", "Package distributables into dist/");
     bundle_step.dependOn(&bundle_run.step);
 
-    // 更新签名工具：keygen（生成密钥对）/ sign（签名安装包产出 manifest）
+    // ---- 更新签名工具：keygen / sign ----
     const keygen = b.addExecutable(.{
         .name = "zilt-keygen",
         .root_module = b.createModule(.{
@@ -141,6 +212,21 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    sign.root_module.linkSystemLibrary("advapi32", .{}); // 无需，保守链接（win32 helper 依赖）
     b.installArtifact(sign);
+
+    // ---- init：项目模板创建 ----
+    const init_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/init.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    init_mod.linkSystemLibrary("shell32", .{});
+    init_mod.linkSystemLibrary("bcrypt", .{});
+    const init_exe = b.addExecutable(.{
+        .name = "zilt-init",
+        .root_module = init_mod,
+    });
+    const init_run = b.addRunArtifact(init_exe);
+    const init_step = b.step("init", "Create a new project from a template (ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=myapp zig build init)");
+    init_step.dependOn(&init_run.step);
 }
