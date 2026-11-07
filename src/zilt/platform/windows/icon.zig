@@ -58,17 +58,53 @@ pub fn pickBest(bytes: []const u8) ?Image {
     return best;
 }
 
-/// .ico 字节 → HICON（失败 null，调用方回退默认图标）。
-pub fn createHicon(bytes: []const u8) win32.HICON {
-    const img = pickBest(bytes) orelse return null;
+/// 从 .ico 字节中挑选最接近目标尺寸的图像：精确匹配优先；否则最小的 ≥ 目标项
+/// （由 CreateIconFromResourceEx 高质量缩放）；都小于目标则取最大项。
+pub fn pickNearest(bytes: []const u8, desired: u32) ?Image {
+    if (desired == 0) return pickBest(bytes);
+    if (bytes.len < DIR_SIZE) return null;
+    if (readU16(bytes, 0) != 0 or readU16(bytes, 2) != 1) return null;
+    const count = readU16(bytes, 4);
+    if (count == 0) return null;
+    if (bytes.len < DIR_SIZE + @as(usize, count) * ENTRY_SIZE) return null;
+
+    var exact: ?Image = null;
+    var above: ?Image = null;
+    var largest: ?Image = null;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const e = DIR_SIZE + i * ENTRY_SIZE;
+        const w_raw = bytes[e];
+        const h_raw = bytes[e + 1];
+        const w: u32 = if (w_raw == 0) 256 else w_raw;
+        const h: u32 = if (h_raw == 0) 256 else h_raw;
+        const bpp = readU16(bytes, e + 6);
+        const size: usize = readU32(bytes, e + 8);
+        const off: usize = readU32(bytes, e + 12);
+        if (size == 0 or off > bytes.len or size > bytes.len - off) continue;
+        const img: Image = .{ .data = bytes[off .. off + size], .width = w, .height = h, .bit_count = bpp };
+
+        if (w == desired and (exact == null or bpp > exact.?.bit_count)) exact = img;
+        if (w >= desired and (above == null or w < above.?.width or (w == above.?.width and bpp > above.?.bit_count))) {
+            above = img;
+        }
+        if (largest == null or w * h > largest.?.width * largest.?.height) largest = img;
+    }
+    return exact orelse above orelse largest;
+}
+
+/// 按目标像素尺寸创建 HICON（托盘/标题栏小图标、Alt-Tab 大图标）。
+/// cx/cy 非 0 时由系统从源图像缩放；精确尺寸条目则原样使用。
+pub fn createHiconAt(bytes: []const u8, cx: u32, cy: u32) win32.HICON {
+    const img = pickNearest(bytes, @max(cx, cy)) orelse return null;
     const mutable: [*]u8 = @constCast(img.data.ptr);
     return win32.CreateIconFromResourceEx(
         mutable,
         @intCast(img.data.len),
-        1, // fIcon
+        1,
         0x0003_0000,
-        0,
-        0,
+        @intCast(cx),
+        @intCast(cy),
         win32.LR_DEFAULTCOLOR,
     );
 }
@@ -155,4 +191,14 @@ test "bundled Zig logo: 多尺寸且最大 256" {
     const best = pickBest(bytes).?;
     try testing.expectEqual(@as(u32, 256), best.width);
     try testing.expectEqual(@as(u32, 256), best.height);
+}
+
+test "pickNearest: 精确优先 / 向上取最近 / 超界取最大" {
+    const bytes = @embedFile("../../assets/zilt.ico");
+    try testing.expectEqual(@as(u32, 16), pickNearest(bytes, 16).?.width);
+    try testing.expectEqual(@as(u32, 32), pickNearest(bytes, 24).?.width); // 150% DPI 小图标
+    try testing.expectEqual(@as(u32, 32), pickNearest(bytes, 32).?.width);
+    try testing.expectEqual(@as(u32, 48), pickNearest(bytes, 48).?.width);
+    try testing.expectEqual(@as(u32, 256), pickNearest(bytes, 64).?.width);
+    try testing.expectEqual(@as(u32, 256), pickNearest(bytes, 300).?.width);
 }

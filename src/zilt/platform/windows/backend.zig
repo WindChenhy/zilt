@@ -304,6 +304,11 @@ pub fn contentTypeOf(path: []const u8) []const u8 {
     return "application/octet-stream";
 }
 
+fn clampIconPx(metric: i32, fallback: u32) u32 {
+    if (metric <= 0 or metric > 256) return fallback;
+    return @intCast(metric);
+}
+
 fn streamFromBytes(bytes: []const u8) ?*wv2.IStream {
     const hg = win32.GlobalAlloc(win32.GMEM_MOVEABLE, @max(bytes.len, 1)) orelse return null;
     const locked = win32.GlobalLock(hg) orelse {
@@ -499,7 +504,8 @@ fn Backend(comptime config: Config) type {
         env: ?*wv2.ICoreWebView2Environment = null,
         main_menu: ?win32.HMENU = null,
         tray_menu: ?win32.HMENU = null,
-        icon: win32.HICON = null,
+        icon_big: win32.HICON = null,
+        icon_small: win32.HICON = null,
         tray_icon: win32.HICON = null,
         tray: ?tray_mod.Tray = null,
         watcher: ?*Watcher = null,
@@ -526,10 +532,21 @@ fn Backend(comptime config: Config) type {
             self.class_u8 = try self.allocator.dupe(u8, class_u8);
             self.class_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, class_u8);
 
-            self.icon = self.loadIcon(config.icon);
-            if (self.icon != null) log.print("[icon] ready (custom={s})", .{if (config.icon) |p| p else "builtin Zig logo"});
+            // 图标按目标尺寸创建：托盘/标题栏用小图标，Alt-Tab/任务栏用大图标。
+            // 直接用 256px HICON 会被托盘按 1:1 绘制成"左上角一块"（实测）。
+            const big_px = clampIconPx(win32.GetSystemMetrics(win32.SM_CXICON), 32);
+            const small_px = clampIconPx(win32.GetSystemMetrics(win32.SM_CXSMICON), 16);
+            self.icon_big = self.makeIcon(config.icon, big_px, big_px);
+            self.icon_small = self.makeIcon(config.icon, small_px, small_px);
             if (config.tray) |t| {
-                self.tray_icon = if (t.icon) |p| self.loadIcon(p) else self.icon;
+                self.tray_icon = self.makeIcon(t.icon, small_px, small_px);
+            }
+            if (self.icon_small != null) {
+                log.print("[icon] ready (custom={s}; small={d}px big={d}px)", .{
+                    if (config.icon) |p| p else "builtin Zig logo",
+                    small_px,
+                    big_px,
+                });
             }
 
             const hinstance = win32.GetModuleHandleW(null);
@@ -540,12 +557,12 @@ fn Backend(comptime config: Config) type {
                 .cbClsExtra = 0,
                 .cbWndExtra = 0,
                 .hInstance = hinstance,
-                .hIcon = self.icon,
+                .hIcon = self.icon_big,
                 .hCursor = win32.LoadCursorW(null, @ptrFromInt(win32.IDC_ARROW)),
                 .hbrBackground = @ptrFromInt(win32.COLOR_WINDOW + 1),
                 .lpszMenuName = null,
                 .lpszClassName = self.class_w.ptr,
-                .hIconSm = self.icon,
+                .hIconSm = self.icon_small,
             };
             if (win32.RegisterClassExW(&wc) == 0) return error.RegisterClassFailed;
 
@@ -567,29 +584,34 @@ fn Backend(comptime config: Config) type {
             }
         }
 
+        const IconBytes = struct {
+            data: []const u8,
+            owned: ?[]u8 = null,
+        };
+
         /// 图标来源：资产路径（config.icon / Tray.icon）或内置 Zig logo 兜底。
-        fn loadIcon(self: *Self, path_opt: ?[]const u8) win32.HICON {
+        fn iconBytes(self: *Self, path_opt: ?[]const u8) IconBytes {
             if (path_opt) |path| {
-                if (self.loadIconAsset(path)) |ic| return ic;
+                for (config.assets) |asset| {
+                    if (!std.mem.eql(u8, asset.path, path)) continue;
+                    switch (asset.encoding) {
+                        .identity => return .{ .data = asset.content },
+                        .gzip => {
+                            const raw = flateDecompress(self.allocator, asset.content) catch break;
+                            return .{ .data = raw, .owned = raw };
+                        },
+                    }
+                }
                 log.print("[icon] custom asset not usable: {s} -> builtin Zig logo", .{path});
             }
-            return icon_mod.createHicon(default_icon_bytes);
+            return .{ .data = default_icon_bytes };
         }
 
-        /// 从嵌入资产表加载 .ico（gzip 存储的先解压）。失败 null。
-        fn loadIconAsset(self: *Self, path: []const u8) win32.HICON {
-            for (config.assets) |asset| {
-                if (!std.mem.eql(u8, asset.path, path)) continue;
-                switch (asset.encoding) {
-                    .identity => return icon_mod.createHicon(asset.content),
-                    .gzip => {
-                        const raw = flateDecompress(self.allocator, asset.content) catch return null;
-                        defer self.allocator.free(raw);
-                        return icon_mod.createHicon(raw);
-                    },
-                }
-            }
-            return null;
+        /// 按目标像素尺寸创建 HICON（源图像由 iconBytes 解析，临时解压随用随释放）。
+        fn makeIcon(self: *Self, path_opt: ?[]const u8, cx: u32, cy: u32) win32.HICON {
+            const src = self.iconBytes(path_opt);
+            defer if (src.owned) |o| self.allocator.free(o);
+            return icon_mod.createHiconAt(src.data, cx, cy);
         }
 
         // ---- 窗口表 ----
@@ -681,8 +703,10 @@ fn Backend(comptime config: Config) type {
             if (self.main_menu) |hm| {
                 if (win32.SetMenu(w.hwnd, hm) == 0) log.print("[menu] SetMenu failed for window {d}", .{w.id});
             }
-            if (self.icon) |ic| {
+            if (self.icon_big) |ic| {
                 _ = win32.SendMessageW(w.hwnd, win32.WM_SETICON, win32.ICON_BIG, @bitCast(@intFromPtr(ic)));
+            }
+            if (self.icon_small) |ic| {
                 _ = win32.SendMessageW(w.hwnd, win32.WM_SETICON, win32.ICON_SMALL, @bitCast(@intFromPtr(ic)));
             }
             win32.DragAcceptFiles(w.hwnd, 1);
@@ -1550,8 +1574,9 @@ fn Backend(comptime config: Config) type {
             if (self.env) |e| _ = e.lpVtbl.Release(e);
             if (self.main_menu) |hm| _ = win32.DestroyMenu(hm);
             if (self.tray_menu) |hm| _ = win32.DestroyMenu(hm);
-            if (self.tray_icon != null and self.tray_icon != self.icon) _ = win32.DestroyIcon(self.tray_icon);
-            if (self.icon) |ic| _ = win32.DestroyIcon(ic);
+            if (self.tray_icon) |ic| _ = win32.DestroyIcon(ic);
+            if (self.icon_small) |ic| _ = win32.DestroyIcon(ic);
+            if (self.icon_big) |ic| _ = win32.DestroyIcon(ic);
             if (self.pending_launch) |*l| l.deinit(self.allocator);
             if (self.class_u8.len > 0) self.allocator.free(self.class_u8);
             self.allocator.free(self.class_w);

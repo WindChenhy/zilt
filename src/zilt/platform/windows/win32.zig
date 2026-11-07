@@ -72,6 +72,11 @@ pub const ICON_BIG: UINT = 1;
 pub const LR_DEFAULTCOLOR: UINT = 0x0000;
 pub const SM_CXSCREEN: i32 = 0;
 pub const SM_CYSCREEN: i32 = 1;
+pub const SM_CXICON: i32 = 11;
+pub const SM_CYICON: i32 = 12;
+/// 小图标（托盘/titlebar）：100% DPI = 16，150% = 24，200% = 32
+pub const SM_CXSMICON: i32 = 49;
+pub const SM_CYSMICON: i32 = 50;
 
 // 剪贴板格式
 pub const CF_UNICODETEXT: UINT = 13;

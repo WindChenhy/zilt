@@ -34,7 +34,7 @@ ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=my-app zig build init
 ```sh
 zig build gen      # 生成前端 TS 绑定（frontend/bindings/zilt.ts）
 zig build run      # 启动示例应用（embedded 模式）
-zig build test    # 单元测试（86 个 test 块：协议/更新器/打包器/系统能力/前端 codegen/模板/图标/深链接/Range）
+zig build test    # 单元测试（87 个 test 块：协议/更新器/打包器/系统能力/前端 codegen/模板/图标/深链接/Range）
 ```
 
 dev 模式：
