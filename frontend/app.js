@@ -129,7 +129,7 @@ async function runChecks() {
 
     // 9. Range/206 资产分块（v0.1.6）
     try {
-      const rr = await fetch('/app.ico', { headers: { Range: 'bytes=0-9' } });
+      const rr = await fetch('/styles.css', { headers: { Range: 'bytes=0-9' } });
       const ab = await rr.arrayBuffer();
       setCheck('c-range', rr.status === 206 && ab.byteLength === 10, `status=${rr.status} len=${ab.byteLength}`);
     } catch (e) {

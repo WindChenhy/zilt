@@ -2,6 +2,24 @@ const std = @import("std");
 const project = @import("src/project.zig");
 const codegen = @import("src/tools/frontend_codegen.zig");
 
+/// 应用 exe 图标（Windows PE 资源）：
+/// project.icon 指定自定义 .ico（相对项目根）时生成临时 .rc；null = 内置 Zig 图标。
+fn addAppIconResource(b: *std.Build, module: *std.Build.Module, icon_path: ?[]const u8) void {
+    if (icon_path) |p| {
+        const base = std.fs.path.basename(p);
+        const dir = std.fs.path.dirname(p) orelse ".";
+        const wf = b.addWriteFiles();
+        const rc_text = std.fmt.allocPrint(b.allocator, "1 ICON \"{s}\"\n", .{base}) catch @panic("OOM");
+        const rc = wf.add("zilt-app-icon.rc", rc_text);
+        module.addWin32ResourceFile(.{ .file = rc, .include_paths = &.{b.path(dir)} });
+    } else {
+        module.addWin32ResourceFile(.{
+            .file = b.path("src/zilt/assets/zilt.rc"),
+            .include_paths = &.{b.path("src/zilt/assets")},
+        });
+    }
+}
+
 pub fn build(b: *std.Build) void {
     // 默认 windows-gnu：Zig 自带 MinGW 导入库，无 MSVC 的机器也能开箱构建。
     const target = b.standardTargetOptions(.{
@@ -141,6 +159,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.linkSystemLibrary("advapi32", .{});
     exe_mod.linkSystemLibrary("comdlg32", .{});
     exe_mod.linkSystemLibrary("shell32", .{});
+    addAppIconResource(b, exe_mod, project.icon);
 
     b.installArtifact(exe);
 
@@ -240,6 +259,7 @@ pub fn build(b: *std.Build) void {
     rel_app_mod.linkSystemLibrary("advapi32", .{});
     rel_app_mod.linkSystemLibrary("comdlg32", .{});
     rel_app_mod.linkSystemLibrary("shell32", .{});
+    addAppIconResource(b, rel_app_mod, project.icon);
 
     const bundle_mod = b.createModule(.{
         .root_source_file = b.path("src/tools/bundle.zig"),

@@ -43,7 +43,7 @@ pub const Config = struct {
     single_instance: bool = false,
     /// 自动更新器（ed25519 验签）
     update: ?Update = null,
-    /// 窗口/托盘默认图标（资产路径，如 "/app.ico"；null = 系统默认）
+    /// 窗口/托盘默认图标（资产路径，如 "/app.ico"；null = 内置 Zig 官方图标）
     icon: ?[]const u8 = null,
     /// 深链接 / 文件关联（Windows；v0.1.6）
     deep_link: ?DeepLink = null,
@@ -65,7 +65,7 @@ pub const Config = struct {
         tooltip: [:0]const u8 = "Zilt App",
         /// 托盘右键菜单（复用菜单树格式；null = 无右键菜单）
         menu: ?[]const MenuItem = null,
-        /// 托盘图标（资产路径；null = 用 Config.icon / 系统默认）
+        /// 托盘图标（资产路径；null = 用 Config.icon（默认内置 Zig 图标））
         icon: ?[]const u8 = null,
     };
 

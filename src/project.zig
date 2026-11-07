@@ -1,10 +1,14 @@
-//! 项目元数据与前端工程配置——build.zig 与应用共用的单一配置源。
+﻿//! 项目元数据与前端工程配置——build.zig 与应用共用的单一配置源。
 //! 纯数据（无模块依赖），build.zig 可直接 @import。
 
 pub const app_name = "Zilt";
 pub const version = "0.1.6";
 pub const app_id = "app.zilt.desktop";
 pub const exe_name = "zilt-app.exe";
+
+// 应用图标（.ico，相对项目根）。null = 内置 Zig 官方图标（窗口/托盘/exe 资源共用）。
+// 自定义示例：pub const icon: ?[]const u8 = "frontend/app.ico";
+pub const icon: ?[]const u8 = null;
 
 // 前端工程配置（语义对齐 Tauri build 四件套，见 docs/research/frontend-integration.md §4.1）
 pub const frontend = .{

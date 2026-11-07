@@ -38,6 +38,8 @@ const WM_ZILT_NEWWIN: win32.UINT = win32.WM_APP + 5;
 const WM_ZILT_CLIP: win32.UINT = win32.WM_APP + 6;
 const TRAY_MENU_BASE: u16 = 100;
 const SMOKE_ENV = "ZILT_SMOKE_TEST_MS";
+/// 内置默认图标（Zig 官方 logo，多尺寸 ICO）。config.icon 为 null 时使用。
+const default_icon_bytes = @embedFile("../../assets/zilt.ico");
 
 pub fn run(comptime config: Config) !void {
     const B = Backend(config);
@@ -524,10 +526,8 @@ fn Backend(comptime config: Config) type {
             self.class_u8 = try self.allocator.dupe(u8, class_u8);
             self.class_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, class_u8);
 
-            if (config.icon) |path| {
-                self.icon = self.loadIcon(path);
-                if (self.icon != null) log.print("[icon] loaded {s}", .{path});
-            }
+            self.icon = self.loadIcon(config.icon);
+            if (self.icon != null) log.print("[icon] ready (custom={s})", .{if (config.icon) |p| p else "builtin Zig logo"});
             if (config.tray) |t| {
                 self.tray_icon = if (t.icon) |p| self.loadIcon(p) else self.icon;
             }
@@ -567,8 +567,17 @@ fn Backend(comptime config: Config) type {
             }
         }
 
-        /// 从嵌入资产表加载 .ico → HICON（gzip 存储的先解压）。
-        fn loadIcon(self: *Self, path: []const u8) win32.HICON {
+        /// 图标来源：资产路径（config.icon / Tray.icon）或内置 Zig logo 兜底。
+        fn loadIcon(self: *Self, path_opt: ?[]const u8) win32.HICON {
+            if (path_opt) |path| {
+                if (self.loadIconAsset(path)) |ic| return ic;
+                log.print("[icon] custom asset not usable: {s} -> builtin Zig logo", .{path});
+            }
+            return icon_mod.createHicon(default_icon_bytes);
+        }
+
+        /// 从嵌入资产表加载 .ico（gzip 存储的先解压）。失败 null。
+        fn loadIconAsset(self: *Self, path: []const u8) win32.HICON {
             for (config.assets) |asset| {
                 if (!std.mem.eql(u8, asset.path, path)) continue;
                 switch (asset.encoding) {
@@ -580,7 +589,6 @@ fn Backend(comptime config: Config) type {
                     },
                 }
             }
-            log.print("[icon] asset not found: {s}", .{path});
             return null;
         }
 

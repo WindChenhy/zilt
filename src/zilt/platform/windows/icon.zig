@@ -149,3 +149,10 @@ test "pickBest: 非法输入返回 null" {
     std.mem.writeInt(u32, bad[18..22], 100, .little); // offset 越界
     try testing.expect(pickBest(&bad) == null);
 }
+
+test "bundled Zig logo: 多尺寸且最大 256" {
+    const bytes = @embedFile("../../assets/zilt.ico");
+    const best = pickBest(bytes).?;
+    try testing.expectEqual(@as(u32, 256), best.width);
+    try testing.expectEqual(@as(u32, 256), best.height);
+}

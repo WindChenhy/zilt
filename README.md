@@ -10,9 +10,11 @@
 
 v0.1.6 新增：
 
+- **默认 Zig 官方图标**：内置多尺寸 `zilt.ico`（窗口/托盘/exe 资源共用，无需配置）；
+  `project.icon` 可自定义 exe 图标，`Config.icon` / `Tray.icon` 可自定义运行时图标
 - **多窗口**：`ctx.newWindow(...)`、每窗口独立 IPC/事件路由、`ctx.emitTo(window_id, ...)`、`windowClosed` 事件
 - **窗口控制**：标题/最小化/最大化/还原/全屏/尺寸/位置/显隐/聚焦/关闭（任意线程安全）
-- **托盘右键菜单 + 自定义图标**：`Config.Tray.menu`、`Config.icon`/`Tray.icon`（资产 `.ico`，纯 Zig 解析）
+- **托盘右键菜单**：`Config.Tray.menu` → `trayMenu` 事件
 - **剪贴板 + 文件拖放**：`ctx.clipboardWriteText/ReadText`、`dropFiles` 事件
 - **深链接/文件关联**：`Config.DeepLink`（HKCU 注册 + 参数分类 + `deepLink` 事件）；第二实例参数经
   `WM_COPYDATA` 转发给首个实例后 exit 5
@@ -32,7 +34,7 @@ ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=my-app zig build init
 ```sh
 zig build gen      # 生成前端 TS 绑定（frontend/bindings/zilt.ts）
 zig build run      # 启动示例应用（embedded 模式）
-zig build test    # 单元测试（85 个 test 块：协议/更新器/打包器/系统能力/前端 codegen/模板/图标/深链接/Range）
+zig build test    # 单元测试（86 个 test 块：协议/更新器/打包器/系统能力/前端 codegen/模板/图标/深链接/Range）
 ```
 
 dev 模式：

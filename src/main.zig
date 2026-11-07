@@ -14,10 +14,9 @@ pub fn main() !void {
         .height = 700,
         .url = "https://zilt.app/index.html",
         // 系统能力（Windows）
-        .icon = "/app.ico",
+        // 图标：项目未指定 → 使用内置 Zig 官方图标（窗口/托盘/exe 资源）
         .tray = .{
             .tooltip = "Zilt — 点击显示/隐藏窗口",
-            .icon = "/app.ico",
             .menu = &.{
                 .{ .label = "显示窗口", .id = "show-window" },
                 .{ .label = "隐藏窗口", .id = "hide-window" },
