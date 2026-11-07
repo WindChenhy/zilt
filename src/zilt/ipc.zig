@@ -12,6 +12,7 @@
 //! 忽略页面上其他 postMessage 流量。
 
 const std = @import("std");
+const updater = @import("updater.zig");
 
 // ---------------------------------------------------------------------------
 // Context
@@ -31,6 +32,19 @@ pub const Context = struct {
     backend: *anyopaque,
     emit_fn: *const fn (backend: *anyopaque, message_json: []const u8) void,
     quit_fn: *const fn (backend: *anyopaque, code: u8) void,
+    /// 系统通知（需要托盘已启用；由平台后端 marshal 到 UI 线程）。null = 未启用。
+    notify_fn: ?*const fn (backend: *anyopaque, title: []const u8, body: []const u8) void = null,
+    /// 自动更新器环境（config.update 存在时由后端组装）。null = 未配置。
+    updater_env: ?updater.Env = null,
+
+    /// 发送系统通知（Windows: 托盘气球 → Toast）。
+    pub fn notify(self: Context, title: []const u8, body: []const u8) void {
+        if (self.notify_fn) |f| {
+            f(self.backend, title, body);
+        } else {
+            std.log.warn("[zilt] notify ignored (tray not enabled in config)", .{});
+        }
+    }
 
     /// 向前端发事件（payload 序列化为 JSON）。
     /// 注意：全程使用 msg_allocator——emit 可能发生在本次调用的 arena 销毁之后

@@ -11,20 +11,39 @@
 const std = @import("std");
 const log = @import("../../log.zig");
 const ipc = @import("../../ipc.zig");
+const updater = @import("../../updater.zig");
 const Config = @import("../../config.zig").Config;
 const com = @import("com.zig");
 const win32 = @import("win32.zig");
 const wv2 = @import("webview2.zig");
 const loader = @import("loader.zig");
+const tray_mod = @import("tray.zig");
+const single_instance = @import("single_instance.zig");
 
 const HRESULT = com.HRESULT;
 const WM_ZILT_EMIT: win32.UINT = win32.WM_APP + 1;
+const WM_ZILT_NOTIFY: win32.UINT = win32.WM_APP + 2;
+const WM_ZILT_TRAY: win32.UINT = win32.WM_APP + 3;
 const SMOKE_ENV = "ZILT_SMOKE_TEST_MS";
 
 pub fn run(comptime config: Config) !void {
     const B = Backend(config);
     log.initFileLog("zilt.log");
     const alloc = std.heap.page_allocator;
+
+    // 单实例保护（第二实例立即以退出码 5 结束）
+    if (config.single_instance) {
+        if (single_instance.Guard.acquire(alloc, config.app_id) == null) {
+            log.print("[single-instance] another instance is running -> exit({d})", .{single_instance.SECOND_INSTANCE_EXIT_CODE});
+            std.process.exit(single_instance.SECOND_INSTANCE_EXIT_CODE);
+        }
+    }
+
+    // 清理上次更新留下的备份
+    if (config.update != null) {
+        const exe_path = try currentExePath(alloc);
+        updater.cleanupOld(alloc, exe_path);
+    }
 
     _ = win32.SetProcessDpiAwarenessContext(win32.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -41,6 +60,12 @@ pub fn run(comptime config: Config) !void {
     defer {
         alloc.destroy(backend);
         B.setInstance(null);
+    }
+
+    // 更新器环境（公钥解析/URL env 覆盖），命令与自动流共用
+    if (config.update) |uc| {
+        backend.updater_env = try buildUpdaterEnv(backend, uc);
+        log.print("[updater] configured (manifest={s}, current={s})", .{ backend.updater_env.?.manifest_url, uc.current_version });
     }
 
     // dev 模式环境变量覆盖（无需重新编译）
@@ -188,6 +213,9 @@ fn Backend(comptime config: Config) type {
         res_handler: ?*WebResourceHandler = null,
         nav_handler: ?*NavCompletedHandler = null,
         watcher: ?*Watcher = null,
+        tray: ?tray_mod.Tray = null,
+        updater_env: ?updater.Env = null,
+        updater_url_override: ?[]u8 = null,
         dev_dir: ?[]const u8 = null, // 环境变量覆盖（运行时）
         dev_url: ?[]const u8 = null,
         quit_code: std.atomic.Value(u8) = .init(0),
@@ -282,6 +310,8 @@ fn Backend(comptime config: Config) type {
                 .backend = self,
                 .emit_fn = emitFromThread,
                 .quit_fn = quitFromBackend,
+                .notify_fn = notifyFromThread,
+                .updater_env = self.updater_env,
             };
         }
 
@@ -341,7 +371,18 @@ fn Backend(comptime config: Config) type {
                 .backend = self,
                 .emit_fn = emitFromThread,
                 .quit_fn = quitFromBackend,
+                .notify_fn = notifyFromThread,
+                .updater_env = self.updater_env,
             };
+        }
+
+        /// 任意线程：系统通知 marshal 入口（Context.notify_fn）。
+        fn notifyFromThread(backend_ptr: *anyopaque, title: []const u8, body: []const u8) void {
+            const self: *Self = @ptrCast(@alignCast(backend_ptr));
+            const hwnd = self.hwnd orelse return;
+            const packed_msg = packNotify(self.allocator, title, body) orelse return;
+            const ok = win32.PostMessageW(hwnd, WM_ZILT_NOTIFY, 0, @bitCast(@intFromPtr(packed_msg.ptr)));
+            if (ok == 0) self.allocator.free(packed_msg);
         }
 
         /// UI 线程：发送 Zig→JS 消息并释放（所有权转移）。
@@ -457,6 +498,7 @@ fn Backend(comptime config: Config) type {
 
         fn cleanup(self: *Self) void {
             _ = win32.KillTimer(self.hwnd orelse return, 1);
+            if (self.tray) |*t| _ = t.remove();
             if (self.webview) |wv| _ = wv.lpVtbl.Release(wv);
             if (self.msg_handler) |h| h.dropRef();
             if (self.res_handler) |h| h.dropRef();
@@ -482,6 +524,16 @@ fn Backend(comptime config: Config) type {
                     if (instance) |b| b.updateBounds();
                     return 0;
                 },
+                win32.WM_CLOSE => {
+                    // close_to_tray：点关闭 = 隐藏到托盘
+                    if (instance) |b| {
+                        if (config.close_to_tray and b.tray != null and b.tray.?.active) {
+                            _ = win32.ShowWindow(hwnd, win32.SW_HIDE);
+                            log.print("[tray] window hidden to tray", .{});
+                            return 0;
+                        }
+                    }
+                },
                 win32.WM_DESTROY => {
                     log.print("[win32] WM_DESTROY", .{});
                     win32.PostQuitMessage(0);
@@ -499,6 +551,33 @@ fn Backend(comptime config: Config) type {
                         const len: usize = @intCast(wparam);
                         const ptr: [*]u8 = @ptrFromInt(@as(usize, @bitCast(lparam)));
                         b.emitJsonUi(ptr[0..len]);
+                    }
+                    return 0;
+                },
+                WM_ZILT_NOTIFY => {
+                    // 任意线程 notify → UI 线程投递托盘通知（所有权随消息转移）
+                    if (instance) |b| {
+                        const ptr: [*]u8 = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                        const nb = unpackNotify(ptr);
+                        defer b.allocator.free(ptr[0 .. 8 + nb.title.len + nb.body.len]);
+                        if (b.tray) |*t| {
+                            const ok = t.notify(nb.title, nb.body);
+                            log.print("[notify] sent (ok={})", .{ok});
+                        } else {
+                            log.print("[notify] dropped (tray not enabled)", .{});
+                        }
+                    }
+                    return 0;
+                },
+                WM_ZILT_TRAY => {
+                    // 托盘图标鼠标事件：左键点击 = 显示/隐藏窗口
+                    if (instance != null) {
+                        if (lparam == win32.WM_LBUTTONUP) {
+                            const visible = win32.IsWindowVisible(hwnd) != 0;
+                            _ = win32.ShowWindow(hwnd, if (visible) win32.SW_HIDE else win32.SW_SHOW);
+                            if (!visible) _ = win32.SetForegroundWindow(hwnd);
+                            log.print("[tray] click -> {s}", .{if (visible) "hidden" else "shown"});
+                        }
                     }
                     return 0;
                 },
@@ -815,9 +894,37 @@ fn Backend(comptime config: Config) type {
                 const hr4 = webview.navigate(url_w.ptr);
                 log.print("[webview] navigate {s} hr=0x{x}", .{ nav_url, @as(u32, @bitCast(hr4)) });
 
+                // 系统托盘
+                if (config.tray) |tc| {
+                    backend.tray = tray_mod.Tray.init(backend.allocator, backend.hwnd, WM_ZILT_TRAY, tc.tooltip) catch null;
+                    if (backend.tray) |*t| {
+                        const ok = t.add();
+                        log.print("[tray] added (ok={})", .{ok});
+                    }
+                }
+
                 // dev-dir 热重载 watcher
                 if (backend.dev_dir) |dir| {
                     backend.watcher = Watcher.start(backend.allocator, backend.makeContext(), dir);
+                }
+
+                // 自动更新检查（后台线程；ZILT_UPDATE_AUTO=1 触发，供 E2E）
+                if (backend.updater_env != null) {
+                    if (win32.getEnvUtf8(backend.allocator, "ZILT_UPDATE_URL")) |u| {
+                        defer backend.allocator.free(u);
+                        if (backend.allocator.dupe(u8, u)) |dup| {
+                            backend.updater_env.?.manifest_url = dup;
+                        } else |_| {}
+                    }
+                    if (win32.getEnvUtf8(backend.allocator, "ZILT_UPDATE_AUTO")) |a| {
+                        defer backend.allocator.free(a);
+                        if (a.len > 0 and a[0] == '1') {
+                            if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, updaterFlow, .{backend})) |t| {
+                                t.detach();
+                                log.print("[updater] auto check started", .{});
+                            } else |_| {}
+                        }
+                    }
                 }
 
                 return com.S_OK;
@@ -992,4 +1099,146 @@ test "contentTypeOf: 扩展名映射" {
     try testing.expectEqualStrings("application/json", contentTypeOf("a/b/data.json"));
     try testing.expectEqualStrings("application/octet-stream", contentTypeOf("/x.bin"));
     try testing.expectEqualStrings("application/octet-stream", contentTypeOf("/noext"));
+}
+
+// ---------------------------------------------------------------------------
+// 系统能力：通知打包 / 当前 exe 路径 / 更新器编排
+// ---------------------------------------------------------------------------
+
+/// 通知 marshal 载荷：[u32 tlen][u32 blen][title][body]（UTF-8）。
+pub fn packNotify(alloc: std.mem.Allocator, title: []const u8, body: []const u8) ?[]u8 {
+    const buf = alloc.alloc(u8, 8 + title.len + body.len) catch return null;
+    std.mem.writeInt(u32, buf[0..4], @intCast(title.len), .little);
+    std.mem.writeInt(u32, buf[4..8], @intCast(body.len), .little);
+    @memcpy(buf[8 .. 8 + title.len], title);
+    @memcpy(buf[8 + title.len ..], body);
+    return buf;
+}
+
+pub const NotifyPair = struct { title: []const u8, body: []const u8 };
+
+/// 解包通知载荷（返回的切片指向 buf）。
+pub fn unpackNotify(buf: [*]u8) NotifyPair {
+    const tlen: usize = std.mem.readInt(u32, buf[0..4], .little);
+    const blen: usize = std.mem.readInt(u32, buf[4..8], .little);
+    return .{ .title = buf[8 .. 8 + tlen], .body = buf[8 + tlen .. 8 + tlen + blen] };
+}
+
+/// 当前运行 exe 的完整路径（UTF-8）。
+pub fn currentExePath(alloc: std.mem.Allocator) ![]u8 {
+    var buf: [1024]u16 = undefined;
+    const n = win32.GetModuleFileNameW(null, &buf, buf.len);
+    if (n == 0 or n >= buf.len) return error.ModuleFileNameFailed;
+    return std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..n]);
+}
+
+/// 组装更新器环境（公钥/URL 均可 env 覆盖 + HTTP fetcher）。file 级：泛型于 Backend 实例。
+fn buildUpdaterEnv(self: anytype, uc: anytype) !updater.Env {
+    var pk: [32]u8 = undefined;
+    var pk_from_env = false;
+    if (win32.getEnvUtf8(self.allocator, "ZILT_UPDATE_PK")) |hex| {
+        defer self.allocator.free(hex);
+        if (hex.len == 64) {
+            _ = std.fmt.hexToBytes(&pk, hex) catch return error.InvalidPublicKey;
+            pk_from_env = true;
+        }
+    }
+    if (!pk_from_env) {
+        if (uc.public_key_hex.len != 64) return error.InvalidPublicKey;
+        _ = std.fmt.hexToBytes(&pk, uc.public_key_hex) catch return error.InvalidPublicKey;
+    }
+
+    var manifest_url: []const u8 = uc.manifest_url;
+    if (win32.getEnvUtf8(self.allocator, "ZILT_UPDATE_URL")) |u| {
+        self.updater_url_override = u;
+        manifest_url = u;
+    }
+
+    return .{
+        .manifest_url = manifest_url,
+        .public_key = pk,
+        .current_version = uc.current_version,
+        .exe_path = try currentExePath(self.allocator),
+        .exe_name = uc.exe_name,
+        .fetcher = .{ .ctx = self, .fetchFn = httpFetch },
+    };
+}
+
+/// HTTP 下载（std.http.Client；每次调用独立 Threaded Io，更新流程低频可接受）。
+fn httpFetch(backend_ptr: *anyopaque, alloc: std.mem.Allocator, url: []const u8) anyerror![]u8 {
+    _ = backend_ptr;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    var client: std.http.Client = .{ .allocator = alloc, .io = threaded.io() };
+    defer client.deinit();
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const result = try client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &aw.writer,
+    });
+    if (result.status != .ok) {
+        log.print("[updater] http {s} -> status {d}", .{ url, @intFromEnum(result.status) });
+        return error.HttpRequestFailed;
+    }
+    return aw.toOwnedSlice();
+}
+
+/// 更新流程（后台线程）：检查 → 下载 → 验签 → 提取替换 → 事件 + 日志。
+fn updaterFlow(self: anytype) void {
+    const env = self.updater_env orelse return;
+    const ctx = self.makeContext(); // emit 用 msg_allocator，线程安全
+
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+
+    const m = updater.checkForUpdate(arena.allocator(), env.fetcher, env.manifest_url, env.current_version) catch |err| {
+        log.print("[updater] check failed: {s}", .{@errorName(err)});
+        ctx.emit("updaterFailed", .{ .stage = "check", .err = @errorName(err) });
+        return;
+    } orelse {
+        log.print("[updater] up to date ({s})", .{env.current_version});
+        return;
+    };
+    log.print("[updater] update available: {s} (current {s})", .{ m.version, env.current_version });
+    ctx.emit("updateInfo", .{ .version = m.version, .notes = m.notes });
+
+    const artifact = updater.downloadAndVerify(self.allocator, env.fetcher, m, env.public_key) catch |err| {
+        log.print("[updater] download/verify failed: {s}", .{@errorName(err)});
+        ctx.emit("updaterFailed", .{ .stage = "download", .err = @errorName(err) });
+        return;
+    };
+    defer self.allocator.free(artifact);
+    log.print("[updater] artifact verified ({d} bytes, sha256+ed25519)", .{artifact.len});
+
+    updater.stageUpdate(self.allocator, env.exe_path, env.exe_name, artifact) catch |err| {
+        log.print("[updater] stage failed: {s}", .{@errorName(err)});
+        ctx.emit("updaterFailed", .{ .stage = "stage", .err = @errorName(err) });
+        return;
+    };
+    log.print("[updater] staged ✓ {s} — restart to apply", .{m.version});
+    ctx.emit("updateStaged", .{ .version = m.version });
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+test "packNotify/unpackNotify: 往返 + 边界" {
+    const alloc = testing.allocator;
+    const packed_msg = packNotify(alloc, "标题", "body ✓") orelse return error.TestUnexpectedResult;
+    defer alloc.free(packed_msg);
+
+    const nb = unpackNotify(packed_msg.ptr);
+    try testing.expectEqualStrings("标题", nb.title);
+    try testing.expectEqualStrings("body ✓", nb.body);
+    try testing.expectEqual(@as(usize, 8 + 6 + 8), packed_msg.len);
+}
+
+test "currentExePath: 返回非空且以 .exe 结尾" {
+    const p = try currentExePath(testing.allocator);
+    defer testing.allocator.free(p);
+    try testing.expect(p.len > 4);
+    try testing.expect(std.mem.endsWith(u8, p, ".exe") or std.mem.endsWith(u8, p, ".EXE"));
 }

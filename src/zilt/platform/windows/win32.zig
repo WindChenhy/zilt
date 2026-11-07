@@ -43,6 +43,7 @@ pub const WS_VISIBLE: DWORD = 0x10000000;
 pub const CW_USEDEFAULT: i32 = @bitCast(@as(u32, 0x80000000));
 
 pub const SW_SHOW: i32 = 5;
+pub const SW_HIDE: i32 = 0;
 
 pub const WM_DESTROY: UINT = 0x0002;
 pub const WM_SIZE: UINT = 0x0005;
@@ -55,6 +56,22 @@ pub const GENERIC_READ: DWORD = 0x80000000;
 pub const GENERIC_WRITE: DWORD = 0x40000000;
 pub const OPEN_EXISTING: DWORD = 3;
 pub const CREATE_ALWAYS: DWORD = 2;
+pub const MOVEFILE_REPLACE_EXISTING: DWORD = 0x1;
+
+// 托盘 / 通知（shellapi.h）
+pub const NIM_ADD: DWORD = 0x00000000;
+pub const NIM_MODIFY: DWORD = 0x00000001;
+pub const NIM_DELETE: DWORD = 0x00000002;
+pub const NIM_SETVERSION: DWORD = 0x00000004;
+pub const NIF_MESSAGE: UINT = 0x00000001;
+pub const NIF_ICON: UINT = 0x00000002;
+pub const NIF_TIP: UINT = 0x00000004;
+pub const NIF_INFO: UINT = 0x00000010;
+pub const NIIF_INFO: DWORD = 0x00000001;
+pub const WM_LBUTTONUP: UINT = 0x0202;
+pub const WM_RBUTTONUP: UINT = 0x0205;
+pub const IDI_APPLICATION: usize = 32512;
+pub const ERROR_ALREADY_EXISTS: DWORD = 183;
 
 pub const INVALID_FILE_ATTRIBUTES: DWORD = 0xFFFFFFFF;
 pub const LOAD_WITH_ALTERED_SEARCH_PATH: DWORD = 0x00000008;
@@ -178,6 +195,88 @@ pub extern "kernel32" fn GetFileAttributesExW(lpFileName: LPCWSTR, fInfoLevelId:
 pub extern "kernel32" fn GetCommandLineW() callconv(.c) [*:0]u16;
 pub extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.c) ?*anyopaque;
 pub extern "shell32" fn CommandLineToArgvW(lpCmdLine: LPCWSTR, pNumArgs: *i32) callconv(.c) ?[*][*:0]u16;
+
+// ---- 托盘 / 通知 / 单实例 / 文件原子替换 ----
+
+pub const NOTIFYICONDATAW = extern struct {
+    cbSize: DWORD,
+    hWnd: HWND,
+    uID: UINT,
+    uFlags: UINT,
+    uCallbackMessage: UINT,
+    hIcon: HICON,
+    szTip: [128]u16,
+    dwState: DWORD,
+    dwStateMask: DWORD,
+    szInfo: [256]u16,
+    uTimeout: UINT, // union{uTimeout, uVersion} —— 布局等价
+    szInfoTitle: [64]u16,
+    dwInfoFlags: DWORD,
+    guidItem: [16]u8,
+    hBalloonIcon: HICON,
+};
+
+pub extern "shell32" fn Shell_NotifyIconW(dwMessage: DWORD, lpData: *NOTIFYICONDATAW) callconv(.c) BOOL;
+pub extern "user32" fn LoadIconW(hInstance: HINSTANCE, lpIconName: LPCWSTR) callconv(.c) HICON;
+pub extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.c) BOOL;
+pub extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.c) BOOL;
+pub extern "kernel32" fn CreateMutexW(lpMutexAttributes: ?*anyopaque, bInitialOwner: BOOL, lpName: LPCWSTR) callconv(.c) HANDLE;
+pub extern "kernel32" fn GetLastError() callconv(.c) DWORD;
+pub extern "kernel32" fn MoveFileExW(lpExistingFileName: LPCWSTR, lpNewFileName: LPCWSTR, dwFlags: DWORD) callconv(.c) BOOL;
+pub extern "kernel32" fn DeleteFileW(lpFileName: LPCWSTR) callconv(.c) BOOL;
+pub extern "kernel32" fn RemoveDirectoryW(lpPathName: LPCWSTR) callconv(.c) BOOL;
+pub extern "kernel32" fn GetModuleFileNameW(hModule: HMODULE, lpFilename: [*]u16, nSize: DWORD) callconv(.c) DWORD;
+pub extern "kernel32" fn CreateProcessW(
+    lpApplicationName: ?LPCWSTR,
+    lpCommandLine: ?[*:0]u16,
+    lpProcessAttributes: ?*anyopaque,
+    lpThreadAttributes: ?*anyopaque,
+    bInheritHandles: BOOL,
+    dwCreationFlags: DWORD,
+    lpEnvironment: ?*anyopaque,
+    lpCurrentDirectory: ?LPCWSTR,
+    lpStartupInfo: *STARTUPINFOW,
+    lpProcessInformation: *PROCESS_INFORMATION,
+) callconv(.c) BOOL;
+
+pub const STARTUPINFOW = extern struct {
+    cb: DWORD,
+    lpReserved: ?*anyopaque,
+    lpDesktop: ?*anyopaque,
+    lpTitle: ?*anyopaque,
+    dwX: DWORD,
+    dwY: DWORD,
+    dwXSize: DWORD,
+    dwYSize: DWORD,
+    dwXCountChars: DWORD,
+    dwYCountChars: DWORD,
+    dwFillAttribute: DWORD,
+    dwFlags: DWORD,
+    wShowWindow: WORD,
+    cbReserved2: WORD,
+    lpReserved2: ?*anyopaque,
+    hStdInput: ?*anyopaque,
+    hStdOutput: ?*anyopaque,
+    hStdError: ?*anyopaque,
+};
+
+pub const PROCESS_INFORMATION = extern struct {
+    hProcess: HANDLE,
+    hThread: HANDLE,
+    dwProcessId: DWORD,
+    dwThreadId: DWORD,
+};
+
+/// 写整个文件（UTF-8 路径）。失败返回 false。
+pub fn writeFileAlloc(alloc: std.mem.Allocator, path_u8: []const u8, data: []const u8) bool {
+    const path_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path_u8) catch return false;
+    defer alloc.free(path_w);
+    const f = CreateFileW(path_w.ptr, GENERIC_WRITE, 0, null, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, null);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    defer _ = CloseHandle(f);
+    var written: DWORD = 0;
+    return WriteFile(f, data.ptr, @intCast(data.len), &written, null) != 0;
+}
 
 pub const WIN32_FILE_ATTRIBUTE_DATA = extern struct {
     dwFileAttributes: DWORD,

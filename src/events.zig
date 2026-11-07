@@ -10,6 +10,24 @@ pub fn frontendLog(_: Context, payload: struct { msg: []const u8 }) void {
     zilt.log.print("[frontend] {s}", .{payload.msg});
 }
 
+// ---- 更新器事件（命令/自动流回传） ----
+
+pub fn updateInfo(_: Context, payload: struct { version: []const u8, notes: []const u8 = "" }) void {
+    if (payload.version.len == 0) {
+        zilt.log.print("[updater] up to date (frontend notice: {s})", .{payload.notes});
+    } else {
+        zilt.log.print("[updater] frontend notice: update {s} — {s}", .{ payload.version, payload.notes });
+    }
+}
+
+pub fn updateStaged(_: Context, payload: struct { version: []const u8 }) void {
+    zilt.log.print("[updater] staged event: {s} (restart to apply)", .{payload.version});
+}
+
+pub fn updaterFailed(_: Context, payload: struct { stage: []const u8, err: []const u8 }) void {
+    zilt.log.print("[updater] failed at '{s}': {s}", .{ payload.stage, payload.err });
+}
+
 /// 冒烟测试结果回传：默认仅记录；设置 ZILT_SMOKE_EXIT=1 时按结果退出
 ///（热重载验证需要应用存活，故退出行为由环境变量控制）。
 pub fn smokeResult(ctx: Context, payload: struct {

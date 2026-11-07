@@ -118,4 +118,27 @@ pub fn build(b: *std.Build) void {
     bundle_run.addArtifactArg(rel_app); // argv[1] = Release exe 路径
     const bundle_step = b.step("bundle", "Package distributables into dist/");
     bundle_step.dependOn(&bundle_run.step);
+
+    // 更新签名工具：keygen（生成密钥对）/ sign（签名安装包产出 manifest）
+    const keygen = b.addExecutable(.{
+        .name = "zilt-keygen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/gen_keys.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    keygen.root_module.linkSystemLibrary("bcrypt", .{});
+    b.installArtifact(keygen);
+
+    const sign = b.addExecutable(.{
+        .name = "zilt-sign",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/sign_update.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    sign.root_module.linkSystemLibrary("advapi32", .{}); // 无需，保守链接（win32 helper 依赖）
+    b.installArtifact(sign);
 }

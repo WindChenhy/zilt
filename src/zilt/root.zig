@@ -9,6 +9,7 @@ pub const log = @import("log.zig");
 pub const ipc = @import("ipc.zig");
 pub const bindings = @import("bindings.zig");
 pub const bundler = @import("bundler.zig");
+pub const updater = @import("updater.zig");
 pub const Config = @import("config.zig").Config;
 pub const Asset = @import("config.zig").Asset;
 pub const Context = ipc.Context;
@@ -28,5 +29,6 @@ test {
     _ = @import("ipc.zig");
     _ = @import("bindings.zig");
     _ = @import("bundler.zig");
+    _ = @import("updater.zig");
     if (builtin.os.tag == .windows) _ = @import("platform/windows/backend.zig");
 }

@@ -70,3 +70,88 @@ pub fn queryUser(_: Context, args: struct { id: i32 }) !struct { user: ?struct {
 pub fn setMode(_: Context, args: struct { mode: enum { fast, slow } }) !struct { applied: []const u8 } {
     return .{ .applied = @tagName(args.mode) };
 }
+
+// ---- 系统能力 / 更新器 demo ----
+
+/// 系统通知（Windows Toast；需 config.tray 启用）。
+pub fn notifyMe(ctx: Context, args: struct { title: []const u8, body: []const u8 }) !void {
+    ctx.notify(args.title, args.body);
+}
+
+/// 检查更新（后台线程 → updateInfo / updaterFailed 事件）。
+pub fn checkUpdate(ctx: Context, args: struct {}) !void {
+    _ = args;
+    const env = ctx.updater_env orelse return error.UpdateNotConfigured;
+    const Ctx = struct { ctx: Context, env: zilt.updater.Env };
+    const S = struct {
+        fn main(state: *Ctx) void {
+            var arena = std.heap.ArenaAllocator.init(state.ctx.msg_allocator);
+            defer arena.deinit();
+            const m = zilt.updater.checkForUpdate(
+                arena.allocator(),
+                state.env.fetcher,
+                state.env.manifest_url,
+                state.env.current_version,
+            ) catch |err| {
+                state.ctx.emit("updaterFailed", .{ .stage = "check", .err = @errorName(err) });
+                state.ctx.msg_allocator.destroy(state);
+                return;
+            } orelse {
+                state.ctx.emit("updaterInfo", .{ .version = "", .notes = "已是最新版本" });
+                state.ctx.msg_allocator.destroy(state);
+                return;
+            };
+            state.ctx.emit("updateInfo", .{ .version = m.version, .notes = m.notes });
+            state.ctx.msg_allocator.destroy(state);
+        }
+    };
+    const state = try ctx.msg_allocator.create(Ctx);
+    state.* = .{ .ctx = ctx, .env = env };
+    _ = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, S.main, .{state}) catch {
+        ctx.msg_allocator.destroy(state);
+        return error.SpawnFailed;
+    };
+}
+
+/// 安装更新（检查→下载→验签→staged，后台线程；重启后生效）。
+pub fn installUpdate(ctx: Context, args: struct {}) !void {
+    _ = args;
+    const env = ctx.updater_env orelse return error.UpdateNotConfigured;
+    const state = try ctx.msg_allocator.create(InstallCtx);
+    state.* = .{ .ctx = ctx, .env = env };
+    _ = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, installMain, .{state}) catch {
+        ctx.msg_allocator.destroy(state);
+        return error.SpawnFailed;
+    };
+}
+
+fn installMain(state: *InstallCtx) void {
+    const ctx = state.ctx;
+    const env = state.env;
+    defer ctx.msg_allocator.destroy(state);
+
+    var arena = std.heap.ArenaAllocator.init(ctx.msg_allocator);
+    defer arena.deinit();
+
+    const m = zilt.updater.checkForUpdate(arena.allocator(), env.fetcher, env.manifest_url, env.current_version) catch |err| {
+        ctx.emit("updaterFailed", .{ .stage = "check", .err = @errorName(err) });
+        return;
+    } orelse {
+        ctx.emit("updaterInfo", .{ .version = "", .notes = "已是最新版本" });
+        return;
+    };
+
+    const artifact = zilt.updater.downloadAndVerify(ctx.msg_allocator, env.fetcher, m, env.public_key) catch |err| {
+        ctx.emit("updaterFailed", .{ .stage = "download", .err = @errorName(err) });
+        return;
+    };
+    ctx.msg_allocator.free(artifact);
+
+    zilt.updater.stageUpdate(ctx.msg_allocator, env.exe_path, env.exe_name, artifact) catch |err| {
+        ctx.emit("updaterFailed", .{ .stage = "stage", .err = @errorName(err) });
+        return;
+    };
+    ctx.emit("updateStaged", .{ .version = m.version });
+}
+
+const InstallCtx = struct { ctx: Context, env: zilt.updater.Env };

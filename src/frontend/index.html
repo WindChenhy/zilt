@@ -44,6 +44,17 @@
         <span id="ticks" class="mono"></span>
       </div>
     </section>
+
+    <section>
+      <h2>系统能力 / 更新器（v0.1.1）</h2>
+      <div class="row">
+        <button onclick="window.zilt.invoke('notifyMe',{title:'Zilt 通知',body:'来自 Zig 核心的系统通知（托盘气球 → Toast）'})">系统通知</button>
+        <button onclick="window.zilt.invoke('checkUpdate',{})">检查更新</button>
+        <button onclick="window.zilt.invoke('installUpdate',{})">安装更新（staged）</button>
+      </div>
+      <div id="upout" class="mono"></div>
+      <p class="sub">托盘：左键点击 = 显示/隐藏窗口；关闭按钮 = 隐藏到托盘（close_to_tray）。单实例保护已启用（第二实例退出码 5）。</p>
+    </section>
   </main>
 
   <footer class="sub">

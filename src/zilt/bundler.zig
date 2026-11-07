@@ -376,3 +376,141 @@ test "replaceAll" {
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("a-b-c", r);
 }
+
+// ---------------------------------------------------------------------------
+// zip 读取（仅支持本项目写出的 store 条目；用于更新器提取新版本 exe）
+// ---------------------------------------------------------------------------
+
+pub const ZipReadError = error{ Corrupted, EntryNotFound, NotStored, CrcMismatch, OutOfMemory };
+
+/// 按名称读取 store 条目内容（返回拷贝）。name 为完整 zip 内路径。
+pub fn readZipStoreEntry(alloc: std.mem.Allocator, zip_bytes: []const u8, name: []const u8) ZipReadError![]u8 {
+    if (zip_bytes.len < 22) return error.Corrupted;
+
+    // 从尾部扫描 EOCD（含 65535 字节注释容差）
+    var eocd: ?usize = null;
+    var i: usize = zip_bytes.len - 22;
+    while (true) : (i -= 1) {
+        if (std.mem.eql(u8, zip_bytes[i..][0..4], &.{ 'P', 'K', 5, 6 })) {
+            eocd = i;
+            break;
+        }
+        if (i == 0) break;
+    }
+    const e = eocd orelse return error.Corrupted;
+    const cd_size = std.mem.readInt(u32, zip_bytes[e + 12 ..][0..4], .little);
+    const cd_start: usize = std.mem.readInt(u32, zip_bytes[e + 16 ..][0..4], .little);
+
+    var pos = cd_start;
+    const cd_end = cd_start + cd_size;
+    while (pos + 46 <= cd_end and pos + 46 <= zip_bytes.len) {
+        if (!std.mem.eql(u8, zip_bytes[pos..][0..4], &.{ 'P', 'K', 1, 2 })) return error.Corrupted;
+        const crc = std.mem.readInt(u32, zip_bytes[pos + 16 ..][0..4], .little);
+        const size = std.mem.readInt(u32, zip_bytes[pos + 24 ..][0..4], .little);
+        const name_len = std.mem.readInt(u16, zip_bytes[pos + 28 ..][0..2], .little);
+        const extra_len = std.mem.readInt(u16, zip_bytes[pos + 30 ..][0..2], .little);
+        const comment_len = std.mem.readInt(u16, zip_bytes[pos + 32 ..][0..2], .little);
+        const lfh_off: usize = std.mem.readInt(u32, zip_bytes[pos + 42 ..][0..4], .little);
+        const entry_name = zip_bytes[pos + 46 ..][0..name_len];
+        pos += 46 + name_len + extra_len + comment_len;
+
+        if (!std.mem.eql(u8, entry_name, name)) continue;
+
+        // local header
+        if (lfh_off + 30 > zip_bytes.len) return error.Corrupted;
+        if (!std.mem.eql(u8, zip_bytes[lfh_off..][0..4], &.{ 'P', 'K', 3, 4 })) return error.Corrupted;
+        const method = std.mem.readInt(u16, zip_bytes[lfh_off + 8 ..][0..2], .little);
+        if (method != 0) return error.NotStored; // 本项目写出的都是 store；解压 deflate 属 Phase 后续
+        const l_name_len = std.mem.readInt(u16, zip_bytes[lfh_off + 26 ..][0..2], .little);
+        const l_extra_len = std.mem.readInt(u16, zip_bytes[lfh_off + 28 ..][0..2], .little);
+        const data_start = lfh_off + 30 + l_name_len + l_extra_len;
+        if (data_start + size > zip_bytes.len) return error.Corrupted;
+        const data = zip_bytes[data_start..][0..size];
+        if (std.hash.Crc32.hash(data) != crc) return error.CrcMismatch;
+        return alloc.dupe(u8, data) catch return error.OutOfMemory;
+    }
+    return error.EntryNotFound;
+}
+
+/// 按后缀匹配读取（zip 内目录前缀不固定时使用，如 "<dir>/zilt-app.exe"）。
+pub fn readZipStoreEntrySuffix(alloc: std.mem.Allocator, zip_bytes: []const u8, name_suffix: []const u8) ZipReadError![]u8 {
+    // 复用读取逻辑：先取全部条目名过于繁琐，这里直接线性扫 central directory
+    if (zip_bytes.len < 22) return error.Corrupted;
+    var eocd: ?usize = null;
+    var i: usize = zip_bytes.len - 22;
+    while (true) : (i -= 1) {
+        if (std.mem.eql(u8, zip_bytes[i..][0..4], &.{ 'P', 'K', 5, 6 })) {
+            eocd = i;
+            break;
+        }
+        if (i == 0) break;
+    }
+    const e = eocd orelse return error.Corrupted;
+    const cd_size = std.mem.readInt(u32, zip_bytes[e + 12 ..][0..4], .little);
+    const cd_start: usize = std.mem.readInt(u32, zip_bytes[e + 16 ..][0..4], .little);
+
+    var pos = cd_start;
+    const cd_end = cd_start + cd_size;
+    while (pos + 46 <= cd_end and pos + 46 <= zip_bytes.len) {
+        const name_len = std.mem.readInt(u16, zip_bytes[pos + 28 ..][0..2], .little);
+        const extra_len = std.mem.readInt(u16, zip_bytes[pos + 30 ..][0..2], .little);
+        const comment_len = std.mem.readInt(u16, zip_bytes[pos + 32 ..][0..2], .little);
+        const entry_name = zip_bytes[pos + 46 ..][0..name_len];
+        const advance = 46 + name_len + extra_len + comment_len;
+        if (entry_name.len >= name_suffix.len and
+            std.mem.eql(u8, entry_name[entry_name.len - name_suffix.len ..], name_suffix))
+        {
+            // 命中：交给精确读取复用 CRC/校验路径
+            const full_name = alloc.dupe(u8, entry_name) catch return error.OutOfMemory;
+            defer alloc.free(full_name);
+            return readZipStoreEntry(alloc, zip_bytes, full_name);
+        }
+        pos += advance;
+    }
+    return error.EntryNotFound;
+}
+
+test "readZipStoreEntry: 回读 / 未命中 / CRC 篡改" {
+    const entries = [_]ZipEntry{
+        .{ .name = "Zilt-9.9.9-x64/zilt-app.exe", .content = "\x4d\x5a-new-binary-\xff\xee" },
+        .{ .name = "Zilt-9.9.9-x64/README.txt", .content = "readme content" },
+    };
+    var zip_bytes: std.ArrayList(u8) = .empty;
+    defer zip_bytes.deinit(testing.allocator);
+    try writeZip(testing.allocator, &entries, &zip_bytes);
+
+    // 精确读取
+    const exe = try readZipStoreEntry(testing.allocator, zip_bytes.items, "Zilt-9.9.9-x64/zilt-app.exe");
+    defer testing.allocator.free(exe);
+    try testing.expectEqualSlices(u8, entries[0].content, exe);
+
+    // 后缀读取
+    const exe2 = try readZipStoreEntrySuffix(testing.allocator, zip_bytes.items, "/zilt-app.exe");
+    defer testing.allocator.free(exe2);
+    try testing.expectEqualSlices(u8, entries[0].content, exe2);
+
+    // 未命中
+    try testing.expectError(error.EntryNotFound, readZipStoreEntry(testing.allocator, zip_bytes.items, "nope.txt"));
+
+    // CRC 篡改：翻转 exe 数据第一个字节
+    var tampered = try testing.allocator.dupe(u8, zip_bytes.items);
+    defer testing.allocator.free(tampered);
+    const cd = cdStartOf(tampered);
+    const lfh_off = std.mem.readInt(u32, tampered[cd + 42 ..][0..4], .little);
+    const l_name_len = std.mem.readInt(u16, tampered[lfh_off + 26 ..][0..2], .little);
+    const l_extra_len = std.mem.readInt(u16, tampered[lfh_off + 28 ..][0..2], .little);
+    const data_start = lfh_off + 30 + l_name_len + l_extra_len;
+    tampered[data_start] ^= 0xff;
+    try testing.expectError(error.CrcMismatch, readZipStoreEntry(testing.allocator, tampered, "Zilt-9.9.9-x64/zilt-app.exe"));
+}
+
+/// 测试辅助：取 EOCD 里的 cd_start。
+fn cdStartOf(zip_bytes: []const u8) usize {
+    var i: usize = zip_bytes.len - 22;
+    while (i > 0) : (i -= 1) {
+        if (std.mem.eql(u8, zip_bytes[i..][0..4], &.{ 'P', 'K', 5, 6 })) {
+            return std.mem.readInt(u32, zip_bytes[i + 16 ..][0..4], .little);
+        }
+    }
+    unreachable;
+}
