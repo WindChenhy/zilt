@@ -18,16 +18,57 @@ pub fn build(b: *std.Build) void {
     // ---- 前端资产 codegen：遍历 dist → 生成 zilt-assets 模块 ----
     const frontend = project.frontend;
     const dist = frontend.dist;
-    const wf = b.addWriteFiles();
-    const files = codegen.collectFiles(b.allocator, dist, &codegen.default_excludes) catch blk: {
+    // build runner 的 cwd 不保证是项目根——统一绝对路径（joinString）
+    const dist_abs = b.root.joinString(b.allocator, dist) catch dist;
+    const files = codegen.collectFiles(b.allocator, dist_abs, &codegen.default_excludes) catch blk: {
         std.log.warn("[zilt] 前端 dist 遍历失败：资产表为空——先运行 `zig build frontend`", .{});
         break :blk &[_][]const u8{};
     };
-    // ---- 资产预压缩（Phase C）：>8KB 且 gzip 收益 ≥10% 的文件附带 .gz 变体 ----
+
+    // ---- configure 缓存毒性声明（0.17 poisonCache API）----
+    // zig build 会缓存 build.zig 求值结果（配置缓存）；下方 Win32 遍历/读取/落盘
+    // 对求值缓存不可见——若保持 pure，前端任何变更（改/增/删文件）都不会重跑求值
+    // 期 → 资产永不更新（实测踩坑）。dependOn* 声明式依赖也覆盖不了本场景：
+    // 依赖集只能在上次求值时确定——新增文件不在旧依赖集内（实测漏新增），
+    // 目录依赖遇 dist 缺失/被前端工具删除则 configure 直接 FileSystemFailure
+    // 且缓存校验先于重求值（实测永久陷阱）。故按官方语义显式 poison：
+    // configure 每次重跑（本段逻辑毫秒级），step 级编译缓存不受影响——内容寻址
+    // 目录保证哈希不变时模块源字节不变 → 编译缓存仍命中，不会无谓重链。
+    b.graph.poisonCache();
+
+    // ---- 内容寻址资产目录（v0.1.5 修复）----
+    // 之前的 WriteFiles 方案有两个实测坑：(1) addCopyFile 引用 dist 源文件，前端哈希
+    // 改名后陈旧 manifest 因旧文件缺失直接构建失败；(2) 内联字节的 manifest 不跟踪
+    // **同名文件内容变更**——原地编辑 app.js 后 zig build 命中缓存，exe 嵌入旧资产。
+    // 改为：聚合内容哈希作目录名，把 assets.zig + payload/ 写成**真实文件**，模块
+    // 直接指向该目录——内容变 → 目录名变 → 模块源必变 → 必然重编；旧目录保留，
+    // 陈旧缓存引用永远安全。
+    const assets_root = ".zilt-cache-assets";
+    {
+        var h = std.hash.Wyhash.init(0);
+        for (files) |rel| {
+            h.update(rel);
+            const abs = codegen.fsJoin(b.allocator, dist_abs, rel) catch unreachable;
+            defer b.allocator.free(abs);
+            if (codegen.readFileAlloc(b.allocator, abs)) |bytes| {
+                h.update(bytes);
+                b.allocator.free(bytes);
+            }
+        }
+        // 哈希里混入生成器版本（gz 策略/表格式变化时也换目录）
+        h.update("zilt-assets-v3");
+        const dir_hash = h.final();
+        codegen.payload_dir_buf = std.fmt.allocPrint(b.allocator, "{s}/{x:0>8}", .{ assets_root, dir_hash }) catch @panic("OOM");
+    }
+    const payload_dir = codegen.payload_dir_buf.?;
+    const payload_dir_abs = b.root.joinString(b.allocator, payload_dir) catch payload_dir;
+    codegen.ensureDirDeep(b.allocator, payload_dir_abs) catch @panic("assets dir create failed");
+
+    // ---- 资产预压缩（Phase C）：>8KB 且 gzip 收益 ≥10% 的文件只嵌 .gz ----
     const gz_flags = b.allocator.alloc(bool, files.len) catch @panic("OOM");
     for (files, 0..) |rel, i| {
         gz_flags[i] = false;
-        const abs = codegen.fsJoin(b.allocator, dist, rel) catch unreachable;
+        const abs = codegen.fsJoin(b.allocator, dist_abs, rel) catch unreachable;
         defer b.allocator.free(abs);
         const bytes = codegen.readFileAlloc(b.allocator, abs) orelse continue;
         defer b.allocator.free(bytes);
@@ -36,34 +77,33 @@ pub fn build(b: *std.Build) void {
         defer b.allocator.free(gz);
         if (!codegen.gzipWorthwhile(bytes.len, gz.len)) continue;
         gz_flags[i] = true;
-        const gz_rel = std.fmt.allocPrint(b.allocator, "zilt-assets/payload/{s}.gz", .{rel}) catch unreachable;
-        defer b.allocator.free(gz_rel);
-        _ = wf.add(gz_rel, gz);
+        const gz_dst = std.fmt.allocPrint(b.allocator, "{s}/payload/{s}.gz", .{ payload_dir_abs, rel }) catch unreachable;
+        defer b.allocator.free(gz_dst);
+        codegen.ensureDirDeep(b.allocator, std.fs.path.dirname(gz_dst) orelse ".") catch @panic("mkdir failed");
+        if (!codegen.writeFilePayload(b.allocator, gz_dst, gz)) @panic("payload gz write failed");
     }
     const generated = codegen.generateAssetsZig(b.allocator, files, gz_flags) catch @panic("assets codegen OOM");
-    _ = wf.add("zilt-assets/assets.zig", generated);
-    // payload 一律读入内存后 wf.add（内联字节进 manifest）——不用 addCopyFile 引用
-    // dist 源文件：前端重新构建会更换哈希文件名，addCopyFile 的陈旧 manifest 会因
-    // 旧文件不存在而使 zig build 直接失败（实测踩坑）。
+    const assets_zig_path = std.fmt.allocPrint(b.allocator, "{s}/assets.zig", .{payload_dir_abs}) catch unreachable;
+    if (!codegen.writeFilePayload(b.allocator, assets_zig_path, generated)) @panic("assets.zig write failed");
     for (files) |rel| {
         const fs_rel = codegen.fsJoin(b.allocator, dist_abs, rel) catch unreachable;
         defer b.allocator.free(fs_rel);
         const bytes = codegen.readFileAlloc(b.allocator, fs_rel) orelse @panic("payload read failed");
         defer b.allocator.free(bytes);
-        const payload_rel = codegen.fsJoin(b.allocator, "zilt-assets/payload", rel) catch unreachable;
-        defer b.allocator.free(payload_rel);
-        _ = wf.add(payload_rel, bytes);
+        const payload_dst = std.fmt.allocPrint(b.allocator, "{s}/payload/{s}", .{ payload_dir_abs, rel }) catch unreachable;
+        defer b.allocator.free(payload_dst);
+        codegen.ensureDirDeep(b.allocator, std.fs.path.dirname(payload_dst) orelse ".") catch @panic("mkdir failed");
+        if (!codegen.writeFilePayload(b.allocator, payload_dst, bytes)) @panic("payload write failed");
     }
     const assets_mod = b.createModule(.{
-        .root_source_file = wf.getDirectory().path(b, "zilt-assets/assets.zig"),
+        .root_source_file = b.path(codegen.fsJoinRel(b.allocator, payload_dir, "assets.zig") catch unreachable),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "zilt", .module = zilt_mod },
         },
     });
-    const assets_step = b.step("assets", "Regenerate embedded assets table");
-    assets_step.dependOn(&wf.step);
+    // 注：资产在构建图求值期已生成（内容寻址、幂等），不再需要手动 assets step
 
     const app_config_mod = b.createModule(.{
         .root_source_file = b.path("src/app_config.zig"),
@@ -109,7 +149,7 @@ pub fn build(b: *std.Build) void {
         fr.setCwd(b.path(frontend.dir));
         frontend_step.dependOn(&fr.step);
     } else {
-        frontend_step.dependOn(assets_step);
+        // 无构建命令（vanilla）：资产在构建图求值期已生成，无需动作
     }
 
     // ---- TS 绑定生成 → frontend/bindings/zilt.ts ----

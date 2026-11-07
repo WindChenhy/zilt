@@ -124,10 +124,16 @@ window.addEventListener('DOMContentLoaded', () => {
   // 菜单 / 快捷键 / 对话框
   const dlg = (t) => { $('dlgout').textContent = t; };
   window.showDlg = dlg;
-  window.zilt.on('menu', (p) => {
+  window.zilt.on('menu', async (p) => {
     dlg(`菜单: ${p.id}`);
     if (p.id === 'exit') window.zilt.invoke('exitApp', {});
-    if (p.id === 'about') window.zilt.invoke('alertBox', { text: 'Zilt v0.1.2 — Zig WebView GUI Framework', title: '关于 Zilt' });
+    if (p.id === 'about') window.zilt.invoke('alertBox', { text: 'Zilt v0.1.5 — Zig WebView GUI Framework', title: '关于 Zilt' });
+    if (p.id === 'open') {
+      try {
+        const r = await window.zilt.invoke('pickFile', {});
+        dlg(r.path ? `已选文件: ${r.path}` : '已取消');
+      } catch (e) { dlg('打开文件失败: ' + e); }
+    }
   });
   window.zilt.on('hotkey', (p) => dlg(`快捷键: ${p.id}`));
 

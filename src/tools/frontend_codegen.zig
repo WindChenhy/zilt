@@ -30,6 +30,49 @@ pub extern "kernel32" fn CreateFileW(lpFileName: LPCWSTR, dwDesiredAccess: DWORD
 pub extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: DWORD, lpNumberOfBytesRead: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.c) BOOL;
 pub extern "kernel32" fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *i64) callconv(.c) BOOL;
 pub extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: [*]const u8, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.c) BOOL;
+
+/// 递归建目录（'/' 或 '' 分段）。
+pub fn ensureDirDeep(alloc: std.mem.Allocator, path: []const u8) !void {
+    var i: usize = 0;
+    while (i < path.len) : (i += 1) {
+        if (path[i] == '/' or path[i] == '\\') {
+            if (i > 0 and path[i - 1] != ':') {
+                const part = path[0..i];
+                const pw = std.unicode.utf8ToUtf16LeAllocZ(alloc, part) catch continue;
+                defer alloc.free(pw);
+                _ = CreateDirectoryW(pw.ptr, null);
+            }
+        }
+    }
+    const pw = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
+    defer alloc.free(pw);
+    _ = CreateDirectoryW(pw.ptr, null);
+}
+
+/// 写文件（覆盖；成功 true）。构建期 payload 落盘用。
+pub fn writeFilePayload(alloc: std.mem.Allocator, path: []const u8, data: []const u8) bool {
+    const pw = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return false;
+    defer alloc.free(pw);
+    const GENERIC_WRITE: DWORD = 0x40000000;
+    const CREATE_ALWAYS: DWORD = 2;
+    const f = CreateFileW(pw.ptr, GENERIC_WRITE, 0, null, CREATE_ALWAYS, 0x80, null);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    defer _ = CloseHandle(f);
+    var total: usize = 0;
+    while (total < data.len) {
+        var got: DWORD = 0;
+        const chunk: DWORD = @intCast(@min(data.len - total, 1 << 30));
+        if (WriteFile(f, data.ptr + total, chunk, &got, null) == 0 or got == 0) return false;
+        total += got;
+    }
+    return true;
+}
+
+/// 相对路径拼接（'/' 分隔；b.path() 用）。
+pub fn fsJoinRel(alloc: std.mem.Allocator, base: []const u8, rel: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}/{s}", .{ base, rel });
+}
+
 pub extern "kernel32" fn GetEnvironmentVariableW(lpName: LPCWSTR, lpBuffer: ?[*]u16, nSize: DWORD) callconv(.c) DWORD;
 
 pub const FILETIME = extern struct {
@@ -52,6 +95,9 @@ pub const WIN32_FIND_DATAW = extern struct {
 
 const FILE_ATTRIBUTE_DIRECTORY: DWORD = 0x10;
 const FILE_ATTRIBUTE_REPARSE_POINT: DWORD = 0x400;
+
+/// 构建期状态：内容寻址资产目录（build.zig 填充）
+pub var payload_dir_buf: ?[]const u8 = null;
 
 /// 排除的目录/文件名（任一路径段命中即跳过）。
 pub const default_excludes = [_][]const u8{
