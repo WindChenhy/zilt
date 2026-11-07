@@ -23,11 +23,36 @@ pub fn build(b: *std.Build) void {
         std.log.warn("[zilt] 前端 dist 遍历失败：资产表为空——先运行 `zig build frontend`", .{});
         break :blk &[_][]const u8{};
     };
-    const generated = codegen.generateAssetsZig(b.allocator, files) catch @panic("assets codegen OOM");
+    // ---- 资产预压缩（Phase C）：>8KB 且 gzip 收益 ≥10% 的文件附带 .gz 变体 ----
+    const gz_flags = b.allocator.alloc(bool, files.len) catch @panic("OOM");
+    for (files, 0..) |rel, i| {
+        gz_flags[i] = false;
+        const abs = codegen.fsJoin(b.allocator, dist, rel) catch unreachable;
+        defer b.allocator.free(abs);
+        const bytes = codegen.readFileAlloc(b.allocator, abs) orelse continue;
+        defer b.allocator.free(bytes);
+        if (bytes.len <= codegen.gzip_min_size) continue;
+        const gz = codegen.gzipCompress(b.allocator, bytes) catch continue;
+        defer b.allocator.free(gz);
+        if (!codegen.gzipWorthwhile(bytes.len, gz.len)) continue;
+        gz_flags[i] = true;
+        const gz_rel = std.fmt.allocPrint(b.allocator, "zilt-assets/payload/{s}.gz", .{rel}) catch unreachable;
+        defer b.allocator.free(gz_rel);
+        _ = wf.add(gz_rel, gz);
+    }
+    const generated = codegen.generateAssetsZig(b.allocator, files, gz_flags) catch @panic("assets codegen OOM");
     _ = wf.add("zilt-assets/assets.zig", generated);
+    // payload 一律读入内存后 wf.add（内联字节进 manifest）——不用 addCopyFile 引用
+    // dist 源文件：前端重新构建会更换哈希文件名，addCopyFile 的陈旧 manifest 会因
+    // 旧文件不存在而使 zig build 直接失败（实测踩坑）。
     for (files) |rel| {
-        const fs_rel = codegen.fsJoin(b.allocator, dist, rel) catch unreachable;
-        _ = wf.addCopyFile(b.path(fs_rel), codegen.fsJoin(b.allocator, "zilt-assets/payload", rel) catch unreachable);
+        const fs_rel = codegen.fsJoin(b.allocator, dist_abs, rel) catch unreachable;
+        defer b.allocator.free(fs_rel);
+        const bytes = codegen.readFileAlloc(b.allocator, fs_rel) orelse @panic("payload read failed");
+        defer b.allocator.free(bytes);
+        const payload_rel = codegen.fsJoin(b.allocator, "zilt-assets/payload", rel) catch unreachable;
+        defer b.allocator.free(payload_rel);
+        _ = wf.add(payload_rel, bytes);
     }
     const assets_mod = b.createModule(.{
         .root_source_file = wf.getDirectory().path(b, "zilt-assets/assets.zig"),
@@ -123,6 +148,7 @@ pub fn build(b: *std.Build) void {
     dev_run.addArg(frontend.dev_url orelse "-");
     dev_run.addArg(std.fmt.allocPrint(b.allocator, "{d}", .{frontend.wait_timeout_secs}) catch "90");
     dev_run.addArg(frontend.dir);
+    dev_run.addArg(if (frontend.dev_proxy) "1" else "-"); // 反代模式标志（Phase C）
     dev_run.step.dependOn(&gen_run.step);
     dev_run.step.dependOn(b.getInstallStep());
     const dev_step = b.step("dev", "Run frontend dev server + app (HMR)");

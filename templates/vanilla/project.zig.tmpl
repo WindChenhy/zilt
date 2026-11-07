@@ -11,5 +11,7 @@ pub const frontend = .{
     .dev_command = null,
     .dev_url = null,
     .build_command = null,
+    // 反代 dev 模式（Phase C）：true = 注入 ZILT_DEV_PROXY——应用保持自身 origin，资产请求转发 dev_url
+    .dev_proxy = false,
     .wait_timeout_secs = 90,
 };

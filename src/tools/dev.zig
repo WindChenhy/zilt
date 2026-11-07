@@ -5,7 +5,9 @@
 //!   3. spawn 应用 exe（继承环境 + 注入 ZILT_DEV_URL）
 //!   4. dev server 与应用同挂 Job Object（KILL_ON_JOB_CLOSE）——退出即整树清理
 //!
-//! argv: <exe-path> <dev-command|空> <dev-url|空> <wait-timeout-secs>
+//! argv: <exe-path> <dev-command|-> <dev-url|-> <wait-timeout-secs> <frontend-dir> [proxy]
+//!   proxy="1"（Phase C 反代模式）：注入 ZILT_DEV_PROXY=<dev-url> 而非 ZILT_DEV_URL
+//!   ——应用保持自身 origin（custom scheme），资产请求转发上游（同源 cookie/fetch 场景）
 
 const std = @import("std");
 
@@ -144,6 +146,9 @@ pub fn main() !void {
     const wait_secs = std.fmt.parseInt(u32, argUtf8(argv_w, 4), 10) catch 90;
     const frontend_dir_rel = argUtf8(argv_w, 5);
     defer alloc.free(frontend_dir_rel);
+    // 反代标志（可选第 6 参；"1" = dev_proxy 模式）
+    const proxy_flag = if (argc >= 7) argUtf8(argv_w, 6) else try alloc.dupe(u8, "-");
+    defer alloc.free(proxy_flag);
     // CreateProcessW 的 lpCurrentDirectory 需要绝对路径
     const frontend_dir = blk: {
         const rel_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, frontend_dir_rel) catch break :blk frontend_dir_rel;
@@ -213,10 +218,15 @@ pub fn main() !void {
         log("[dev] dev server ready", .{});
     }
 
-    // ---- 注入 ZILT_DEV_URL 并启动应用 ----
+    // ---- 注入 dev 模式环境变量并启动应用 ----
     if (dev_url.len > 0 and !std.mem.eql(u8, dev_url, "-")) {
-        setEnvUtf8("ZILT_DEV_URL", dev_url);
-        log("[dev] ZILT_DEV_URL={s}", .{dev_url});
+        if (std.mem.eql(u8, proxy_flag, "1")) {
+            setEnvUtf8("ZILT_DEV_PROXY", dev_url);
+            log("[dev] ZILT_DEV_PROXY={s}（反代模式：应用保持自身 origin）", .{dev_url});
+        } else {
+            setEnvUtf8("ZILT_DEV_URL", dev_url);
+            log("[dev] ZILT_DEV_URL={s}", .{dev_url});
+        }
     }
     log("[dev] launching app: {s}", .{exe_path});
     const app_proc = spawnDirect(exe_path, ".") orelse {

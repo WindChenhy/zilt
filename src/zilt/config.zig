@@ -3,8 +3,14 @@
 pub const Asset = struct {
     /// URL 路径（如 "/index.html"、"/"）
     path: []const u8,
-    /// 文件内容（通常来自 @embedFile）
+    /// 存储字节：原始内容或 gzip 压缩内容（见 encoding）
     content: []const u8,
+    /// content 的存储编码。.gzip 时服务端首次请求惰性解压并缓存进程内
+    /// （Tauri brotli 同款：预压缩收益为 exe 体积，服务字节始终 identity——
+    /// 实测 WebView2 custom scheme 响应不经过网络栈内容解码，不能下发压缩字节）。
+    encoding: Encoding = .identity,
+
+    pub const Encoding = enum { identity, gzip };
 };
 
 pub const Config = struct {

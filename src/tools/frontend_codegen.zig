@@ -6,6 +6,9 @@
 //!  - 遍历结果按路径排序 → 生成文件内容确定 → zig 缓存命中（资产未变不重编）
 //!  - 内建排除：node_modules/.git/zig-cache 等（防误嵌，Tauri build.rs 同款防御）
 //!  - dist 缺失 → 空资产表 + 生成文件内注释警告（应用可构建，运行时 404）
+//!  - 资产预压缩（Phase C，对标 tauri-codegen brotli）：>gzip_min_size 且 gzip
+//!    收益 ≥10% 的文件附 .gz 变体（std.compress.flate，输出确定）→ 运行时按
+//!    Accept-Encoding 直接下发 + Content-Encoding: gzip
 
 const std = @import("std");
 
@@ -24,6 +27,8 @@ pub extern "kernel32" fn CreateDirectoryW(lpPathName: LPCWSTR, lpSecurityAttribu
 pub extern "kernel32" fn RemoveDirectoryW(lpPathName: LPCWSTR) callconv(.c) BOOL;
 pub extern "kernel32" fn DeleteFileW(lpFileName: LPCWSTR) callconv(.c) BOOL;
 pub extern "kernel32" fn CreateFileW(lpFileName: LPCWSTR, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?*anyopaque) callconv(.c) HANDLE;
+pub extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: DWORD, lpNumberOfBytesRead: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.c) BOOL;
+pub extern "kernel32" fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *i64) callconv(.c) BOOL;
 pub extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: [*]const u8, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.c) BOOL;
 pub extern "kernel32" fn GetEnvironmentVariableW(lpName: LPCWSTR, lpBuffer: ?[*]u16, nSize: DWORD) callconv(.c) DWORD;
 
@@ -133,8 +138,10 @@ fn joinPath(alloc: std.mem.Allocator, base: []const u8, name: []const u8) ![]u8 
     return std.fmt.allocPrint(alloc, "{s}\\{s}", .{ base, name });
 }
 
-/// 生成 zilt-assets/assets.zig 源码（payload 相对路径与 collectFiles 顺序一致）。
-pub fn generateAssetsZig(alloc: std.mem.Allocator, files: []const []const u8) ![]u8 {
+/// 生成 zilt-assets/assets.zig 源码（payload 相对路径与 collectFiles 顺序一致；
+/// gz_flags[i] 为 true 的条目只嵌 .gz 字节并标记 encoding=.gzip（Tauri 式缩 exe，
+/// 服务端惰性解压后以 identity 下发）。
+pub fn generateAssetsZig(alloc: std.mem.Allocator, files: []const []const u8, gz_flags: []const bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
 
@@ -142,12 +149,16 @@ pub fn generateAssetsZig(alloc: std.mem.Allocator, files: []const []const u8) ![
         try out.appendSlice(alloc, "// 警告：前端 dist 目录为空或不存在——先运行前端构建（zig build frontend）。\n");
     }
     try out.appendSlice(alloc, "// 由 build.zig 资产 codegen 自动生成（排序稳定，勿手改）。\nconst zilt = @import(\"zilt\");\n\npub const assets = [_]zilt.Asset{\n");
-    for (files) |rel| {
+    for (files, 0..) |rel, i| {
         const url = try urlPath(alloc, rel);
         defer alloc.free(url);
         const esc = try zigEscape(alloc, url);
         defer alloc.free(esc);
-        try out.print(alloc, "    .{{ .path = \"{s}\", .content = @embedFile(\"payload/{s}\") }},\n", .{ esc, rel });
+        if (i < gz_flags.len and gz_flags[i]) {
+            try out.print(alloc, "    .{{ .path = \"{s}\", .content = @embedFile(\"payload/{s}.gz\"), .encoding = .gzip }},\n", .{ esc, rel });
+        } else {
+            try out.print(alloc, "    .{{ .path = \"{s}\", .content = @embedFile(\"payload/{s}\") }},\n", .{ esc, rel });
+        }
     }
     try out.appendSlice(alloc, "};\n");
     return out.toOwnedSlice(alloc);
@@ -186,6 +197,68 @@ pub fn fsJoin(alloc: std.mem.Allocator, base: []const u8, rel: []const u8) ![]u8
         if (c.* == '/') c.* = '\\';
     }
     return std.fmt.allocPrint(alloc, "{s}\\{s}", .{ base, out });
+}
+
+// ---------------------------------------------------------------------------
+// 资产预压缩（Phase C；tauri-codegen brotli 的 flate 对应物）
+// ---------------------------------------------------------------------------
+
+/// 小于该值的文件不预压缩（收益抵不过元数据/解压开销）。
+pub const gzip_min_size = 8 * 1024;
+
+/// gzip 变体是否值得附带：压缩后体积需减少 ≥10%（图片等已压缩格式自然落选）。
+pub fn gzipWorthwhile(raw_len: usize, gz_len: usize) bool {
+    return gz_len * 10 < raw_len * 9;
+}
+
+/// gzip 预压缩（std.compress.flate，gzip 容器；相同输入输出确定 → 缓存友好）。
+pub fn gzipCompress(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try aw.ensureTotalCapacity(256); // Compress.init 断言 output.buffer.len > 8
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var comp = try std.compress.flate.Compress.init(&aw.writer, &window, .gzip, .default);
+    _ = try comp.writer.writeAll(raw);
+    try comp.finish();
+    return alloc.dupe(u8, aw.written());
+}
+
+/// gzip 解压（运行时回退路径：客户端不接受 gzip 时还原原始字节）。
+pub fn gzipDecompress(alloc: std.mem.Allocator, gz: []const u8) ![]u8 {
+    var in: std.Io.Reader = .fixed(gz);
+    var dec = std.compress.flate.Decompress.init(&in, .gzip, &.{});
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const n = try dec.reader.streamRemaining(&aw.writer);
+    const out = try alloc.dupe(u8, aw.written());
+    std.debug.assert(n == out.len);
+    return out;
+}
+
+/// 读取整个文件（构建期压缩输入；失败返回 null）。自包含 win32 实现。
+pub fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return null;
+    defer alloc.free(w);
+    const GENERIC_READ: DWORD = 0x80000000;
+    const OPEN_EXISTING: DWORD = 3;
+    const FILE_SHARE_READ_WRITE: DWORD = 1 | 2;
+    const f = CreateFileW(w.ptr, GENERIC_READ, FILE_SHARE_READ_WRITE, null, OPEN_EXISTING, 0, null);
+    if (f == INVALID_HANDLE_VALUE) return null;
+    defer _ = CloseHandle(f);
+    var size: i64 = 0;
+    if (GetFileSizeEx(f, &size) == 0) return null;
+    if (size <= 0 or size > 512 * 1024 * 1024) return null;
+    const buf = alloc.alloc(u8, @intCast(size)) catch return null;
+    var off: usize = 0;
+    while (off < buf.len) {
+        var got: DWORD = 0;
+        if (ReadFile(f, buf.ptr + off, @intCast(buf.len - off), &got, null) == 0 or got == 0) {
+            alloc.free(buf);
+            return null;
+        }
+        off += got;
+    }
+    return buf;
 }
 
 var temp_w_buf = [5:0]u16{ 'T', 'E', 'M', 'P', 0 };
@@ -246,11 +319,76 @@ test "collectFiles: 排序 + 排除 + 递归（真实临时目录）" {
     try testing.expectEqualStrings("assets/app.js", files[0]); // 排序稳定
     try testing.expectEqualStrings("index.html", files[1]);
 
-    const src = try generateAssetsZig(alloc, files);
+    const src = try generateAssetsZig(alloc, files, &.{ false, false });
     defer alloc.free(src);
     try testing.expect(std.mem.indexOf(u8, src, ".path = \"/index.html\"") != null);
     try testing.expect(std.mem.indexOf(u8, src, "@embedFile(\"payload/index.html\")") != null);
     try testing.expect(std.mem.indexOf(u8, src, "@import(\"zilt\")") != null);
+}
+
+test "gzipCompress/gzipDecompress: magic + 往返 + 确定性" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    var raw: std.ArrayList(u8) = .empty;
+    for (0..500) |i| {
+        try raw.print(alloc, "zilt asset line {d}: the quick brown fox jumps over the lazy dog\n", .{i});
+    }
+
+    const gz1 = try gzipCompress(alloc, raw.items);
+    const gz2 = try gzipCompress(alloc, raw.items);
+    try testing.expect(gz1.len > 2);
+    try testing.expectEqual(@as(u8, 0x1f), gz1[0]); // gzip magic
+    try testing.expectEqual(@as(u8, 0x8b), gz1[1]);
+    try testing.expect(gzipWorthwhile(raw.items.len, gz1.len));
+    try testing.expectEqualSlices(u8, gz1, gz2); // 确定性（缓存友好）
+
+    const back = try gzipDecompress(alloc, gz1);
+    try testing.expectEqualSlices(u8, raw.items, back);
+}
+
+test "gzipWorthwhile: 已压缩格式落选" {
+    // 随机样式的数据（近似不可压）→ gzip 不省 10% → 不附带
+    var raw: [8193]u8 = undefined;
+    var x: u32 = 12345;
+    for (&raw, 0..) |*b, i| {
+        x = x *% 1664525 +% 1013904223;
+        b.* = @truncate(x >> 16);
+        _ = i;
+    }
+    const gz = try gzipCompress(testing.allocator, &raw);
+    defer testing.allocator.free(gz);
+    try testing.expect(!gzipWorthwhile(raw.len, gz.len));
+}
+
+test "generateAssetsZig: gz_flags 控制存储编码" {
+    const files = [_][]const u8{ "a.js", "big.js" };
+    const src = try generateAssetsZig(testing.allocator, &files, &.{ false, true });
+    defer testing.allocator.free(src);
+    try testing.expect(std.mem.indexOf(u8, src, ".path = \"/a.js\", .content = @embedFile(\"payload/a.js\") }") != null);
+    try testing.expect(std.mem.indexOf(u8, src, ".content = @embedFile(\"payload/big.js.gz\"), .encoding = .gzip }") != null);
+    // 压缩条目不再嵌原始字节（单份拷贝，缩 exe）
+    try testing.expect(std.mem.indexOf(u8, src, "@embedFile(\"payload/big.js\")") == null);
+}
+
+test "readFileAlloc: 往返（真实临时文件）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const pid = std.os.windows.GetCurrentProcessId();
+    const root = try std.fmt.allocPrint(alloc, "{s}\\zilt-rf-{d}", .{ try tempRoot(alloc), pid });
+    defer alloc.free(root);
+    try mkDir(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}\\data.bin", .{root});
+    defer alloc.free(path);
+    const payload = "bin\x00ary\xff bytes";
+    try writeFileTree(path, payload);
+    defer cleanupTree(alloc, root);
+
+    const got = readFileAlloc(alloc, path) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, payload, got);
+    try testing.expect(readFileAlloc(alloc, try std.fmt.allocPrint(alloc, "{s}\\missing.bin", .{root})) == null);
 }
 
 fn mkDir(path: []const u8) !void {

@@ -2,7 +2,7 @@
 //! 纯数据（无模块依赖），build.zig 可直接 @import。
 
 pub const app_name = "Zilt";
-pub const version = "0.1.2";
+pub const version = "0.1.4";
 pub const app_id = "app.zilt.desktop";
 pub const exe_name = "zilt-app.exe";
 
@@ -18,6 +18,9 @@ pub const frontend = .{
     .dev_url = @as(?[]const u8, null),
     // 生产构建命令（如 "npm run build"；null = 无需构建）
     .build_command = @as(?[]const u8, null),
+    // 反代 dev 模式（Phase C）：true = dev 模式注入 ZILT_DEV_PROXY——应用保持自身
+    // origin（custom scheme），资产请求转发 dev_url 上游；适合同源 cookie/fetch/SW 场景
+    .dev_proxy = false,
     // 等待 dev_url 就绪超时（秒）
     .wait_timeout_secs = 90,
 };

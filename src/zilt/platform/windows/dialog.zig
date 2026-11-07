@@ -81,8 +81,9 @@ fn runFileDialog(alloc: std.mem.Allocator, hwnd: win32.HWND, opts: ipc.FileDialo
     defer alloc.free(filter);
 
     var buffers = win32.makeOfn(hwnd, opts.title, filter, opts.default_name, save_mode);
+    // buffers.filter 即 filter（makeOfn 透传不拷贝，所有权仍在上方 defer）；
+    // file/title/def_ext 由 makeOfn 以 page_allocator 分配，须用同源释放。
     defer {
-        std.heap.page_allocator.free(buffers.filter);
         std.heap.page_allocator.free(buffers.file);
         std.heap.page_allocator.free(buffers.title);
         if (buffers.def_ext) |d| std.heap.page_allocator.free(d);

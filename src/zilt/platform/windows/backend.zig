@@ -80,6 +80,12 @@ pub fn run(comptime config: Config) !void {
         backend.dev_url = u;
         log.print("[dev] ZILT_DEV_URL={s}", .{u});
     }
+    if (win32.getEnvUtf8(alloc, "ZILT_DEV_PROXY")) |u| {
+        backend.dev_proxy = u;
+        // 反代模式优先生效（应用保持自身 origin；dev_url 仅作为 origin 白名单兜底无意义，忽略）
+        if (backend.dev_url != null) log.print("[dev] ZILT_DEV_PROXY 与 ZILT_DEV_URL 同时设置：反代优先", .{});
+        log.print("[dev] ZILT_DEV_PROXY={s}", .{u});
+    }
 
     try backend.createWindow();
     _ = win32.ShowWindow(backend.hwnd.?, win32.SW_SHOW);
@@ -201,6 +207,101 @@ fn streamFromBytes(bytes: []const u8) ?*wv2.IStream {
 }
 
 // ---------------------------------------------------------------------------
+// 资产服务纯函数（Phase C；单测覆盖）
+// ---------------------------------------------------------------------------
+
+/// gzip 解压（运行时：压缩资产的 serve 期还原；std.compress.flate）。
+fn flateDecompress(alloc: std.mem.Allocator, gz: []const u8) ![]u8 {
+    var in: std.Io.Reader = .fixed(gz);
+    var dec = std.compress.flate.Decompress.init(&in, .gzip, &.{});
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const n = try dec.reader.streamRemaining(&aw.writer);
+    const out = try alloc.dupe(u8, aw.written());
+    std.debug.assert(n == out.len);
+    return out;
+}
+
+/// 实体标记字节缓冲：`"` + 16 hex + `"` = 18 字节。
+pub const EtagBytes = [18]u8;
+
+/// 内容强 ETag：wyhash(u64) hex（同内容必同值，跨构建稳定）。
+pub fn etagOf(content: []const u8) EtagBytes {
+    const digest = std.hash.Wyhash.hash(0, content);
+    const hexd = "0123456789abcdef";
+    var out: EtagBytes = undefined;
+    out[0] = '"';
+    out[17] = '"';
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        const shift: u6 = @intCast((15 - i) * 4);
+        out[1 + i] = hexd[(digest >> shift) & 0xf];
+    }
+    return out;
+}
+
+/// Accept-Encoding 是否接受 gzip（RFC 9110：大小写不敏感；q=0 视为拒绝）。
+/// 注意：实测 WebView2 custom scheme 请求不携带 Accept-Encoding（§G.5）——
+/// 此解析当前用于语义完备与未来 HTTP 通道（反代/本地 server）。
+pub fn acceptsGzip(header: ?[]const u8) bool {
+    const h = header orelse return false;
+    var it = std.mem.splitScalar(u8, h, ',');
+    while (it.next()) |tok_raw| {
+        var tok = std.mem.trim(u8, tok_raw, " \t");
+        if (tok.len == 0) continue;
+        var q: f32 = 1.0;
+        if (std.mem.indexOfScalar(u8, tok, ';')) |semi| {
+            const params = tok[semi + 1 ..];
+            tok = std.mem.trim(u8, tok[0..semi], " \t");
+            var pit = std.mem.splitScalar(u8, params, ';');
+            while (pit.next()) |p_raw| {
+                const p = std.mem.trim(u8, p_raw, " \t");
+                if (p.len >= 2 and (p[0] == 'q' or p[0] == 'Q') and p[1] == '=') {
+                    q = std.fmt.parseFloat(f32, p[2..]) catch 1.0;
+                }
+            }
+        }
+        if (q > 0 and std.ascii.eqlIgnoreCase(tok, "gzip")) return true;
+    }
+    return false;
+}
+
+/// If-None-Match 匹配（RFC 9110：逗号列表 / `*` / W/ 弱前缀均可参与比较）。
+pub fn ifNoneMatchMatches(header: ?[]const u8, etag: []const u8) bool {
+    const h = header orelse return false;
+    var it = std.mem.splitScalar(u8, h, ',');
+    while (it.next()) |tok_raw| {
+        var tok = std.mem.trim(u8, tok_raw, " \t");
+        if (tok.len == 0) continue;
+        if (std.mem.eql(u8, tok, "*")) return true;
+        if (tok.len > 2 and tok[0] == 'W' and tok[1] == '/') tok = tok[2..];
+        if (std.mem.eql(u8, tok, etag)) return true;
+    }
+    return false;
+}
+
+/// 反代上游 URL：base 去尾 '/' + path（含 query，须以 '/' 开头）。
+pub fn joinProxyUrl(alloc: std.mem.Allocator, base: []const u8, path_with_query: []const u8) ![]u8 {
+    var b = base;
+    while (b.len > 0 and b[b.len - 1] == '/') b = b[0 .. b.len - 1];
+    return std.fmt.allocPrint(alloc, "{s}{s}", .{ b, path_with_query });
+}
+
+/// 读请求头（UTF-8，调用方释放）；头不存在返回 null。
+fn requestHeaderUtf8(args: *wv2.ICoreWebView2WebResourceRequestedEventArgs, alloc: std.mem.Allocator, name: [:0]const u8) ?[]u8 {
+    const rr = args.getRequest();
+    if (com.failed(rr.hr) or rr.request == null) return null;
+    const hh = rr.request.?.getHeaders();
+    if (com.failed(hh.hr) or hh.headers == null) return null;
+    const name_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch return null;
+    defer alloc.free(name_w);
+    const r = hh.headers.?.getHeader(name_w.ptr);
+    if (com.failed(r.hr) or r.value == null) return null;
+    defer wv2.freeCoString(r.value.?);
+    return std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(r.value.?)) catch null;
+}
+
+// ---------------------------------------------------------------------------
 // Backend（按 Config 编译期实例化）
 // ---------------------------------------------------------------------------
 
@@ -236,6 +337,12 @@ fn Backend(comptime config: Config) type {
         updater_url_override: ?[]u8 = null,
         dev_dir: ?[]const u8 = null, // 环境变量覆盖（运行时）
         dev_url: ?[]const u8 = null,
+        /// dev 反代模式（Phase C）：应用保持自身 origin，资产请求转发到该上游（如 vite）
+        dev_proxy: ?[]const u8 = null,
+        proxy_threaded: ?*std.Io.Threaded = null, // 懒建，连接池复用
+        proxy_client: ?*std.http.Client = null,
+        /// 压缩资产惰性解压缓存（key = asset path；UI 线程独占访问，无需锁）
+        asset_cache: std.StringHashMapUnmanaged([]u8) = .empty,
         quit_code: std.atomic.Value(u8) = .init(0),
 
         fn createWindow(self: *Self) !void {
@@ -454,56 +561,109 @@ fn Backend(comptime config: Config) type {
 
         // ---- 资产服务 ----
 
-        /// WebResourceRequested：按 dev 模式（磁盘/devUrl）或 embedded 表服务。
+        /// WebResourceRequested：按 dev 模式（反代/磁盘）或 embedded 表服务；
+        /// 统一附 ETag（If-None-Match 命中 → 304）；embedded 支持 gzip 预压缩变体。
         fn onWebResource(self: *Self, uri_u8: []const u8, args: *wv2.ICoreWebView2WebResourceRequestedEventArgs) void {
             const env = self.env orelse return;
+
+            // 实测（§G.6）：custom scheme 请求不带 Accept-Encoding（协商无从谈起）；
+            // If-None-Match 读取保留（304 通道待用，若未来 WebView2 回传验证器即生效）。
+            const if_none_match = requestHeaderUtf8(args, self.allocator, "If-None-Match");
+            defer if (if_none_match) |v| self.allocator.free(v);
 
             var body: ?[]const u8 = null;
             var content_type: []const u8 = "application/octet-stream";
             var status: c_int = 404;
-            var owned: ?[]u8 = null; // dev 模式读盘内容（需要释放）
+            var from_gz_store = false; // 服务字节来自压缩存储（解压后 identity 下发）
+            var etag: ?EtagBytes = null; // 实际下发表示的实体标记
+            var owned: ?[]u8 = null; // dev-dir/proxy 内容（需要释放）
+            var owned_ct: ?[]u8 = null; // proxy 上游 content-type
             defer if (owned) |o| self.allocator.free(o);
+            defer if (owned_ct) |c| self.allocator.free(c);
 
             const app_origin = originOf(config.url);
             if (std.mem.startsWith(u8, uri_u8, app_origin)) {
                 var path = uri_u8[app_origin.len..];
                 if (std.mem.indexOfScalar(u8, path, '?')) |q| path = path[0..q];
-                if (std.mem.eql(u8, path, "") or std.mem.eql(u8, path, "/")) path = "/index.html";
+                if (path.len == 0 or std.mem.eql(u8, path, "/")) path = "/index.html";
 
-                if (self.dev_dir) |dir| {
+                if (self.dev_proxy) |base| {
+                    // 反代：保留完整 path（含 query——vite 模块时间戳 HMR 需要）
+                    self.serveFromProxy(base, uri_u8[app_origin.len..], path, &body, &content_type, &status, &owned, &owned_ct, &etag);
+                } else if (self.dev_dir) |dir| {
                     var ct: []const u8 = undefined;
                     if (self.serveFromDir(dir, path, &owned, &ct)) {
                         body = owned.?;
                         content_type = ct;
                         status = 200;
+                        etag = etagOf(body.?);
                     }
                 } else {
                     for (config.assets) |asset| {
                         if (std.mem.eql(u8, asset.path, path)) {
-                            body = asset.content;
+                            switch (asset.encoding) {
+                                .identity => body = asset.content,
+                                .gzip => {
+                                    // Tauri brotli 同款：存储压缩、服务 identity（惰性解压 + 进程内缓存）。
+                                    // 实测（§G.6/G.7）：custom scheme 响应不走网络栈内容解码，
+                                    // 压缩字节不能直接下发（模块 MIME 校验必炸）。
+                                    if (self.assetDecompress(path, asset.content)) |raw| {
+                                        body = raw;
+                                        from_gz_store = true;
+                                    } else {
+                                        log.print("[assets] gzip decompress failed: {s}", .{path});
+                                        continue;
+                                    }
+                                },
+                            }
+                            etag = etagOf(body.?);
                             content_type = contentTypeOf(path);
                             status = 200;
                             break;
                         }
                     }
                 }
+
+                // ETag / 304（三种模式统一）
+                if (status == 200) {
+                    if (etag) |e| {
+                        if (ifNoneMatchMatches(if_none_match, &e)) {
+                            status = 304;
+                            from_gz_store = false;
+                            body = "";
+                            log.print("[assets] 304 {s} (etag match)", .{path});
+                        }
+                    }
+                }
             }
 
             if (status == 200) {
-                log.print("[assets] 200 {s} {d} bytes <- {s}", .{ content_type, body.?.len, uri_u8 });
-            } else {
-                log.print("[assets] 404 <- {s}", .{uri_u8});
-                content_type = "text/plain";
-                body = "";
+                log.print("[assets] 200 {s} {d} bytes{s} <- {s}", .{ content_type, body.?.len, if (from_gz_store) " (gz-store)" else "", uri_u8 });
+            } else if (status != 304) {
+                log.print("[assets] {d} <- {s}", .{ status, uri_u8 });
+                if (status != 502) content_type = "text/plain";
+                body = if (status == 502) "zilt dev proxy: upstream unreachable (dev only)" else "";
             }
 
-            const reason_w: [:0]u16 = if (status == 200)
-                std.unicode.utf8ToUtf16LeAllocZ(self.allocator, "OK") catch return
-            else
-                std.unicode.utf8ToUtf16LeAllocZ(self.allocator, "Not Found") catch return;
+            const reason: []const u8 = switch (status) {
+                200 => "OK",
+                304 => "Not Modified",
+                502 => "Bad Gateway",
+                else => "Not Found",
+            };
+            const reason_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, reason) catch return;
             defer self.allocator.free(reason_w);
 
-            const headers = std.fmt.allocPrint(self.allocator, "Content-Type: {s}", .{content_type}) catch return;
+            // 实测（docs/reference §G.7）：custom scheme 响应头对模块脚本走严格 MIME
+            // 校验——服务字节恒为 identity（压缩存储在解压缓存层消化），
+            // 200 只发 Content-Type；ETag 仅出现在 304（规格必带；当前通道
+            // 不回传 If-None-Match，304 逻辑保留待用）。
+            const headers = blk: {
+                if (status == 304) {
+                    break :blk std.fmt.allocPrint(self.allocator, "Content-Type: {s}\r\nETag: {s}", .{ content_type, etag.? }) catch return;
+                }
+                break :blk std.fmt.allocPrint(self.allocator, "Content-Type: {s}", .{content_type}) catch return;
+            };
             defer self.allocator.free(headers);
             const headers_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, headers) catch return;
             defer self.allocator.free(headers_w);
@@ -515,6 +675,120 @@ fn Backend(comptime config: Config) type {
             } else {
                 log.print("[assets] createWebResourceResponse failed hr=0x{x}", .{@as(u32, @bitCast(r.hr))});
             }
+        }
+
+        /// 压缩资产解压（惰性 + 进程内缓存；UI 线程独占，无锁）。
+        fn assetDecompress(self: *Self, path: []const u8, gz: []const u8) ?[]const u8 {
+            if (self.asset_cache.get(path)) |raw| return raw;
+            const raw = flateDecompress(self.allocator, gz) catch return null;
+            const key = self.allocator.dupe(u8, path) catch {
+                self.allocator.free(raw);
+                return null;
+            };
+            self.asset_cache.put(self.allocator, key, raw) catch {
+                self.allocator.free(key);
+                self.allocator.free(raw);
+                return null;
+            };
+            return raw;
+        }
+
+        /// dev 反代（Phase C，Wails build_dev.go 对应物）：应用 origin 的请求转发上游。
+        /// UI 线程同步拉取——仅 dev 模式（vite 本地响应快）；生产路径不走此处。
+        fn serveFromProxy(
+            self: *Self,
+            base: []const u8,
+            path_full: []const u8, // 含 query（vite HMR 时间戳）
+            path: []const u8, // 仅路径（ct 猜测/日志）
+            body: *?[]const u8,
+            content_type: *[]const u8,
+            status: *c_int,
+            owned: *?[]u8,
+            owned_ct: *?[]u8,
+            etag: *?EtagBytes,
+        ) void {
+            const url = joinProxyUrl(self.allocator, base, path_full) catch return;
+            defer self.allocator.free(url);
+            const result = self.proxyFetch(self.allocator, url, owned_ct) catch |err| {
+                log.print("[proxy] GET {s} failed: {s}", .{ path_full, @errorName(err) });
+                status.* = 502;
+                content_type.* = "text/plain";
+                body.* = "zilt dev proxy: upstream unreachable (dev only)";
+                return;
+            };
+            owned.* = result;
+            body.* = result;
+            status.* = 200;
+            content_type.* = if (owned_ct.*) |ct|
+                (if (ct.len > 0) ct else contentTypeOf(path))
+            else
+                contentTypeOf(path);
+            etag.* = etagOf(result);
+            log.print("[proxy] GET {s} -> 200 ({s}) {d} bytes", .{ path_full, content_type.*, result.len });
+        }
+
+        /// 上游 HTTP GET（带一次重试：vite 等 dev server 会关闭空闲 keep-alive
+        /// 连接——复用死连接表现为 ReadFailed，此时重建连接池再试）。
+        fn proxyFetch(self: *Self, alloc: std.mem.Allocator, url: []const u8, out_ct: *?[]u8) ![]u8 {
+            return self.proxyFetchInner(alloc, url, out_ct) catch |err| {
+                log.print("[proxy] retry once after {s}", .{@errorName(err)});
+                if (out_ct.*) |c| self.allocator.free(c);
+                out_ct.* = null;
+                self.proxyClientReset();
+                return self.proxyFetchInner(alloc, url, out_ct);
+            };
+        }
+
+        /// 丢弃并释放反代 client（连接池随之关闭，下次请求懒建重建）。
+        fn proxyClientReset(self: *Self) void {
+            if (self.proxy_client) |c| {
+                c.deinit();
+                self.allocator.destroy(c);
+                self.proxy_client = null;
+            }
+        }
+
+        /// 上游 HTTP GET（std.http.Client，镜像 fetch() 的读取模式以获取 Content-Type）。
+        /// 返回 body（调用方释放）；ct 拷贝写入 out_ct（调用方释放，可能为 null）。
+        fn proxyFetchInner(self: *Self, alloc: std.mem.Allocator, url: []const u8, out_ct: *?[]u8) ![]u8 {
+            const client = blk: {
+                if (self.proxy_client) |c| break :blk c;
+                const threaded = try self.allocator.create(std.Io.Threaded);
+                threaded.* = .init(self.allocator, .{});
+                self.proxy_threaded = threaded;
+                const c = try self.allocator.create(std.http.Client);
+                c.* = .{ .allocator = self.allocator, .io = threaded.io() };
+                self.proxy_client = c;
+                break :blk c;
+            };
+
+            const uri = try std.Uri.parse(url);
+            var req = try client.request(.GET, uri, .{ .redirect_behavior = @enumFromInt(3) });
+            defer req.deinit();
+            try req.sendBodiless();
+            var redirect_buffer: [8192]u8 = undefined;
+            var response = try req.receiveHead(&redirect_buffer);
+
+            // head.content_type 指向 redirect_buffer —— 立即拷贝
+            out_ct.* = if (response.head.content_type) |ct|
+                (self.allocator.dupe(u8, ct) catch null)
+            else
+                null;
+
+            // 上游若已压缩则解压（下游按 identity 下发，不透传 Content-Encoding）
+            const decompress_buf: []u8 = switch (response.head.content_encoding) {
+                .identity => &.{},
+                else => self.allocator.alloc(u8, std.compress.flate.max_window_len) catch &.{},
+            };
+            defer if (decompress_buf.len > 0) self.allocator.free(decompress_buf);
+
+            var transfer_buffer: [64]u8 = undefined;
+            var decompress: std.http.Decompress = undefined;
+            const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buf);
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            defer aw.deinit();
+            _ = try reader.streamRemaining(&aw.writer);
+            return aw.toOwnedSlice();
         }
 
         fn serveFromDir(self: *Self, dir: []const u8, path: []const u8, out: *?[]u8, content_type: *[]const u8) bool {
@@ -550,6 +824,20 @@ fn Backend(comptime config: Config) type {
                 if (self.hwnd) |h| hotkey_mod.unregisterAll(h, hks);
             }
             if (self.tray) |*t| _ = t.remove();
+            self.proxyClientReset();
+            if (self.proxy_threaded) |t| {
+                t.deinit();
+                self.allocator.destroy(t);
+                self.proxy_threaded = null;
+            }
+            {
+                var it = self.asset_cache.iterator();
+                while (it.next()) |e| {
+                    self.allocator.free(e.key_ptr.*);
+                    self.allocator.free(e.value_ptr.*);
+                }
+                self.asset_cache.deinit(self.allocator);
+            }
             if (self.webview) |wv| _ = wv.lpVtbl.Release(wv);
             if (self.msg_handler) |h| h.dropRef();
             if (self.res_handler) |h| h.dropRef();
@@ -1319,4 +1607,62 @@ test "currentExePath: 返回非空且以 .exe 结尾" {
     defer testing.allocator.free(p);
     try testing.expect(p.len > 4);
     try testing.expect(std.mem.endsWith(u8, p, ".exe") or std.mem.endsWith(u8, p, ".EXE"));
+}
+
+test "acceptsGzip: 常见头形态 + q=0 拒绝" {
+    try testing.expect(!acceptsGzip(null));
+    try testing.expect(!acceptsGzip(""));
+    try testing.expect(acceptsGzip("gzip, deflate, br, zstd")); // WebView2/Chromium 默认
+    try testing.expect(acceptsGzip("deflate, gzip"));
+    try testing.expect(acceptsGzip("GZIP")); // 大小写不敏感
+    try testing.expect(acceptsGzip("gzip;q=0.5, br"));
+    try testing.expect(acceptsGzip("br;q=1.0, gzip"));
+    try testing.expect(!acceptsGzip("deflate")); // 不含 gzip
+    try testing.expect(!acceptsGzip("br, zstd"));
+    try testing.expect(!acceptsGzip("gzip;q=0")); // 显式拒绝
+    try testing.expect(!acceptsGzip("gzip;q=0.000, br;q=1.0"));
+    try testing.expect(!acceptsGzip("GZIP ; Q=0")); // 大小写 + 空格
+}
+
+test "etagOf: 强 ETag（定长/引号/确定性/区分度）" {
+    const e1 = etagOf("hello");
+    const e2 = etagOf("hello");
+    const e3 = etagOf("hello!");
+    try testing.expectEqual(@as(usize, 18), e1.len);
+    try testing.expectEqual(@as(u8, '"'), e1[0]);
+    try testing.expectEqual(@as(u8, '"'), e1[17]);
+    try testing.expectEqualSlices(u8, &e1, &e2); // 同内容同值
+    try testing.expect(!std.mem.eql(u8, &e1, &e3)); // 异内容异值
+    for (e1[1..17]) |c| {
+        try testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
+    }
+}
+
+test "ifNoneMatchMatches: 列表 / * / W/ 前缀 / 非匹配" {
+    const e = etagOf("hello"); // "xxxxxxxxxxxxxxxx"
+    try testing.expect(!ifNoneMatchMatches(null, &e));
+    try testing.expect(!ifNoneMatchMatches("", &e));
+    try testing.expect(ifNoneMatchMatches(&e, &e)); // 精确
+    try testing.expect(ifNoneMatchMatches(" \"zzzz\",  W/\"aaaa\" , W/", &e) == false); // 半个 token 不误判
+    try testing.expect(ifNoneMatchMatches("*", &e)); // 星号
+    try testing.expect(ifNoneMatchMatches("\"aaaa\", \"bbbb\", ", &e) == false);
+    const list = try std.fmt.allocPrint(testing.allocator, "\"aaaa\", {s}, \"cccc\"", .{&e});
+    defer testing.allocator.free(list);
+    try testing.expect(ifNoneMatchMatches(list, &e)); // 列表内命中
+    const weak = try std.fmt.allocPrint(testing.allocator, "W/{s}", .{&e});
+    defer testing.allocator.free(weak);
+    try testing.expect(ifNoneMatchMatches(weak, &e)); // W/ 弱前缀剥离后可比
+}
+
+test "joinProxyUrl: 去尾斜杠 + 保留 query" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const up1 = try joinProxyUrl(alloc, "http://localhost:5173", "/index.html?t=123");
+    try testing.expectEqualStrings("http://localhost:5173/index.html?t=123", up1);
+    const up2 = try joinProxyUrl(alloc, "http://localhost:5173/", "/");
+    try testing.expectEqualStrings("http://localhost:5173/", up2);
+    const up3 = try joinProxyUrl(alloc, "http://localhost:5173///", "/src/main.ts?import");
+    try testing.expectEqualStrings("http://localhost:5173/src/main.ts?import", up3);
 }

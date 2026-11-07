@@ -341,13 +341,44 @@ pub const ICoreWebView2WebResourceRequest = extern struct {
         put_Method: *const fn (*ICoreWebView2WebResourceRequest, LPCWSTR) callconv(.c) HRESULT,
         get_Content: *const fn (*ICoreWebView2WebResourceRequest, *?*IStream) callconv(.c) HRESULT,
         put_Content: *const fn (*ICoreWebView2WebResourceRequest, ?*IStream) callconv(.c) HRESULT,
-        get_Headers: *const fn (*ICoreWebView2WebResourceRequest, *?*anyopaque) callconv(.c) HRESULT,
+        get_Headers: *const fn (*ICoreWebView2WebResourceRequest, *?*ICoreWebView2HttpRequestHeaders) callconv(.c) HRESULT,
     };
 
     /// 出参字符串需 CoTaskMemFree。
     pub fn getUri(self: *ICoreWebView2WebResourceRequest) struct { hr: HRESULT, value: ?LPWSTR } {
         var value: ?LPWSTR = null;
         const hr = self.lpVtbl.get_Uri(self, &value);
+        return .{ .hr = hr, .value = value };
+    }
+
+    pub fn getHeaders(self: *ICoreWebView2WebResourceRequest) struct { hr: HRESULT, headers: ?*ICoreWebView2HttpRequestHeaders } {
+        var headers: ?*ICoreWebView2HttpRequestHeaders = null;
+        const hr = self.lpVtbl.get_Headers(self, &headers);
+        return .{ .hr = hr, .headers = headers };
+    }
+};
+
+/// 请求头集合（Phase C：读取 Accept-Encoding / If-None-Match）。
+/// vtable 槽位对齐 WebView2.h；无 IID 常量（get_Headers 直接返回该类型，无需 QI）。
+pub const ICoreWebView2HttpRequestHeaders = extern struct {
+    lpVtbl: *const VTable,
+
+    pub const VTable = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2HttpRequestHeaders, *const com.GUID, *?*anyopaque) callconv(.c) HRESULT,
+        AddRef: *const fn (*ICoreWebView2HttpRequestHeaders) callconv(.c) u32,
+        Release: *const fn (*ICoreWebView2HttpRequestHeaders) callconv(.c) u32,
+        GetHeader: *const fn (*ICoreWebView2HttpRequestHeaders, LPCWSTR, *?LPWSTR) callconv(.c) HRESULT, // 3
+        GetHeaders: *const fn (*ICoreWebView2HttpRequestHeaders, LPCWSTR, *?*anyopaque) callconv(.c) HRESULT, // 4
+        Contains: *const fn (*ICoreWebView2HttpRequestHeaders, LPCWSTR, *BOOL) callconv(.c) HRESULT, // 5
+        RemoveHeader: *const fn (*ICoreWebView2HttpRequestHeaders, LPCWSTR) callconv(.c) HRESULT, // 6
+        SetHeader: *const fn (*ICoreWebView2HttpRequestHeaders, LPCWSTR, LPCWSTR) callconv(.c) HRESULT, // 7
+        First: *const fn (*ICoreWebView2HttpRequestHeaders, *?*anyopaque) callconv(.c) HRESULT, // 8
+    };
+
+    /// 取单个头；头不存在时 hr != 0。出参字符串需 CoTaskMemFree。
+    pub fn getHeader(self: *ICoreWebView2HttpRequestHeaders, name: LPCWSTR) struct { hr: HRESULT, value: ?LPWSTR } {
+        var value: ?LPWSTR = null;
+        const hr = self.lpVtbl.GetHeader(self, name, &value);
         return .{ .hr = hr, .value = value };
     }
 };

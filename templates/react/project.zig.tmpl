@@ -11,5 +11,7 @@ pub const frontend = .{
     .dev_command = @as(?[]const u8, "npm run dev"),
     .dev_url = @as(?[]const u8, "http://localhost:1420"),
     .build_command = @as(?[]const u8, "npm run build"),
+    // 反代 dev 模式（Phase C）：true = 注入 ZILT_DEV_PROXY——应用保持自身 origin，资产请求转发 dev_url
+    .dev_proxy = false,
     .wait_timeout_secs = 90,
 };
