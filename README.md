@@ -6,7 +6,17 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.5（Windows 全栈 + 前端工程化 + Phase C + 对话框/更新器/多平台打包扩展：绑定 + IPC 协议 + comptime 绑定生成 + 前端资产 codegen + dev/init 工具链 + 打包器 + 托盘/菜单/对话框/快捷键 + 自动更新器）**。路线图见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.1.6（Windows 全栈 + 前端工程化 + 多窗口/窗口控制/托盘菜单/剪贴板/拖放/深链接/Range：绑定 + IPC 协议 + comptime 绑定生成 + 前端资产 codegen + dev/init 工具链 + 打包器 + 托盘/菜单/对话框/快捷键 + 自动更新器）**。路线图见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
+v0.1.6 新增：
+
+- **多窗口**：`ctx.newWindow(...)`、每窗口独立 IPC/事件路由、`ctx.emitTo(window_id, ...)`、`windowClosed` 事件
+- **窗口控制**：标题/最小化/最大化/还原/全屏/尺寸/位置/显隐/聚焦/关闭（任意线程安全）
+- **托盘右键菜单 + 自定义图标**：`Config.Tray.menu`、`Config.icon`/`Tray.icon`（资产 `.ico`，纯 Zig 解析）
+- **剪贴板 + 文件拖放**：`ctx.clipboardWriteText/ReadText`、`dropFiles` 事件
+- **深链接/文件关联**：`Config.DeepLink`（HKCU 注册 + 参数分类 + `deepLink` 事件）；第二实例参数经
+  `WM_COPYDATA` 转发给首个实例后 exit 5
+- **Range/206**：内嵌资产支持 `Range: bytes=…` 分块下载（200 附 `Accept-Ranges`，206 带 `Content-Range`）
 
 ## 创建新项目（vue/react/svelte）
 
@@ -22,7 +32,7 @@ ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=my-app zig build init
 ```sh
 zig build gen      # 生成前端 TS 绑定（frontend/bindings/zilt.ts）
 zig build run      # 启动示例应用（embedded 模式）
-zig build test    # 单元测试（43 项：协议/更新器/打包器/系统能力/前端 codegen/模板）
+zig build test    # 单元测试（85 个 test 块：协议/更新器/打包器/系统能力/前端 codegen/模板/图标/深链接/Range）
 ```
 
 dev 模式：
@@ -40,6 +50,7 @@ GUI 冒烟测试：
 
 ```sh
 ZILT_SMOKE_TEST_MS=15000 ZILT_SMOKE_EXIT=1 zig-out/bin/zilt-app.exe && echo PASS
+ZILT_SMOKE_MULTI=12 ZILT_SMOKE_TEST_MS=12000 zig-out/bin/zilt-app.exe   # 多窗口 E2E（3s 后自动关第二窗）
 ```
 
 ## 写一个命令

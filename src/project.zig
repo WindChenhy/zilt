@@ -2,7 +2,7 @@
 //! 纯数据（无模块依赖），build.zig 可直接 @import。
 
 pub const app_name = "Zilt";
-pub const version = "0.1.5";
+pub const version = "0.1.6";
 pub const app_id = "app.zilt.desktop";
 pub const exe_name = "zilt-app.exe";
 

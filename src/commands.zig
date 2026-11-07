@@ -149,6 +149,74 @@ pub fn restartAfterUpdate(ctx: Context, args: struct {}) !void {
     ctx.restartToApply();
 }
 
+// ---- v0.1.6：多窗口 / 窗口控制 / 剪贴板 demo ----
+
+/// 新建窗口（默认加载 /second.html）。
+pub fn newWindowDemo(ctx: Context, args: struct {
+    title: []const u8 = "Zilt 子窗口",
+    width: u32 = 720,
+    height: u32 = 500,
+    path: []const u8 = "/second.html",
+}) !struct { id: u32 } {
+    const url = try std.fmt.allocPrint(ctx.allocator, "https://zilt.app{s}", .{args.path});
+    const id = try ctx.newWindow(.{ .title = args.title, .width = args.width, .height = args.height, .url = url });
+    return .{ .id = id };
+}
+
+/// 窗口控制（作用于当前调用窗口）。
+pub fn windowControlDemo(ctx: Context, args: struct {
+    action: enum { minimize, maximize, restore, fullscreen_on, fullscreen_off, show, hide, focus, close, set_title, set_size, set_position },
+    title: []const u8 = "Zilt 窗口",
+    width: u32 = 960,
+    height: u32 = 700,
+    x: i32 = 100,
+    y: i32 = 100,
+}) !struct { ok: bool } {
+    switch (args.action) {
+        .minimize => ctx.windowMinimize(),
+        .maximize => ctx.windowMaximize(),
+        .restore => ctx.windowRestore(),
+        .fullscreen_on => ctx.windowSetFullscreen(true),
+        .fullscreen_off => ctx.windowSetFullscreen(false),
+        .show => ctx.windowShow(),
+        .hide => ctx.windowHide(),
+        .focus => ctx.windowFocus(),
+        .close => ctx.windowClose(),
+        .set_title => ctx.windowSetTitle(args.title),
+        .set_size => ctx.windowSetSize(args.width, args.height),
+        .set_position => ctx.windowSetPosition(args.x, args.y),
+    }
+    return .{ .ok = true };
+}
+
+/// 写剪贴板文本。
+pub fn clipboardWriteDemo(ctx: Context, args: struct { text: []const u8 }) !struct { ok: bool } {
+    try ctx.clipboardWriteText(args.text);
+    return .{ .ok = true };
+}
+
+/// 读剪贴板文本（无文本时 text = null）。
+pub fn clipboardReadDemo(ctx: Context, args: struct {}) !struct { text: ?[]const u8 } {
+    _ = args;
+    return .{ .text = try ctx.clipboardReadText(ctx.allocator) };
+}
+
+/// 剪贴板往返（冒烟断言用）：写 text 后读回并比较。
+pub fn clipboardRoundtrip(ctx: Context, args: struct { text: []const u8 }) !struct { ok: bool, text: ?[]const u8 } {
+    try ctx.clipboardWriteText(args.text);
+    const back = try ctx.clipboardReadText(ctx.allocator);
+    return .{
+        .ok = back != null and std.mem.eql(u8, back.?, args.text),
+        .text = back,
+    };
+}
+
+/// 窗口标题设置（冒烟断言用：调用后观察标题变化）。
+pub fn windowTitleDemo(ctx: Context, args: struct { title: []const u8 }) !struct { ok: bool } {
+    ctx.windowSetTitle(args.title);
+    return .{ .ok = true };
+}
+
 pub fn exitApp(ctx: Context, args: struct {}) !void {
     _ = args;
     ctx.quit(0);

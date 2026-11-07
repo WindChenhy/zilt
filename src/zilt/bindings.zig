@@ -53,6 +53,19 @@ pub fn generateTs(comptime Commands: type, comptime Events: type) []const u8 {
             const p_t = if (e.payload) |P| tsType(P) else "null";
             out = out ++ "  \"" ++ e.name ++ "\": " ++ p_t ++ ",\n";
         }
+        // 框架内置事件（v0.1.6）：与用户事件同名时以用户定义为准
+        const builtins = [_]struct { name: []const u8, ts: []const u8 }{
+            .{ .name = "menu", .ts = "{ id: string }" },
+            .{ .name = "hotkey", .ts = "{ id: string }" },
+            .{ .name = "trayMenu", .ts = "{ id: string }" },
+            .{ .name = "dropFiles", .ts = "{ files: string[] }" },
+            .{ .name = "deepLink", .ts = "{ url?: string; files: string[] }" },
+            .{ .name = "windowClosed", .ts = "{ id: number }" },
+        };
+        for (builtins) |b| {
+            if (hasEvent(Events, b.name)) continue;
+            out = out ++ "  \"" ++ b.name ++ "\": " ++ b.ts ++ ",\n";
+        }
         out = out ++ "  \"__reload\": null,\n";
         out = out ++
             \\};
@@ -87,6 +100,15 @@ fn eventMetas(comptime Events: type) []const EventMeta {
     }
     const frozen = metas;
     return &frozen;
+}
+
+fn hasEvent(comptime Events: type, comptime name: []const u8) bool {
+    comptime {
+        for (@typeInfo(Events).@"struct".decl_names) |decl| {
+            if (std.mem.eql(u8, decl, name)) return true;
+        }
+        return false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -191,5 +213,9 @@ test "generateTs contains typed commands and events" {
     // 事件表
     try testing.expect(std.mem.indexOf(u8, ts, "\"tick\": { n: number },") != null);
     try testing.expect(std.mem.indexOf(u8, ts, "\"log\": { msg: string; level?: number },") != null);
+    // 内置事件（v0.1.6）
+    try testing.expect(std.mem.indexOf(u8, ts, "\"menu\": { id: string },") != null);
+    try testing.expect(std.mem.indexOf(u8, ts, "\"dropFiles\": { files: string[] },") != null);
+    try testing.expect(std.mem.indexOf(u8, ts, "\"deepLink\": { url?: string; files: string[] },") != null);
     try testing.expect(std.mem.indexOf(u8, ts, "\"__reload\": null,") != null);
 }

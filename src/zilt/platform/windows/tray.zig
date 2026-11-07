@@ -16,14 +16,15 @@ pub const Tray = struct {
     active: bool = false,
 
     /// 构造托盘数据（不注册）。tooltip 最长 127 个 UTF-16 码元（截断）。
-    pub fn init(allocator: std.mem.Allocator, hwnd: win32.HWND, callback_msg: win32.UINT, tooltip_u8: []const u8) !Tray {
+    /// icon 为 null 时用系统默认应用图标。
+    pub fn init(allocator: std.mem.Allocator, hwnd: win32.HWND, callback_msg: win32.UINT, tooltip_u8: []const u8, icon: win32.HICON) !Tray {
         var nid: win32.NOTIFYICONDATAW = std.mem.zeroes(win32.NOTIFYICONDATAW);
         nid.cbSize = @sizeOf(win32.NOTIFYICONDATAW);
         nid.hWnd = hwnd;
         nid.uID = TRAY_ID;
         nid.uFlags = win32.NIF_MESSAGE | win32.NIF_ICON | win32.NIF_TIP;
         nid.uCallbackMessage = callback_msg;
-        nid.hIcon = win32.LoadIconW(null, @ptrFromInt(win32.IDI_APPLICATION));
+        nid.hIcon = icon orelse win32.LoadIconW(null, @ptrFromInt(win32.IDI_APPLICATION));
 
         const tip = try utf16Trunc(128, allocator, tooltip_u8);
         defer allocator.free(tip);
@@ -117,7 +118,7 @@ pub fn singleInstanceMutexName(allocator: std.mem.Allocator, app_id: []const u8)
 const testing = std.testing;
 
 test "Tray.init: 结构体字段与 tooltip" {
-    var tray = try Tray.init(testing.allocator, @ptrFromInt(0x1000), 0x8100, "Zilt 托盘");
+    var tray = try Tray.init(testing.allocator, @ptrFromInt(0x1000), 0x8100, "Zilt 托盘", null);
     defer tray.allocator.free(tray.nid.szTip[0..0]); // szTip 内嵌数组无需释放
 
     try testing.expectEqual(@sizeOf(win32.NOTIFYICONDATAW), tray.nid.cbSize);

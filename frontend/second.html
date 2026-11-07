@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Zilt 子窗口</title>
+<style>
+  body { font-family: "Segoe UI", system-ui, sans-serif; background: #0f172a; color: #e2e8f0; padding: 32px; }
+  h1 { font-size: 22px; margin: 0 0 12px; }
+  p { color: #94a3b8; font-size: 13px; }
+  button { background: #2563eb; color: #fff; border: 0; border-radius: 8px; padding: 8px 14px; margin: 4px 6px 4px 0; cursor: pointer; }
+  button:hover { background: #1d4ed8; }
+  .mono { font-family: Consolas, monospace; color: #7dd3fc; margin-top: 12px; min-height: 20px; }
+</style>
+</head>
+<body>
+  <h1>子窗口（多窗口 IPC 演示）</h1>
+  <p>同一套 Zig 命令命名空间；事件只回到发起窗口。</p>
+  <button onclick="greetHere()">invoke greet</button>
+  <button onclick="window.zilt.invoke('clipboardReadDemo',{}).then(r=>out('剪贴板: '+(r.text??'(空)')))">读剪贴板</button>
+  <button onclick="window.zilt.invoke('windowTitleDemo',{title:'Zilt 子窗口 — 已改标题'})">改本窗口标题</button>
+  <button onclick="window.zilt.invoke('windowControlDemo',{action:'close'})">关闭本窗口</button>
+  <div id="out" class="mono"></div>
+  <script src="/second.js"></script>
+</body>
+</html>

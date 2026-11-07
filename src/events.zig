@@ -47,18 +47,21 @@ pub fn smokeResult(ctx: Context, payload: struct {
     user: bool = false,
     event: bool = false,
     mode: bool = false,
+    clip: bool = false,
+    win: bool = false,
+    range: bool = false,
     fatal: ?[]const u8 = null,
 }) void {
     var ok = false;
     if (payload.fatal) |f| {
         zilt.log.print("[smoke] FATAL(frontend): {s}", .{f});
     } else {
-        ok = payload.greet and payload.add and payload.fail and payload.user and payload.event and payload.mode;
+        ok = payload.greet and payload.add and payload.fail and payload.user and payload.event and payload.mode and payload.clip and payload.win and payload.range;
         if (ok) {
-            zilt.log.print("[smoke] ALL CHECKS PASSED (greet/add/fail-reject/user-optional/event-tick/mode-enum)", .{});
+            zilt.log.print("[smoke] ALL CHECKS PASSED (greet/add/fail-reject/user-optional/event-tick/mode-enum/clipboard/window/range)", .{});
         } else {
-            zilt.log.print("[smoke] FAILED greet={} add={} fail={} user={} event={} mode={}", .{
-                payload.greet, payload.add, payload.fail, payload.user, payload.event, payload.mode,
+            zilt.log.print("[smoke] FAILED greet={} add={} fail={} user={} event={} mode={} clip={} win={} range={}", .{
+                payload.greet, payload.add, payload.fail, payload.user, payload.event, payload.mode, payload.clip, payload.win, payload.range,
             });
         }
     }

@@ -48,13 +48,43 @@ pub fn idFromIndex(comptime items: []const Config.MenuItem, idx: u16) ?[]const u
 /// 构建 Win32 菜单栏（运行时）。叶子项 win id 与 collectIds 顺序一致。
 pub fn buildWin32(allocator: std.mem.Allocator, items: []const Config.MenuItem) !win32.HMENU {
     var counter: u16 = 0;
-    return buildSub(allocator, items, &counter);
-}
-
-fn buildSub(allocator: std.mem.Allocator, items: []const Config.MenuItem, counter: *u16) !win32.HMENU {
     const hmenu = win32.CreateMenu() orelse return error.CreateMenuFailed;
     errdefer _ = win32.DestroyMenu(hmenu);
+    try fill(allocator, hmenu, items, &counter);
+    return hmenu;
+}
 
+/// 构建弹出菜单（托盘右键）。菜单 id 从 base 起（避免与菜单栏 id 空间冲突）。
+pub fn buildPopup(allocator: std.mem.Allocator, items: []const Config.MenuItem, base: u16) !win32.HMENU {
+    var counter: u16 = base;
+    const hmenu = win32.CreatePopupMenu() orelse return error.CreateMenuFailed;
+    errdefer _ = win32.DestroyMenu(hmenu);
+    try fill(allocator, hmenu, items, &counter);
+    return hmenu;
+}
+
+/// 弹出菜单 id → 字符串 id（base 为 buildPopup 起始值；运行时查找，
+/// 兼容 config 中托盘菜单为 null 的编译期场景）。
+pub fn idFromPopup(items: []const Config.MenuItem, base: u16, menu_id: u16) ?[]const u8 {
+    if (menu_id <= base) return null;
+    var counter: u16 = 0;
+    return findNth(items, menu_id - base, &counter);
+}
+
+fn findNth(items: []const Config.MenuItem, target: u16, counter: *u16) ?[]const u8 {
+    for (items) |it| {
+        if (std.mem.eql(u8, it.label, "-")) continue;
+        if (it.items) |children| {
+            if (findNth(children, target, counter)) |id| return id;
+        } else if (it.id) |id| {
+            counter.* += 1;
+            if (counter.* == target) return id;
+        }
+    }
+    return null;
+}
+
+fn fill(allocator: std.mem.Allocator, hmenu: win32.HMENU, items: []const Config.MenuItem, counter: *u16) !void {
     for (items) |it| {
         if (std.mem.eql(u8, it.label, "-")) {
             if (win32.AppendMenuW(hmenu, win32.MF_SEPARATOR, 0, null) == 0) return error.AppendMenuFailed;
@@ -64,7 +94,9 @@ fn buildSub(allocator: std.mem.Allocator, items: []const Config.MenuItem, counte
         defer allocator.free(label_w);
 
         if (it.items) |children| {
-            const sub = try buildSub(allocator, children, counter);
+            const sub = win32.CreatePopupMenu() orelse return error.CreateMenuFailed;
+            errdefer _ = win32.DestroyMenu(sub);
+            try fill(allocator, sub, children, counter);
             if (win32.AppendMenuW(hmenu, win32.MF_POPUP, @intFromPtr(sub), label_w.ptr) == 0) return error.AppendMenuFailed;
         } else {
             if (it.id == null) continue; // 无 id 的叶子不响应
@@ -72,7 +104,6 @@ fn buildSub(allocator: std.mem.Allocator, items: []const Config.MenuItem, counte
             if (win32.AppendMenuW(hmenu, win32.MF_STRING, counter.*, label_w.ptr) == 0) return error.AppendMenuFailed;
         }
     }
-    return hmenu;
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +139,14 @@ test "idFromIndex: 双向映射" {
     try testing.expectEqualStrings("about", idFromIndex(&TestMenu, 3).?);
     try testing.expect(idFromIndex(&TestMenu, 4) == null);
     try testing.expect(idFromIndex(&TestMenu, 0) == null);
+}
+
+test "idFromPopup: base 偏移映射" {
+    // 托盘菜单 id 从 100 起：101 → open，102 → exit，103 → about
+    try testing.expectEqualStrings("open", idFromPopup(&TestMenu, 100, 101).?);
+    try testing.expectEqualStrings("about", idFromPopup(&TestMenu, 100, 103).?);
+    try testing.expect(idFromPopup(&TestMenu, 100, 100) == null);
+    try testing.expect(idFromPopup(&TestMenu, 100, 104) == null);
 }
 
 test "collectIds: 空菜单与无 id 叶子" {

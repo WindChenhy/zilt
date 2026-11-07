@@ -43,6 +43,11 @@ pub const Config = struct {
     single_instance: bool = false,
     /// 自动更新器（ed25519 验签）
     update: ?Update = null,
+    /// 窗口/托盘默认图标（资产路径，如 "/app.ico"；null = 系统默认）
+    icon: ?[]const u8 = null,
+    /// 深链接 / 文件关联（Windows；v0.1.6）
+    deep_link: ?DeepLink = null,
+
     /// 原生菜单栏（叶子项触发 "menu" IPC 事件）
     menu: ?[]const MenuItem = null,
     /// 全局快捷键（触发 "hotkey" IPC 事件）
@@ -58,6 +63,20 @@ pub const Config = struct {
     pub const Tray = struct {
         /// 托盘悬停提示
         tooltip: [:0]const u8 = "Zilt App",
+        /// 托盘右键菜单（复用菜单树格式；null = 无右键菜单）
+        menu: ?[]const MenuItem = null,
+        /// 托盘图标（资产路径；null = 用 Config.icon / 系统默认）
+        icon: ?[]const u8 = null,
+    };
+
+    /// 深链接 / 文件关联（HKCU 注册，per-user 无需管理员）。
+    pub const DeepLink = struct {
+        /// URL 协议名（如 "zilt" → zilt://…）
+        scheme: []const u8 = "zilt",
+        /// 启动时注册协议处理器
+        register: bool = false,
+        /// 注册文件关联扩展名（如 ".zilt"）
+        file_ext: ?[]const u8 = null,
     };
 
     /// 菜单项：label "-" 为分隔符；items 非空为子菜单；叶子需 id（emit 事件用）。

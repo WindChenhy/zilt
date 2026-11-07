@@ -2,13 +2,13 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>Zilt — Phase 2 示例</title>
+<title>Zilt — v0.1.6 示例</title>
 <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <header>
-    <h1>Zilt <span class="badge">Phase 2</span></h1>
-    <p class="sub">Zig WebView GUI 框架 · IPC 协议 / comptime 绑定 / dev 热重载</p>
+    <h1>Zilt <span class="badge">v0.1.6</span></h1>
+    <p class="sub">Zig WebView GUI 框架 · 多窗口 / 窗口控制 / 剪贴板 / 拖放 / 深链接</p>
     <p class="sub" id="conn">连接中…</p>
   </header>
 
@@ -23,6 +23,9 @@
         <tr><td>invoke queryUser（可选/嵌套对象）</td><td id="c-user" class="pending">…</td></tr>
         <tr><td>Zig→JS 事件 tick（后台线程 emit）</td><td id="c-event" class="pending">…</td></tr>
         <tr><td>invoke setMode（枚举参数映射）</td><td id="c-mode" class="pending">…</td></tr>
+        <tr><td>剪贴板往返（v0.1.6）</td><td id="c-clip" class="pending">…</td></tr>
+        <tr><td>窗口标题设置（v0.1.6）</td><td id="c-win" class="pending">…</td></tr>
+        <tr><td>Range/206 资产分块（v0.1.6）</td><td id="c-range" class="pending">…</td></tr>
       </table>
       <div id="out"></div>
     </section>
@@ -63,8 +66,35 @@
       </div>
       <div id="dlgout" class="mono"></div>
       <div id="upout" class="mono"></div>
-      <p class="sub">菜单栏：文件/帮助（点击触发 menu 事件）；全局快捷键：Ctrl+Alt+N / Ctrl+Alt+R / F1。</p>
-      <p class="sub">托盘：左键点击 = 显示/隐藏窗口；关闭按钮 = 隐藏到托盘（close_to_tray）。单实例保护已启用（第二实例退出码 5）。</p>
+      <p class="sub">菜单栏：文件/帮助（点击触发 menu 事件）；全局快捷键：Ctrl+Alt+N / Ctrl+Alt+R / F7。</p>
+      <p class="sub">托盘：左键点击 = 显示/隐藏窗口，右键 = 弹出菜单（v0.1.6）；关闭按钮 = 隐藏到托盘。单实例保护已启用（第二实例参数转发后退出码 5）。</p>
+    </section>
+
+    <section>
+      <h2>多窗口 / 窗口控制 / 剪贴板（v0.1.6）</h2>
+      <div class="row">
+        <button onclick="newWindowDemo()">新建窗口（second.html）</button>
+        <button onclick="winCtl('set_title',{title:'Zilt 子窗口标题'})">改标题</button>
+        <button onclick="winCtl('minimize')">最小化</button>
+        <button onclick="winCtl('maximize')">最大化</button>
+        <button onclick="winCtl('restore')">还原</button>
+      </div>
+      <div class="row">
+        <button onclick="winCtl('fullscreen_on')">全屏</button>
+        <button onclick="winCtl('fullscreen_off')">退出全屏</button>
+        <button onclick="winCtl('set_size',{width:960,height:700})">默认尺寸</button>
+        <button onclick="winCtl('set_position',{x:120,y:120})">移到 (120,120)</button>
+        <button onclick="winCtl('hide')">隐藏窗口</button>
+        <button onclick="winCtl('show')">显示窗口</button>
+        <button onclick="winCtl('close')">关闭窗口</button>
+      </div>
+      <div class="row">
+        <input id="clipin" value="Zilt clipboard ✓" placeholder="要写入的文本">
+        <button onclick="clipboardWriteDemo()">写剪贴板</button>
+        <button onclick="clipboardReadDemo()">读剪贴板</button>
+      </div>
+      <div id="winout" class="mono"></div>
+      <p class="sub">把文件拖进窗口 → dropFiles 事件；从外部打开 zilt://… 或 .zilt 文件、再启动一次 exe（第二实例）→ deepLink 事件。</p>
     </section>
   </main>
 

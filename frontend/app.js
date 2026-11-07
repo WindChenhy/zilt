@@ -47,6 +47,40 @@ async function pickFontDemo() {
   } catch (e) { showOut('错误: ' + e); }
 }
 
+// ---- v0.1.6：多窗口 / 窗口控制 / 剪贴板 / 拖放 / 深链接 ----
+function winOut(text) {
+  const el = document.getElementById('winout');
+  if (el) el.textContent = text;
+}
+
+async function newWindowDemo() {
+  try {
+    const r = await window.zilt.invoke('newWindowDemo', {});
+    winOut(`已创建窗口 #${r.id}`);
+  } catch (e) { winOut('新建窗口失败: ' + e); }
+}
+
+async function winCtl(action, extra = {}) {
+  try {
+    const r = await window.zilt.invoke('windowControlDemo', Object.assign({ action }, extra));
+    winOut(`窗口操作 ${action}: ${r.ok ? 'ok' : '失败'}`);
+  } catch (e) { winOut('窗口操作失败: ' + e); }
+}
+
+async function clipboardWriteDemo() {
+  try {
+    await window.zilt.invoke('clipboardWriteDemo', { text: $('clipin').value || 'Zilt clipboard' });
+    winOut('已写入剪贴板');
+  } catch (e) { winOut('写剪贴板失败: ' + e); }
+}
+
+async function clipboardReadDemo() {
+  try {
+    const r = await window.zilt.invoke('clipboardReadDemo', {});
+    winOut('剪贴板: ' + (r.text ?? '(空)'));
+  } catch (e) { winOut('读剪贴板失败: ' + e); }
+}
+
 async function runChecks() {
   try {
     // 1. greet：嵌套返回字段
@@ -84,7 +118,25 @@ async function runChecks() {
     const m = await window.zilt.invoke('setMode', { mode: 'fast' });
     setCheck('c-mode', m.applied === 'fast', JSON.stringify(m));
 
-    // 7. 系统通知（托盘气球 → Toast；冒烟断言走 Zig 日志）
+    // 7. 剪贴板往返（v0.1.6）
+    const cb = await window.zilt.invoke('clipboardRoundtrip', { text: 'zilt-clip-0.1.6' });
+    setCheck('c-clip', cb.ok === true, JSON.stringify(cb));
+
+    // 8. 窗口控制（标题设置 + 还原；v0.1.6）
+    const w1 = await window.zilt.invoke('windowTitleDemo', { title: 'Zilt v0.1.6 — 冒烟' });
+    const w2 = await window.zilt.invoke('windowTitleDemo', { title: 'Zilt — v0.1.6 示例' });
+    setCheck('c-win', w1.ok === true && w2.ok === true);
+
+    // 9. Range/206 资产分块（v0.1.6）
+    try {
+      const rr = await fetch('/app.ico', { headers: { Range: 'bytes=0-9' } });
+      const ab = await rr.arrayBuffer();
+      setCheck('c-range', rr.status === 206 && ab.byteLength === 10, `status=${rr.status} len=${ab.byteLength}`);
+    } catch (e) {
+      setCheck('c-range', false, String(e));
+    }
+
+    // 10. 系统通知（托盘气球 → Toast；冒烟断言走 Zig 日志）
     await window.zilt.invoke('notifyMe', { title: 'Zilt 冒烟', body: '系统通知链路验证' });
 
     $('ver').textContent = window.zilt.version;
@@ -97,6 +149,9 @@ async function runChecks() {
       user: $('c-user').className === 'pass',
       event: $('c-event').className === 'pass',
       mode: $('c-mode').className === 'pass',
+      clip: $('c-clip').className === 'pass',
+      win: $('c-win').className === 'pass',
+      range: $('c-range').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });
@@ -127,7 +182,8 @@ window.addEventListener('DOMContentLoaded', () => {
   window.zilt.on('menu', async (p) => {
     dlg(`菜单: ${p.id}`);
     if (p.id === 'exit') window.zilt.invoke('exitApp', {});
-    if (p.id === 'about') window.zilt.invoke('alertBox', { text: 'Zilt v0.1.5 — Zig WebView GUI Framework', title: '关于 Zilt' });
+    if (p.id === 'about') window.zilt.invoke('alertBox', { text: 'Zilt v0.1.6 — Zig WebView GUI Framework', title: '关于 Zilt' });
+    if (p.id === 'new-window') newWindowDemo();
     if (p.id === 'open') {
       try {
         const r = await window.zilt.invoke('pickFile', {});
@@ -136,6 +192,32 @@ window.addEventListener('DOMContentLoaded', () => {
     }
   });
   window.zilt.on('hotkey', (p) => dlg(`快捷键: ${p.id}`));
+
+  // 托盘右键菜单（v0.1.6）
+  window.zilt.on('trayMenu', (p) => {
+    winOut(`托盘菜单: ${p.id}`);
+    if (p.id === 'show-window') winCtl('show');
+    else if (p.id === 'hide-window') winCtl('hide');
+    else if (p.id === 'new-window') newWindowDemo();
+    else if (p.id === 'about') window.zilt.invoke('alertBox', { text: 'Zilt v0.1.6 — Zig WebView GUI Framework', title: '关于 Zilt' });
+    else if (p.id === 'exit') window.zilt.invoke('exitApp', {});
+  });
+
+  // 文件拖放（v0.1.6）：把文件拖进窗口
+  window.zilt.on('dropFiles', (p) => {
+    winOut(`拖入 ${p.files.length} 个文件: ${p.files.join(' ; ')}`);
+  });
+
+  // 深链接 / 第二实例参数转发（v0.1.6）
+  window.zilt.on('deepLink', (p) => {
+    const parts = [];
+    if (p.url) parts.push(`URL=${p.url}`);
+    if (p.files && p.files.length) parts.push(`文件=${p.files.join(' ; ')}`);
+    winOut('深链接: ' + (parts.length ? parts.join(' ') : '(空)'));
+  });
+
+  // 子窗口关闭通知
+  window.zilt.on('windowClosed', (p) => winOut(`窗口 #${p.id} 已关闭`));
 
   // 自动运行（供自动化冒烟测试；页面重载后亦会重跑）
   runChecks();

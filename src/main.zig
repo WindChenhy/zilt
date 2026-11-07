@@ -9,16 +9,36 @@ pub fn main() !void {
         .commands = app.commands,
         .events = app.events,
         .assets = &app.assets,
-        .title = "Zilt — v0.1.5 示例",
+        .title = "Zilt — v0.1.6 示例",
         .width = 960,
         .height = 700,
         .url = "https://zilt.app/index.html",
         // 系统能力（Windows）
-        .tray = .{ .tooltip = "Zilt — 点击显示/隐藏窗口" },
+        .icon = "/app.ico",
+        .tray = .{
+            .tooltip = "Zilt — 点击显示/隐藏窗口",
+            .icon = "/app.ico",
+            .menu = &.{
+                .{ .label = "显示窗口", .id = "show-window" },
+                .{ .label = "隐藏窗口", .id = "hide-window" },
+                .{ .label = "-" },
+                .{ .label = "新建窗口", .id = "new-window" },
+                .{ .label = "关于 Zilt", .id = "about" },
+                .{ .label = "-" },
+                .{ .label = "退出", .id = "exit" },
+            },
+        },
         .close_to_tray = true,
         .single_instance = true,
+        // 深链接 / 文件关联（HKCU per-user 注册；第二实例参数转发）
+        .deep_link = .{
+            .scheme = "zilt",
+            .register = true,
+            .file_ext = ".zilt",
+        },
         .menu = &.{
             .{ .label = "文件", .items = &.{
+                .{ .label = "新建窗口", .id = "new-window" },
                 .{ .label = "打开文件...", .id = "open" },
                 .{ .label = "-" },
                 .{ .label = "退出", .id = "exit" },

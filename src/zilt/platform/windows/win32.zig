@@ -45,12 +45,40 @@ pub const CW_USEDEFAULT: i32 = @bitCast(@as(u32, 0x80000000));
 pub const SW_SHOW: i32 = 5;
 pub const SW_HIDE: i32 = 0;
 
+pub const WM_NULL: UINT = 0x0000;
 pub const WM_DESTROY: UINT = 0x0002;
 pub const WM_SIZE: UINT = 0x0005;
 pub const WM_CLOSE: UINT = 0x0010;
 pub const WM_QUIT: UINT = 0x0012;
+pub const WM_COPYDATA: UINT = 0x004A;
+pub const WM_SETICON: UINT = 0x0080;
 pub const WM_TIMER: UINT = 0x0113;
+pub const WM_DROPFILES: UINT = 0x0233;
 pub const WM_APP: UINT = 0x8000;
+
+// 窗口控制
+pub const SW_MINIMIZE: i32 = 6;
+pub const SW_MAXIMIZE: i32 = 3;
+pub const SW_RESTORE: i32 = 9;
+pub const GWL_STYLE: i32 = -16;
+pub const WS_POPUP: DWORD = 0x80000000;
+pub const SWP_NOSIZE: UINT = 0x0001;
+pub const SWP_NOMOVE: UINT = 0x0002;
+pub const SWP_NOZORDER: UINT = 0x0004;
+pub const SWP_FRAMECHANGED: UINT = 0x0020;
+pub const SWP_SHOWWINDOW: UINT = 0x0040;
+pub const ICON_SMALL: UINT = 0;
+pub const ICON_BIG: UINT = 1;
+pub const LR_DEFAULTCOLOR: UINT = 0x0000;
+pub const SM_CXSCREEN: i32 = 0;
+pub const SM_CYSCREEN: i32 = 1;
+
+// 剪贴板格式
+pub const CF_UNICODETEXT: UINT = 13;
+
+// 托盘弹出菜单
+pub const TPM_RIGHTBUTTON: UINT = 0x0002;
+pub const TPM_RETURNCMD: UINT = 0x0100;
 
 pub const GENERIC_READ: DWORD = 0x80000000;
 pub const GENERIC_WRITE: DWORD = 0x40000000;
@@ -158,6 +186,12 @@ pub const MSG = extern struct {
     pt: POINT,
 };
 
+pub const COPYDATASTRUCT = extern struct {
+    dwData: usize,
+    cbData: DWORD,
+    lpData: ?*anyopaque,
+};
+
 pub const TIMERPROC = ?*const fn (HWND, UINT, WPARAM, LPARAM) callconv(.c) void;
 
 // ---- user32 ----
@@ -190,7 +224,36 @@ pub extern "user32" fn SetTimer(hWnd: HWND, nIDEvent: usize, uElapse: UINT, lpTi
 pub extern "user32" fn KillTimer(hWnd: HWND, uIDEvent: usize) callconv(.c) BOOL;
 pub extern "user32" fn AdjustWindowRect(lpRect: *RECT, dwStyle: DWORD, bMenu: BOOL) callconv(.c) BOOL;
 pub extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.c) BOOL;
+pub extern "user32" fn GetWindowRect(hWnd: HWND, lpRect: *RECT) callconv(.c) BOOL;
+pub extern "user32" fn GetForegroundWindow() callconv(.c) HWND;
 pub extern "user32" fn LoadCursorW(hInstance: HINSTANCE, lpCursorName: LPCWSTR) callconv(.c) HCURSOR;
+pub extern "user32" fn SetWindowTextW(hWnd: HWND, lpString: LPCWSTR) callconv(.c) BOOL;
+pub extern "user32" fn SetWindowPos(hWnd: HWND, hWndInsertAfter: HWND, x: i32, y: i32, cx: i32, cy: i32, uFlags: UINT) callconv(.c) BOOL;
+pub extern "user32" fn SetWindowLongW(hWnd: HWND, nIndex: i32, dwNewLong: LONG) callconv(.c) LONG;
+pub extern "user32" fn GetWindowLongW(hWnd: HWND, nIndex: i32) callconv(.c) LONG;
+pub extern "user32" fn GetSystemMetrics(nIndex: i32) callconv(.c) i32;
+pub extern "user32" fn GetCursorPos(lpPoint: *POINT) callconv(.c) BOOL;
+pub extern "user32" fn TrackPopupMenu(hMenu: HMENU, uFlags: UINT, x: i32, y: i32, nReserved: i32, hWnd: HWND, prcRect: ?*const RECT) callconv(.c) BOOL;
+pub extern "user32" fn FindWindowW(lpClassName: ?LPCWSTR, lpWindowName: ?LPCWSTR) callconv(.c) HWND;
+pub extern "user32" fn SendMessageW(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c) LRESULT;
+pub extern "user32" fn CreateIconFromResourceEx(presbits: [*]u8, dwResSize: DWORD, fIcon: BOOL, dwVer: DWORD, cx: i32, cy: i32, uFlags: UINT) callconv(.c) HICON;
+pub extern "user32" fn DestroyIcon(hIcon: HICON) callconv(.c) BOOL;
+pub extern "user32" fn IsIconic(hWnd: HWND) callconv(.c) BOOL;
+pub extern "user32" fn IsZoomed(hWnd: HWND) callconv(.c) BOOL;
+
+// ---- 剪贴板（user32）----
+
+pub extern "user32" fn OpenClipboard(hWndNewOwner: HWND) callconv(.c) BOOL;
+pub extern "user32" fn CloseClipboard() callconv(.c) BOOL;
+pub extern "user32" fn EmptyClipboard() callconv(.c) BOOL;
+pub extern "user32" fn SetClipboardData(uFormat: UINT, hMem: ?*anyopaque) callconv(.c) ?*anyopaque;
+pub extern "user32" fn GetClipboardData(uFormat: UINT) callconv(.c) ?*anyopaque;
+
+// ---- 文件拖放（shell32）----
+
+pub extern "shell32" fn DragAcceptFiles(hWnd: HWND, fAccept: BOOL) callconv(.c) void;
+pub extern "shell32" fn DragQueryFileW(hDrop: HANDLE, iFile: UINT, lpszFile: ?[*]u16, cch: UINT) callconv(.c) UINT;
+pub extern "shell32" fn DragFinish(hDrop: HANDLE) callconv(.c) void;
 
 // ---- kernel32 ----
 
@@ -538,3 +601,27 @@ pub extern "advapi32" fn RegGetValueW(
     pvData: ?*anyopaque,
     pcbData: ?*DWORD,
 ) callconv(.c) HRESULT;
+
+pub const REG_SZ: DWORD = 1;
+pub const KEY_WRITE: DWORD = 0x20006;
+
+pub extern "advapi32" fn RegCreateKeyExW(
+    hKey: HKEY,
+    lpSubKey: LPCWSTR,
+    Reserved: DWORD,
+    lpClass: ?LPCWSTR,
+    dwOptions: DWORD,
+    samDesired: DWORD,
+    lpSecurityAttributes: ?*anyopaque,
+    phkResult: *HKEY,
+    lpdwDisposition: ?*DWORD,
+) callconv(.c) LONG;
+pub extern "advapi32" fn RegSetValueExW(
+    hKey: HKEY,
+    lpValueName: LPCWSTR,
+    Reserved: DWORD,
+    dwType: DWORD,
+    lpData: ?[*]const u8,
+    cbData: DWORD,
+) callconv(.c) LONG;
+pub extern "advapi32" fn RegCloseKey(hKey: HKEY) callconv(.c) LONG;

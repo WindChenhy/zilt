@@ -98,6 +98,32 @@ pub const DialogResponse = union(enum) {
 };
 
 // ---------------------------------------------------------------------------
+// 多窗口 / 窗口控制 / 剪贴板（平台后端实现；Context 暴露类型安全接口）
+// ---------------------------------------------------------------------------
+
+pub const WindowOptions = struct {
+    title: []const u8 = "Zilt Window",
+    width: u32 = 900,
+    height: u32 = 640,
+    /// 完整 URL（如 "https://zilt.app/second.html"）；null = 应用主 URL
+    url: ?[]const u8 = null,
+};
+
+pub const WindowCmd = union(enum) {
+    set_title: []const u8,
+    minimize,
+    maximize,
+    restore,
+    fullscreen: bool,
+    size: struct { width: u32, height: u32 },
+    position: struct { x: i32, y: i32 },
+    show,
+    hide,
+    focus,
+    close,
+};
+
+// ---------------------------------------------------------------------------
 // Context
 // ---------------------------------------------------------------------------
 
@@ -109,13 +135,16 @@ pub const DialogResponse = union(enum) {
 ///    需要跨线程 marshal），后端收到后用同一分配器释放。
 ///
 /// emit 线程安全：平台后端负责把事件编排（marshal）到 UI 线程后再投递。
+/// emit 默认发往 `window_id` 对应窗口（0 = 主窗口）；`emitTo` 可指定目标窗口。
 pub const Context = struct {
     allocator: std.mem.Allocator,
     msg_allocator: std.mem.Allocator,
     backend: *anyopaque,
-    emit_fn: *const fn (backend: *anyopaque, message_json: []const u8) void,
+    /// 当前上下文所属窗口 id（0 = 主窗口/应用级）
+    window_id: u32 = 0,
+    emit_fn: *const fn (backend: *anyopaque, window_id: u32, message_json: []const u8) void,
     quit_fn: *const fn (backend: *anyopaque, code: u8) void,
-    /// 系统通知（需要托盘已启用；由平台后端 marshal 到 UI 线程）。null = 未启用。
+    /// 系统通知（由平台后端 marshal 到 UI 线程）。null = 未启用。
     notify_fn: ?*const fn (backend: *anyopaque, title: []const u8, body: []const u8) void = null,
     /// 原生对话框（UI 线程调用；模态会阻塞至用户关闭）。null = 不可用。
     dialog_fn: ?*const fn (backend: *anyopaque, alloc: std.mem.Allocator, req: DialogRequest) anyerror!DialogResponse = null,
@@ -123,6 +152,14 @@ pub const Context = struct {
     updater_env: ?updater.Env = null,
     /// 重启以应用已暂存的更新（v0.1.5：分离接力进程拉起新 exe 后退出）。null = 不可用。
     restart_fn: ?*const fn (backend: *anyopaque) void = null,
+    /// 窗口控制（v0.1.6：跨线程安全 marshal 到 UI 线程）。null = 平台不支持。
+    window_fn: ?*const fn (backend: *anyopaque, window_id: u32, cmd: WindowCmd) bool = null,
+    /// 新建窗口（返回新窗口 id；null = 创建失败/平台不支持）。
+    spawn_window_fn: ?*const fn (backend: *anyopaque, opts: WindowOptions) ?u32 = null,
+    /// 剪贴板写文本（成功 true）。
+    clipboard_write_fn: ?*const fn (backend: *anyopaque, text: []const u8) bool = null,
+    /// 剪贴板读文本（调用方 allocator 分配；无文本 null）。
+    clipboard_read_fn: ?*const fn (backend: *anyopaque, alloc: std.mem.Allocator) ?[]u8 = null,
 
     /// 发送系统通知（Windows: 托盘气球 → Toast）。
     pub fn notify(self: Context, title: []const u8, body: []const u8) void {
@@ -205,23 +242,92 @@ pub const Context = struct {
         }
     }
 
-    /// 向前端发事件（payload 序列化为 JSON）。
+    // ---- 窗口控制（v0.1.6）----
+
+    fn winCmd(self: Context, cmd: WindowCmd) bool {
+        const f = self.window_fn orelse return false;
+        return f(self.backend, self.window_id, cmd);
+    }
+
+    pub fn windowSetTitle(self: Context, title: []const u8) void {
+        _ = self.winCmd(.{ .set_title = title });
+    }
+    pub fn windowMinimize(self: Context) void {
+        _ = self.winCmd(.minimize);
+    }
+    pub fn windowMaximize(self: Context) void {
+        _ = self.winCmd(.maximize);
+    }
+    pub fn windowRestore(self: Context) void {
+        _ = self.winCmd(.restore);
+    }
+    pub fn windowSetFullscreen(self: Context, on: bool) void {
+        _ = self.winCmd(.{ .fullscreen = on });
+    }
+    pub fn windowSetSize(self: Context, width: u32, height: u32) void {
+        _ = self.winCmd(.{ .size = .{ .width = width, .height = height } });
+    }
+    pub fn windowSetPosition(self: Context, x: i32, y: i32) void {
+        _ = self.winCmd(.{ .position = .{ .x = x, .y = y } });
+    }
+    pub fn windowShow(self: Context) void {
+        _ = self.winCmd(.show);
+    }
+    pub fn windowHide(self: Context) void {
+        _ = self.winCmd(.hide);
+    }
+    pub fn windowFocus(self: Context) void {
+        _ = self.winCmd(.focus);
+    }
+    pub fn windowClose(self: Context) void {
+        _ = self.winCmd(.close);
+    }
+
+    /// 新建窗口（title/width/height/url）。失败返回 error.WindowCreateFailed。
+    pub fn newWindow(self: Context, opts: WindowOptions) !u32 {
+        const f = self.spawn_window_fn orelse return error.WindowCreateFailed;
+        return f(self.backend, opts) orelse error.WindowCreateFailed;
+    }
+
+    // ---- 剪贴板（v0.1.6；文本）----
+
+    pub fn clipboardWriteText(self: Context, text: []const u8) !void {
+        const f = self.clipboard_write_fn orelse return error.ClipboardNotAvailable;
+        if (!f(self.backend, text)) return error.ClipboardWriteFailed;
+    }
+
+    /// 读剪贴板文本（调用方 allocator 分配）。无文本/不支持返回 null。
+    pub fn clipboardReadText(self: Context, alloc: std.mem.Allocator) !?[]u8 {
+        const f = self.clipboard_read_fn orelse return error.ClipboardNotAvailable;
+        return f(self.backend, alloc);
+    }
+
+    /// 向前端发事件（payload 序列化为 JSON）。发往当前窗口。
     /// 注意：全程使用 msg_allocator——emit 可能发生在本次调用的 arena 销毁之后
     /// （如后台线程继续 emit）。
     pub fn emit(self: Context, name: []const u8, payload: anytype) void {
+        self.emitTo(self.window_id, name, payload);
+    }
+
+    /// 向前端发事件（无 payload，当前窗口）。
+    pub fn emitNull(self: Context, name: []const u8) void {
+        self.emitToNull(self.window_id, name);
+    }
+
+    /// 向指定窗口发事件（window_id 0 = 主窗口）。
+    pub fn emitTo(self: Context, window_id: u32, name: []const u8, payload: anytype) void {
         const payload_json = std.json.Stringify.valueAlloc(self.msg_allocator, payload, .{}) catch return;
         defer self.msg_allocator.free(payload_json);
-        self.emitJson(name, payload_json);
+        self.emitJsonTo(window_id, name, payload_json);
     }
 
-    /// 向前端发事件（无 payload）。
-    pub fn emitNull(self: Context, name: []const u8) void {
-        self.emitJson(name, "null");
+    pub fn emitToNull(self: Context, window_id: u32, name: []const u8) void {
+        self.emitJsonTo(window_id, name, "null");
     }
 
-    fn emitJson(self: Context, name: []const u8, payload_json: []const u8) void {
+    fn emitJsonTo(self: Context, window_id: u32, name: []const u8, payload_json: []const u8) void {
         const msg = encodeEvent(self.msg_allocator, name, payload_json) catch return;
-        self.emit_fn(self.backend, msg); // 所有权转移给后端（UI 线程用完用 msg_allocator 释放）
+        self.emit_fn(self.backend, window_id, msg); // 所有权转移给后端（UI 线程用完用 msg_allocator 释放）
     }
 
     /// 请求退出应用（在 UI 线程的命令/事件回调内调用）。
@@ -521,7 +627,7 @@ pub const runtime_js =
     \\      ls.push(cb);
     \\      listeners.set(name, ls);
     \\    },
-    \\    version: '0.2.0-phase2',
+    \\    version: '0.1.6',
     \\  };
     \\  window.zilt.on('__reload', () => window.location.reload());
     \\})();
@@ -563,7 +669,8 @@ const TestEvents = struct {
     }
 };
 
-fn testEmit(backend: *anyopaque, message_json: []const u8) void {
+fn testEmit(backend: *anyopaque, window_id: u32, message_json: []const u8) void {
+    _ = window_id;
     const list: *std.ArrayList(u8) = @ptrCast(@alignCast(backend));
     list.appendSlice(testing.allocator, message_json) catch {};
     testing.allocator.free(message_json); // 模拟后端用 msg_allocator 释放的契约
@@ -650,6 +757,64 @@ test "context.emit marshals encoded event" {
     const ctx = testContext(testing.allocator, @ptrCast(&captured));
     ctx.emit("tick", .{ .n = 5 });
     try testing.expectEqualStrings("{\"zilt\":1,\"kind\":\"event\",\"name\":\"tick\",\"payload\":{\"n\":5}}", captured.items);
+}
+
+const WindowCap = struct {
+    cmd: ?WindowCmd = null,
+    window_id: u32 = 0,
+    spawned: ?WindowOptions = null,
+    clip: ?[]const u8 = null,
+};
+
+fn capWindow(backend: *anyopaque, window_id: u32, cmd: WindowCmd) bool {
+    const cap: *WindowCap = @ptrCast(@alignCast(backend));
+    cap.cmd = cmd;
+    cap.window_id = window_id;
+    return true;
+}
+fn capSpawn(backend: *anyopaque, opts: WindowOptions) ?u32 {
+    const cap: *WindowCap = @ptrCast(@alignCast(backend));
+    cap.spawned = opts;
+    return 9;
+}
+fn capClipWrite(backend: *anyopaque, text: []const u8) bool {
+    const cap: *WindowCap = @ptrCast(@alignCast(backend));
+    cap.clip = text;
+    return true;
+}
+
+test "context.window/newWindow/clipboard 走回调" {
+    var cap: WindowCap = .{};
+    const ctx = Context{
+        .allocator = testing.allocator,
+        .msg_allocator = testing.allocator,
+        .backend = @ptrCast(&cap),
+        .window_id = 3,
+        .emit_fn = testEmit,
+        .quit_fn = testQuit,
+        .window_fn = capWindow,
+        .spawn_window_fn = capSpawn,
+        .clipboard_write_fn = capClipWrite,
+    };
+
+    ctx.windowSetTitle("新标题");
+    try testing.expect(std.meta.activeTag(cap.cmd.?) == .set_title);
+    try testing.expectEqualStrings("新标题", cap.cmd.?.set_title);
+    try testing.expectEqual(@as(u32, 3), cap.window_id);
+
+    ctx.windowSetFullscreen(true);
+    try testing.expect(std.meta.activeTag(cap.cmd.?) == .fullscreen);
+    try testing.expect(cap.cmd.?.fullscreen);
+
+    ctx.windowMinimize();
+    try testing.expect(std.meta.activeTag(cap.cmd.?) == .minimize);
+
+    const id = try ctx.newWindow(.{ .title = "子窗口", .width = 400, .height = 300 });
+    try testing.expectEqual(@as(u32, 9), id);
+    try testing.expectEqualStrings("子窗口", cap.spawned.?.title);
+
+    try ctx.clipboardWriteText("hello");
+    try testing.expectEqualStrings("hello", cap.clip.?);
 }
 
 test "metas reflect command signatures" {

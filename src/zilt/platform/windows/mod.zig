@@ -10,4 +10,7 @@ pub const single_instance = @import("single_instance.zig");
 pub const menu = @import("menu.zig");
 pub const hotkey = @import("hotkey.zig");
 pub const dialog = @import("dialog.zig");
+pub const icon = @import("icon.zig");
+pub const deep_link = @import("deep_link.zig");
+pub const range = @import("range.zig");
 pub const backend = @import("backend.zig");
