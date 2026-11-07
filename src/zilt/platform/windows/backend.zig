@@ -19,6 +19,9 @@ const wv2 = @import("webview2.zig");
 const loader = @import("loader.zig");
 const tray_mod = @import("tray.zig");
 const single_instance = @import("single_instance.zig");
+const menu_mod = @import("menu.zig");
+const hotkey_mod = @import("hotkey.zig");
+const dialog_mod = @import("dialog.zig");
 
 const HRESULT = com.HRESULT;
 const WM_ZILT_EMIT: win32.UINT = win32.WM_APP + 1;
@@ -82,6 +85,15 @@ pub fn run(comptime config: Config) !void {
     _ = win32.ShowWindow(backend.hwnd.?, win32.SW_SHOW);
     _ = win32.UpdateWindow(backend.hwnd.?);
     log.print("[win32] window created: \"{s}\" {d}x{d}", .{ config.title, config.width, config.height });
+
+    // 全局快捷键（编译期校验 key 合法性）
+    if (B.hotkey_cfg) |hks| {
+        if (hotkey_mod.registerAll(backend.hwnd.?, hks)) |failed_id| {
+            log.print("[hotkey] register failed: {s}（可能被其他程序占用）", .{failed_id});
+        } else {
+            log.print("[hotkey] registered {} hotkeys", .{B.hotkey_count});
+        }
+    }
 
     var runtime = try loader.findRuntime(alloc);
     log.print("[loader] runtime version: {s}", .{runtime.version});
@@ -196,6 +208,12 @@ fn Backend(comptime config: Config) type {
     return struct {
         const Self = @This();
 
+        /// comptime 固化的配置切片（供 comptime 参数的反射函数使用）
+        const menu_cfg: ?[]const Config.MenuItem = config.menu;
+        const hotkey_cfg: ?[]const Config.Hotkey = config.hotkeys;
+        const menu_leaf_count: usize = if (config.menu) |items| menu_mod.collectIds(items).len else 0;
+        const hotkey_count: usize = if (config.hotkeys) |h| h.len else 0;
+
         var instance: ?*Self = null;
 
         fn setInstance(p: ?*Self) void {
@@ -264,6 +282,16 @@ fn Backend(comptime config: Config) type {
                 hinstance,
                 null,
             ) orelse return error.CreateWindowFailed;
+
+            // 原生菜单栏（comptime 叶子计数供日志）
+            if (Self.menu_cfg) |items| {
+                const hmenu = menu_mod.buildWin32(self.allocator, items) catch |err| {
+                    log.print("[menu] build failed: {s}", .{@errorName(err)});
+                    return err;
+                };
+                if (win32.SetMenu(self.hwnd.?, hmenu) == 0) return error.SetMenuFailed;
+                log.print("[menu] built ({} leaf items)", .{Self.menu_leaf_count});
+            }
         }
 
         fn updateBounds(self: *Self) void {
@@ -277,6 +305,25 @@ fn Backend(comptime config: Config) type {
         // ---- IPC ----
 
         /// UI 线程：把事件 JSON 投递给页面，然后释放（所有权在 emit 契约中转移）。
+    /// UI 线程便捷事件：序列化 payload 并直接投递（菜单/快捷键/更新流程用）。
+        fn emitEventPayload(self: *Self, name: []const u8, payload: anytype) void {
+            const payload_json = std.json.Stringify.valueAlloc(self.allocator, payload, .{}) catch return;
+            defer self.allocator.free(payload_json);
+            const msg = ipc.encodeEvent(self.allocator, name, payload_json) catch return;
+            self.emitJsonUi(msg); // 所有权转移
+        }
+
+        /// 原生对话框实现（Context.dialog_fn）。仅在 UI 线程调用（模态阻塞）。
+        fn runDialog(backend_ptr: *anyopaque, alloc: std.mem.Allocator, req: ipc.DialogRequest) anyerror!ipc.DialogResponse {
+            const self: *Self = @ptrCast(@alignCast(backend_ptr));
+            const hwnd = self.hwnd orelse return error.DialogNotAvailable;
+            switch (req) {
+                .message_box => |o| return .{ .button = try dialog_mod.runMessageBox(alloc, hwnd, o) },
+                .open_file => |o| return .{ .path = try dialog_mod.runOpenFile(alloc, hwnd, o) },
+                .save_file => |o| return .{ .path = try dialog_mod.runSaveFile(alloc, hwnd, o) },
+            }
+        }
+
         fn emitJsonUi(self: *Self, msg: []u8) void {
             defer self.allocator.free(msg);
             const webview = self.webview orelse return;
@@ -372,6 +419,7 @@ fn Backend(comptime config: Config) type {
                 .emit_fn = emitFromThread,
                 .quit_fn = quitFromBackend,
                 .notify_fn = notifyFromThread,
+                .dialog_fn = runDialog,
                 .updater_env = self.updater_env,
             };
         }
@@ -498,6 +546,9 @@ fn Backend(comptime config: Config) type {
 
         fn cleanup(self: *Self) void {
             _ = win32.KillTimer(self.hwnd orelse return, 1);
+            if (Self.hotkey_cfg) |hks| {
+                if (self.hwnd) |h| hotkey_mod.unregisterAll(h, hks);
+            }
             if (self.tray) |*t| _ = t.remove();
             if (self.webview) |wv| _ = wv.lpVtbl.Release(wv);
             if (self.msg_handler) |h| h.dropRef();
@@ -543,6 +594,33 @@ fn Backend(comptime config: Config) type {
                     log.print("[test] smoke timer fired (no quit) -> exit(124)", .{});
                     if (instance) |b| b.quit_code.store(124, .monotonic);
                     win32.PostQuitMessage(124);
+                    return 0;
+                },
+                win32.WM_COMMAND => {
+                    // 菜单点击：LOWORD(wparam) = win 菜单 id → 字符串 id 事件
+                    if (instance) |b| {
+                        const mid: u16 = @intCast(wparam & 0xffff);
+                        if (Self.menu_cfg != null) {
+                            const items = Self.menu_cfg.?;
+                            if (menu_mod.idFromIndex(items, mid)) |id| {
+                                log.print("[menu] {s}", .{id});
+                                b.emitEventPayload("menu", .{ .id = id });
+                            }
+                        }
+                    }
+                    return 0;
+                },
+                win32.WM_HOTKEY => {
+                    // 全局快捷键触发：wparam = 配置顺序
+                    if (instance) |b| {
+                        if (Self.hotkey_cfg != null) {
+                            const hks = Self.hotkey_cfg.?;
+                            if (hotkey_mod.idFromIndex(hks, @intCast(wparam))) |id| {
+                                log.print("[hotkey] {s}", .{id});
+                                b.emitEventPayload("hotkey", .{ .id = id });
+                            }
+                        }
+                    }
                     return 0;
                 },
                 WM_ZILT_EMIT => {

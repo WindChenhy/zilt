@@ -45,6 +45,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.linkSystemLibrary("gdi32", .{});
     exe_mod.linkSystemLibrary("ole32", .{});
     exe_mod.linkSystemLibrary("advapi32", .{});
+    exe_mod.linkSystemLibrary("comdlg32", .{}); // 对话框
 
     b.installArtifact(exe);
 
@@ -99,6 +100,7 @@ pub fn build(b: *std.Build) void {
     rel_app_mod.linkSystemLibrary("gdi32", .{});
     rel_app_mod.linkSystemLibrary("ole32", .{});
     rel_app_mod.linkSystemLibrary("advapi32", .{});
+    rel_app_mod.linkSystemLibrary("comdlg32", .{});
 
     const bundle_mod = b.createModule(.{
         .root_source_file = b.path("src/tools/bundle.zig"),

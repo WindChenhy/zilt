@@ -46,13 +46,20 @@
     </section>
 
     <section>
-      <h2>系统能力 / 更新器（v0.1.1）</h2>
+      <h2>系统能力 / 更新器（v0.1.2）</h2>
       <div class="row">
         <button onclick="window.zilt.invoke('notifyMe',{title:'Zilt 通知',body:'来自 Zig 核心的系统通知（托盘气球 → Toast）'})">系统通知</button>
         <button onclick="window.zilt.invoke('checkUpdate',{})">检查更新</button>
         <button onclick="window.zilt.invoke('installUpdate',{})">安装更新（staged）</button>
       </div>
+      <div class="row">
+        <button onclick="window.zilt.invoke('pickFile',{})">打开文件…</button>
+        <button onclick="window.zilt.invoke('saveFileDialog',{})">保存文件…</button>
+        <button onclick="window.zilt.invoke('alertBox',{text:'来自 Zig 的模态消息框',title:'关于',yes_no:true}).then(r=>showDlg(r.clicked))">消息框</button>
+      </div>
+      <div id="dlgout" class="mono"></div>
       <div id="upout" class="mono"></div>
+      <p class="sub">菜单栏：文件/帮助（点击触发 menu 事件）；全局快捷键：Ctrl+Alt+N / Ctrl+Alt+R / F1。</p>
       <p class="sub">托盘：左键点击 = 显示/隐藏窗口；关闭按钮 = 隐藏到托盘（close_to_tray）。单实例保护已启用（第二实例退出码 5）。</p>
     </section>
   </main>

@@ -85,6 +85,16 @@ window.addEventListener('DOMContentLoaded', () => {
   window.zilt.on('updateInfo', (p) => { $('upout').textContent = p.version ? `发现新版本 ${p.version}: ${p.notes}` : p.notes; });
   window.zilt.on('updateStaged', (p) => { $('upout').textContent = `已就绪 ${p.version}（重启应用生效）`; });
   window.zilt.on('updaterFailed', (p) => { $('upout').textContent = `更新失败[${p.stage}]: ${p.err}`; });
+  // 菜单 / 快捷键 / 对话框
+  const dlg = (t) => { $('dlgout').textContent = t; };
+  window.showDlg = dlg;
+  window.zilt.on('menu', (p) => {
+    dlg(`菜单: ${p.id}`);
+    if (p.id === 'exit') window.zilt.invoke('exitApp', {});
+    if (p.id === 'about') window.zilt.invoke('alertBox', { text: 'Zilt v0.1.2 — Zig WebView GUI Framework', title: '关于 Zilt' });
+  });
+  window.zilt.on('hotkey', (p) => dlg(`快捷键: ${p.id}`));
+
   // 自动运行（供自动化冒烟测试；页面重载后亦会重跑）
   runChecks();
 });

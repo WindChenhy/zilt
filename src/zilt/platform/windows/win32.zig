@@ -73,6 +73,33 @@ pub const WM_RBUTTONUP: UINT = 0x0205;
 pub const IDI_APPLICATION: usize = 32512;
 pub const ERROR_ALREADY_EXISTS: DWORD = 183;
 
+// 菜单 / 对话框 / 全局快捷键
+pub const WM_COMMAND: UINT = 0x0111;
+pub const WM_HOTKEY: UINT = 0x0312;
+pub const MF_STRING: UINT = 0x00000000;
+pub const MF_POPUP: UINT = 0x00000010;
+pub const MF_SEPARATOR: UINT = 0x00000800;
+pub const MB_ICONERROR: DWORD = 0x00000010;
+pub const MB_ICONWARNING: DWORD = 0x00000030;
+pub const MB_ICONINFORMATION: DWORD = 0x00000040;
+pub const MB_OK: DWORD = 0x00000000;
+pub const MB_OKCANCEL: DWORD = 0x00000001;
+pub const MB_YESNO: DWORD = 0x00000004;
+pub const MB_SETFOREGROUND: DWORD = 0x00010000;
+pub const IDOK: i32 = 1;
+pub const IDCANCEL: i32 = 2;
+pub const IDYES: i32 = 6;
+pub const IDNO: i32 = 7;
+pub const MOD_ALT: UINT = 0x0001;
+pub const MOD_CONTROL: UINT = 0x0002;
+pub const MOD_SHIFT: UINT = 0x0004;
+pub const MOD_WIN: UINT = 0x0008;
+pub const OFN_OVERWRITEPROMPT: DWORD = 0x00000002;
+pub const OFN_HIDEREADONLY: DWORD = 0x00000004;
+pub const OFN_NOCHANGEDIR: DWORD = 0x00000008;
+pub const OFN_PATHMUSTEXIST: DWORD = 0x00000800;
+pub const OFN_FILEMUSTEXIST: DWORD = 0x00001000;
+
 pub const INVALID_FILE_ATTRIBUTES: DWORD = 0xFFFFFFFF;
 pub const LOAD_WITH_ALTERED_SEARCH_PATH: DWORD = 0x00000008;
 pub const FILE_APPEND_DATA: DWORD = 0x0004;
@@ -225,6 +252,114 @@ pub extern "kernel32" fn GetLastError() callconv(.c) DWORD;
 pub extern "kernel32" fn MoveFileExW(lpExistingFileName: LPCWSTR, lpNewFileName: LPCWSTR, dwFlags: DWORD) callconv(.c) BOOL;
 pub extern "kernel32" fn DeleteFileW(lpFileName: LPCWSTR) callconv(.c) BOOL;
 pub extern "kernel32" fn RemoveDirectoryW(lpPathName: LPCWSTR) callconv(.c) BOOL;
+
+// ---- 菜单 / 对话框 / 全局快捷键 ----
+
+pub const OPENFILENAMEW = extern struct {
+    lStructSize: DWORD,
+    hwndOwner: HWND,
+    hInstance: HINSTANCE,
+    lpstrFilter: ?LPCWSTR,
+    lpstrCustomFilter: ?LPWSTR,
+    nMaxCustFilter: DWORD,
+    nFilterIndex: DWORD,
+    lpstrFile: LPWSTR,
+    nMaxFile: DWORD,
+    lpstrFileTitle: ?LPWSTR,
+    nMaxFileTitle: DWORD,
+    lpstrInitialDir: ?LPCWSTR,
+    lpstrTitle: ?LPCWSTR,
+    Flags: DWORD,
+    nFileOffset: WORD,
+    nFileExtension: WORD,
+    lpstrDefExt: ?LPCWSTR,
+    lCustData: LONG,
+    lpfnHook: ?*anyopaque,
+    lpTemplateName: ?*anyopaque,
+    pvReserved: ?*anyopaque,
+    dwReserved: DWORD,
+    FlagsEx: DWORD,
+};
+
+pub extern "user32" fn MessageBoxW(hWnd: HWND, lpText: LPCWSTR, lpCaption: LPCWSTR, uType: UINT) callconv(.c) i32;
+pub extern "user32" fn CreateMenu() callconv(.c) HMENU;
+pub extern "user32" fn CreatePopupMenu() callconv(.c) HMENU;
+pub extern "user32" fn AppendMenuW(hMenu: HMENU, uFlags: UINT, uIDNewItem: usize, lpNewItem: ?LPCWSTR) callconv(.c) BOOL;
+pub extern "user32" fn SetMenu(hWnd: HWND, hMenu: HMENU) callconv(.c) BOOL;
+pub extern "user32" fn DestroyMenu(hMenu: HMENU) callconv(.c) BOOL;
+pub extern "user32" fn RegisterHotKey(hWnd: HWND, id: i32, fsModifiers: UINT, vk: UINT) callconv(.c) BOOL;
+pub extern "user32" fn UnregisterHotKey(hWnd: HWND, id: i32) callconv(.c) BOOL;
+pub extern "comdlg32" fn GetOpenFileNameW(lpofn: *OPENFILENAMEW) callconv(.c) BOOL;
+pub extern "comdlg32" fn GetSaveFileNameW(lpofn: *OPENFILENAMEW) callconv(.c) BOOL;
+
+/// 打开/保存文件对话框共用的构造（可单测）。
+pub const OfnBuffers = struct {
+    filter: [:0]u16,
+    file: []u16,
+    title: [:0]u16,
+    def_ext: ?[:0]u16,
+    ofn: OPENFILENAMEW,
+};
+
+pub fn makeOfn(
+    hwnd: HWND,
+    title_u8: []const u8,
+    filter_utf16: [:0]u16,
+    default_name_u8: []const u8,
+    save_mode: bool,
+) OfnBuffers {
+    const title = utf16zFrom(title_u8);
+    const file = utf16zFrom(default_name_u8);
+    // 文件缓冲需要额外空间供用户输入长路径
+    var file_buf = std.heap.page_allocator.alloc(u16, @max(file.len + 1, 4096)) catch unreachable;
+    @memset(file_buf, 0);
+    @memcpy(file_buf[0..file.len], file);
+    std.heap.page_allocator.free(file);
+
+    var flags: DWORD = OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    if (save_mode) {
+        flags |= OFN_OVERWRITEPROMPT;
+    } else {
+        flags |= OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+    }
+
+    return .{
+        .filter = filter_utf16,
+        .file = file_buf,
+        .title = title,
+        .def_ext = null,
+        .ofn = .{
+            .lStructSize = @sizeOf(OPENFILENAMEW),
+            .hwndOwner = hwnd,
+            .hInstance = null,
+            .lpstrFilter = filter_utf16.ptr,
+            .lpstrCustomFilter = null,
+            .nMaxCustFilter = 0,
+            .nFilterIndex = 1,
+            .lpstrFile = @ptrCast(file_buf.ptr),
+            .nMaxFile = @intCast(file_buf.len),
+            .lpstrFileTitle = null,
+            .nMaxFileTitle = 0,
+            .lpstrInitialDir = null,
+            .lpstrTitle = title.ptr,
+            .Flags = flags,
+            .nFileOffset = 0,
+            .nFileExtension = 0,
+            .lpstrDefExt = null,
+            .lCustData = 0,
+            .lpfnHook = null,
+            .lpTemplateName = null,
+            .pvReserved = null,
+            .dwReserved = 0,
+            .FlagsEx = 0,
+        },
+    };
+}
+
+/// UTF-8 → UTF-16Z（页分配器；对话框低频调用可接受）。
+pub fn utf16zFrom(s: []const u8) [:0]u16 {
+    return std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, s) catch unreachable;
+}
 pub extern "kernel32" fn GetModuleFileNameW(hModule: HMODULE, lpFilename: [*]u16, nSize: DWORD) callconv(.c) DWORD;
 pub extern "kernel32" fn CreateProcessW(
     lpApplicationName: ?LPCWSTR,

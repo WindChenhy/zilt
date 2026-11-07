@@ -15,6 +15,45 @@ const std = @import("std");
 const updater = @import("updater.zig");
 
 // ---------------------------------------------------------------------------
+// 原生对话框（平台后端实现；Context 暴露类型安全接口）
+// ---------------------------------------------------------------------------
+
+pub const MsgKind = enum { info, warning, err };
+pub const MsgButtons = enum { ok, ok_cancel, yes_no };
+pub const Button = enum { ok, cancel, yes, no };
+
+pub const MessageBoxOptions = struct {
+    text: []const u8,
+    caption: []const u8 = "提示",
+    kind: MsgKind = .info,
+    buttons: MsgButtons = .ok,
+};
+
+pub const Filter = struct {
+    /// 显示名（如 "文本文件"）
+    name: []const u8,
+    /// 模式（如 "*.txt"）
+    pattern: []const u8,
+};
+
+pub const FileDialogOptions = struct {
+    title: []const u8 = "",
+    filters: []const Filter = &.{},
+    default_name: []const u8 = "",
+};
+
+pub const DialogRequest = union(enum) {
+    message_box: MessageBoxOptions,
+    open_file: FileDialogOptions,
+    save_file: FileDialogOptions,
+};
+
+pub const DialogResponse = union(enum) {
+    button: Button,
+    path: ?[]u8,
+};
+
+// ---------------------------------------------------------------------------
 // Context
 // ---------------------------------------------------------------------------
 
@@ -34,6 +73,8 @@ pub const Context = struct {
     quit_fn: *const fn (backend: *anyopaque, code: u8) void,
     /// 系统通知（需要托盘已启用；由平台后端 marshal 到 UI 线程）。null = 未启用。
     notify_fn: ?*const fn (backend: *anyopaque, title: []const u8, body: []const u8) void = null,
+    /// 原生对话框（UI 线程调用；模态会阻塞至用户关闭）。null = 不可用。
+    dialog_fn: ?*const fn (backend: *anyopaque, alloc: std.mem.Allocator, req: DialogRequest) anyerror!DialogResponse = null,
     /// 自动更新器环境（config.update 存在时由后端组装）。null = 未配置。
     updater_env: ?updater.Env = null,
 
@@ -44,6 +85,33 @@ pub const Context = struct {
         } else {
             std.log.warn("[zilt] notify ignored (tray not enabled in config)", .{});
         }
+    }
+
+    /// 消息框（模态）。返回用户点击的按钮。
+    pub fn messageBox(self: Context, opts: MessageBoxOptions) anyerror!Button {
+        const r = try (self.dialog_fn orelse return error.DialogNotAvailable)(self.backend, self.allocator, .{ .message_box = opts });
+        return switch (r) {
+            .button => |b| b,
+            else => error.DialogNotAvailable,
+        };
+    }
+
+    /// 打开文件对话框。取消返回 null（路径用传入的 allocator 分配）。
+    pub fn openFile(self: Context, alloc: std.mem.Allocator, opts: FileDialogOptions) anyerror!?[]u8 {
+        const r = try (self.dialog_fn orelse return error.DialogNotAvailable)(self.backend, alloc, .{ .open_file = opts });
+        return switch (r) {
+            .path => |p| p,
+            else => error.DialogNotAvailable,
+        };
+    }
+
+    /// 保存文件对话框（覆盖提示）。取消返回 null。
+    pub fn saveFile(self: Context, alloc: std.mem.Allocator, opts: FileDialogOptions) anyerror!?[]u8 {
+        const r = try (self.dialog_fn orelse return error.DialogNotAvailable)(self.backend, alloc, .{ .save_file = opts });
+        return switch (r) {
+            .path => |p| p,
+            else => error.DialogNotAvailable,
+        };
     }
 
     /// 向前端发事件（payload 序列化为 JSON）。

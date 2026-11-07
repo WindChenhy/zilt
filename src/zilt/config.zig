@@ -36,6 +36,10 @@ pub const Config = struct {
     single_instance: bool = false,
     /// 自动更新器（ed25519 验签）
     update: ?Update = null,
+    /// 原生菜单栏（叶子项触发 "menu" IPC 事件）
+    menu: ?[]const MenuItem = null,
+    /// 全局快捷键（触发 "hotkey" IPC 事件）
+    hotkeys: ?[]const Hotkey = null,
 
     pub const Dev = struct {
         /// dev 模式：从磁盘目录服务资产（支持热重载事件）
@@ -47,6 +51,23 @@ pub const Config = struct {
     pub const Tray = struct {
         /// 托盘悬停提示
         tooltip: [:0]const u8 = "Zilt App",
+    };
+
+    /// 菜单项：label "-" 为分隔符；items 非空为子菜单；叶子需 id（emit 事件用）。
+    pub const MenuItem = struct {
+        label: []const u8,
+        id: ?[]const u8 = null,
+        items: ?[]const MenuItem = null,
+    };
+
+    /// 全局快捷键（key: "A"-"Z"/"0"-"9"/"F1"-"F12"，编译期校验）。
+    pub const Hotkey = struct {
+        id: []const u8,
+        key: []const u8,
+        ctrl: bool = false,
+        alt: bool = false,
+        shift: bool = false,
+        win: bool = false,
     };
 
     pub const Update = struct {

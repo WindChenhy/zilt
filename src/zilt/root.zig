@@ -30,5 +30,10 @@ test {
     _ = @import("bindings.zig");
     _ = @import("bundler.zig");
     _ = @import("updater.zig");
-    if (builtin.os.tag == .windows) _ = @import("platform/windows/backend.zig");
+    if (builtin.os.tag == .windows) {
+        _ = @import("platform/windows/backend.zig");
+        _ = @import("platform/windows/menu.zig");
+        _ = @import("platform/windows/hotkey.zig");
+        _ = @import("platform/windows/dialog.zig");
+    }
 }

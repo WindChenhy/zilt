@@ -10,6 +10,16 @@ pub fn frontendLog(_: Context, payload: struct { msg: []const u8 }) void {
     zilt.log.print("[frontend] {s}", .{payload.msg});
 }
 
+// ---- 菜单 / 全局快捷键（v0.1.2）----
+
+pub fn menu(_: Context, payload: struct { id: []const u8 }) void {
+    zilt.log.print("[frontend] menu clicked: {s}", .{payload.id});
+}
+
+pub fn hotkey(_: Context, payload: struct { id: []const u8 }) void {
+    zilt.log.print("[frontend] hotkey fired: {s}", .{payload.id});
+}
+
 // ---- 更新器事件（命令/自动流回传） ----
 
 pub fn updateInfo(_: Context, payload: struct { version: []const u8, notes: []const u8 = "" }) void {

@@ -78,6 +78,46 @@ pub fn notifyMe(ctx: Context, args: struct { title: []const u8, body: []const u8
     ctx.notify(args.title, args.body);
 }
 
+// ---- 对话框 / 菜单 / 快捷键 demo（v0.1.2）----
+
+/// 原生消息框（模态）。返回用户点击的按钮名。
+pub fn alertBox(ctx: Context, args: struct { text: []const u8, title: []const u8 = "提示", yes_no: bool = false }) !struct { clicked: []const u8 } {
+    const b = try ctx.messageBox(.{
+        .text = args.text,
+        .caption = args.title,
+        .buttons = if (args.yes_no) .yes_no else .ok_cancel,
+    });
+    return .{ .clicked = @tagName(b) };
+}
+
+/// 打开文件对话框。
+pub fn pickFile(ctx: Context, args: struct {}) !struct { path: ?[]const u8 } {
+    _ = args;
+    const p = try ctx.openFile(ctx.allocator, .{
+        .title = "选择文件",
+        .filters = &.{
+            .{ .name = "所有文件", .pattern = "*.*" },
+            .{ .name = "文本文件", .pattern = "*.txt" },
+        },
+    });
+    return .{ .path = p };
+}
+
+/// 保存文件对话框。
+pub fn saveFileDialog(ctx: Context, args: struct { default: []const u8 = "out.txt" }) !struct { path: ?[]const u8 } {
+    const p = try ctx.saveFile(ctx.allocator, .{
+        .title = "保存文件",
+        .default_name = args.default,
+    });
+    return .{ .path = p };
+}
+
+/// 退出应用（菜单"退出"项的落点）。
+pub fn exitApp(ctx: Context, args: struct {}) !void {
+    _ = args;
+    ctx.quit(0);
+}
+
 /// 检查更新（后台线程 → updateInfo / updaterFailed 事件）。
 pub fn checkUpdate(ctx: Context, args: struct {}) !void {
     _ = args;
