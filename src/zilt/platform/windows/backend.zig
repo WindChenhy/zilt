@@ -22,6 +22,18 @@ const toast_mod = @import("toast.zig");
 const patch = @import("../../patch.zig");
 const single_instance = @import("single_instance.zig");
 const menu_mod = @import("menu.zig");
+const menu_runtime = @import("menu_runtime.zig");
+const win_taskbar = @import("taskbar.zig");
+const win_sysinfo = @import("sysinfo.zig");
+const sys_integration = @import("system_integration.zig");
+const shared_system = @import("../../system_api.zig");
+const shared_menu_model = @import("../../menu_model.zig");
+const accel_mod = @import("../../accel.zig");
+const shell_mod = @import("../../shell.zig");
+const autostart_mod = @import("../../autostart.zig");
+const theme_mod = @import("../../theme.zig");
+const shared_taskbar = @import("../../taskbar.zig");
+const shared_sysinfo = @import("../../sysinfo.zig");
 const hotkey_mod = @import("hotkey.zig");
 const dialog_mod = @import("dialog.zig");
 const dlgx = @import("dialog_ext.zig");
@@ -53,6 +65,9 @@ const WM_ZILT_TRAY: win32.UINT = win32.WM_APP + 3;
 const WM_ZILT_WINCTL: win32.UINT = win32.WM_APP + 4;
 const WM_ZILT_NEWWIN: win32.UINT = win32.WM_APP + 5;
 const WM_ZILT_CLIP: win32.UINT = win32.WM_APP + 6;
+/// 托盘回调里用到、但本项目 win32.zig 尚未声明的鼠标消息（v0.1.13）
+const WM_LBUTTONDBLCLK: win32.UINT = 0x0203;
+const WM_MBUTTONUP: win32.UINT = 0x0207;
 const WM_ZILT_ACTION: win32.UINT = win32.WM_APP + 7; // 统一能力动作 marshal（UI 线程）
 const WM_ZILT_WAKE: win32.UINT = win32.WM_APP + 8; // WebView driver 延迟派发
 const WM_ZILT_TOAST_EVENT: win32.UINT = win32.WM_APP + 9; // WinRT 线程 → UI 线程
@@ -639,6 +654,16 @@ fn openExternal(alloc: std.mem.Allocator, url: []const u8) void {
     if (rc <= 32) log.print("[webview] ShellExecuteW failed ({d}) for {s}", .{ rc, url });
 }
 
+/// 运行时注册的全局快捷键（v0.1.13）。sys_id 是 RegisterHotKey 的 id，
+/// 从 0x8000 起分配，避免与编译期 config.hotkeys（0..n）冲突。
+pub const RuntimeHotkey = struct {
+    id: []const u8,
+    accel_text: []const u8,
+    vk: u8,
+    mods: u32,
+    sys_id: u32,
+};
+
 fn Backend(comptime config: Config) type {
     return struct {
         const Self = @This();
@@ -772,6 +797,17 @@ fn Backend(comptime config: Config) type {
         icon_small: win32.HICON = null,
         tray_icon: win32.HICON = null,
         tray: ?tray_mod.Tray = null,
+        /// v0.1.13：托盘右键菜单的运行时模型（支持增删/勾选/禁用）
+        menu_state: ?shared_menu_model.Model = null,
+        tray_popup: ?menu_runtime.Built = null,
+        tray_click_left: shared_system.ClickAction = .toggle_window,
+        tray_click_middle: shared_system.ClickAction = .none,
+        tray_click_double: shared_system.ClickAction = .toggle_window,
+        /// v0.1.13：任务栏 ITaskbarList3（惰性创建）
+        taskbar_list: ?win_taskbar.Taskbar = null,
+        /// v0.1.13：运行时注册的全局快捷键（与编译期 config.hotkeys 的 id 空间分离）
+        runtime_hotkeys: std.ArrayListUnmanaged(RuntimeHotkey) = .empty,
+        next_runtime_hotkey_id: u32 = 0x8000,
         watcher: ?*Watcher = null,
         updater_env: ?updater.Env = null,
         updater_url_override: ?[]u8 = null,
@@ -831,11 +867,21 @@ fn Backend(comptime config: Config) type {
             if (win32.RegisterClassExW(&wc) == 0) return error.RegisterClassFailed;
 
             if (Self.tray_menu_cfg) |items| {
-                if (menu_mod.buildPopup(self.allocator, items, TRAY_MENU_BASE)) |m| {
+                // v0.1.13：托盘菜单改由运行时模型驱动，支持勾选/禁用/增删后重建
+                self.menu_state = shared_menu_model.Model.fromConfig(self.allocator, items) catch |err| blk: {
+                    log.print("[tray] menu model init failed: {s}（回退静态菜单）", .{@errorName(err)});
+                    break :blk null;
+                };
+                if (self.menu_state) |*model| {
+                    if (menu_runtime.buildPopup(self.allocator, model, TRAY_MENU_BASE)) |built| {
+                        self.tray_popup = built;
+                        log.print("[tray] popup menu built (runtime model, {d} leaves)", .{built.ids.items.len});
+                    } else |err| {
+                        log.print("[tray] popup menu build failed: {s}", .{@errorName(err)});
+                    }
+                } else if (menu_mod.buildPopup(self.allocator, items, TRAY_MENU_BASE) catch null) |m| {
                     self.tray_menu = m;
-                    log.print("[tray] popup menu built", .{});
-                } else |err| {
-                    log.print("[tray] popup menu build failed: {s}", .{@errorName(err)});
+                    log.print("[tray] popup menu built (static fallback)", .{});
                 }
             }
         }
@@ -1330,6 +1376,8 @@ fn Backend(comptime config: Config) type {
                 .notification_status_fn = notificationStatus,
                 .webview_request_fn = webviewRequestAction,
                 .eval_async_fn = evalAsyncAction,
+                // ---- v0.1.13 / v0.1.14 ----
+                .system_fn = systemAction,
             };
         }
 
@@ -1521,6 +1569,8 @@ fn Backend(comptime config: Config) type {
             notification_status: struct { status: shared_notification.Status = .enabled },
             webview_request: struct { alloc: std.mem.Allocator, request: shared_webview.Request, out: ?[]u8 = null },
             eval_async: struct { script: []const u8, completion: shared_webview.Completion },
+            /// v0.1.13 / v0.1.14：系统能力统一通道
+            system: struct { alloc: std.mem.Allocator, req: shared_system.Request, out: ?shared_system.Result = null },
         };
         const ActionReq = struct {
             action: Action,
@@ -1600,8 +1650,301 @@ fn Backend(comptime config: Config) type {
             if (req.err) |e| return e;
         }
 
+        fn systemAction(backend_ptr: *anyopaque, window_id: u32, alloc: std.mem.Allocator, request: shared_system.Request) anyerror!shared_system.Result {
+            var req = ActionReq{ .action = .{ .system = .{ .alloc = alloc, .req = request } } };
+            marshalAction(backend_ptr, window_id, &req);
+            if (req.err) |e| return e;
+            return switch (req.action) {
+                .system => |a| a.out orelse .none,
+                else => unreachable,
+            };
+        }
+
+        // ------------------------------------------------------------------
+        // v0.1.13 / v0.1.14：系统能力执行（UI 线程）
+        // ------------------------------------------------------------------
+
+        fn runSystem(self: *Self, w: *Window, request: shared_system.Request, alloc: std.mem.Allocator) !shared_system.Result {
+            switch (request) {
+                .menu => |op| return self.runMenuOp(w, op, alloc),
+                .tray => |op| {
+                    self.runTrayOp(op);
+                    return .{ .ok = true };
+                },
+                .hotkey => |op| return self.runHotkeyOp(w, op, alloc),
+                .taskbar => |op| {
+                    const supported = try self.runTaskbarOp(w, op, alloc);
+                    return .{ .ok = supported };
+                },
+                .info => |kind| return .{ .json = try self.collectSystemInfo(kind, alloc) },
+                .shell => |target| {
+                    try sys_integration.open(alloc, target);
+                    return .{ .ok = true };
+                },
+                .admin_restart => |args| {
+                    const exe = try currentExePath(alloc);
+                    defer alloc.free(exe);
+                    try sys_integration.restartAsAdmin(alloc, exe, args);
+                    log.print("[shell] admin restart requested: {s}", .{exe});
+                    return .{ .ok = true };
+                },
+                .autostart => |op| return .{ .state = try self.runAutostartOp(op, alloc) },
+                .appearance => |ap| {
+                    const r = sys_integration.applyAppearance(w.hwnd, ap);
+                    log.print("[appearance] dark_titlebar={} backdrop={}", .{ r.dark, r.backdrop });
+                    return .{ .ok = r.dark or r.backdrop };
+                },
+            }
+        }
+
+        fn rebuildTrayPopup(self: *Self) void {
+            const model = if (self.menu_state) |*m| m else return;
+            if (self.tray_popup) |*old| old.deinit(self.allocator);
+            self.tray_popup = menu_runtime.buildPopup(self.allocator, model, TRAY_MENU_BASE) catch |err| blk: {
+                log.print("[tray] popup rebuild failed: {s}", .{@errorName(err)});
+                break :blk null;
+            };
+        }
+
+        fn runMenuOp(self: *Self, w: *Window, op: shared_system.MenuOp, alloc: std.mem.Allocator) !shared_system.Result {
+            switch (op) {
+                .list => {
+                    if (self.menu_state) |*m| return .{ .json = try m.toJson(alloc) };
+                    return .{ .json = try alloc.dupe(u8, "[]") };
+                },
+                .add => |spec| {
+                    const model = if (self.menu_state) |*m| m else return error.MenuNotConfigured;
+                    _ = try model.add(spec.parent, spec.index, .{
+                        .id = spec.id,
+                        .label = spec.label,
+                        .accel = spec.accel,
+                        .checked = spec.checked,
+                        .enabled = spec.enabled,
+                    });
+                    self.rebuildTrayPopup();
+                    log.print("[menu] added '{s}' under {s}", .{ spec.label, spec.parent orelse "<root>" });
+                    return .{ .ok = true };
+                },
+                .remove => |path| {
+                    const model = if (self.menu_state) |*m| m else return error.MenuNotConfigured;
+                    const removed = model.remove(path);
+                    if (removed) self.rebuildTrayPopup();
+                    log.print("[menu] remove '{s}' (ok={})", .{ path, removed });
+                    return .{ .ok = removed };
+                },
+                .set => |spec| {
+                    const model = if (self.menu_state) |*m| m else return error.MenuNotConfigured;
+                    var changed = false;
+                    if (spec.label) |label| changed = model.setLabel(spec.path, label) or changed;
+                    if (spec.checked) |checked| changed = model.setChecked(spec.path, checked) or changed;
+                    if (spec.enabled) |enabled| changed = model.setEnabled(spec.path, enabled) or changed;
+                    if (spec.accel) |a| changed = model.setAccel(spec.path, a) or changed;
+                    if (changed) self.rebuildTrayPopup();
+                    log.print("[menu] set '{s}' (changed={})", .{ spec.path, changed });
+                    return .{ .ok = changed };
+                },
+                .popup => |pt| {
+                    const built = if (self.tray_popup) |*b| b else return error.MenuNotConfigured;
+                    _ = win32.SetForegroundWindow(w.hwnd);
+                    const cmd = win32.TrackPopupMenu(built.hmenu, win32.TPM_RIGHTBUTTON | win32.TPM_RETURNCMD, pt.x, pt.y, 0, w.hwnd, null);
+                    _ = win32.PostMessageW(w.hwnd, win32.WM_NULL, 0, 0);
+                    if (cmd == 0) return .{ .ok = false };
+                    const menu_id: u16 = @intCast(cmd & 0xffff);
+                    if (built.idFor(menu_id)) |id| {
+                        log.print("[menu] popup pick {s}", .{id});
+                        w.emitEventPayload("menu", .{ .id = id });
+                    }
+                    return .{ .ok = true };
+                },
+            }
+        }
+
+        fn runTrayOp(self: *Self, op: shared_system.TrayOp) void {
+            switch (op) {
+                .set_tooltip => |text| {
+                    if (self.tray) |*t| {
+                        const ok = t.setTooltip(text);
+                        log.print("[tray] tooltip updated (ok={})", .{ok});
+                    }
+                },
+                .set_icon => |path| {
+                    if (self.tray) |*t| {
+                        const px: u32 = @intCast(win32.GetSystemMetrics(win32.SM_CXSMICON));
+                        const icon = if (path) |p| self.makeIcon(p, px, px) else self.tray_icon;
+                        const ok = t.setIcon(icon);
+                        log.print("[tray] icon updated (ok={})", .{ok});
+                    }
+                },
+                .set_click => |cfg| {
+                    self.tray_click_left = cfg.left;
+                    self.tray_click_middle = cfg.middle;
+                    self.tray_click_double = cfg.double;
+                    log.print("[tray] click behavior updated", .{});
+                },
+            }
+        }
+
+        fn runHotkeyOp(self: *Self, w: *Window, op: shared_system.HotkeyOp, alloc: std.mem.Allocator) !shared_system.Result {
+            switch (op) {
+                .list => {
+                    var entries: std.ArrayListUnmanaged(shared_system.HotkeyEntry) = .empty;
+                    defer entries.deinit(alloc);
+                    for (self.runtime_hotkeys.items) |hk| {
+                        try entries.append(alloc, .{ .id = hk.id, .accel = hk.accel_text });
+                    }
+                    return .{ .json = try shared_system.hotkeysToJson(alloc, entries.items) };
+                },
+                .register => |spec| {
+                    const parsed = accel_mod.parse(spec.accel) catch return error.InvalidAccel;
+                    const flags = parsed.mods.flags();
+                    for (self.runtime_hotkeys.items) |hk| {
+                        if (hk.vk == parsed.vk and hk.mods == flags) return error.HotkeyConflict;
+                    }
+                    const id = try self.allocator.dupe(u8, spec.id);
+                    errdefer self.allocator.free(id);
+                    const text = try self.allocator.dupe(u8, spec.accel);
+                    errdefer self.allocator.free(text);
+
+                    const sys_id = self.next_runtime_hotkey_id;
+                    if (win32.RegisterHotKey(w.hwnd, @intCast(sys_id), flags, parsed.vk) == 0) {
+                        log.print("[hotkey] register failed {s}（可能被其他程序占用）", .{spec.accel});
+                        return error.HotkeyRegisterFailed;
+                    }
+                    self.next_runtime_hotkey_id += 1;
+                    try self.runtime_hotkeys.append(self.allocator, .{
+                        .id = id,
+                        .accel_text = text,
+                        .vk = parsed.vk,
+                        .mods = flags,
+                        .sys_id = sys_id,
+                    });
+                    log.print("[hotkey] runtime registered {s} = {s}", .{ id, text });
+                    return .{ .ok = true };
+                },
+                .unregister => |id| {
+                    for (self.runtime_hotkeys.items, 0..) |hk, i| {
+                        if (!std.mem.eql(u8, hk.id, id)) continue;
+                        _ = win32.UnregisterHotKey(w.hwnd, @intCast(hk.sys_id));
+                        self.allocator.free(hk.id);
+                        self.allocator.free(hk.accel_text);
+                        _ = self.runtime_hotkeys.orderedRemove(i);
+                        log.print("[hotkey] runtime unregistered {s}", .{id});
+                        return .{ .ok = true };
+                    }
+                    return .{ .ok = false };
+                },
+            }
+        }
+
+        /// 返回 ITaskbarList3 是否可用（本机可能只暴露 ITaskbarList/2；
+        /// 那时进度/overlay 不可用，但调用仍应正常返回 false 而不是报错）。
+        fn runTaskbarOp(self: *Self, w: *Window, op: shared_taskbar.Request, alloc: std.mem.Allocator) !bool {
+            if (self.taskbar_list == null) {
+                self.taskbar_list = win_taskbar.Taskbar.init() catch |err| {
+                    log.print("[taskbar] ITaskbarList3 unavailable: {s}（本机 COM 未暴露该接口）", .{@errorName(err)});
+                    return false;
+                };
+            }
+            const tb = &self.taskbar_list.?;
+            switch (op) {
+                .progress => |p| {
+                    tb.setProgress(w.hwnd, p);
+                    log.print("[taskbar] progress {s} value={?d}", .{ @tagName(p.state), p.value });
+                },
+                .overlay => |maybe| {
+                    if (maybe) |ov| {
+                        const px: u32 = @intCast(win32.GetSystemMetrics(win32.SM_CXSMICON));
+                        const icon = if (ov.icon) |path| self.makeIcon(path, px, px) else self.icon_small;
+                        tb.setOverlay(w.hwnd, icon, ov.description, alloc);
+                    } else {
+                        tb.setOverlay(w.hwnd, null, "", alloc);
+                    }
+                    log.print("[taskbar] overlay updated", .{});
+                },
+                .tooltip => |text| {
+                    tb.setTooltip(w.hwnd, text, alloc);
+                },
+                .flash => |f| {
+                    const ok = win_taskbar.Taskbar.flash(w.hwnd, f);
+                    log.print("[taskbar] flash (ok={})", .{ok});
+                },
+                .thumb_buttons => |buttons| {
+                    var icons = std.mem.zeroes([7]win32.HICON);
+                    const n = @min(buttons.len, 7);
+                    for (0..n) |i| icons[i] = self.icon_small;
+                    const ok = tb.setThumbButtons(w.hwnd, buttons, icons[0..n]);
+                    log.print("[taskbar] thumbnail buttons (n={d}, ok={})", .{ n, ok });
+                },
+            }
+            return true;
+        }
+
+        fn collectSystemInfo(self: *Self, kind: shared_system.InfoKind, alloc: std.mem.Allocator) ![]u8 {
+            _ = self;
+            switch (kind) {
+                .os => {
+                    var owned = win_sysinfo.collectOs();
+                    return shared_sysinfo.osToJson(alloc, owned.toInfo());
+                },
+                .monitors => {
+                    const monitors = try win_sysinfo.collectMonitors(alloc);
+                    defer alloc.free(monitors);
+                    return shared_sysinfo.monitorsToJson(alloc, monitors);
+                },
+                .all => {
+                    var owned = win_sysinfo.collectOs();
+                    const os_json = try shared_sysinfo.osToJson(alloc, owned.toInfo());
+                    defer alloc.free(os_json);
+                    const monitors = try win_sysinfo.collectMonitors(alloc);
+                    defer alloc.free(monitors);
+                    const mons_json = try shared_sysinfo.monitorsToJson(alloc, monitors);
+                    defer alloc.free(mons_json);
+                    return std.fmt.allocPrint(alloc, "{{\"os\":{s},\"monitors\":{s}}}", .{ os_json, mons_json });
+                },
+            }
+        }
+
+        fn runAutostartOp(self: *Self, op: shared_system.AutostartOp, alloc: std.mem.Allocator) !autostart_mod.State {
+            _ = self;
+            const exe = try currentExePath(alloc);
+            defer alloc.free(exe);
+            switch (op) {
+                .query => return sys_integration.autostartState(alloc, config.app_id, exe),
+                .enable => |args| {
+                    const cmd = try sys_integration.autostartEnable(alloc, config.app_id, exe, args);
+                    defer alloc.free(cmd);
+                    log.print("[autostart] enabled: {s}", .{cmd});
+                    return sys_integration.autostartState(alloc, config.app_id, exe);
+                },
+                .disable => {
+                    const ok = sys_integration.autostartDisable(alloc, config.app_id);
+                    log.print("[autostart] disabled (ok={})", .{ok});
+                    return .{ .enabled = false, .command = null };
+                },
+                .toggle => {
+                    const state = try sys_integration.autostartState(alloc, config.app_id, exe);
+                    if (state.command) |c| alloc.free(c);
+                    if (state.enabled) {
+                        _ = sys_integration.autostartDisable(alloc, config.app_id);
+                        log.print("[autostart] toggled off", .{});
+                        return .{ .enabled = false, .command = null };
+                    }
+                    const cmd = try sys_integration.autostartEnable(alloc, config.app_id, exe, null);
+                    defer alloc.free(cmd);
+                    log.print("[autostart] toggled on: {s}", .{cmd});
+                    return sys_integration.autostartState(alloc, config.app_id, exe);
+                },
+            }
+        }
+
         fn runAction(self: *Self, w: *Window, req: *ActionReq) void {
             switch (req.action) {
+                .system => |*a| {
+                    a.out = self.runSystem(w, a.req, a.alloc) catch |e| {
+                        req.err = e;
+                        return;
+                    };
+                },
                 .clipboard_read => |*a| {
                     a.out = win_clipboard.read(a.alloc, w.hwnd, a.format) catch |e| {
                         req.err = e;
@@ -2067,8 +2410,9 @@ fn Backend(comptime config: Config) type {
         }
 
         fn showTrayMenu(self: *Self, hwnd: win32.HWND) void {
-            const hm = self.tray_menu orelse return;
-            const items = Self.tray_menu_cfg orelse return;
+            // v0.1.13：优先用运行时模型构建的弹菜单（勾选/禁用态实时反映）
+            const popup_hm = if (self.tray_popup) |*b| b.hmenu else self.tray_menu;
+            const hm = popup_hm orelse return;
             var pt: win32.POINT = undefined;
             if (win32.GetCursorPos(&pt) == 0) return;
             _ = win32.SetForegroundWindow(hwnd);
@@ -2076,9 +2420,36 @@ fn Backend(comptime config: Config) type {
             _ = win32.PostMessageW(hwnd, win32.WM_NULL, 0, 0);
             if (cmd == 0) return;
             const menu_id: u16 = @intCast(cmd & 0xffff);
+
+            if (self.tray_popup) |*built| {
+                if (built.idFor(menu_id)) |id| {
+                    log.print("[tray] menu {s}", .{id});
+                    if (self.mainWindow()) |w| w.emitEventPayload("trayMenu", .{ .id = id });
+                    return;
+                }
+            }
+            const items = Self.tray_menu_cfg orelse return;
             if (menu_mod.idFromPopup(items, TRAY_MENU_BASE, menu_id)) |id| {
                 log.print("[tray] menu {s}", .{id});
                 if (self.mainWindow()) |w| w.emitEventPayload("trayMenu", .{ .id = id });
+            }
+        }
+
+        fn applyTrayClick(self: *Self, hwnd: win32.HWND, action: shared_system.ClickAction) void {
+            switch (action) {
+                .none => {},
+                .toggle_window => {
+                    const w = self.mainWindow() orelse return;
+                    const visible = win32.IsWindowVisible(w.hwnd) != 0;
+                    _ = win32.ShowWindow(w.hwnd, if (visible) win32.SW_HIDE else win32.SW_SHOW);
+                    if (!visible) _ = win32.SetForegroundWindow(w.hwnd);
+                    log.print("[tray] click -> {s}", .{if (visible) "hidden" else "shown"});
+                },
+                .show_menu => self.showTrayMenu(hwnd),
+                .emit_event => {
+                    log.print("[tray] click -> trayClick event", .{});
+                    if (self.mainWindow()) |w| w.emitEventPayload("trayClick", .{});
+                },
             }
         }
 
@@ -2416,6 +2787,20 @@ fn Backend(comptime config: Config) type {
                 if (self.mainWindow()) |w| hotkey_mod.unregisterAll(w.hwnd, hks);
             }
             if (self.tray) |*t| _ = t.remove();
+            // v0.1.13：运行时快捷键 / 任务栏 / 菜单模型清理
+            if (self.runtime_hotkeys.items.len != 0) {
+                if (self.mainWindow()) |w| {
+                    for (self.runtime_hotkeys.items) |hk| _ = win32.UnregisterHotKey(w.hwnd, @intCast(hk.sys_id));
+                }
+                for (self.runtime_hotkeys.items) |hk| {
+                    self.allocator.free(hk.id);
+                    self.allocator.free(hk.accel_text);
+                }
+                self.runtime_hotkeys.deinit(self.allocator);
+            }
+            if (self.taskbar_list) |*tb| tb.deinit();
+            if (self.tray_popup) |*b| b.deinit(self.allocator);
+            if (self.menu_state) |*m| m.deinit();
             if (self.toast) |*t| t.deinit();
             self.proxyClientReset();
             if (self.proxy_threaded) |t| {
@@ -2636,6 +3021,15 @@ fn Backend(comptime config: Config) type {
                 },
                 win32.WM_HOTKEY => {
                     if (instance) |b| {
+                        const hk_id: u32 = @intCast(wparam & 0xffff);
+                        // v0.1.13：运行时注册的快捷键优先
+                        for (b.runtime_hotkeys.items) |hk| {
+                            if (hk.sys_id != hk_id) continue;
+                            log.print("[hotkey] {s} (runtime)", .{hk.id});
+                            const target = b.focusedWindow() orelse b.mainWindow();
+                            if (target) |w| w.emitEventPayload("hotkey", .{ .id = hk.id });
+                            return 0;
+                        }
                         if (Self.hotkey_cfg) |hks| {
                             if (hotkey_mod.idFromIndex(hks, @intCast(wparam))) |id| {
                                 log.print("[hotkey] {s}", .{id});
@@ -2679,15 +3073,18 @@ fn Backend(comptime config: Config) type {
                 },
                 WM_ZILT_TRAY => {
                     if (instance) |b| {
-                        if (lparam == win32.WM_LBUTTONUP) {
-                            const w = b.mainWindow() orelse return 0;
-                            const visible = win32.IsWindowVisible(w.hwnd) != 0;
-                            _ = win32.ShowWindow(w.hwnd, if (visible) win32.SW_HIDE else win32.SW_SHOW);
-                            if (!visible) _ = win32.SetForegroundWindow(w.hwnd);
-                            log.print("[tray] click -> {s}", .{if (visible) "hidden" else "shown"});
-                        } else if (lparam == win32.WM_RBUTTONUP) {
-                            b.showTrayMenu(hwnd);
-                        }
+                        // v0.1.13：左右键/中键/双击行为可配置
+                        const action: shared_system.ClickAction = if (lparam == win32.WM_LBUTTONUP)
+                            b.tray_click_left
+                        else if (lparam == WM_LBUTTONDBLCLK)
+                            b.tray_click_double
+                        else if (lparam == WM_MBUTTONUP)
+                            b.tray_click_middle
+                        else if (lparam == win32.WM_RBUTTONUP)
+                            .show_menu
+                        else
+                            .none;
+                        b.applyTrayClick(hwnd, action);
                     }
                     return 0;
                 },

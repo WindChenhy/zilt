@@ -1,0 +1,211 @@
+//! 任务栏集成 Windows 实现（v0.1.13）：ITaskbarList3。
+//!
+//! 覆盖：进度条、overlay 图标、缩略图提示、缩略图工具栏按钮、闪烁窗口。
+//! Jump List 需要 ICustomDestinationList + IShellLink 组合，见 docs/ROADMAP 的
+//! v0.1.13 备注（当前未实现，调用会返回 error.JumpListNotImplemented）。
+//!
+//! ABI 依据：ShellApi.h / ShObjIdl_core.h（ITaskbarList3 槽序：
+//! IUnknown 3 + ITaskbarList 5 + ITaskbarList2 1 + ITaskbarList3 12 = 21）。
+const std = @import("std");
+const com = @import("com.zig");
+const win32 = @import("win32.zig");
+const taskbar = @import("../../taskbar.zig");
+const log = @import("../../log.zig");
+
+pub const CLSID_TaskbarList: com.GUID = .parse("{56FDF344-FD6D-11D0-958A-006097C9A090}");
+pub const IID_ITaskbarList3: com.GUID = .parse("{EA1AFB91-9E28-4B86-90E9-9E9F8A5EEA84}");
+pub const CLSCTX_INPROC_SERVER: u32 = 0x1;
+
+extern "ole32" fn CoCreateInstance(
+    rclsid: *const com.GUID,
+    pUnkOuter: ?*anyopaque,
+    dwClsContext: u32,
+    riid: *const com.GUID,
+    ppvObject: *?*anyopaque,
+) callconv(.c) com.HRESULT;
+
+extern "user32" fn FlashWindowEx(pfwi: *FLASHWINFO) callconv(.c) win32.BOOL;
+
+pub const FLASHW_STOP: win32.DWORD = 0x00000000;
+pub const FLASHW_CAPTION: win32.DWORD = 0x00000001;
+pub const FLASHW_TRAY: win32.DWORD = 0x00000002;
+pub const FLASHW_ALL: win32.DWORD = 0x00000003;
+pub const FLASHW_TIMER: win32.DWORD = 0x00000004;
+pub const FLASHW_TIMERNOFG: win32.DWORD = 0x0000000C;
+
+pub const FLASHWINFO = extern struct {
+    cbSize: win32.UINT,
+    hwnd: win32.HWND,
+    dwFlags: win32.DWORD,
+    uCount: win32.UINT,
+    dwTimeout: win32.DWORD,
+};
+
+// ---- THUMBBUTTON ----
+
+pub const THB_ICON: u32 = 0x2;
+pub const THB_TOOLTIP: u32 = 0x4;
+pub const THB_FLAGS: u32 = 0x8;
+
+pub const THBF_ENABLED: u32 = 0x0;
+pub const THBF_DISABLED: u32 = 0x1;
+pub const THBF_DISMISSONCLICK: u32 = 0x2;
+pub const THBF_NOBACKGROUND: u32 = 0x4;
+
+pub const THUMBBUTTON = extern struct {
+    dwMask: u32,
+    iId: u32,
+    iBitmap: u32,
+    hIcon: win32.HICON,
+    szTip: [260]u16,
+    dwFlags: u32,
+};
+
+pub const ITaskbarList3 = extern struct {
+    lpVtbl: *const VTable,
+
+    pub const VTable = extern struct {
+        QueryInterface: *const fn (*ITaskbarList3, *const com.GUID, *?*anyopaque) callconv(.c) com.HRESULT,
+        AddRef: *const fn (*ITaskbarList3) callconv(.c) u32,
+        Release: *const fn (*ITaskbarList3) callconv(.c) u32,
+        // ITaskbarList
+        HrInit: *const fn (*ITaskbarList3) callconv(.c) com.HRESULT,
+        AddTab: *const fn (*ITaskbarList3, win32.HWND) callconv(.c) com.HRESULT,
+        DeleteTab: *const fn (*ITaskbarList3, win32.HWND) callconv(.c) com.HRESULT,
+        ActivateTab: *const fn (*ITaskbarList3, win32.HWND) callconv(.c) com.HRESULT,
+        SetActiveAlt: *const fn (*ITaskbarList3, win32.HWND) callconv(.c) com.HRESULT,
+        // ITaskbarList2
+        MarkFullscreenWindow: *const fn (*ITaskbarList3, win32.HWND, win32.BOOL) callconv(.c) com.HRESULT,
+        // ITaskbarList3
+        SetProgressValue: *const fn (*ITaskbarList3, win32.HWND, u64, u64) callconv(.c) com.HRESULT,
+        SetProgressState: *const fn (*ITaskbarList3, win32.HWND, u32) callconv(.c) com.HRESULT,
+        RegisterTab: *const fn (*ITaskbarList3, win32.HWND, win32.HWND) callconv(.c) com.HRESULT,
+        UnregisterTab: *const fn (*ITaskbarList3, win32.HWND) callconv(.c) com.HRESULT,
+        SetTabOrder: *const fn (*ITaskbarList3, win32.HWND, win32.HWND) callconv(.c) com.HRESULT,
+        SetTabActive: *const fn (*ITaskbarList3, win32.HWND, win32.HWND, win32.DWORD) callconv(.c) com.HRESULT,
+        ThumbBarAddButtons: *const fn (*ITaskbarList3, win32.HWND, u32, [*]THUMBBUTTON) callconv(.c) com.HRESULT,
+        ThumbBarUpdateButtons: *const fn (*ITaskbarList3, win32.HWND, u32, [*]THUMBBUTTON) callconv(.c) com.HRESULT,
+        ThumbBarSetImageList: *const fn (*ITaskbarList3, win32.HWND, ?*anyopaque) callconv(.c) com.HRESULT,
+        SetOverlayIcon: *const fn (*ITaskbarList3, win32.HWND, win32.HICON, ?win32.LPCWSTR) callconv(.c) com.HRESULT,
+        SetThumbnailTooltip: *const fn (*ITaskbarList3, win32.HWND, win32.LPCWSTR) callconv(.c) com.HRESULT,
+        SetThumbnailClip: *const fn (*ITaskbarList3, win32.HWND, ?*const RECT) callconv(.c) com.HRESULT,
+    };
+
+    pub fn release(self: *ITaskbarList3) void {
+        _ = self.lpVtbl.Release(self);
+    }
+};
+
+pub const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
+
+/// 任务栏对象。COM 要求在同一线程使用（backend 的 UI 线程）。
+pub const Taskbar = struct {
+    list: *ITaskbarList3,
+
+    pub fn init() !Taskbar {
+        var raw: ?*anyopaque = null;
+        const hr = CoCreateInstance(&CLSID_TaskbarList, null, CLSCTX_INPROC_SERVER, &IID_ITaskbarList3, &raw);
+        if (com.failed(hr) or raw == null) {
+            log.print("[taskbar] CoCreateInstance failed hr=0x{x} raw_null={}", .{ @as(u32, @bitCast(hr)), raw == null });
+            return error.TaskbarUnavailable;
+        }
+        const list: *ITaskbarList3 = @ptrCast(@alignCast(raw.?));
+        const hr_init = list.lpVtbl.HrInit(list);
+        if (com.failed(hr_init)) {
+            log.print("[taskbar] HrInit failed hr=0x{x}", .{@as(u32, @bitCast(hr_init))});
+            list.release();
+            return error.TaskbarInitFailed;
+        }
+        return .{ .list = list };
+    }
+
+    pub fn deinit(self: *Taskbar) void {
+        self.list.release();
+    }
+
+    pub fn setProgress(self: *Taskbar, hwnd: win32.HWND, progress: taskbar.Progress) void {
+        _ = self.list.lpVtbl.SetProgressState(self.list, hwnd, @intFromEnum(progress.state));
+        if (progress.state == .none or progress.state == .indeterminate) return;
+        const scaled = progress.scaled();
+        _ = self.list.lpVtbl.SetProgressValue(self.list, hwnd, scaled.done, scaled.total);
+    }
+
+    pub fn setOverlay(self: *Taskbar, hwnd: win32.HWND, icon: win32.HICON, description_u8: []const u8, alloc: std.mem.Allocator) void {
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, description_u8) catch {
+            _ = self.list.lpVtbl.SetOverlayIcon(self.list, hwnd, icon, null);
+            return;
+        };
+        defer alloc.free(wide);
+        _ = self.list.lpVtbl.SetOverlayIcon(self.list, hwnd, icon, wide.ptr);
+    }
+
+    pub fn setTooltip(self: *Taskbar, hwnd: win32.HWND, text_u8: []const u8, alloc: std.mem.Allocator) void {
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, text_u8) catch return;
+        defer alloc.free(wide);
+        _ = self.list.lpVtbl.SetThumbnailTooltip(self.list, hwnd, wide.ptr);
+    }
+
+    pub fn setThumbButtons(self: *Taskbar, hwnd: win32.HWND, buttons: []const taskbar.Button, icons: []const win32.HICON) bool {
+        if (buttons.len == 0 or buttons.len > 7) return false; // Win7 限制 7 个
+        var buf: [7]THUMBBUTTON = undefined;
+        for (buttons, 0..) |b, i| {
+            var btn = THUMBBUTTON{
+                .dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS,
+                .iId = b.id,
+                .iBitmap = 0,
+                .hIcon = if (i < icons.len) icons[i] else null,
+                .szTip = std.mem.zeroes([260]u16),
+                .dwFlags = if (!b.enabled) THBF_DISABLED else THBF_ENABLED,
+            };
+            if (b.dismiss_on_click) btn.dwFlags |= THBF_DISMISSONCLICK;
+            const n = @min(b.tooltip.len, 259);
+            _ = std.unicode.utf8ToUtf16Le(btn.szTip[0..n], b.tooltip[0..n]) catch 0;
+            btn.szTip[n] = 0;
+            buf[i] = btn;
+        }
+        const hr = self.list.lpVtbl.ThumbBarAddButtons(self.list, hwnd, @intCast(buttons.len), &buf);
+        return com.succeeded(hr);
+    }
+
+    pub fn flash(hwnd: win32.HWND, req: taskbar.Flash) bool {
+        var info = FLASHWINFO{
+            .cbSize = @sizeOf(FLASHWINFO),
+            .hwnd = hwnd,
+            .dwFlags = if (req.tray_only) FLASHW_TRAY else FLASHW_ALL,
+            .uCount = req.count,
+            .dwTimeout = req.timeout_ms,
+        };
+        if (req.count == 0) info.dwFlags |= FLASHW_TIMERNOFG;
+        return FlashWindowEx(&info) != 0;
+    }
+
+    pub fn stopFlash(hwnd: win32.HWND) void {
+        var info = FLASHWINFO{
+            .cbSize = @sizeOf(FLASHWINFO),
+            .hwnd = hwnd,
+            .dwFlags = FLASHW_STOP,
+            .uCount = 0,
+            .dwTimeout = 0,
+        };
+        _ = FlashWindowEx(&info);
+    }
+};
+
+const testing = std.testing;
+
+test "vtable layout stays at 21 slots" {
+    // 编译期断言：任何槽位增删都会让这里失败，避免 ABI 漂移。
+    try testing.expectEqual(21, @typeInfo(ITaskbarList3.VTable).@"struct".field_names.len);
+}
+
+test "flash info carries size and flags" {
+    try testing.expect(@sizeOf(FLASHWINFO) >= 24);
+    try testing.expectEqual(@as(u32, 0x2), FLASHW_TRAY);
+    try testing.expectEqual(@as(u32, 0x3), FLASHW_ALL);
+}
+
+test "thumbnail button layout matches ShellApi.h" {
+    // dwMask/iId/iBitmap + hIcon(8, 4 padding) + szTip[260] + dwFlags
+    try testing.expectEqual(@as(usize, 552), @sizeOf(THUMBBUTTON));
+    try testing.expectEqual(@as(usize, 520), @sizeOf([260]u16));
+}

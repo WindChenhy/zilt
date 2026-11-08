@@ -124,6 +124,8 @@ pub const Config = struct {
         label: []const u8,
         id: ?[]const u8 = null,
         items: ?[]const MenuItem = null,
+        /// 加速键展示（v0.1.13）：`"Ctrl+N"`，菜单项右侧以 `\t` 对齐显示
+        accel: ?[]const u8 = null,
     };
 
     /// 全局快捷键（key: "A"-"Z"/"0"-"9"/"F1"-"F12"，编译期校验）。

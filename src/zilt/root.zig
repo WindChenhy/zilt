@@ -22,6 +22,17 @@ pub const environment = @import("environment.zig");
 pub const clipboard = @import("clipboard.zig");
 pub const drag_drop = @import("drag_drop.zig");
 pub const notification = @import("notification.zig");
+pub const accel = @import("accel.zig");
+pub const menu_model = @import("menu_model.zig");
+pub const taskbar = @import("taskbar.zig");
+pub const sysinfo = @import("sysinfo.zig");
+pub const shell = @import("shell.zig");
+pub const autostart = @import("autostart.zig");
+pub const theme = @import("theme.zig");
+pub const system_api = @import("system_api.zig");
+pub const store = @import("store.zig");
+pub const fs_api = @import("fs_api.zig");
+pub const services = @import("services.zig");
 
 /// 平台模块（Windows 后端内部使用；用户一般无需直接接触）
 pub const platform_windows = @import("platform/windows/mod.zig");
@@ -43,6 +54,17 @@ test {
     _ = @import("clipboard.zig");
     _ = @import("drag_drop.zig");
     _ = @import("notification.zig");
+    _ = @import("accel.zig");
+    _ = @import("menu_model.zig");
+    _ = @import("taskbar.zig");
+    _ = @import("sysinfo.zig");
+    _ = @import("shell.zig");
+    _ = @import("autostart.zig");
+    _ = @import("theme.zig");
+    _ = @import("system_api.zig");
+    _ = @import("store.zig");
+    _ = @import("fs_api.zig");
+    _ = @import("services.zig");
     _ = @import("ipc.zig");
     _ = @import("bindings.zig");
     _ = @import("bundler.zig");
@@ -52,5 +74,8 @@ test {
         _ = @import("platform/windows/menu.zig");
         _ = @import("platform/windows/hotkey.zig");
         _ = @import("platform/windows/dialog.zig");
+        _ = @import("platform/windows/taskbar.zig");
+        _ = @import("platform/windows/sysinfo.zig");
+        _ = @import("platform/windows/system_integration.zig");
     }
 }

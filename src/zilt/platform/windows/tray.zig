@@ -46,6 +46,30 @@ pub const Tray = struct {
         return win32.Shell_NotifyIconW(win32.NIM_DELETE, &self.nid) != 0;
     }
 
+    /// 更新悬停提示（v0.1.13 运行时托盘能力）。
+    pub fn setTooltip(self: *Tray, tooltip_u8: []const u8) bool {
+        if (!self.active) return false;
+        var nid = self.nid;
+        nid.uFlags = win32.NIF_TIP;
+        @memset(&nid.szTip, 0);
+        copyTrunc(nid.szTip[0..127], tooltip_u8);
+        if (win32.Shell_NotifyIconW(win32.NIM_MODIFY, &nid) == 0) return false;
+        self.nid.szTip = nid.szTip;
+        return true;
+    }
+
+    /// 更新托盘图标（v0.1.13）。icon 为 null 时保持当前图标不变。
+    pub fn setIcon(self: *Tray, icon: win32.HICON) bool {
+        if (!self.active) return false;
+        const new_icon = icon orelse return true;
+        var nid = self.nid;
+        nid.uFlags = win32.NIF_ICON;
+        nid.hIcon = new_icon;
+        if (win32.Shell_NotifyIconW(win32.NIM_MODIFY, &nid) == 0) return false;
+        self.nid.hIcon = new_icon;
+        return true;
+    }
+
     /// 发送系统通知（Win10+ 渲染为 Toast）。title 最长 63 码元、body 最长 255 码元（截断）。
     pub fn notify(self: *Tray, title_u8: []const u8, body_u8: []const u8) bool {
         if (!self.active) return false;

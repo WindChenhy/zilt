@@ -9,6 +9,9 @@ const ipc = @import("ipc.zig");
 const webview = @import("webview.zig");
 const clipboard = @import("clipboard.zig");
 const notification = @import("notification.zig");
+const system_api = @import("system_api.zig");
+const taskbar = @import("taskbar.zig");
+const theme = @import("theme.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -57,6 +60,22 @@ pub const Args = struct {
     progress_status: ?[]const u8 = null,
     actions: ?[]const ActionArg = null,
     input: ?InputArg = null,
+
+    // ---- v0.1.13 / v0.1.14（系统能力统一通道）----
+    path: ?[]const u8 = null,
+    accel: ?[]const u8 = null,
+    checked: ?bool = null,
+    menu_parent: ?[]const u8 = null,
+    index: ?i32 = null,
+    tooltip: ?[]const u8 = null,
+    icon: ?[]const u8 = null,
+    click_left: ?[]const u8 = null,
+    click_middle: ?[]const u8 = null,
+    click_double: ?[]const u8 = null,
+    backdrop: ?[]const u8 = null,
+    dark_titlebar: ?bool = null,
+    exe_args: ?[]const u8 = null,
+    count: ?u32 = null,
 };
 
 pub fn isBuiltin(method: []const u8) bool {
@@ -76,6 +95,7 @@ pub fn dispatch(ctx: ipc.Context, method: []const u8, args_json: []const u8) !?[
     if (std.mem.eql(u8, method, "__zilt.clipboard")) return try clipboardCmd(ctx, a);
     if (std.mem.eql(u8, method, "__zilt.notification")) return try notificationCmd(ctx, a);
     if (std.mem.eql(u8, method, "__zilt.drag")) return try dragCmd(ctx, a);
+    if (isSystemMethod(method)) return try systemCmd(ctx, method, a);
     return error.UnknownBuiltin;
 }
 
@@ -315,6 +335,143 @@ fn notificationCmd(ctx: ipc.Context, a: Args) ![]u8 {
 }
 
 // ---------------------------------------------------------------------------
+// v0.1.13 / v0.1.14：系统能力统一通道
+// ---------------------------------------------------------------------------
+
+pub fn isSystemMethod(method: []const u8) bool {
+    const prefix = "__zilt.";
+    if (!std.mem.startsWith(u8, method, prefix)) return false;
+    const name = method[prefix.len..];
+    const eql = std.mem.eql;
+    return eql(u8, name, "menu") or eql(u8, name, "tray") or eql(u8, name, "hotkey") or
+        eql(u8, name, "taskbar") or eql(u8, name, "system") or eql(u8, name, "shell") or
+        eql(u8, name, "autostart") or eql(u8, name, "appearance");
+}
+
+pub fn clickActionFromName(name: ?[]const u8) system_api.ClickAction {
+    const n = name orelse return .none;
+    const eql = std.mem.eql;
+    if (eql(u8, n, "toggle") or eql(u8, n, "toggleWindow")) return .toggle_window;
+    if (eql(u8, n, "menu") or eql(u8, n, "showMenu")) return .show_menu;
+    if (eql(u8, n, "event") or eql(u8, n, "emitEvent")) return .emit_event;
+    return .none;
+}
+
+/// 把 `window.zilt.*` 的扁平参数映射为类型化请求；未知动作返回明确错误。
+pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
+    const eql = std.mem.eql;
+    const name = method["__zilt.".len..];
+
+    if (eql(u8, name, "menu")) {
+        if (eql(u8, a.action, "list")) return .{ .menu = .list };
+        if (eql(u8, a.action, "add")) return .{ .menu = .{ .add = .{
+            .parent = a.menu_parent,
+            .index = a.index orelse -1,
+            .id = a.path,
+            .label = a.title orelse a.text orelse "",
+            .accel = a.accel,
+            .checked = a.checked orelse false,
+            .enabled = a.enabled orelse true,
+        } } };
+        if (eql(u8, a.action, "remove")) return .{ .menu = .{ .remove = a.path orelse return error.MissingPath } };
+        if (eql(u8, a.action, "set")) return .{ .menu = .{ .set = .{
+            .path = a.path orelse return error.MissingPath,
+            .label = a.title,
+            .checked = a.checked,
+            .enabled = a.enabled,
+            .accel = a.accel,
+        } } };
+        if (eql(u8, a.action, "popup")) return .{ .menu = .{ .popup = .{ .x = a.x orelse 0, .y = a.y orelse 0 } } };
+        return error.UnknownMenuAction;
+    }
+
+    if (eql(u8, name, "tray")) {
+        if (eql(u8, a.action, "setTooltip")) return .{ .tray = .{ .set_tooltip = a.tooltip orelse a.text orelse "" } };
+        if (eql(u8, a.action, "setIcon")) return .{ .tray = .{ .set_icon = a.icon } };
+        if (eql(u8, a.action, "setClick")) return .{ .tray = .{ .set_click = .{
+            .left = clickActionFromName(a.click_left),
+            .middle = clickActionFromName(a.click_middle),
+            .double = clickActionFromName(a.click_double),
+        } } };
+        return error.UnknownTrayAction;
+    }
+
+    if (eql(u8, name, "hotkey")) {
+        if (eql(u8, a.action, "register")) return .{ .hotkey = .{ .register = .{
+            .id = a.path orelse return error.MissingPath,
+            .accel = a.accel orelse return error.MissingAccel,
+        } } };
+        if (eql(u8, a.action, "unregister")) return .{ .hotkey = .{ .unregister = a.path orelse return error.MissingPath } };
+        if (eql(u8, a.action, "list")) return .{ .hotkey = .list };
+        return error.UnknownHotkeyAction;
+    }
+
+    if (eql(u8, name, "taskbar")) {
+        if (eql(u8, a.action, "progress")) {
+            var p = taskbar.Progress{ .value = a.progress };
+            if (a.kind) |k| p.state = try taskbar.ProgressState.fromName(k);
+            return .{ .taskbar = .{ .progress = p } };
+        }
+        if (eql(u8, a.action, "overlay")) {
+            return .{ .taskbar = .{ .overlay = if (a.icon) |i|
+                taskbar.Request.Overlay{ .icon = i, .description = a.text orelse "" }
+            else
+                null } };
+        }
+        if (eql(u8, a.action, "tooltip")) return .{ .taskbar = .{ .tooltip = a.text orelse "" } };
+        if (eql(u8, a.action, "flash")) return .{ .taskbar = .{ .flash = .{
+            .count = a.count orelse 3,
+            .timeout_ms = 0,
+            .tray_only = a.enabled orelse true,
+        } } };
+        return error.UnknownTaskbarAction;
+    }
+
+    if (eql(u8, name, "system")) {
+        if (eql(u8, a.action, "info")) {
+            const kind = if (a.kind) |k| blk: {
+                if (eql(u8, k, "os")) break :blk system_api.InfoKind.os;
+                if (eql(u8, k, "monitors")) break :blk system_api.InfoKind.monitors;
+                break :blk system_api.InfoKind.all;
+            } else system_api.InfoKind.all;
+            return .{ .info = kind };
+        }
+        if (eql(u8, a.action, "adminRestart")) return .{ .admin_restart = a.exe_args };
+        return error.UnknownSystemAction;
+    }
+
+    if (eql(u8, name, "shell")) {
+        if (eql(u8, a.action, "openUrl")) return .{ .shell = .{ .url = a.url orelse a.text orelse return error.MissingUrl } };
+        if (eql(u8, a.action, "openPath")) return .{ .shell = .{ .path = a.path orelse return error.MissingPath } };
+        if (eql(u8, a.action, "reveal")) return .{ .shell = .{ .reveal = a.path orelse return error.MissingPath } };
+        return error.UnknownShellAction;
+    }
+
+    if (eql(u8, name, "autostart")) {
+        if (eql(u8, a.action, "query")) return .{ .autostart = .query };
+        if (eql(u8, a.action, "enable")) return .{ .autostart = .{ .enable = a.exe_args } };
+        if (eql(u8, a.action, "disable")) return .{ .autostart = .disable };
+        if (eql(u8, a.action, "toggle")) return .{ .autostart = .toggle };
+        return error.UnknownAutostartAction;
+    }
+
+    if (eql(u8, name, "appearance")) {
+        var ap = theme.Appearance{};
+        if (a.dark_titlebar) |d| ap.dark_titlebar = d;
+        if (a.backdrop) |b| ap.backdrop = try theme.Backdrop.fromName(b);
+        return .{ .appearance = ap };
+    }
+
+    return error.UnknownBuiltin;
+}
+
+fn systemCmd(ctx: ipc.Context, method: []const u8, a: Args) ![]u8 {
+    const req = try systemRequestFromArgs(method, a);
+    const result = try ctx.systemRequest(req);
+    return system_api.encodeResult(ctx.allocator, result);
+}
+
+// ---------------------------------------------------------------------------
 // Tests (no platform calls; mock Context function pointers)
 // ---------------------------------------------------------------------------
 
@@ -333,6 +490,21 @@ fn mockSpawn(_: *anyopaque, _: ipc.WindowOptions) ?u32 {
     return 7;
 }
 
+var last_system: ?system_api.Request = null;
+
+fn mockSystem(_: *anyopaque, _: u32, alloc: std.mem.Allocator, req: system_api.Request) anyerror!system_api.Result {
+    last_system = req;
+    return switch (req) {
+        .menu => |op| switch (op) {
+            .list => .{ .json = try alloc.dupe(u8, "[]") },
+            else => .{ .ok = true },
+        },
+        .info => .{ .json = try alloc.dupe(u8, "{}") },
+        .autostart => .{ .state = .{ .enabled = false, .command = null } },
+        else => .{ .ok = true },
+    };
+}
+
 fn testContext(alloc: Allocator) ipc.Context {
     return .{
         .allocator = alloc,
@@ -343,6 +515,7 @@ fn testContext(alloc: Allocator) ipc.Context {
         .quit_fn = mockQuit,
         .window_fn = mockWindow,
         .spawn_window_fn = mockSpawn,
+        .system_fn = mockSystem,
     };
 }
 
@@ -419,4 +592,56 @@ test "clipboard JSON roundtrip for every format" {
     }
     const owned = try t.allocator.dupe(u8, "text");
     freeClipboard(t.allocator, .{ .text = owned });
+}
+
+test "system method detection and request mapping" {
+    const t = std.testing;
+    try t.expect(isSystemMethod("__zilt.menu"));
+    try t.expect(isSystemMethod("__zilt.taskbar"));
+    try t.expect(!isSystemMethod("__zilt.window"));
+    try t.expect(!isSystemMethod("greet"));
+
+    const hk = try systemRequestFromArgs("__zilt.hotkey", .{ .action = "register", .path = "save", .accel = "Ctrl+S" });
+    try t.expectEqualStrings("save", hk.hotkey.register.id);
+    try t.expectEqualStrings("Ctrl+S", hk.hotkey.register.accel);
+
+    const info = try systemRequestFromArgs("__zilt.system", .{ .action = "info", .kind = "monitors" });
+    try t.expectEqual(system_api.InfoKind.monitors, info.info);
+
+    const progress = try systemRequestFromArgs("__zilt.taskbar", .{ .action = "progress", .progress = 0.25, .kind = "paused" });
+    try t.expectEqual(taskbar.ProgressState.paused, progress.taskbar.progress.state);
+    try t.expect(progress.taskbar.progress.value.? == 0.25);
+
+    const overlay_clear = try systemRequestFromArgs("__zilt.taskbar", .{ .action = "overlay" });
+    try t.expect(overlay_clear.taskbar.overlay == null);
+
+    const ap = try systemRequestFromArgs("__zilt.appearance", .{ .action = "apply", .dark_titlebar = true, .backdrop = "mica" });
+    try t.expectEqual(true, ap.appearance.dark_titlebar.?);
+    try t.expectEqual(theme.Backdrop.mica, ap.appearance.backdrop.?);
+
+    const tray = try systemRequestFromArgs("__zilt.tray", .{ .action = "setClick", .click_left = "menu", .click_double = "toggle" });
+    try t.expectEqual(system_api.ClickAction.show_menu, tray.tray.set_click.left);
+    try t.expectEqual(system_api.ClickAction.toggle_window, tray.tray.set_click.double);
+
+    const auto = try systemRequestFromArgs("__zilt.autostart", .{ .action = "toggle" });
+    try t.expectEqual(system_api.AutostartOp.toggle, auto.autostart);
+
+    try t.expectError(error.UnknownMenuAction, systemRequestFromArgs("__zilt.menu", .{ .action = "explode" }));
+    try t.expectError(error.UnknownTaskbarAction, systemRequestFromArgs("__zilt.taskbar", .{ .action = "explode" }));
+    try t.expectError(error.MissingAccel, systemRequestFromArgs("__zilt.hotkey", .{ .action = "register", .path = "x" }));
+}
+
+test "system dispatch goes through Context and encodes results" {
+    const t = std.testing;
+    const list = try dispatch(testContext(t.allocator), "__zilt.menu", "{\"action\":\"list\"}");
+    defer t.allocator.free(list.?);
+    try t.expectEqualStrings("[]", list.?);
+
+    const state = try dispatch(testContext(t.allocator), "__zilt.autostart", "{\"action\":\"query\"}");
+    defer t.allocator.free(state.?);
+    try t.expect(std.mem.indexOf(u8, state.?, "\"enabled\":false") != null);
+
+    const shell = try dispatch(testContext(t.allocator), "__zilt.shell", "{\"action\":\"openUrl\",\"url\":\"https://example.com\"}");
+    defer t.allocator.free(shell.?);
+    try t.expectEqualStrings("true", shell.?);
 }

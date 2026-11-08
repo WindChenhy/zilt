@@ -10,7 +10,7 @@ pub fn main() !void {
         .events = app.events,
         .assets = &app.assets,
         .security = app.security,
-        .title = "Zilt — v0.1.12 示例",
+        .title = "Zilt — v0.1.14 示例",
         .width = 960,
         .height = 700,
         .url = "https://zilt.app/index.html",
@@ -36,6 +36,8 @@ pub fn main() !void {
                 .{ .label = "显示窗口", .id = "show-window" },
                 .{ .label = "隐藏窗口", .id = "hide-window" },
                 .{ .label = "-" },
+                // v0.1.13：运行时勾选态由 window.zilt.menu 驱动
+                .{ .label = "勾选示例", .id = "tray-check" },
                 .{ .label = "新建窗口", .id = "new-window" },
                 .{ .label = "关于 Zilt", .id = "about" },
                 .{ .label = "-" },
@@ -52,13 +54,13 @@ pub fn main() !void {
         },
         .menu = &.{
             .{ .label = "文件", .items = &.{
-                .{ .label = "新建窗口", .id = "new-window" },
-                .{ .label = "打开文件...", .id = "open" },
+                .{ .label = "新建窗口", .id = "new-window", .accel = "Ctrl+N" },
+                .{ .label = "打开文件...", .id = "open", .accel = "Ctrl+O" },
                 .{ .label = "-" },
-                .{ .label = "退出", .id = "exit" },
+                .{ .label = "退出", .id = "exit", .accel = "Alt+F4" },
             } },
             .{ .label = "帮助", .items = &.{
-                .{ .label = "关于 Zilt", .id = "about" },
+                .{ .label = "关于 Zilt", .id = "about", .accel = "F1" },
             } },
         },
         .hotkeys = &.{

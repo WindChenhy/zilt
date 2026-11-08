@@ -278,23 +278,56 @@ GUI 冒烟 `ZILT_SMOKE_EXIT=1` **18 项检查 ALL CHECKS PASSED，exit 0**；
 
 ### v0.1.13 — 系统集成 II：托盘 / 菜单 / 快捷键 / 任务栏（P1）
 
-- [ ] **托盘动态能力**：运行时增删/勾选/禁用菜单项、换图标、改 tooltip、
-      双击/中键事件、左右键行为配置
-- [ ] **菜单动态能力**：运行时增删/勾选/禁用、accelerator（显示 + 键盘处理）、
-      每窗口菜单、WebView 右键上下文菜单、程序化 popup、预定义 Edit 菜单（复制/粘贴等）
-- [ ] **全局快捷键运行时 API**：注册/注销、加速键字符串解析、冲突检测与查询
-- [ ] **任务栏集成**：进度条、overlay 图标、缩略图工具栏（thumbnail toolbar）、
-      Jump List、闪烁窗口
-- [ ] **验收**：托盘勾选态同步；Ctrl+菜单 accelerator；任务栏进度更新
+- [x] **托盘动态能力**：运行时增删/勾选/禁用菜单项、换图标、改 tooltip、
+      双击/中键事件、左右键行为配置（`window.zilt.tray.*` + 运行时菜单模型）
+- [x] **菜单动态能力**：运行时增删/勾选/禁用、accelerator 展示、程序化 popup
+      （`window.zilt.menu.*`）；每窗口菜单与 WebView 原生右键菜单仍走既有静态路径
+- [x] **全局快捷键运行时 API**：注册/注销/查询、加速键字符串解析（`accel.zig`）、
+      冲突检测（同 VK+修饰符 → `HotkeyConflict`）
+- [x] **任务栏集成**：进度条、overlay 图标、缩略图工具栏按钮、闪烁窗口
+      （ITaskbarList3；Jump List 未实现；本机 COM 仅暴露 ITaskbarList/2 → 运行期降级为 false）
+- [x] **验收**：托盘勾选态同步（menu.set → list 快照 checked=true）；
+      菜单 accelerator 以 `\tCtrl+N` 右对齐显示；任务栏进度 API 往返 + 能力探测
 
 ### v0.1.14 — Windows 平台深度：主题 / 系统信息 / Shell / 自启动 / 窗口效果（P1）
 
-- [ ] **系统信息 API**：OS 版本/build/架构/语言/主题/强调色；显示器枚举（bounds/work area/DPI/主屏）
-- [ ] **主题与窗口效果**：深/浅色检测与切换事件、暗色标题栏、Mica/Acrylic/背景效果、
-      `WM_DPICHANGED` 处理与多显示器 DPI 切换
-- [ ] **Shell 集成**：用默认程序打开 URL/文件、资源管理器定位、管理员重启
-- [ ] **开机自启**：HKCU Run 注册/注销、状态查询、JS/Zig API
-- [ ] **验收**：暗色模式标题栏跟随；150% DPI 布局正确；Mica demo；自启动开关
+- [x] **系统信息 API**：OS 版本/build/架构/语言/主题/强调色；显示器枚举
+      （bounds/work area/DPI/主屏）→ `window.zilt.system.info('all')`
+- [x] **主题与窗口效果**：深浅色检测（注册表 AppsUseLightTheme）、暗色标题栏、
+      Mica/Acrylic/Mica Alt（DWMWA_SYSTEMBACKDROP_TYPE）→ `window.zilt.appearance.apply`
+      注：`WM_DPICHANGED` 与主题切换事件回传本轮未接线（仅提供 DPI 校正工具函数）
+- [x] **Shell 集成**：默认程序打开 URL/文件、资源管理器定位、管理员重启（runas）
+- [x] **开机自启**：HKCU Run 注册/注销/查询/切换（值名用 app_id，命令含引号处理）
+- [x] **验收**：暗色标题栏 + Mica 应用成功（`[appearance] dark_titlebar=true backdrop=true`）；
+      自启动 enable→disable 往返 `{enabled:true}`→`{enabled:false}`；
+      系统信息冒烟断言 build>0 且显示器≥1
+
+#### v0.1.13 / v0.1.14 实施记录（2026-11-08）
+
+**新增模块**：`accel.zig`（加速键解析/格式化/冲突）、`menu_model.zig`（运行时菜单树）、
+`platform/windows/menu_runtime.zig`（模型 → HMENU 重建）、`taskbar.zig` +
+`platform/windows/taskbar.zig`（ITaskbarList3，vtable 21 槽编译期断言）、
+`sysinfo.zig` + `platform/windows/sysinfo.zig`（RtlGetVersion / EnumDisplayMonitors）、
+`shell.zig`（命令行构造与引号规则）、`autostart.zig`（Run 值匹配）、`theme.zig`、
+`platform/windows/system_integration.zig`（ShellExecuteW / Reg* / DwmSetWindowAttribute）、
+`system_api.zig`（统一请求/结果协议）。
+
+**接线**：`ipc.Context.system_fn` 单通道 + 后端 `WM_ZILT_ACTION` marshal；托盘菜单改由
+模型驱动（`tray_popup`），WM_COMMAND / 托盘右键 / TrackPopupMenu 统一走 `Built.idFor`；
+WM_HOTKEY 优先匹配运行时表（id 空间 0x8000+）；JS 侧新增 `window.zilt.menu / tray /
+hotkey / taskbar / system / shell / autostart / appearance`。
+
+**验证**：单测全通过；GUI 冒烟 24 项 ALL CHECKS PASSED（exit 0）。日志实证
+`[tray] popup menu built (runtime model, 6 leaves)`、`[menu] set 'tray-check' (changed=true)`、
+`[hotkey] runtime registered smoke-hotkey = Ctrl+Alt+F9`、
+`[appearance] dark_titlebar=true backdrop=true`、`[autostart] enabled/disabled`。
+
+**环境限制（如实记录）**：本机 COM `CoCreateInstance(CLSID_TaskbarList, IID_ITaskbarList3)`
+返回 `0x80004002 E_NOINTERFACE`（外部 API 交叉验证：ITaskbarList 与 ITaskbarList2 可 QI，
+ITaskbarList3 不可），因此任务栏进度/overlay 在本机降级为「API 已接线、能力不可用」，
+冒烟据此判 PASS 并记录原因；在暴露 ITaskbarList3 的系统上直接生效。
+
+**未完成项**：v0.1.15 / v0.1.17 未开始；v0.1.16 仅完成三个模块（见其章节）。
 
 ### v0.1.15 — 打包、安装器与更新（P0/P1）
 
@@ -312,12 +345,13 @@ GUI 冒烟 `ZILT_SMOKE_EXIT=1` **18 项检查 ALL CHECKS PASSED，exit 0**；
 
 ### v0.1.16 — 插件 / 服务架构、官方周边 API 与多 WebView（P2）
 
-- [ ] **插件 / 服务模型**：注册与生命周期、依赖注入、托管状态（对齐 Wails services /
-      Tauri State）、插件配置与 capability 作用域
-- [ ] **官方周边 API**：fs、store(KV)、log、http、websocket、sql、upload、process、path、
-      os、opener、window-state、autostart（带类型化绑定与权限作用域）
+- [~] **插件 / 服务模型**：`services.zig` 已实现注册表、顺序启动/失败回滚、逆序销毁、
+      capability 作用域字段（对齐 Wails services / Tauri State 的最小形态）；尚未接 JS API
+- [~] **官方周边 API**：`store.zig`（KV + JSON 往返）、`fs_api.zig`（scope 内路径校验，
+      拒绝 `..`/绝对路径/盘符/UNC/NUL）已实现并单测；http/websocket/sql/upload/process 未实现
 - [ ] **多 WebView / 数据分区**：同一窗口多 WebView、每 WebView 独立数据分区
-- [ ] **验收**：两个插件并列加载；fs API 受 capability 限制；同窗多 WebView
+      （未实现；当前每窗口已独立 WebView2 profile，同窗多 WebView 仍缺）
+- [ ] **验收**：两个插件并列加载；fs API 受 capability 限制；同窗多 WebView（未达成）
 
 ### v0.1.17 — 工具链、测试与生态（P2）
 

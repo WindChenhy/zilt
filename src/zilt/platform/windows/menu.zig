@@ -90,7 +90,13 @@ fn fill(allocator: std.mem.Allocator, hmenu: win32.HMENU, items: []const Config.
             if (win32.AppendMenuW(hmenu, win32.MF_SEPARATOR, 0, null) == 0) return error.AppendMenuFailed;
             continue;
         }
-        const label_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, it.label);
+        // v0.1.13：加速键用制表符右对齐显示（Windows 菜单惯例）
+        const label_text = if (it.accel) |a|
+            try std.fmt.allocPrint(allocator, "{s}\t{s}", .{ it.label, a })
+        else
+            try allocator.dupe(u8, it.label);
+        defer allocator.free(label_text);
+        const label_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, label_text);
         defer allocator.free(label_w);
 
         if (it.items) |children| {

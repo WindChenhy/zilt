@@ -16,6 +16,7 @@ const updater = @import("updater.zig");
 const clipboard = @import("clipboard.zig");
 const notification = @import("notification.zig");
 const webview = @import("webview.zig");
+pub const system_api = @import("system_api.zig");
 
 pub const EvalCallback = @FieldType(webview.Completion, "callback");
 
@@ -211,6 +212,13 @@ pub const Context = struct {
     webview_request_fn: ?*const fn (backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator, request: webview.Request) anyerror![]u8 = null,
     /// Backend copies script before returning; completion JSON is borrowed.
     eval_async_fn: ?*const fn (backend: *anyopaque, window_id: u32, script: []const u8, completion: webview.Completion) anyerror!void = null,
+    /// 系统能力统一通道（v0.1.13/v0.1.14）：菜单 / 托盘 / 快捷键 / 任务栏 /
+    /// 系统信息 / Shell / 开机自启 / 窗口效果。null = 平台不支持。
+    system_fn: ?*const fn (backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator, req: system_api.Request) anyerror!system_api.Result = null,
+
+    pub fn systemRequest(self: Context, req: system_api.Request) !system_api.Result {
+        return (self.system_fn orelse return error.SystemNotAvailable)(self.backend, self.window_id, self.allocator, req);
+    }
 
     pub fn clipboardRead(self: Context, format: clipboard.Format) !?clipboard.Data {
         return (self.clipboard_read_data_fn orelse return error.ClipboardNotAvailable)(self.backend, self.window_id, self.allocator, format);
@@ -789,7 +797,54 @@ pub const runtime_js =
     \\      update: (opts) => builtin('__zilt.notification', Object.assign({ action: 'update' }, opts ?? {})),
     \\      status: () => builtin('__zilt.notification', { action: 'status' }),
     \\    },
-    \\    version: '0.1.12',
+    \\    // v0.1.13: tray / menu / hotkey / taskbar
+    \\    menu: {
+    \\      list: () => builtin('__zilt.menu', { action: 'list' }),
+    \\      add: (opts) => builtin('__zilt.menu', Object.assign({ action: 'add' }, opts ?? {})),
+    \\      remove: (path) => builtin('__zilt.menu', { action: 'remove', path }),
+    \\      set: (path, opts) => builtin('__zilt.menu', Object.assign({ action: 'set', path }, opts ?? {})),
+    \\      popup: (x, y) => builtin('__zilt.menu', { action: 'popup', x: x ?? 0, y: y ?? 0 }),
+    \\    },
+    \\    tray: {
+    \\      setTooltip: (tooltip) => builtin('__zilt.tray', { action: 'setTooltip', tooltip }),
+    \\      setIcon: (icon) => builtin('__zilt.tray', { action: 'setIcon', icon }),
+    \\      setClick: (opts) => builtin('__zilt.tray', Object.assign({ action: 'setClick' }, opts ?? {})),
+    \\    },
+    \\    hotkey: {
+    \\      register: (id, accel) => builtin('__zilt.hotkey', { action: 'register', path: id, accel }),
+    \\      unregister: (id) => builtin('__zilt.hotkey', { action: 'unregister', path: id }),
+    \\      list: () => builtin('__zilt.hotkey', { action: 'list' }),
+    \\    },
+    \\    taskbar: {
+    \\      progress: (value, state) => builtin('__zilt.taskbar', { action: 'progress', progress: value, kind: state ?? 'normal' }),
+    \\      clearProgress: () => builtin('__zilt.taskbar', { action: 'progress', kind: 'none' }),
+    \\      overlay: (icon, description) => builtin('__zilt.taskbar', { action: 'overlay', icon, text: description }),
+    \\      clearOverlay: () => builtin('__zilt.taskbar', { action: 'overlay' }),
+    \\      tooltip: (text) => builtin('__zilt.taskbar', { action: 'tooltip', text }),
+    \\      flash: (count) => builtin('__zilt.taskbar', { action: 'flash', count: count ?? 3 }),
+    \\    },
+    \\    // v0.1.14: system info / shell / autostart / appearance
+    \\    system: {
+    \\      info: (kind) => builtin('__zilt.system', { action: 'info', kind: kind ?? 'all' }),
+    \\      os: () => builtin('__zilt.system', { action: 'info', kind: 'os' }),
+    \\      monitors: () => builtin('__zilt.system', { action: 'info', kind: 'monitors' }),
+    \\      adminRestart: (args) => builtin('__zilt.system', { action: 'adminRestart', exe_args: args }),
+    \\    },
+    \\    shell: {
+    \\      openUrl: (url) => builtin('__zilt.shell', { action: 'openUrl', url }),
+    \\      openPath: (path) => builtin('__zilt.shell', { action: 'openPath', path }),
+    \\      reveal: (path) => builtin('__zilt.shell', { action: 'reveal', path }),
+    \\    },
+    \\    autostart: {
+    \\      query: () => builtin('__zilt.autostart', { action: 'query' }),
+    \\      enable: (args) => builtin('__zilt.autostart', { action: 'enable', exe_args: args }),
+    \\      disable: () => builtin('__zilt.autostart', { action: 'disable' }),
+    \\      toggle: () => builtin('__zilt.autostart', { action: 'toggle' }),
+    \\    },
+    \\    appearance: {
+    \\      apply: (opts) => builtin('__zilt.appearance', Object.assign({ action: 'apply' }, opts ?? {})),
+    \\    },
+    \\    version: '0.1.14',
     \\  };
     \\  window.zilt.on('__zilt.evalResult', (p) => {
     \\    const w = evalWaiters.get(p.id);

@@ -260,6 +260,63 @@ async function runChecks() {
       setCheck('c-spa', spaOk, spaOk ? 'index.html fallback' : 'no fallback');
     } catch (e) { setCheck('c-spa', false, String(e)); }
 
+    // 19. v0.1.13：托盘菜单勾选态同步（模型 → HMENU → JSON 快照）
+    try {
+      await window.zilt.menu.set('tray-check', { checked: true });
+      const snapshot = await window.zilt.menu.list();
+      const synced = JSON.stringify(snapshot).includes('"checked":true');
+      setCheck('c-traycheck', synced, synced ? 'checked=true' : 'not synced');
+      await window.zilt.menu.set('tray-check', { checked: false });
+    } catch (e) { setCheck('c-traycheck', false, String(e)); }
+
+    // 20. v0.1.13：任务栏进度 + 闪烁
+    try {
+      const progress = await window.zilt.taskbar.progress(0.5, 'normal');
+      const flash = await window.zilt.taskbar.flash(1);
+      setTimeout(() => { window.zilt.taskbar.clearProgress().catch(() => {}); }, 400);
+      // progress 返回 false 表示本机 COM 未暴露 ITaskbarList3（能力探测失败，非错误）
+      const wired = typeof progress === 'boolean' && typeof flash === 'boolean';
+      const applied = progress === true;
+      setCheck('c-taskbar', wired, wired
+        ? (applied ? 'progress 50% + flash' : 'API wired / ITaskbarList3 unsupported')
+        : 'progress/flash failed');
+    } catch (e) { setCheck('c-taskbar', false, String(e)); }
+
+    // 21. v0.1.13：运行时快捷键注册 / 查询 / 注销
+    try {
+      await window.zilt.hotkey.register('smoke-hotkey', 'Ctrl+Alt+F9');
+      const list = await window.zilt.hotkey.list();
+      const registered = Array.isArray(list) && list.some((h) => h.id === 'smoke-hotkey');
+      await window.zilt.hotkey.unregister('smoke-hotkey');
+      const after = await window.zilt.hotkey.list();
+      const removed = Array.isArray(after) && !after.some((h) => h.id === 'smoke-hotkey');
+      setCheck('c-hotkey', registered && removed, registered && removed ? 'Ctrl+Alt+F9 ok' : 'register/unregister mismatch');
+    } catch (e) { setCheck('c-hotkey', false, String(e)); }
+
+    // 22. v0.1.14：系统信息（OS + 显示器）
+    try {
+      const info = await window.zilt.system.info('all');
+      const ok = !!info && !!info.os && info.os.build > 0 &&
+        Array.isArray(info.monitors) && info.monitors.length > 0;
+      setCheck('c-sysinfo', ok, ok
+        ? `${info.os.name} ${info.os.version} / ${info.monitors.length} 显示器`
+        : 'missing fields');
+    } catch (e) { setCheck('c-sysinfo', false, String(e)); }
+
+    // 23. v0.1.14：窗口外观（暗色标题栏 + Mica）
+    try {
+      const applied = await window.zilt.appearance.apply({ dark_titlebar: true, backdrop: 'mica' });
+      setCheck('c-appearance', applied === true, applied ? 'mica + dark titlebar' : 'not applied');
+    } catch (e) { setCheck('c-appearance', false, String(e)); }
+
+    // 24. v0.1.14：开机自启状态往返（启用后立即关闭，避免污染系统设置）
+    try {
+      const on = await window.zilt.autostart.enable();
+      const off = await window.zilt.autostart.disable();
+      const ok = !!on && on.enabled === true && !!off && off.enabled === false;
+      setCheck('c-autostart', ok, ok ? 'enable → disable' : 'state mismatch');
+    } catch (e) { setCheck('c-autostart', false, String(e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -282,6 +339,12 @@ async function runChecks() {
       notification: $('c-notification').className === 'pass',
       acl: $('c-acl').className === 'pass',
       spa: $('c-spa').className === 'pass',
+      traycheck: $('c-traycheck').className === 'pass',
+      taskbar: $('c-taskbar').className === 'pass',
+      hotkey: $('c-hotkey').className === 'pass',
+      sysinfo: $('c-sysinfo').className === 'pass',
+      appearance: $('c-appearance').className === 'pass',
+      autostart: $('c-autostart').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

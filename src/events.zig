@@ -60,6 +60,13 @@ pub fn smokeResult(ctx: Context, payload: struct {
     notification: bool = false,
     acl: bool = false,
     spa: bool = false,
+    // v0.1.13–v0.1.14 新增检查
+    traycheck: bool = false,
+    taskbar: bool = false,
+    hotkey: bool = false,
+    sysinfo: bool = false,
+    appearance: bool = false,
+    autostart: bool = false,
     fatal: ?[]const u8 = null,
 }) void {
     var ok = false;
@@ -67,14 +74,16 @@ pub fn smokeResult(ctx: Context, payload: struct {
         zilt.log.print("[smoke] FATAL(frontend): {s}", .{f});
     } else {
         ok = payload.greet and payload.add and payload.fail and payload.user and payload.event and payload.mode and payload.clip and payload.win and payload.range and payload.winevent and
-            payload.windowapi and payload.eval and payload.webview and payload.capability and payload.clipmulti and payload.notification and payload.acl and payload.spa;
+            payload.windowapi and payload.eval and payload.webview and payload.capability and payload.clipmulti and payload.notification and payload.acl and payload.spa and
+            payload.traycheck and payload.taskbar and payload.hotkey and payload.sysinfo and payload.appearance and payload.autostart;
         if (ok) {
-            zilt.log.print("[smoke] ALL CHECKS PASSED (18 checks: core-10 + window-api/eval/webview-api/capability-manifest/clipboard-multi/notification-status/acl-deny/spa-fallback)", .{});
+            zilt.log.print("[smoke] ALL CHECKS PASSED (24 checks: core-10 + window-api/eval/webview-api/capability/clipboard-multi/notification/acl/spa + tray-check/taskbar/hotkey/sysinfo/appearance/autostart)", .{});
         } else {
-            zilt.log.print("[smoke] FAILED greet={} add={} fail={} user={} event={} mode={} clip={} win={} range={} winevent={} windowapi={} eval={} webview={} capability={} clipmulti={} notification={} acl={} spa={}", .{
+            zilt.log.print("[smoke] FAILED greet={} add={} fail={} user={} event={} mode={} clip={} win={} range={} winevent={} windowapi={} eval={} webview={} capability={} clipmulti={} notification={} acl={} spa={} traycheck={} taskbar={} hotkey={} sysinfo={} appearance={} autostart={}", .{
                 payload.greet, payload.add, payload.fail, payload.user, payload.event, payload.mode, payload.clip,
                 payload.win, payload.range, payload.winevent, payload.windowapi, payload.eval, payload.webview,
                 payload.capability, payload.clipmulti, payload.notification, payload.acl, payload.spa,
+                payload.traycheck, payload.taskbar, payload.hotkey, payload.sysinfo, payload.appearance, payload.autostart,
             });
         }
     }
