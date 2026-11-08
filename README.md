@@ -6,7 +6,15 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.16（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs/path/log/opener/windowState 周边 API + 更新器通道/崩溃回滚/健康确认 + 代码签名（签名产物已实测 Authenticode + RFC3161）+ MSI（WiX 3.14 自动 vendor，安装/卸载实测）+ MSIX（makeappx，松散注册实测）+ services 生命周期 + http（异步） + `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.1.16（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs/path/log/opener/windowState 周边 API + 更新器通道/崩溃回滚/健康确认 + 代码签名（签名产物已实测 Authenticode + RFC3161）+ MSI（WiX 3.14 自动 vendor，安装/卸载实测）+ MSIX（makeappx，松散注册实测）+ services 生命周期 + http（异步）+ websocket 客户端 + 单窗口多 WebView + `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
+v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
+
+- **v0.1.13**：系统能力统一通道（`system_api.Request` 单次 marshal）——托盘 tooltip/图标/点击行为、运行时菜单增删改查与程序化弹出、全局快捷键、任务栏进度/覆盖图标/闪烁
+- **v0.1.14**：`window.zilt.system`（OS/显示器信息）、`shell`（openUrl/openPath/reveal）、`autostart`（注册表自启 + 冲突报告）、`appearance`（暗色标题栏/Mica 背景材质）、管理员重启
+- **v0.1.15**：PE VERSIONINFO + manifest（PerMonitorV2/longPathAware）、安装器增强（per-machine/License/URL 协议与文件关联/升级检测）、MSI（WiX 3.14.1 自动 vendor + SHA256 校验 + 安装/卸载往返实测）、MSIX（AppxManifest 生成 + ICO→PNG 帧提取 + makeappx + 松散注册实测）、代码签名（signtool 自动定位 + RFC3161 时间戳，签名产物 Get-AuthenticodeSignature 实测）、更新器通道 + restart helper 崩溃回滚 + 健康确认
+- **v0.1.16**：`services`（声明式服务注册表，init/start 逆序 deinit，状态暴露给 JS）、`http`（后台线程异步，错误穿透全链路实测）、`websocket`（协议层手写 RFC6455 必需子集 + 后台线程握手/读循环 + echo 服务端对照实测，wss 明确报错不静默降级）、**单窗口多 WebView**（附加子 webview：WS_CHILD 子窗口 + 独立 controller + IPC 按 sender 路由，created→ready→navigate→remove 全链路实测）、`path`/`log`/`opener`/`windowState`、`zilt` CLI（doctor/info/version）
+- **验收**：单元测试 226/226（框架核心 209 + 工具链 17）；GUI 冒烟 **30 项** `ALL CHECKS PASSED`（exit 0，含 http/ws/webviews 全链路检查）；Release 构建冒烟同过；NSIS 升级安装覆盖 + 卸载干净实测；MSI/MSIX 重打成功
 
 v0.1.8–v0.1.12 新增（2026-11-08，均已实现、验证并提交）：
 
@@ -16,7 +24,6 @@ v0.1.8–v0.1.12 新增（2026-11-08，均已实现、验证并提交）：
 - **v0.1.11**：`window.zilt.window` 全量窗口 API、capability ACL（构建期生成 `capabilities.json`、运行时强制、未授权返回 `PermissionDenied`）、远程内容边界与隔离模式
 - **v0.1.12**：剪贴板多格式（文本/图片/HTML/文件）+ 变化监听、OLE `IDropTarget` 拖放（含坐标与自定义格式）+ 文件拖出、Toast 交互（按钮/输入/进度/点击深链/分组/状态查询）
 - 前端运行时新增 `window.zilt.eval` / `webview` / `clipboard` / `drag` / `notification`；Zig 侧对应 `zilt.Context` 方法
-- **验收**：单元测试 212/212；`zig build` / `zig build gen` / 模板 init→build→test 回归全通过；GUI 冒烟 28 项 `ALL CHECKS PASSED`（exit 0）；`zilt doctor` 全绿（含 signtool 与 WiX 3.14 检测）；MSI 安装/卸载往返 exit 0
 
 v0.1.7 新增：
 
@@ -51,7 +58,7 @@ ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=my-app zig build init
 ```sh
 zig build gen      # 生成前端 TS 绑定（frontend/bindings/zilt.ts）
 zig build run      # 启动示例应用（embedded 模式）
-zig build test    # 单元测试（212/212：协议/更新器/打包器/系统能力/codegen/模板/图标/深链接/Range/窗口模型/安全 ACL/SPA 回退/WebView2 驱动 ABI/剪贴板编解码/OLE 拖放/Toast/能力清单/内置命令/加速键/运行时菜单/任务栏 ABI/系统信息/自启/存储/受限 fs/服务注册表/VERSIONINFO/manifest/NSIS 增强/WiX vendor/MSIX manifest/http 异步/签名凭据/base64 解码）
+zig build test    # 单元测试（226/226：协议/更新器/打包器/系统能力/codegen/模板/图标/深链接/Range/窗口模型/安全 ACL/SPA 回退/WebView2 驱动 ABI/剪贴板编解码/OLE 拖放/Toast/能力清单/内置命令/加速键/运行时菜单/任务栏 ABI/系统信息/自启/存储/受限 fs/服务注册表/VERSIONINFO/manifest/NSIS 增强/WiX vendor/MSIX manifest/http 异步/签名凭据/base64 解码/WebSocket 协议）
 ```
 
 dev 模式：
@@ -117,7 +124,7 @@ ZILT_SIGN_PFX=cert.pfx ZILT_SIGN_PASSWORD=*** zig build bundle
 ZILT_SIGN_PFX_BASE64=<base64> ZILT_SIGN_PASSWORD=*** zig build bundle   # CI secret
 ```
 
-GUI 冒烟测试（28 项前端检查 + Zig 侧 `smokeResult` 断言，日志 `ALL CHECKS PASSED` 且 exit 0）：
+GUI 冒烟测试（30 项前端检查 + Zig 侧 `smokeResult` 断言，日志 `ALL CHECKS PASSED` 且 exit 0）：
 
 ```sh
 zig build                            # 生成 frontend/bindings/capabilities.json 并嵌入资产
