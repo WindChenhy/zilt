@@ -12,6 +12,7 @@
 //! 使全部决策/验签/staging 逻辑可离线单测。
 
 const std = @import("std");
+// v0.1.15: channel + rollback + health confirmation
 const bundler = @import("bundler.zig");
 
 pub const Manifest = struct {
@@ -21,6 +22,9 @@ pub const Manifest = struct {
     url: []const u8,
     sha256: []const u8,
     signature: []const u8,
+    /// 发布通道：stable / beta。缺失视为 stable（向后兼容旧清单）。
+    /// beta 通道的客户端会同时接受 stable 与 beta；stable 只接受 stable。
+    channel: []const u8 = "stable",
     /// 增量/差分包（v0.1.5）：from == 当前版本且基线校验通过时优先走差分，失败自动回退全量
     patch: ?PatchInfo = null,
 };
@@ -97,6 +101,17 @@ pub fn verifyArtifact(artifact: []const u8, signature_b64: []const u8, public_ke
 }
 
 /// 下载器注入接口。
+pub const UpdateChannel = enum { stable, beta };
+
+/// 通道接受规则：stable 清单对两种客户端都可用；beta 只给 beta 客户端。
+/// 未知通道一律拒绝（避免把 canary/dev 误推给正式用户）。
+pub fn accepts(manifest_channel: []const u8, wanted: UpdateChannel) bool {
+    const c = if (manifest_channel.len == 0) "stable" else manifest_channel;
+    if (std.mem.eql(u8, c, "stable")) return true;
+    if (std.mem.eql(u8, c, "beta")) return wanted == .beta;
+    return false;
+}
+
 pub const Fetcher = struct {
     ctx: *anyopaque,
     fetchFn: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, url: []const u8) anyerror![]u8,
@@ -104,12 +119,13 @@ pub const Fetcher = struct {
 
 /// 检查更新：取 manifest → 比较 → 返回新版本 manifest；已是最新返回 null。
 /// 返回的 Manifest 字符串指向 arena。
-pub fn checkForUpdate(arena: std.mem.Allocator, fetcher: Fetcher, manifest_url: []const u8, current_version: []const u8) UpdateError!?Manifest {
+pub fn checkForUpdate(arena: std.mem.Allocator, fetcher: Fetcher, manifest_url: []const u8, current_version: []const u8, channel: UpdateChannel) UpdateError!?Manifest {
     const raw = fetcher.fetchFn(fetcher.ctx, arena, manifest_url) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.ManifestInvalid,
     };
     const m = try parseManifest(arena, raw);
+    if (!accepts(m.channel, channel)) return null;
     if (!versionNewer(current_version, m.version)) return null;
     return m;
 }
@@ -183,7 +199,6 @@ pub fn isRestartHelperCall(argv: []const []const u8) ?[]const u8 {
 /// helper：延迟等待旧实例退出（互斥体释放）→ 拉起新 exe → 退出。
 /// 子进程退出码 5（单实例冲突）时重试——旧实例尚未完全退出。
 pub fn runRestartHelper(alloc: std.mem.Allocator, target: []const u8) void {
-    _ = alloc;
     const win32 = @import("platform/windows/win32.zig");
     win32.Sleep(800);
     var attempt: u32 = 0;
@@ -192,17 +207,47 @@ pub fn runRestartHelper(alloc: std.mem.Allocator, target: []const u8) void {
             @import("log.zig").print("[updater] restart helper: spawn failed", .{});
             return;
         };
-        _ = win32.WaitForSingleObject(pi.hProcess, 3000);
+        const waited = win32.WaitForSingleObject(pi.hProcess, 3000);
         var code: u32 = 0;
         _ = win32.GetExitCodeProcess(pi.hProcess, &code);
         _ = win32.CloseHandle(pi.hProcess);
         _ = win32.CloseHandle(pi.hThread);
-        if (code != 5) return; // 非单实例冲突 → 完成
-        win32.Sleep(400);
+
+        if (code == 5) { // 单实例冲突 → 旧实例尚未退出，重试
+            win32.Sleep(400);
+            continue;
+        }
+        if (waited == 0 and code != 0) {
+            // 3 秒内退出且非 0：视为更新后启动失败 → 回滚到 .zilt-old
+            if (rollbackToBackup(alloc, target)) {
+                @import("log.zig").print("[updater] target exited with {d}, rolled back to backup", .{code});
+                if (win32.spawnDetached(target, "")) |pi2| {
+                    _ = win32.WaitForSingleObject(pi2.hProcess, 3000);
+                    _ = win32.CloseHandle(pi2.hProcess);
+                    _ = win32.CloseHandle(pi2.hThread);
+                }
+            } else {
+                @import("log.zig").print("[updater] target exited with {d}, no backup available", .{code});
+            }
+        }
+        return;
     }
 }
 
-/// 启动时清理上次更新留下的备份。
+/// 用 `<exe>.zilt-old` 覆盖当前 exe（崩溃回滚）。返回是否成功。
+pub fn rollbackToBackup(alloc: std.mem.Allocator, exe_path: []const u8) bool {
+    const win32 = @import("platform/windows/win32.zig");
+    const old_path = std.fmt.allocPrint(alloc, "{s}.zilt-old", .{exe_path}) catch return false;
+    defer alloc.free(old_path);
+    const old_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, old_path) catch return false;
+    defer alloc.free(old_w);
+    const exe_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, exe_path) catch return false;
+    defer alloc.free(exe_w);
+    return win32.MoveFileExW(old_w.ptr, exe_w.ptr, win32.MOVEFILE_REPLACE_EXISTING) != 0;
+}
+
+/// 启动后确认健康：清理上次更新留下的备份（`<exe>.zilt-old`）。
+/// 调用时机很关键——必须在新版本已经跑起来一段时间之后，否则会毁掉回滚凭据。
 pub fn cleanupOld(alloc: std.mem.Allocator, exe_path: []const u8) void {
     const win32 = @import("platform/windows/win32.zig");
     const old_path = std.fmt.allocPrint(alloc, "{s}.zilt-old", .{exe_path}) catch return;
@@ -221,6 +266,8 @@ pub const Env = struct {
     /// 更新包内 exe 的文件名
     exe_name: []const u8,
     fetcher: Fetcher,
+    /// 订阅通道（stable 默认；beta 同时接受 stable 清单）
+    channel: UpdateChannel = .stable,
 };
 
 // ---------------------------------------------------------------------------
@@ -335,16 +382,16 @@ test "checkForUpdate: 有新版 / 已最新 / fetch 失败" {
     } };
     const fetcher = f.make();
 
-    const m = (try checkForUpdate(arena.allocator(), fetcher, "http://x/manifest.json", "0.1.1")).?;
+    const m = (try checkForUpdate(arena.allocator(), fetcher, "http://x/manifest.json", "0.1.1", .stable)).?;
     try testing.expectEqualStrings("9.9.9", m.version);
 
     // 已是最新
-    try testing.expectEqual(@as(?Manifest, null), try checkForUpdate(arena.allocator(), fetcher, "http://x/manifest.json", "9.9.9"));
-    try testing.expectEqual(@as(?Manifest, null), try checkForUpdate(arena.allocator(), fetcher, "http://x/manifest.json", "10.0.0"));
+    try testing.expectEqual(@as(?Manifest, null), try checkForUpdate(arena.allocator(), fetcher, "http://x/manifest.json", "9.9.9", .stable));
+    try testing.expectEqual(@as(?Manifest, null), try checkForUpdate(arena.allocator(), fetcher, "http://x/manifest.json", "10.0.0", .stable));
 
     // fetch 失败
     var f2 = FakeFetcher{ .responses = &.{} };
-    try testing.expectError(error.ManifestInvalid, checkForUpdate(arena.allocator(), f2.make(), "http://x/none.json", "0.1.1"));
+    try testing.expectError(error.ManifestInvalid, checkForUpdate(arena.allocator(), f2.make(), "http://x/none.json", "0.1.1", .stable));
 }
 
 test "downloadAndVerify: 全链路（sha256 + 验签）" {
@@ -371,7 +418,7 @@ test "downloadAndVerify: 全链路（sha256 + 验签）" {
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const m = (try checkForUpdate(arena.allocator(), fetcher, "http://x/manifest.json", "0.1.1")).?;
+    const m = (try checkForUpdate(arena.allocator(), fetcher, "http://x/manifest.json", "0.1.1", .stable)).?;
     const got = try downloadAndVerify(testing.allocator, fetcher, m, TestKeys.kp.public_key.bytes);
     defer testing.allocator.free(got);
     try testing.expectEqualSlices(u8, artifact, got);
@@ -454,4 +501,83 @@ fn cleanupTestDir(alloc: std.mem.Allocator, dir: []const u8) void {
     const dir_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, dir) catch return;
     defer alloc.free(dir_w);
     _ = win32.RemoveDirectoryW(dir_w.ptr);
+}
+
+test "channel acceptance matrix" {
+    try testing.expect(accepts("stable", .stable));
+    try testing.expect(accepts("stable", .beta)); // beta 客户端也收 stable
+    try testing.expect(accepts("", .stable)); // 缺省 = stable
+    try testing.expect(accepts("", .beta));
+
+    try testing.expect(!accepts("beta", .stable));
+    try testing.expect(accepts("beta", .beta));
+
+    try testing.expect(!accepts("canary", .stable));
+    try testing.expect(!accepts("canary", .beta));
+    try testing.expect(!accepts("dev", .beta));
+}
+
+test "manifest channel defaults to stable" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const m = try parseManifest(arena.allocator(),
+        \\{"version":"9.9.9","url":"http://x/a.zip","sha256":"aa","signature":"c2ln"}
+    );
+    try testing.expectEqualStrings("stable", m.channel);
+
+    const beta = try parseManifest(arena.allocator(),
+        \\{"version":"9.9.9","channel":"beta","url":"http://x/a.zip","sha256":"aa","signature":"c2ln"}
+    );
+    try testing.expectEqualStrings("beta", beta.channel);
+}
+
+test "rollbackToBackup replaces exe with .zilt-old" {
+    if (@import("builtin").os.tag != .windows) return;
+    const win32 = @import("platform/windows/win32.zig");
+    const alloc = testing.allocator;
+
+    const tmp = win32.getEnvUtf8(alloc, "TEMP") orelse return error.SkipZigTest;
+    defer alloc.free(tmp);
+    const dir = try std.fmt.allocPrint(alloc, "{s}\\zilt-rollback-test", .{tmp});
+    defer alloc.free(dir);
+
+    const dir_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, dir);
+    defer alloc.free(dir_w);
+    _ = win32.CreateDirectoryW(dir_w.ptr, null);
+
+    const exe = try std.fmt.allocPrint(alloc, "{s}\\app.exe", .{dir});
+    defer alloc.free(exe);
+    const old = try std.fmt.allocPrint(alloc, "{s}.zilt-old", .{exe});
+    defer alloc.free(old);
+
+    defer {
+        const exe_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, exe) catch null;
+        if (exe_w) |w| {
+            _ = win32.DeleteFileW(w.ptr);
+            alloc.free(w);
+        }
+        const old_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, old) catch null;
+        if (old_w) |w| {
+            _ = win32.DeleteFileW(w.ptr);
+            alloc.free(w);
+        }
+        _ = win32.RemoveDirectoryW(dir_w.ptr);
+    }
+
+    try testing.expect(win32.writeFileAlloc(alloc, exe, "NEW-BUILD"));
+    try testing.expect(win32.writeFileAlloc(alloc, old, "OLD-BUILD"));
+
+    // 无备份时不应误报成功：删掉备份后再试
+    try testing.expect(rollbackToBackup(alloc, exe));
+    const back = win32.readFileAlloc(alloc, exe) orelse return error.ReadFailed;
+    defer alloc.free(back);
+    try testing.expectEqualStrings("OLD-BUILD", back);
+    try testing.expect(win32.readFileAlloc(alloc, old) == null); // 已被移走
+
+    // 备份不存在 → 返回 false（不清空 exe）
+    try testing.expect(!rollbackToBackup(alloc, exe));
+    const still = win32.readFileAlloc(alloc, exe) orelse return error.ReadFailed;
+    defer alloc.free(still);
+    try testing.expectEqualStrings("OLD-BUILD", still);
 }

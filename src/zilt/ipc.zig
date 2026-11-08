@@ -858,6 +858,24 @@ pub const runtime_js =
     \\      exists: (path) => builtin('__zilt.fs', { action: 'exists', path }),
     \\      remove: (path) => builtin('__zilt.fs', { action: 'remove', path }),
     \\    },
+    \\    // v0.1.16: path / log / opener / windowState
+    \\    path: {
+    \\      join: function () { return builtin('__zilt.path', { action: 'join', items: Array.prototype.slice.call(arguments) }); },
+    \\      dirname: (path) => builtin('__zilt.path', { action: 'dirname', path }),
+    \\      basename: (path) => builtin('__zilt.path', { action: 'basename', path }),
+    \\      extname: (path) => builtin('__zilt.path', { action: 'extname', path }),
+    \\      normalize: (path) => builtin('__zilt.path', { action: 'normalize', path }),
+    \\    },
+    \\    log: (level, message) => builtin('__zilt.log', { level: level ?? 'info', message }),
+    \\    opener: {
+    \\      openUrl: (url) => builtin('__zilt.shell', { action: 'openUrl', url }),
+    \\      openPath: (path) => builtin('__zilt.shell', { action: 'openPath', path }),
+    \\      reveal: (path) => builtin('__zilt.shell', { action: 'reveal', path }),
+    \\    },
+    \\    windowState: {
+    \\      get: () => builtin('__zilt.windowState', { action: 'get' }),
+    \\      save: () => builtin('__zilt.windowState', { action: 'save' }),
+    \\    },
     \\    version: '0.1.16',
     \\  };
     \\  window.zilt.on('__zilt.evalResult', (p) => {

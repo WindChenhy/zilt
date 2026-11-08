@@ -130,6 +130,9 @@ pub fn main() !void {
     try writeFileW(alloc, nsi_path, script_bom);
     log.print("[bundle] nsis script: {s}", .{nsi_path});
 
+    // ---- 代码签名（v0.1.15）：有 ZILT_SIGN_* 时签名 exe 与 setup ----
+    signArtifacts(alloc, exe_abs, setup_path);
+
     // makensis（有则产出 setup.exe，无则提示）
     var threaded: std.Io.Threaded = .init(alloc, .{});
     defer threaded.deinit();
@@ -199,4 +202,111 @@ fn fileSizeW(alloc: std.mem.Allocator, path_u8: []const u8) u64 {
     var data: win32.WIN32_FILE_ATTRIBUTE_DATA = undefined;
     if (win32.GetFileAttributesExW(w.ptr, 0, &data) == 0) return 0;
     return (@as(u64, data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+}
+
+// ---------------------------------------------------------------------------
+// 代码签名（v0.1.15）
+// ---------------------------------------------------------------------------
+
+extern "kernel32" fn SearchPathW(
+    lpPath: ?win32.LPCWSTR,
+    lpFileName: win32.LPCWSTR,
+    lpExtension: ?win32.LPCWSTR,
+    nBufferLength: u32,
+    lpBuffer: [*]u16,
+    lpFilePart: ?*?[*:0]u16,
+) callconv(.c) u32;
+
+/// PATH 中查找 signtool.exe。
+fn searchPath(alloc: std.mem.Allocator, name: []const u8) ?[]u8 {
+    const name_z = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch return null;
+    defer alloc.free(name_z);
+    var buf: [1024]u16 = undefined;
+    const n = SearchPathW(null, name_z.ptr, null, buf.len, &buf, null);
+    if (n == 0 or n >= buf.len) return null;
+    return std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..n]) catch null;
+}
+
+/// 查找 signtool：PATH 优先，其次 Windows Kits 下任意版本（`bin\*\x64`）。
+fn findSigntool(alloc: std.mem.Allocator) ?[]u8 {
+    if (searchPath(alloc, "signtool.exe")) |p| return p;
+
+    const pf86 = win32.getEnvUtf8(alloc, "ProgramFiles(x86)") orelse return null;
+    defer alloc.free(pf86);
+    const pattern = std.fmt.allocPrint(alloc, "{s}\\Windows Kits\\10\\bin\\*\\x64\\signtool.exe", .{pf86}) catch return null;
+    defer alloc.free(pattern);
+    const wz = std.unicode.utf8ToUtf16LeAllocZ(alloc, pattern) catch return null;
+    defer alloc.free(wz);
+
+    var fd: win32.WIN32_FIND_DATAW = undefined;
+    const h = win32.FindFirstFileW(wz.ptr, &fd);
+    if (h == win32.INVALID_HANDLE_VALUE) return null;
+    defer _ = win32.FindClose(h);
+
+    const dir = std.fs.path.dirname(pattern) orelse return null;
+    const name = std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.sliceTo(&fd.cFileName, 0)) catch return null;
+    defer alloc.free(name);
+    return std.fmt.allocPrint(alloc, "{s}\\{s}", .{ dir, name }) catch null;
+}
+
+/// 按 ZILT_SIGN_* 环境变量签名 exe 与 setup；缺配置/缺工具时明确提示，不阻断打包。
+fn signArtifacts(alloc: std.mem.Allocator, exe_path: []const u8, setup_path: []const u8) void {
+    const sign = zilt.codesign;
+
+    const pfx = win32.getEnvUtf8(alloc, "ZILT_SIGN_PFX");
+    defer if (pfx) |v| alloc.free(v);
+    const thumb = win32.getEnvUtf8(alloc, "ZILT_SIGN_THUMBPRINT");
+    defer if (thumb) |v| alloc.free(v);
+
+    if (pfx == null and thumb == null) {
+        log.print("[sign] skipped (set ZILT_SIGN_PFX or ZILT_SIGN_THUMBPRINT to enable)", .{});
+        return;
+    }
+
+    const pw = win32.getEnvUtf8(alloc, "ZILT_SIGN_PASSWORD");
+    defer if (pw) |v| alloc.free(v);
+    const ts = win32.getEnvUtf8(alloc, "ZILT_SIGN_TIMESTAMP");
+    defer if (ts) |v| alloc.free(v);
+
+    const opts = sign.Options{
+        .pfx_path = pfx,
+        .pfx_password = pw,
+        .cert_thumbprint = thumb,
+        .timestamp_url = if (ts) |t| t else "http://timestamp.digicert.com",
+    };
+    sign.validate(opts) catch |err| {
+        log.print("[sign] invalid config: {s}", .{@errorName(err)});
+        return;
+    };
+
+    const tool = findSigntool(alloc);
+    defer if (tool) |t| alloc.free(t);
+
+    if (tool == null) {
+        const cmd = sign.fullCommand(alloc, opts, exe_path) catch return;
+        defer alloc.free(cmd);
+        log.print("[sign] signtool not found — run manually://n  {s}", .{cmd});
+        return;
+    }
+
+    const files = [_][]const u8{ exe_path, setup_path };
+    for (files) |file| {
+        const args = sign.signArgs(alloc, opts, file) catch |err| {
+            log.print("[sign] args failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer alloc.free(args);
+
+        const pi = win32.spawnDetached(tool.?, args) orelse {
+            log.print("[sign] spawn failed: {s}", .{file});
+            return;
+        };
+        _ = win32.WaitForSingleObject(pi.hProcess, 120_000);
+        var code: u32 = 0;
+        _ = win32.GetExitCodeProcess(pi.hProcess, &code);
+        _ = win32.CloseHandle(pi.hProcess);
+        _ = win32.CloseHandle(pi.hThread);
+        log.print("[sign] {s} -> exit {d}", .{ file, code });
+        if (code != 0) return;
+    }
 }

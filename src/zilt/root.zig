@@ -30,6 +30,7 @@ pub const shell = @import("shell.zig");
 pub const autostart = @import("autostart.zig");
 pub const theme = @import("theme.zig");
 pub const system_api = @import("system_api.zig");
+pub const codesign = @import("codesign.zig");
 pub const store = @import("store.zig");
 pub const fs_api = @import("fs_api.zig");
 pub const services = @import("services.zig");
@@ -62,6 +63,7 @@ test {
     _ = @import("autostart.zig");
     _ = @import("theme.zig");
     _ = @import("system_api.zig");
+    _ = @import("codesign.zig");
     _ = @import("store.zig");
     _ = @import("fs_api.zig");
     _ = @import("services.zig");

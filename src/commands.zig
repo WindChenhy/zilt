@@ -292,6 +292,7 @@ pub fn checkUpdate(ctx: Context, args: struct {}) !void {
                 state.env.fetcher,
                 state.env.manifest_url,
                 state.env.current_version,
+                state.env.channel,
             ) catch |err| {
                 state.ctx.emit("updaterFailed", .{ .stage = "check", .err = @errorName(err) });
                 state.ctx.msg_allocator.destroy(state);
@@ -333,7 +334,7 @@ fn installMain(state: *InstallCtx) void {
     var arena = std.heap.ArenaAllocator.init(ctx.msg_allocator);
     defer arena.deinit();
 
-    const m = zilt.updater.checkForUpdate(arena.allocator(), env.fetcher, env.manifest_url, env.current_version) catch |err| {
+    const m = zilt.updater.checkForUpdate(arena.allocator(), env.fetcher, env.manifest_url, env.current_version, env.channel) catch |err| {
         ctx.emit("updaterFailed", .{ .stage = "check", .err = @errorName(err) });
         return;
     } orelse {

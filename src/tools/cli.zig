@@ -107,6 +107,20 @@ fn runDoctor(alloc: std.mem.Allocator) !u8 {
         print("[warn] makensis not in PATH — `zig build bundle` 只能生成 .nsi\n", .{});
     }
 
+    // 可选工具链：代码签名 / MSI
+    if (findInPath(alloc, "signtool.exe")) |p| {
+        defer alloc.free(p);
+        print("[ok]   signtool: {s}\n", .{p});
+    } else {
+        print("[warn] signtool not found — code signing needs Windows SDK (bundle prints the command)\n", .{});
+    }
+    if (findInPath(alloc, "wix.exe")) |p| {
+        defer alloc.free(p);
+        print("[ok]   wix: {s}\n", .{p});
+    } else {
+        print("[warn] WiX not found — MSI build unavailable (.wxs still generated)\n", .{});
+    }
+
     // 前端 dist
     const dist = meta.frontend.dist;
     if (dirExists(alloc, dist)) {

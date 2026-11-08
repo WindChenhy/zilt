@@ -123,15 +123,6 @@ pub fn run(comptime config: Config) !void {
     }
     defer if (guard) |*g| g.release();
 
-    // 清理上次更新留下的备份
-    if (config.update != null) {
-        const exe_path = currentExePath(alloc) catch null;
-        if (exe_path) |p| {
-            defer alloc.free(p);
-            updater.cleanupOld(alloc, p);
-        }
-    }
-
     _ = win32.SetProcessDpiAwarenessContext(win32.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     const hr_init = win32.CoInitializeEx(null, win32.COINIT_APARTMENTTHREADED);
@@ -288,6 +279,13 @@ pub fn run(comptime config: Config) !void {
         const ms = std.fmt.parseInt(u32, ms_str, 10) catch 20000;
         _ = win32.SetTimer(main.hwnd, 1, ms, null);
         log.print("[test] smoke timer set: {d} ms", .{ms});
+    }
+
+    // 更新健康确认（v0.1.15）：新版本跑满 10s 才删除 .zilt-old 备份，
+    // 避免「刚启动就删掉回滚凭据」导致崩溃后无法恢复。
+    if (config.update != null) {
+        _ = win32.SetTimer(main.hwnd, 3, 10_000, null);
+        log.print("[updater] health timer armed (10s)", .{});
     }
 
     // 消息泵
@@ -1704,6 +1702,7 @@ fn Backend(comptime config: Config) type {
                 },
                 .store => |op| return self.runStoreOp(op, alloc),
                 .fs => |op| return self.runFsOp(op, alloc),
+                .window_state => |op| return self.runWindowStateOp(w, op, alloc),
             }
         }
 
@@ -1738,6 +1737,26 @@ fn Backend(comptime config: Config) type {
             defer self.allocator.free(path);
             if (!win32.writeFileAlloc(self.allocator, path, json)) {
                 log.print("[store] persist failed: {s}", .{path});
+            }
+        }
+
+        fn runWindowStateOp(self: *Self, w: *Window, op: shared_system.WindowStateOp, alloc: std.mem.Allocator) !shared_system.Result {
+            switch (op) {
+                .save => {
+                    self.saveWindowState(w);
+                    log.print("[window-state] saved on demand", .{});
+                    return .{ .ok = true };
+                },
+                .get => {
+                    var rect: win32.RECT = undefined;
+                    if (win32.GetWindowRect(w.hwnd, &rect) == 0) return error.WindowNotFound;
+                    const maximized = win32.IsZoomed(w.hwnd) != 0;
+                    return .{ .json = try std.fmt.allocPrint(
+                        alloc,
+                        "{{\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d},\"maximized\":{}}}",
+                        .{ rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, maximized },
+                    ) };
+                },
             }
         }
 
@@ -3113,6 +3132,18 @@ fn Backend(comptime config: Config) type {
                     return 0;
                 },
                 win32.WM_TIMER => {
+                    if (wparam == 3) {
+                        _ = win32.KillTimer(hwnd, 3);
+                        const alloc_h = std.heap.page_allocator;
+                        if (instance != null) {
+                            if (currentExePath(alloc_h)) |p| {
+                                defer alloc_h.free(p);
+                                updater.cleanupOld(alloc_h, p);
+                                log.print("[updater] health confirmed, backup cleaned", .{});
+                            } else |_| {}
+                        }
+                        return 0;
+                    }
                     if (wparam == 2) {
                         log.print("[multi] timer -> close secondary window", .{});
                         _ = win32.DestroyWindow(hwnd);
@@ -3809,7 +3840,10 @@ fn buildUpdaterEnv(self: anytype, uc: anytype) !updater.Env {
         manifest_url = u;
     }
 
+    const channel: updater.UpdateChannel = if (std.mem.eql(u8, uc.channel, "beta")) .beta else .stable;
+
     return .{
+        .channel = channel,
         .manifest_url = manifest_url,
         .public_key = pk,
         .current_version = uc.current_version,
@@ -3917,7 +3951,7 @@ fn updaterFlow(self: anytype) void {
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
 
-    const m = updater.checkForUpdate(arena.allocator(), env.fetcher, env.manifest_url, env.current_version) catch |err| {
+    const m = updater.checkForUpdate(arena.allocator(), env.fetcher, env.manifest_url, env.current_version, env.channel) catch |err| {
         log.print("[updater] check failed: {s}", .{@errorName(err)});
         ctx.emit("updaterFailed", .{ .stage = "check", .err = @errorName(err) });
         return;

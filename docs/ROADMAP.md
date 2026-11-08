@@ -341,24 +341,38 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
 - [x] **安装器增强**：setup.exe 图标、per-machine（admin + Program Files + HKLM）、
       安装目录选择、License 页、升级检测、**安装时注册 URL 协议与文件关联**
       （`ZILT_INSTALLER_*` 环境变量控制；makensis 实测两种变体均编译通过）
-- [ ] **MSI / MSIX**：WiX 实际构建 MSI；MSIX/Store 打包；Fixed WebView2 分发（未实现）
-- [ ] **代码签名接入**：证书/时间戳自动签名（未实现，仍只生成 signtool 命令）
-- [ ] **更新器增强**：安装器式更新、通道（stable/beta）、回滚与健康检查、前端更新 UI（未实现）
-- [~] **验收**：exe 属性显示 Zilt / 0.1.16、manifest 含 PerMonitorV2；
-      setup.exe 814KB（默认）/ 824KB（per-machine + license + 协议 + 关联）；
-      签名 MSI 与旧版本升级链未验证
+- [~] **MSI / MSIX**：WiX 未安装 → 本机无法构建 MSI（`.wxs` 仍生成，`zilt doctor` 会提示）；
+      MSIX 未实现；**Fixed WebView2 已支持**（`Config.environment.browser_directory`，
+      loader 走 fixed 模式且不回落 Evergreen —— 代码已接线，缺专项 E2E）
+- [x] **代码签名接入**：`codesign.zig` 构造 signtool 命令（PFX/指纹二选一、RFC3161 时间戳、
+      /fd /td 一致、路径引号、指纹规范化）；`zig build bundle` 自动发现 signtool
+      （PATH + Windows Kits `bin\*\x64`）并依次签 exe 与 setup；未装 SDK 时打印可复制命令
+      ⚠ 本机无 Windows SDK/证书，**未做真实签名验证**
+- [x] **更新器增强**：通道（stable/beta，`Config.update.channel`；beta 客户端同时接受
+      stable 清单，未知通道一律拒绝）+ 崩溃回滚（restart helper 观察 3 秒，非 0 退出即用
+      `.zilt-old` 回滚并重拉）+ 健康确认（启动 10 秒后才清理备份，`WM_TIMER` id=3）
+- [~] **验收**：exe 属性 Zilt / 0.1.16、manifest 含 PerMonitorV2；
+      setup.exe 814KB / 824KB；通道矩阵与回滚文件语义有单测；
+      健康确认实测 `health timer armed (10s)` → `health confirmed, backup cleaned`；
+      真实签名与 MSI 安装/卸载未验证（缺 SDK/WiX）
 
 ### v0.1.16 — 插件 / 服务架构、官方周边 API 与多 WebView（P2）
 
 - [~] **插件 / 服务模型**：`services.zig` 注册表/顺序启动/失败回滚/逆序销毁/作用域已实现并单测；
       JS API 未暴露（框架层能力，应用可在 main 里自行注册）
-- [~] **官方周边 API**：`store`（KV + 落盘 `%LOCALAPPDATA%\<app_id>\store.json`）与
-      `fs`（scope 内读写，拒绝 `..`/绝对路径/盘符/UNC/NUL）已接 JS：
-      `window.zilt.store.get/set/remove/keys/all`、`window.zilt.fs.read/write/exists/remove`；
-      http/websocket/sql/upload/process/path/os/opener 未实现
+- [x] **官方周边 API**（已接 JS，可冒烟验证）：
+      `store`（KV + 落盘 `%LOCALAPPDATA%\<app_id>\store.json`）、
+      `fs`（scope 内读写，拒绝 `..`/绝对路径/盘符/UNC/NUL）、
+      `path`（join/dirname/basename/extname/normalize）、
+      `log`（前端日志汇入 Zig 日志）、
+      `opener`（openUrl/openPath/reveal，复用 shell）、
+      `windowState`（get 当前几何 / save 立即持久化）、
+      以及既有的 `system`/`shell`/`autostart`/`appearance`
+- [ ] **未实现的周边 API**：http、websocket、sql、upload、process、os（独立命名空间）
 - [ ] **多 WebView / 数据分区**：同一窗口多 WebView（未实现；每窗口已有独立 WebView2 profile）
-- [~] **验收**：冒烟 25 项含 store set/get + fs 写读 exists + `../` 逃逸被拒（PathEscape）；
-      多 WebView 未达成
+- [~] **验收**：冒烟 26 项含 store set/get + fs 写读 exists + `../` 逃逸被拒（PathEscape）
+      + path join/basename/extname + log 转发 + windowState get/save；
+      多 WebView 未达成（见下）
 
 ### v0.1.17 — 工具链、测试与生态（P2）
 
@@ -401,8 +415,16 @@ fs 走 `fs_api.joinChecked` 做 scope 内路径校验。JS 新增 `window.zilt.s
 **踩坑**：WebView2 版本在 32 位安装器写入 `WOW6432Node`，64 位进程读
 `HKLM\SOFTWARE` 不会自动重定向，必须显式尝试两条路径。
 
-**未完成（如实记录）**：MSI/MSIX 构建、代码签名自动签名、更新器通道/回滚、多 WebView、
-npm 脚手架、图标生成 CLI、模板扩充、WebDriver、headless 模式、CI 流水线模板。
+**（2026-11-08 补完）v0.1.15 剩余项**：`codesign.zig`（7 条单测）+ bundle 自动签名；
+更新器通道 + restart helper 崩溃回滚 + 10 秒健康确认（实测日志两阶段）；
+`zilt doctor` 增加 signtool/WiX 检测。MSI 仍无法构建（本机无 WiX），已如实标注。
+
+**（2026-11-08 补完）v0.1.16 周边 API**：新增 `path` / `log` / `opener` / `windowState`
+（`store`/`fs` 上轮已接）；冒烟增至 26 项并通过。
+
+**仍未完成**：多 WebView（需重构 backend 单 webview 假设：多 controller 布局、消息来源区分、
+销毁时序——属重构级改动，建议单独一轮并配 WebDriver 回归）、MSIX、http/websocket/sql/
+upload/process、npm 脚手架、图标生成 CLI、模板扩充、WebDriver、headless、CI 模板。
 
 ## v0.1.6（2026-11-07）
 

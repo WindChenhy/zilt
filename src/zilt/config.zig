@@ -149,5 +149,7 @@ pub const Config = struct {
         exe_name: []const u8 = "zilt-app.exe",
         /// 暂存成功后自动重启应用（v0.1.5；false = 应用收到 updateStaged 事件后自行调 ctx.restartToApply）
         auto_restart: bool = false,
+        /// 订阅通道（v0.1.15）："stable" | "beta"。beta 同时接受 stable 清单。
+        channel: []const u8 = "stable",
     };
 };

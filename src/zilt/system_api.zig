@@ -91,6 +91,9 @@ pub const FsOp = union(enum) {
     remove: []const u8,
 };
 
+/// 窗口状态（v0.1.16 window-state）：读当前几何 / 立即持久化
+pub const WindowStateOp = enum { get, save };
+
 pub const Request = union(enum) {
     menu: MenuOp,
     tray: TrayOp,
@@ -106,6 +109,8 @@ pub const Request = union(enum) {
     store: StoreOp,
     /// v0.1.16：受限文件访问（scope = app_data，路径禁止逃逸）
     fs: FsOp,
+    /// v0.1.16：窗口状态读写
+    window_state: WindowStateOp,
 };
 
 pub const Result = union(enum) {

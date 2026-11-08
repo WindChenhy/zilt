@@ -12,6 +12,7 @@ const notification = @import("notification.zig");
 const system_api = @import("system_api.zig");
 const taskbar = @import("taskbar.zig");
 const theme = @import("theme.zig");
+const log = @import("log.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -79,6 +80,9 @@ pub const Args = struct {
     key: ?[]const u8 = null,
     value: ?[]const u8 = null,
     data: ?[]const u8 = null,
+    items: ?[]const []const u8 = null,
+    level: ?[]const u8 = null,
+    message: ?[]const u8 = null,
 };
 
 pub fn isBuiltin(method: []const u8) bool {
@@ -98,6 +102,8 @@ pub fn dispatch(ctx: ipc.Context, method: []const u8, args_json: []const u8) !?[
     if (std.mem.eql(u8, method, "__zilt.clipboard")) return try clipboardCmd(ctx, a);
     if (std.mem.eql(u8, method, "__zilt.notification")) return try notificationCmd(ctx, a);
     if (std.mem.eql(u8, method, "__zilt.drag")) return try dragCmd(ctx, a);
+    if (std.mem.eql(u8, method, "__zilt.path")) return try pathCmd(ctx, a);
+    if (std.mem.eql(u8, method, "__zilt.log")) return try logCmd(ctx, a);
     if (isSystemMethod(method)) return try systemCmd(ctx, method, a);
     return error.UnknownBuiltin;
 }
@@ -349,7 +355,7 @@ pub fn isSystemMethod(method: []const u8) bool {
     return eql(u8, name, "menu") or eql(u8, name, "tray") or eql(u8, name, "hotkey") or
         eql(u8, name, "taskbar") or eql(u8, name, "system") or eql(u8, name, "shell") or
         eql(u8, name, "autostart") or eql(u8, name, "appearance") or
-        eql(u8, name, "store") or eql(u8, name, "fs");
+        eql(u8, name, "store") or eql(u8, name, "fs") or eql(u8, name, "windowState");
 }
 
 pub fn clickActionFromName(name: ?[]const u8) system_api.ClickAction {
@@ -482,6 +488,12 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
         return error.UnknownFsAction;
     }
 
+    if (eql(u8, name, "windowState")) {
+        if (eql(u8, a.action, "get")) return .{ .window_state = .get };
+        if (eql(u8, a.action, "save")) return .{ .window_state = .save };
+        return error.UnknownWindowStateAction;
+    }
+
     if (eql(u8, name, "appearance")) {
         var ap = theme.Appearance{};
         if (a.dark_titlebar) |d| ap.dark_titlebar = d;
@@ -490,6 +502,52 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
     }
 
     return error.UnknownBuiltin;
+}
+
+/// `window.zilt.path.*`（v0.1.16）：纯路径运算，不触碰文件系统。
+fn pathCmd(ctx: ipc.Context, a: Args) ![]u8 {
+    const eql = std.mem.eql;
+    const alloc = ctx.allocator;
+
+    if (eql(u8, a.action, "join")) {
+        const items = a.items orelse return error.MissingItems;
+        const joined = try std.fs.path.join(alloc, items);
+        defer alloc.free(joined);
+        return std.json.Stringify.valueAlloc(alloc, joined, .{});
+    }
+
+    const p = a.path orelse return error.MissingPath;
+    var value: []const u8 = "";
+    if (eql(u8, a.action, "dirname")) {
+        value = std.fs.path.dirname(p) orelse "";
+    } else if (eql(u8, a.action, "basename")) {
+        value = std.fs.path.basename(p);
+    } else if (eql(u8, a.action, "extname")) {
+        value = std.fs.path.extension(p);
+    } else if (eql(u8, a.action, "normalize")) {
+        const resolved = try std.fs.path.resolve(alloc, &.{p});
+        defer alloc.free(resolved);
+        return std.json.Stringify.valueAlloc(alloc, resolved, .{});
+    } else {
+        return error.UnknownPathAction;
+    }
+    return std.json.Stringify.valueAlloc(alloc, value, .{});
+}
+
+/// `window.zilt.log(level, message)`（v0.1.16）：前端日志汇入 Zig 日志。
+fn logCmd(ctx: ipc.Context, a: Args) ![]u8 {
+    const level = a.level orelse "info";
+    const msg = a.message orelse a.text orelse "";
+    if (std.mem.eql(u8, level, "debug")) {
+        log.print("[fe:debug] {s}", .{msg});
+    } else if (std.mem.eql(u8, level, "warn")) {
+        log.print("[fe:warn] {s}", .{msg});
+    } else if (std.mem.eql(u8, level, "error")) {
+        log.print("[fe:error] {s}", .{msg});
+    } else {
+        log.print("[fe:info] {s}", .{msg});
+    }
+    return ok(ctx);
 }
 
 fn systemCmd(ctx: ipc.Context, method: []const u8, a: Args) ![]u8 {

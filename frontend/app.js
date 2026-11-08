@@ -334,6 +334,21 @@ async function runChecks() {
       setCheck('c-storage', ok, ok ? 'store+fs ok, escape denied' : `store=${stored} fs=${text} exists=${exists} escape=${escapeDenied}`);
     } catch (e) { setCheck('c-storage', false, String(e)); }
 
+    // 26. v0.1.16：周边 API（path / log / windowState）
+    try {
+      const joined = await window.zilt.path.join('a', 'b', 'c.txt');
+      const base = await window.zilt.path.basename(joined);
+      const ext = await window.zilt.path.extname(joined);
+      await window.zilt.log('info', 'smoke peripheral api');
+      const state = await window.zilt.windowState.get();
+      const saved = await window.zilt.windowState.save();
+      const ok = /c\.txt$/.test(joined) && base === 'c.txt' && ext === '.txt' &&
+        !!state && state.width > 0 && state.height > 0 && saved === true;
+      setCheck('c-peripheral', ok, ok
+        ? `path/log/state ok (${state.width}x${state.height})`
+        : `join=${joined} base=${base} ext=${ext} saved=${saved}`);
+    } catch (e) { setCheck('c-peripheral', false, String(e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -363,6 +378,7 @@ async function runChecks() {
       appearance: $('c-appearance').className === 'pass',
       autostart: $('c-autostart').className === 'pass',
       storage: $('c-storage').className === 'pass',
+      peripheral: $('c-peripheral').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });
