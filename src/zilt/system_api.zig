@@ -104,6 +104,22 @@ pub const ServicesOp = union(enum) {
     stop: []const u8,
 };
 
+/// HTTP 请求（v0.1.16）。异步执行：立即返回，完成后以 `httpResponse` 事件回传。
+/// headers 用 "A: 1\r\nB: 2" 单串传递，避免嵌套数组的 IPC 编解码开销。
+pub const HttpRequest = struct {
+    /// 调用方生成，用于在事件里匹配（避免并发请求串号）
+    id: i64,
+    url: []const u8,
+    method: []const u8 = "GET",
+    headers: []const u8 = "",
+    body: []const u8 = "",
+    timeout_ms: u32 = 30_000,
+};
+
+pub const HttpOp = union(enum) {
+    request: HttpRequest,
+};
+
 pub const Request = union(enum) {
     menu: MenuOp,
     tray: TrayOp,
@@ -123,6 +139,8 @@ pub const Request = union(enum) {
     window_state: WindowStateOp,
     /// v0.1.16：服务注册表
     services: ServicesOp,
+    /// v0.1.16：HTTP 请求（异步，结果走 httpResponse 事件）
+    http: HttpOp,
 };
 
 pub const Result = union(enum) {

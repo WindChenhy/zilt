@@ -70,6 +70,7 @@ pub fn smokeResult(ctx: Context, payload: struct {
     storage: bool = false,
     peripheral: bool = false,
     services: bool = false,
+    http: bool = false,
     fatal: ?[]const u8 = null,
 }) void {
     var ok = false;
@@ -78,15 +79,15 @@ pub fn smokeResult(ctx: Context, payload: struct {
     } else {
         ok = payload.greet and payload.add and payload.fail and payload.user and payload.event and payload.mode and payload.clip and payload.win and payload.range and payload.winevent and
             payload.windowapi and payload.eval and payload.webview and payload.capability and payload.clipmulti and payload.notification and payload.acl and payload.spa and
-            payload.traycheck and payload.taskbar and payload.hotkey and payload.sysinfo and payload.appearance and payload.autostart and payload.storage and payload.peripheral and payload.services;
+            payload.traycheck and payload.taskbar and payload.hotkey and payload.sysinfo and payload.appearance and payload.autostart and payload.storage and payload.peripheral and payload.services and payload.http;
         if (ok) {
-            zilt.log.print("[smoke] ALL CHECKS PASSED (27 checks: core-10 + window-api/eval/webview-api/capability/clipboard-multi/notification/acl/spa + tray-check/taskbar/hotkey/sysinfo/appearance/autostart + store/fs + path/log/state + services)", .{});
+            zilt.log.print("[smoke] ALL CHECKS PASSED (28 checks: core-10 + window-api/eval/webview-api/capability/clipboard-multi/notification/acl/spa + tray-check/taskbar/hotkey/sysinfo/appearance/autostart + store/fs + path/log/state + services + http)", .{});
         } else {
-            zilt.log.print("[smoke] FAILED greet={} add={} fail={} user={} event={} mode={} clip={} win={} range={} winevent={} windowapi={} eval={} webview={} capability={} clipmulti={} notification={} acl={} spa={} traycheck={} taskbar={} hotkey={} sysinfo={} appearance={} autostart={} storage={} peripheral={} services={}", .{
+            zilt.log.print("[smoke] FAILED greet={} add={} fail={} user={} event={} mode={} clip={} win={} range={} winevent={} windowapi={} eval={} webview={} capability={} clipmulti={} notification={} acl={} spa={} traycheck={} taskbar={} hotkey={} sysinfo={} appearance={} autostart={} storage={} peripheral={} services={} http={}", .{
                 payload.greet, payload.add, payload.fail, payload.user, payload.event, payload.mode, payload.clip,
                 payload.win, payload.range, payload.winevent, payload.windowapi, payload.eval, payload.webview,
                 payload.capability, payload.clipmulti, payload.notification, payload.acl, payload.spa,
-                payload.traycheck, payload.taskbar, payload.hotkey, payload.sysinfo, payload.appearance, payload.autostart, payload.storage, payload.peripheral, payload.services,
+                payload.traycheck, payload.taskbar, payload.hotkey, payload.sysinfo, payload.appearance, payload.autostart, payload.storage, payload.peripheral, payload.services, payload.http,
             });
         }
     }

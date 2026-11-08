@@ -74,6 +74,7 @@ const WM_MBUTTONUP: win32.UINT = 0x0207;
 const WM_ZILT_ACTION: win32.UINT = win32.WM_APP + 7; // 统一能力动作 marshal（UI 线程）
 const WM_ZILT_WAKE: win32.UINT = win32.WM_APP + 8; // WebView driver 延迟派发
 const WM_ZILT_TOAST_EVENT: win32.UINT = win32.WM_APP + 9; // WinRT 线程 → UI 线程
+const WM_ZILT_HTTP: win32.UINT = win32.WM_APP + 10; // HTTP 后台线程 → UI 线程
 const WM_CLIPBOARDUPDATE: win32.UINT = 0x031D;
 const TRAY_MENU_BASE: u16 = 100;
 
@@ -1708,6 +1709,7 @@ fn Backend(comptime config: Config) type {
                 .fs => |op| return self.runFsOp(op, alloc),
                 .window_state => |op| return self.runWindowStateOp(w, op, alloc),
                 .services => |op| return self.runServicesOp(op, alloc),
+                .http => |op| return self.runHttpOp(op, alloc),
             }
         }
 
@@ -1742,6 +1744,52 @@ fn Backend(comptime config: Config) type {
             defer self.allocator.free(path);
             if (!win32.writeFileAlloc(self.allocator, path, json)) {
                 log.print("[store] persist failed: {s}", .{path});
+            }
+        }
+
+        // ---- v0.1.16：HTTP（异步） ----
+
+        /// 发起请求后立刻返回；结果由后台线程 PostMessage 回 UI 线程，
+        /// 再以 `httpResponse` 事件推给前端。**不阻塞 UI 线程**是这里的核心约束
+        /// —— 同步实现会让窗口在慢请求下冻结数秒，体验上等同于卡死。
+        fn runHttpOp(self: *Self, op: shared_system.HttpOp, alloc: std.mem.Allocator) !shared_system.Result {
+            _ = alloc;
+            const a = std.heap.page_allocator;
+            switch (op) {
+                .request => |req| {
+                    const w = self.mainWindow() orelse return error.NoMainWindow;
+
+                    const job = a.create(HttpJob) catch return error.OutOfMemory;
+                    job.* = .{
+                        .hwnd = w.hwnd,
+                        .id = req.id,
+                        .url = a.dupe(u8, req.url) catch {
+                            a.destroy(job);
+                            return error.OutOfMemory;
+                        },
+                        .method = a.dupe(u8, req.method) catch {
+                            freeHttpJob(job);
+                            return error.OutOfMemory;
+                        },
+                        .headers = a.dupe(u8, req.headers) catch {
+                            freeHttpJob(job);
+                            return error.OutOfMemory;
+                        },
+                        .body = a.dupe(u8, req.body) catch {
+                            freeHttpJob(job);
+                            return error.OutOfMemory;
+                        },
+                    };
+
+                    const t = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, httpWorker, .{job}) catch {
+                        freeHttpJob(job);
+                        log.print("[http] spawn failed", .{});
+                        return error.HttpSpawnFailed;
+                    };
+                    t.detach();
+                    log.print("[http] {s} {s} (id={d}) dispatched", .{ job.method, job.url, job.id });
+                    return .{ .ok = true };
+                },
             }
         }
 
@@ -3372,6 +3420,24 @@ fn Backend(comptime config: Config) type {
                     }
                     return 0;
                 },
+                WM_ZILT_HTTP => {
+                    const res: *HttpResult = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    defer freeHttpResult(res);
+                    if (instance) |b| {
+                        if (b.mainWindow()) |w| {
+                            w.emitEventPayload("httpResponse", .{
+                                .id = res.id,
+                                .status = res.status,
+                                .body = res.body,
+                                .err = res.err,
+                            });
+                        }
+                        log.print("[http] done id={d} status={d} bytes={d} err={s}", .{
+                            res.id, res.status, res.body.len, res.err orelse "-",
+                        });
+                    }
+                    return 0;
+                },
                 WM_ZILT_TOAST_EVENT => {
                     if (instance) |b| {
                         const len: usize = @intCast(wparam);
@@ -4024,6 +4090,119 @@ fn appendJsonEscaped(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8),
             else => try out.append(alloc, c),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// v0.1.16：HTTP 请求（后台线程执行，结果 PostMessage 回 UI 线程）
+// ---------------------------------------------------------------------------
+
+/// 后台线程 → UI 线程的结果。page_allocator 持有，UI 线程取走后 free。
+const HttpResult = struct {
+    id: i64,
+    status: u16,
+    body: []u8,
+    err: ?[]u8,
+};
+
+const HttpJob = struct {
+    hwnd: win32.HWND,
+    id: i64,
+    url: []u8,
+    method: []u8,
+    headers: []u8,
+    body: []u8,
+};
+
+fn freeHttpJob(job: *HttpJob) void {
+    const a = std.heap.page_allocator;
+    a.free(job.url);
+    a.free(job.method);
+    a.free(job.headers);
+    a.free(job.body);
+    a.destroy(job);
+}
+
+fn freeHttpResult(res: *HttpResult) void {
+    const a = std.heap.page_allocator;
+    a.free(res.body);
+    if (res.err) |e| a.free(e);
+    a.destroy(res);
+}
+
+fn parseHttpMethod(m: []const u8) std.http.Method {
+    if (std.ascii.eqlIgnoreCase(m, "POST")) return .POST;
+    if (std.ascii.eqlIgnoreCase(m, "PUT")) return .PUT;
+    if (std.ascii.eqlIgnoreCase(m, "DELETE")) return .DELETE;
+    if (std.ascii.eqlIgnoreCase(m, "PATCH")) return .PATCH;
+    if (std.ascii.eqlIgnoreCase(m, "HEAD")) return .HEAD;
+    return .GET;
+}
+
+/// `"A: 1\nB: 2"` → 头列表。name/value 指向 raw（job 存活期内有效）。
+fn parseHeaderList(a: std.mem.Allocator, raw: []const u8) ![]std.http.Header {
+    var list: std.ArrayListUnmanaged(std.http.Header) = .empty;
+    errdefer list.deinit(a);
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (t.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, t, ':') orelse continue;
+        const name = std.mem.trim(u8, t[0..colon], " \t");
+        const value = std.mem.trim(u8, t[colon + 1 ..], " \t");
+        if (name.len == 0) continue;
+        try list.append(a, .{ .name = name, .value = value });
+    }
+    return list.toOwnedSlice(a);
+}
+
+fn httpWorker(job: *HttpJob) void {
+    const a = std.heap.page_allocator;
+
+    const res = a.create(HttpResult) catch {
+        freeHttpJob(job);
+        return;
+    };
+    res.* = .{
+        .id = job.id,
+        .status = 0,
+        .body = a.dupe(u8, "") catch &[_]u8{},
+        .err = null,
+    };
+
+    {
+        var threaded: std.Io.Threaded = .init(a, .{});
+        defer threaded.deinit();
+        var client: std.http.Client = .{ .allocator = a, .io = threaded.io() };
+        defer client.deinit();
+
+        const hdrs = parseHeaderList(a, job.headers) catch a.alloc(std.http.Header, 0) catch &[_]std.http.Header{};
+        defer a.free(hdrs);
+
+        var aw: std.Io.Writer.Allocating = .init(a);
+        defer aw.deinit();
+
+        const outcome = client.fetch(.{
+            .location = .{ .url = job.url },
+            .method = parseHttpMethod(job.method),
+            .payload = if (job.body.len > 0) job.body else null,
+            .extra_headers = hdrs,
+            .response_writer = &aw.writer,
+        });
+
+        if (outcome) |r| {
+            res.status = @intFromEnum(r.status);
+            if (aw.toOwnedSlice()) |bytes| {
+                res.body = bytes;
+            } else |_| {}
+        } else |e| {
+            res.err = a.dupe(u8, @errorName(e)) catch null;
+        }
+    }
+
+    if (win32.PostMessageW(job.hwnd, WM_ZILT_HTTP, 0, @bitCast(@intFromPtr(res))) == 0) {
+        freeHttpResult(res);
+    }
+    freeHttpJob(job);
 }
 
 /// HTTP 下载（std.http.Client；每次调用独立 Threaded Io，更新流程低频可接受）。

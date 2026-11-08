@@ -1,3 +1,4 @@
+// v0.1.16: http（后台线程 + PostMessage + httpResponse 事件）
 // v0.1.15: msix（AppxManifest / ICO 帧 / 版本规范化）
 // v0.1.15: wix_vendor（MSI 工具链 vendor）
 //! Zilt —— 基于系统 WebView 的跨平台 GUI 框架（框架本体 Zig）。

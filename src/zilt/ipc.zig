@@ -709,6 +709,7 @@ pub const runtime_js =
     \\  const resolvers = new Map();
     \\  const listeners = new Map();
     \\  let nextId = 1;
+    \\  let httpSeq = 0;
     \\  const post = (m) => window.chrome.webview.postMessage(m);
     \\  window.chrome.webview.addEventListener('message', (e) => {
     \\    const m = e.data;
@@ -739,6 +740,13 @@ pub const runtime_js =
     \\      const ls = listeners.get(name) ?? [];
     \\      ls.push(cb);
     \\      listeners.set(name, ls);
+    \\      // 返回取消函数：一次性请求（如 http）必须能摘掉自己的监听，否则会累积
+    \\      return () => {
+    \\        const cur = listeners.get(name);
+    \\        if (!cur) return;
+    \\        const i = cur.indexOf(cb);
+    \\        if (i >= 0) cur.splice(i, 1);
+    \\      };
     \\    },
     \\    startDragging: () => builtin('__zilt.startDragging', {}),
     \\    // v0.1.11: window.zilt.window
@@ -882,6 +890,30 @@ pub const runtime_js =
     \\      status: (name) => builtin('__zilt.services', { action: 'status', name }),
     \\      start: (name) => builtin('__zilt.services', { action: 'start', name }),
     \\      stop: (name) => builtin('__zilt.services', { action: 'stop', name }),
+    \\    },
+    \\    // v0.1.16: HTTP。异步实现 —— 立即返回、后台线程执行、完成走 httpResponse 事件，
+    \\    // 所以这里用 Promise 包一层，调用方直接 await，UI 线程不会被阻塞。
+    \\    http: {
+    \\      request: (opts) => {
+    \\        const o = opts ?? {};
+    \\        const id = ++httpSeq;
+    \\        return new Promise((resolve, reject) => {
+    \\          const off = window.zilt.on('httpResponse', (p) => {
+    \\            if (!p || p.id !== id) return;
+    \\            off();
+    \\            if (p.err) reject(new Error(p.err));
+    \\            else resolve({ status: p.status, body: p.body });
+    \\          });
+    \\          builtin('__zilt.http', {
+    \\            action: 'request', id,
+    \\            url: o.url,
+    \\            method: o.method ?? 'GET',
+    \\            headers: typeof o.headers === 'string' ? o.headers : Object.entries(o.headers ?? {}).map(([k, v]) => k + ': ' + v).join('\\n'),
+    \\            body: o.body ?? '',
+    \\            timeout_ms: o.timeout_ms ?? 30000,
+    \\          }).catch((e) => { off(); reject(e); });
+    \\        });
+    \\      },
     \\    },
     \\    version: '0.1.16',
     \\  };

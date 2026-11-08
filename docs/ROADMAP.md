@@ -401,9 +401,20 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
       `opener`（openUrl/openPath/reveal，复用 shell）、
       `windowState`（get 当前几何 / save 立即持久化）、
       以及既有的 `system`/`shell`/`autostart`/`appearance`
-- [ ] **未实现的周边 API**：http、websocket、sql、upload、process、os（独立命名空间）
+- [x] **`http`**（v0.1.16，**异步**）：`window.zilt.http.request({url, method, headers, body})`
+      → `{status, body}`。实现方式：后台线程执行 → `PostMessage` 回 UI 线程 →
+      `httpResponse` 事件 → JS 侧 Promise resolve/reject。
+      **为什么不做成同步**：IPC 在窗口消息循环里同步处理，同步 HTTP 会让窗口在慢请求下
+      冻结数秒，体验等同卡死。
+      **实测**：`https://example.com` → `status=200 bytes=577`，body 为字符串
+      （`bodyType=string`，内容为真实 HTML）；`http://127.0.0.1:1/` → `err=ConnectionRefused`
+      且错误完整穿过线程→消息→事件→Promise reject。
+      `on()` 现返回取消函数（一次性请求必须能摘监听，否则会累积）。
+      ⚠ `timeout_ms` 目前只是透传，**未强制生效**（std.http.Client.fetch 无超时参数）；
+      要真正超时需额外看门狗线程，留待后续
+- [ ] **未实现的周边 API**：websocket、sql、upload、process、os（独立命名空间）
 - [ ] **多 WebView / 数据分区**：同一窗口多 WebView（未实现；每窗口已有独立 WebView2 profile）
-- [~] **验收**：冒烟 27 项含 store set/get + fs 写读 exists + `../` 逃逸被拒（PathEscape）
+- [~] **验收**：冒烟 28 项含 store set/get + fs 写读 exists + `../` 逃逸被拒（PathEscape）
       + path join/basename/extname + log 转发 + windowState get/save；
       多 WebView 未达成（见下）
 

@@ -362,6 +362,17 @@ async function runChecks() {
         : `list=${JSON.stringify(list)} st=${JSON.stringify(st)} unknown=${JSON.stringify(unknown)}`);
     } catch (e) { setCheck('c-services', false, String(e)); }
 
+    // 28. v0.1.16：HTTP 异步请求。冒烟用必然拒绝连接的地址（不依赖外网），
+    // 断言错误穿过 后台线程 → PostMessage → httpResponse 事件 → Promise reject 全链路。
+    try {
+      let httpErr = null;
+      try {
+        await window.zilt.http.request({ url: 'http://127.0.0.1:1/', timeout_ms: 2000 });
+      } catch (e) { httpErr = String(e.message || e); }
+      const ok = !!httpErr;
+      setCheck('c-http', ok, ok ? `http error path ok (${httpErr})` : 'expected failure but resolved');
+    } catch (e) { setCheck('c-http', false, String(e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -393,6 +404,7 @@ async function runChecks() {
       storage: $('c-storage').className === 'pass',
       peripheral: $('c-peripheral').className === 'pass',
       services: $('c-services').className === 'pass',
+      http: $('c-http').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

@@ -85,6 +85,10 @@ pub const Args = struct {
     message: ?[]const u8 = null,
     /// 服务名（__zilt.services）
     name: ?[]const u8 = null,
+    /// HTTP 方法 / 头 / 超时（__zilt.http）；body 复用上面的同名字段
+    method: ?[]const u8 = null,
+    headers: ?[]const u8 = null,
+    timeout_ms: ?u32 = null,
 };
 
 pub fn isBuiltin(method: []const u8) bool {
@@ -358,7 +362,7 @@ pub fn isSystemMethod(method: []const u8) bool {
         eql(u8, name, "taskbar") or eql(u8, name, "system") or eql(u8, name, "shell") or
         eql(u8, name, "autostart") or eql(u8, name, "appearance") or
         eql(u8, name, "store") or eql(u8, name, "fs") or eql(u8, name, "windowState") or
-        eql(u8, name, "services");
+        eql(u8, name, "services") or eql(u8, name, "http");
 }
 
 pub fn clickActionFromName(name: ?[]const u8) system_api.ClickAction {
@@ -489,6 +493,20 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
         if (eql(u8, a.action, "exists")) return .{ .fs = .{ .exists = a.path orelse return error.MissingPath } };
         if (eql(u8, a.action, "remove")) return .{ .fs = .{ .remove = a.path orelse return error.MissingPath } };
         return error.UnknownFsAction;
+    }
+
+    if (eql(u8, name, "http")) {
+        if (eql(u8, a.action, "request")) {
+            return .{ .http = .{ .request = .{
+                .id = a.id orelse 0,
+                .url = a.url orelse return error.MissingUrl,
+                .method = a.method orelse "GET",
+                .headers = a.headers orelse "",
+                .body = a.body orelse a.text orelse a.data orelse "",
+                .timeout_ms = a.timeout_ms orelse 30_000,
+            } } };
+        }
+        return error.UnknownHttpAction;
     }
 
     if (eql(u8, name, "services")) {
