@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.16（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs/path/log/opener/windowState 周边 API + 更新器通道/崩溃回滚/健康确认 + 代码签名命令 + `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.1.16（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs/path/log/opener/windowState 周边 API + 更新器通道/崩溃回滚/健康确认 + 代码签名（签名产物已实测 Authenticode + RFC3161）+ MSI（WiX 3.14 自动 vendor，安装/卸载实测）+ `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 v0.1.8–v0.1.12 新增（2026-11-08，均已实现、验证并提交）：
 
@@ -16,7 +16,7 @@ v0.1.8–v0.1.12 新增（2026-11-08，均已实现、验证并提交）：
 - **v0.1.11**：`window.zilt.window` 全量窗口 API、capability ACL（构建期生成 `capabilities.json`、运行时强制、未授权返回 `PermissionDenied`）、远程内容边界与隔离模式
 - **v0.1.12**：剪贴板多格式（文本/图片/HTML/文件）+ 变化监听、OLE `IDropTarget` 拖放（含坐标与自定义格式）+ 文件拖出、Toast 交互（按钮/输入/进度/点击深链/分组/状态查询）
 - 前端运行时新增 `window.zilt.eval` / `webview` / `clipboard` / `drag` / `notification`；Zig 侧对应 `zilt.Context` 方法
-- **验收**：单元测试 193/193；`zig build` / `zig build gen` / 模板 init→build→test 回归全通过；GUI 冒烟 26 项 `ALL CHECKS PASSED`（exit 0）；`zilt doctor` 全绿
+- **验收**：单元测试 205/205；`zig build` / `zig build gen` / 模板 init→build→test 回归全通过；GUI 冒烟 26 项 `ALL CHECKS PASSED`（exit 0）；`zilt doctor` 全绿（含 signtool 与 WiX 3.14 检测）；MSI 安装/卸载往返 exit 0
 
 v0.1.7 新增：
 
@@ -51,7 +51,7 @@ ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=my-app zig build init
 ```sh
 zig build gen      # 生成前端 TS 绑定（frontend/bindings/zilt.ts）
 zig build run      # 启动示例应用（embedded 模式）
-zig build test    # 单元测试（193/193：协议/更新器/打包器/系统能力/codegen/模板/图标/深链接/Range/窗口模型/安全 ACL/SPA 回退/WebView2 驱动 ABI/剪贴板编解码/OLE 拖放/Toast/能力清单/内置命令/加速键/运行时菜单/任务栏 ABI/系统信息/自启/存储/受限 fs/服务注册表/VERSIONINFO/manifest/NSIS 增强/存储/受限 fs）
+zig build test    # 单元测试（205/205：协议/更新器/打包器/系统能力/codegen/模板/图标/深链接/Range/窗口模型/安全 ACL/SPA 回退/WebView2 驱动 ABI/剪贴板编解码/OLE 拖放/Toast/能力清单/内置命令/加速键/运行时菜单/任务栏 ABI/系统信息/自启/存储/受限 fs/服务注册表/VERSIONINFO/manifest/NSIS 增强/WiX vendor/签名凭据/base64 解码）
 ```
 
 dev 模式：
@@ -90,6 +90,22 @@ zig build doctor                # 等价快捷 step
 zig build bundle
 ZILT_INSTALLER_PER_MACHINE=1 ZILT_INSTALLER_LICENSE=LICENSE.txt \
 ZILT_INSTALLER_SCHEME=zilt ZILT_INSTALLER_EXT=.zilt zig build bundle
+```
+
+MSI（首次构建自动下载并缓存 WiX 3.14.1 到 `%LOCALAPPDATA%\zilt\WixTools`，
+带 SHA256 校验；离线环境可预置或用 `ZILT_WIX_TOOLPATH` 指定）：
+
+```sh
+ZILT_PACK_TARGET=msi zig build pack                  # per-user → %LOCALAPPDATA%\Programs
+ZILT_PACK_TARGET=msi ZILT_INSTALLER_PER_MACHINE=1 zig build pack   # per-machine → Program Files
+```
+
+代码签名（三种凭据来源，按优先级：路径 > base64 > 指纹）：
+
+```sh
+ZILT_SIGN_THUMBPRINT=<指纹> zig build bundle          # 证书已在证书存储
+ZILT_SIGN_PFX=cert.pfx ZILT_SIGN_PASSWORD=*** zig build bundle
+ZILT_SIGN_PFX_BASE64=<base64> ZILT_SIGN_PASSWORD=*** zig build bundle   # CI secret
 ```
 
 GUI 冒烟测试（26 项前端检查 + Zig 侧 `smokeResult` 断言，日志 `ALL CHECKS PASSED` 且 exit 0）：

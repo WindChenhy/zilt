@@ -216,3 +216,119 @@ test "full command quotes the tool path" {
     try testing.expect(std.mem.startsWith(u8, cmd, "\"C:\\Program Files (x86)\\Windows Kits\\10\\bin\\signtool.exe\" sign"));
     try testing.expectError(error.EmptyFile, signArgs(testing.allocator, .{ .pfx_path = "a.pfx" }, ""));
 }
+
+// ---------------------------------------------------------------------------
+// 凭据来源（对齐 Tauri / Wails 的 CI 友好做法）
+//
+// Tauri：WINDOWS_CERTIFICATE（base64 PFX）+ WINDOWS_CERTIFICATE_PASSWORD
+// Wails：SIGN_CERTIFICATE 路径 / SIGN_THUMBPRINT，密码进系统钥匙串
+// 这里两种都支持：路径、base64（给 CI secret）、指纹（证书已在存储）。
+// ---------------------------------------------------------------------------
+
+pub const Source = enum {
+    /// 已解压的 .pfx 文件路径
+    pfx_path,
+    /// base64 编码的 .pfx（CI secret 常见形态）
+    pfx_base64,
+    /// 证书已在当前用户/机器证书存储中
+    thumbprint,
+};
+
+/// 按优先级挑选凭据来源；都为空返回 null（调用方应跳过签名）。
+/// 显式文件路径优先于 base64（更可控），两者都优先于指纹。
+pub fn pickSource(pfx_path: ?[]const u8, pfx_base64: ?[]const u8, thumbprint: ?[]const u8) ?Source {
+    if (nonBlank(pfx_path)) return .pfx_path;
+    if (nonBlank(pfx_base64)) return .pfx_base64;
+    if (nonBlank(thumbprint)) return .thumbprint;
+    return null;
+}
+
+fn nonBlank(v: ?[]const u8) bool {
+    const s = v orelse return false;
+    return std.mem.trim(u8, s, " \t\r\n").len > 0;
+}
+
+/// 解码 base64 的 PFX。容忍：
+///   - 折行/空格/CRLF（secret 里粘贴常被折行）
+///   - 缺失的尾部 padding
+///   - PEM 头尾（`certutil -encode` 的产物）
+pub fn decodePfxBase64(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+    const body = stripPemArmor(std.mem.trim(u8, input, " \t\r\n"));
+
+    var clean: std.ArrayListUnmanaged(u8) = .empty;
+    defer clean.deinit(alloc);
+    for (body) |c| {
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') continue;
+        try clean.append(alloc, c);
+    }
+    if (clean.items.len == 0) return error.EmptyInput;
+
+    // 补齐 padding：长度必须是 4 的倍数，否则解码器直接报错
+    const pad = (4 - clean.items.len % 4) % 4;
+    for (0..pad) |_| try clean.append(alloc, '=');
+
+    const dec = std.base64.standard.Decoder;
+    const size = try dec.calcSizeForSlice(clean.items);
+    const out = try alloc.alloc(u8, size);
+    errdefer alloc.free(out);
+    try dec.decode(out, clean.items);
+    return out;
+}
+
+fn stripPemArmor(s: []const u8) []const u8 {
+    var start: usize = 0;
+    var end: usize = s.len;
+    if (std.mem.startsWith(u8, s, "-----BEGIN")) {
+        if (std.mem.indexOfScalar(u8, s, '\n')) |nl| start = nl + 1;
+    }
+    if (std.mem.lastIndexOf(u8, s, "-----END")) |idx| {
+        if (idx > start) end = idx;
+    }
+    return s[start..end];
+}
+
+test "pickSource: path beats base64 beats thumbprint, blanks ignored" {
+    try testing.expectEqual(Source.pfx_path, pickSource("a.pfx", "AAAA", "ABCD").?);
+    try testing.expectEqual(Source.pfx_base64, pickSource(null, "AAAA", "ABCD").?);
+    try testing.expectEqual(Source.pfx_base64, pickSource("  ", "AAAA", "ABCD").?);
+    try testing.expectEqual(Source.thumbprint, pickSource(null, null, "ABCD").?);
+    try testing.expectEqual(@as(?Source, null), pickSource(null, null, null));
+    try testing.expectEqual(@as(?Source, null), pickSource("", "  \n", ""));
+}
+
+test "decodePfxBase64 handles plain, wrapped and unpadded input" {
+    const a = testing.allocator;
+    // "hello" 的 base64
+    const expect = "hello";
+
+    const plain = try decodePfxBase64(a, "aGVsbG8=");
+    defer a.free(plain);
+    try testing.expectEqualStrings(expect, plain);
+
+    // 折行 + CRLF
+    const wrapped = try decodePfxBase64(a, "aGVs\r\nbG8=\n");
+    defer a.free(wrapped);
+    try testing.expectEqualStrings(expect, wrapped);
+
+    // 丢掉 padding
+    const unpadded = try decodePfxBase64(a, "aGVsbG8");
+    defer a.free(unpadded);
+    try testing.expectEqualStrings(expect, unpadded);
+}
+
+test "decodePfxBase64 strips PEM armor" {
+    const a = testing.allocator;
+    const pem =
+        \\-----BEGIN PKCS12-----
+        \\aGVsbG8=
+        \\-----END PKCS12-----
+    ;
+    const out = try decodePfxBase64(a, pem);
+    defer a.free(out);
+    try testing.expectEqualStrings("hello", out);
+}
+
+test "decodePfxBase64 rejects empty payload" {
+    const a = testing.allocator;
+    try testing.expectError(error.EmptyInput, decodePfxBase64(a, "   \n\t "));
+}

@@ -14,6 +14,7 @@
 const std = @import("std");
 const zilt = @import("zilt");
 const app_meta = @import("app_meta");
+const wix_tool = @import("wix_tool.zig");
 
 const PackMeta = zilt.pack_formats.PackMeta;
 
@@ -29,6 +30,7 @@ pub extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: [*]const u8, nNumber
 pub extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.c) BOOL;
 pub extern "kernel32" fn CreateDirectoryW(lpPathName: [*:0]const u16, lpSecurityAttributes: ?*anyopaque) callconv(.c) BOOL;
 pub extern "kernel32" fn GetCommandLineW() callconv(.c) [*:0]u16;
+pub extern "kernel32" fn GetFullPathNameW(lpFileName: [*:0]const u16, nBufferLength: DWORD, lpBuffer: [*]u16, lpFilePart: ?*?[*:0]u16) callconv(.c) DWORD;
 pub extern "shell32" fn CommandLineToArgvW(lpCmdLine: [*:0]const u16, pNumArgs: *i32) callconv(.c) ?[*][*:0]u16;
 
 const BOOL = i32;
@@ -103,6 +105,18 @@ fn pathJoin(alloc: std.mem.Allocator, base: []const u8, rest: []const u8) ![]u8 
     return std.fmt.allocPrint(alloc, "{s}\\{s}", .{ base, rest });
 }
 
+/// candle 的 Source 需要绝对路径；build 系统注入的 argv[1] 是
+/// `.zig-cache/o/<hash>/zilt-app.exe` 这样的相对路径，相对 cwd 虽能解析，
+/// 但一旦 out 目录变化就会指向错误位置。
+fn getFullPathW(alloc: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const pw = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return null;
+    defer alloc.free(pw);
+    var buf: [2048]u16 = undefined;
+    const n = GetFullPathNameW(pw.ptr, buf.len, &buf, null);
+    if (n == 0 or n >= buf.len) return null;
+    return std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..n]) catch null;
+}
+
 fn exeBaseName(alloc: std.mem.Allocator, meta: PackMeta) ![]const u8 {
     if (std.mem.endsWith(u8, meta.exe_name, ".exe")) return meta.exe_name[0 .. meta.exe_name.len - 4];
     _ = alloc;
@@ -140,12 +154,50 @@ pub fn main() !void {
     };
 
     if (std.mem.eql(u8, target, "msi")) {
-        const exe_src = exe_path orelse return error.ExeArgRequired;
-        const wxs = try zilt.pack_formats.generateWxs(alloc, meta, exe_src);
+        const exe_arg = exe_path orelse return error.ExeArgRequired;
+        // candle 的 Source 必须是绝对路径（argv[1] 来自 .zig-cache 相对路径）
+        const exe_src = getFullPathW(alloc, exe_arg) orelse exe_arg;
+
+        // 与 NSIS 同一套开关：ZILT_INSTALLER_PER_MACHINE=1 → Program Files + HKLM
+        const per_machine = blk: {
+            const v = getEnv(alloc, "ZILT_INSTALLER_PER_MACHINE") orelse break :blk false;
+            break :blk v.len > 0 and v[0] == '1';
+        };
+
+        const wxs = try zilt.pack_formats.generateWxsOpt(alloc, meta, exe_src, .{ .per_machine = per_machine });
         const out = try pathJoin(alloc, out_dir, try std.fmt.allocPrint(alloc, "{s}-{s}-x64.wxs", .{ meta.name, meta.version }));
         if (!writeFile(alloc, out, wxs)) return error.WriteFailed;
         std.debug.print("[pack] wxs -> {s}\n", .{out});
-        std.debug.print("[pack] msi: 需要 WiX（wix build <wxs> -o out.msi，或 v3 candle+light）；本机未自动检测构建\n", .{});
+
+        // v0.1.15：自动供应 WiX（Tauri 式 vendor）并真实构建 MSI
+        const prepared = wix_tool.ensure(alloc) catch |err| {
+            std.debug.print(
+                "[pack] WiX 供应失败：{s}\n" ++
+                    "  · 离线环境可手工放置：解压 wix314-binaries.zip 到 %LOCALAPPDATA%\\zilt\\WixTools\n" ++
+                    "  · 或用 ZILT_WIX_TOOLPATH 指向已解压目录（含 candle.exe/light.exe）\n" ++
+                    "  · wxs 已生成，可自行执行：candle -arch x64 -out x.wixobj {s} && light -out x.msi x.wixobj\n",
+                .{ @errorName(err), out },
+            );
+            return;
+        };
+        if (prepared == null) {
+            std.debug.print(
+                "[pack] 未找到 WiX 且自动下载被禁用；wxs 已生成：{s}\n" ++
+                    "  · 将其解压目录设到 ZILT_WIX_TOOLPATH 后重试\n",
+                .{out},
+            );
+            return;
+        }
+        defer wix_tool.freePrepared(alloc, prepared);
+        const wix = prepared.?;
+        std.debug.print("[pack] using WiX from {s} (source={s})\n", .{ wix.dir, @tagName(wix.source) });
+
+        const msi = try pathJoin(alloc, out_dir, try std.fmt.allocPrint(alloc, "{s}-{s}-x64.msi", .{ meta.name, meta.version }));
+        wix_tool.buildMsi(alloc, wix.dir, out, msi, "x64") catch |err| {
+            std.debug.print("[pack] MSI 构建失败：{s}（wxs 见 {s}）\n", .{ @errorName(err), out });
+            return err;
+        };
+        std.debug.print("[pack] msi -> {s}\n", .{msi});
     } else if (std.mem.eql(u8, target, "macos")) {
         const exe_src = exe_path orelse return error.ExeArgRequired;
         const exe_bytes = readFileAlloc(alloc, exe_src) orelse return error.ExeReadFailed;

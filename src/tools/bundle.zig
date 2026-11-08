@@ -9,6 +9,7 @@ const std = @import("std");
 const zilt = @import("zilt");
 const bundler = zilt.bundler;
 const meta = @import("app_meta");
+const signtool_locator = @import("signtool_locate.zig");
 
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
@@ -130,9 +131,6 @@ pub fn main() !void {
     try writeFileW(alloc, nsi_path, script_bom);
     log.print("[bundle] nsis script: {s}", .{nsi_path});
 
-    // ---- 代码签名（v0.1.15）：有 ZILT_SIGN_* 时签名 exe 与 setup ----
-    signArtifacts(alloc, exe_abs, setup_path);
-
     // makensis（有则产出 setup.exe，无则提示）
     var threaded: std.Io.Threaded = .init(alloc, .{});
     defer threaded.deinit();
@@ -161,6 +159,10 @@ pub fn main() !void {
             return error.MakensisFailed;
         },
     }
+
+    // ---- 代码签名（有 ZILT_SIGN_* 时）：必须放在 makensis 之后，
+    // 否则 setup.exe 尚未生成，签名必然失败（曾因顺序错踩过）。
+    signArtifacts(alloc, exe_abs, setup_path);
 }
 
 // ---- 小工具 ----
@@ -208,78 +210,72 @@ fn fileSizeW(alloc: std.mem.Allocator, path_u8: []const u8) u64 {
 // 代码签名（v0.1.15）
 // ---------------------------------------------------------------------------
 
-extern "kernel32" fn SearchPathW(
-    lpPath: ?win32.LPCWSTR,
-    lpFileName: win32.LPCWSTR,
-    lpExtension: ?win32.LPCWSTR,
-    nBufferLength: u32,
-    lpBuffer: [*]u16,
-    lpFilePart: ?*?[*:0]u16,
-) callconv(.c) u32;
-
-/// PATH 中查找 signtool.exe。
-fn searchPath(alloc: std.mem.Allocator, name: []const u8) ?[]u8 {
-    const name_z = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch return null;
-    defer alloc.free(name_z);
-    var buf: [1024]u16 = undefined;
-    const n = SearchPathW(null, name_z.ptr, null, buf.len, &buf, null);
-    if (n == 0 or n >= buf.len) return null;
-    return std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..n]) catch null;
-}
-
-/// 查找 signtool：PATH 优先，其次 Windows Kits 下任意版本（`bin\*\x64`）。
-fn findSigntool(alloc: std.mem.Allocator) ?[]u8 {
-    if (searchPath(alloc, "signtool.exe")) |p| return p;
-
-    const pf86 = win32.getEnvUtf8(alloc, "ProgramFiles(x86)") orelse return null;
-    defer alloc.free(pf86);
-    const pattern = std.fmt.allocPrint(alloc, "{s}\\Windows Kits\\10\\bin\\*\\x64\\signtool.exe", .{pf86}) catch return null;
-    defer alloc.free(pattern);
-    const wz = std.unicode.utf8ToUtf16LeAllocZ(alloc, pattern) catch return null;
-    defer alloc.free(wz);
-
-    var fd: win32.WIN32_FIND_DATAW = undefined;
-    const h = win32.FindFirstFileW(wz.ptr, &fd);
-    if (h == win32.INVALID_HANDLE_VALUE) return null;
-    defer _ = win32.FindClose(h);
-
-    const dir = std.fs.path.dirname(pattern) orelse return null;
-    const name = std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.sliceTo(&fd.cFileName, 0)) catch return null;
-    defer alloc.free(name);
-    return std.fmt.allocPrint(alloc, "{s}\\{s}", .{ dir, name }) catch null;
-}
-
 /// 按 ZILT_SIGN_* 环境变量签名 exe 与 setup；缺配置/缺工具时明确提示，不阻断打包。
 fn signArtifacts(alloc: std.mem.Allocator, exe_path: []const u8, setup_path: []const u8) void {
     const sign = zilt.codesign;
+    const win32 = zilt.platform_windows.win32;
+    const log = zilt.log;
 
     const pfx = win32.getEnvUtf8(alloc, "ZILT_SIGN_PFX");
     defer if (pfx) |v| alloc.free(v);
+    const pfx_b64 = win32.getEnvUtf8(alloc, "ZILT_SIGN_PFX_BASE64");
+    defer if (pfx_b64) |v| alloc.free(v);
     const thumb = win32.getEnvUtf8(alloc, "ZILT_SIGN_THUMBPRINT");
     defer if (thumb) |v| alloc.free(v);
 
-    if (pfx == null and thumb == null) {
-        log.print("[sign] skipped (set ZILT_SIGN_PFX or ZILT_SIGN_THUMBPRINT to enable)", .{});
+    const src = sign.pickSource(pfx, pfx_b64, thumb) orelse {
+        log.print("[sign] skipped (set ZILT_SIGN_PFX / ZILT_SIGN_PFX_BASE64 / ZILT_SIGN_THUMBPRINT)", .{});
         return;
-    }
+    };
 
     const pw = win32.getEnvUtf8(alloc, "ZILT_SIGN_PASSWORD");
     defer if (pw) |v| alloc.free(v);
     const ts = win32.getEnvUtf8(alloc, "ZILT_SIGN_TIMESTAMP");
     defer if (ts) |v| alloc.free(v);
 
-    const opts = sign.Options{
-        .pfx_path = pfx,
+    // base64 凭据（CI secret 形态）：解到临时 .pfx，签完立刻删
+    var tmp_pfx: ?[]u8 = null;
+    defer if (tmp_pfx) |p| {
+        if (std.unicode.utf8ToUtf16LeAllocZ(alloc, p)) |wz| {
+            _ = win32.DeleteFileW(wz.ptr);
+            alloc.free(wz);
+        } else |_| {}
+        alloc.free(p);
+    };
+
+    var opts = sign.Options{
         .pfx_password = pw,
-        .cert_thumbprint = thumb,
         .timestamp_url = if (ts) |t| t else "http://timestamp.digicert.com",
     };
+    switch (src) {
+        .pfx_path => opts.pfx_path = pfx,
+        .thumbprint => opts.cert_thumbprint = thumb,
+        .pfx_base64 => {
+            const der = sign.decodePfxBase64(alloc, pfx_b64.?) catch |err| {
+                log.print("[sign] base64 PFX decode failed: {s}", .{@errorName(err)});
+                return;
+            };
+            defer alloc.free(der);
+            const tmp_dir = win32.getEnvUtf8(alloc, "TEMP") orelse ".";
+            defer alloc.free(tmp_dir);
+            const p = std.fmt.allocPrint(alloc, "{s}\\zilt-sign-temp.pfx", .{tmp_dir}) catch return;
+            if (!win32.writeFileAlloc(alloc, p, der)) {
+                alloc.free(p);
+                log.print("[sign] cannot write temp PFX", .{});
+                return;
+            }
+            tmp_pfx = p;
+            opts.pfx_path = p;
+            log.print("[sign] decoded base64 PFX to temp file (deleted after signing)", .{});
+        },
+    }
+
     sign.validate(opts) catch |err| {
         log.print("[sign] invalid config: {s}", .{@errorName(err)});
         return;
     };
 
-    const tool = findSigntool(alloc);
+    const tool = signtool_locator.locate(alloc);
     defer if (tool) |t| alloc.free(t);
 
     if (tool == null) {
@@ -291,6 +287,10 @@ fn signArtifacts(alloc: std.mem.Allocator, exe_path: []const u8, setup_path: []c
 
     const files = [_][]const u8{ exe_path, setup_path };
     for (files) |file| {
+        if (!signtool_locator.fileExists(alloc, file)) {
+            log.print("[sign] skip (not found): {s}", .{file});
+            continue;
+        }
         const args = sign.signArgs(alloc, opts, file) catch |err| {
             log.print("[sign] args failed: {s}", .{@errorName(err)});
             return;

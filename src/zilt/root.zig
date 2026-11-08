@@ -1,3 +1,4 @@
+// v0.1.15: wix_vendor（MSI 工具链 vendor）
 //! Zilt —— 基于系统 WebView 的跨平台 GUI 框架（框架本体 Zig）。
 //!
 //! Phase 0–2：Windows 平台（纯 Zig 手写 WebView2 COM 绑定）。
@@ -31,6 +32,7 @@ pub const autostart = @import("autostart.zig");
 pub const theme = @import("theme.zig");
 pub const system_api = @import("system_api.zig");
 pub const codesign = @import("codesign.zig");
+pub const wix_vendor = @import("wix_vendor.zig");
 pub const store = @import("store.zig");
 pub const fs_api = @import("fs_api.zig");
 pub const services = @import("services.zig");
@@ -64,6 +66,7 @@ test {
     _ = @import("theme.zig");
     _ = @import("system_api.zig");
     _ = @import("codesign.zig");
+    _ = @import("wix_vendor.zig");
     _ = @import("store.zig");
     _ = @import("fs_api.zig");
     _ = @import("services.zig");

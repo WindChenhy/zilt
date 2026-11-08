@@ -55,17 +55,78 @@ pub fn derivedGuid(alloc: std.mem.Allocator, seed: []const u8) ![]u8 {
 }
 
 // ---------------------------------------------------------------------------
-// WiX .wxs（MSI；per-user + 开始菜单快捷方式 + MajorUpgrade）
+// WiX .wxs（MSI）
+//
+// 两条真实约束（light 的 ICE 校验会拦）：
+//   ICE38 per-user 安装时文件不能当 KeyPath，必须用 HKCU 注册表值做 KeyPath
+//   ICE64 user profile 下的目录必须能被卸载清理（RemoveFolder；MSI 只删空目录，
+//         所以对共用层 %LOCALAPPDATA%\Programs 也安全）
 // ---------------------------------------------------------------------------
 
+pub const WxsOptions = struct {
+    /// per-machine：Program Files + HKLM + 需要提权；默认 per-user。
+    per_machine: bool = false,
+};
+
 pub fn generateWxs(alloc: std.mem.Allocator, meta: PackMeta, exe_source_path: []const u8) ![]u8 {
+    return generateWxsOpt(alloc, meta, exe_source_path, .{});
+}
+
+pub fn generateWxsOpt(
+    alloc: std.mem.Allocator,
+    meta: PackMeta,
+    exe_source_path: []const u8,
+    opts: WxsOptions,
+) ![]u8 {
     const upgrade_code = try derivedGuid(alloc, meta.app_id);
     defer alloc.free(upgrade_code);
-    return std.fmt.allocPrint(alloc,
+
+    const scope = if (opts.per_machine) "perMachine" else "perUser";
+    const reg_root = if (opts.per_machine) "HKLM" else "HKCU";
+
+    // 组件 GUID 必须显式：带 registry keypath 的组件不能用 Guid="*"
+    // （candle 报 CNDL0230）。用稳定派生值而非随机 GUID —— 升级时 MSI 才能
+    // 认出「同一个组件」，MajorUpgrade 的引用计数才不会错。
+    const scope_key = if (opts.per_machine) "permachine" else "peruser";
+    const exe_seed = try std.fmt.allocPrint(alloc, "{s}.{s}.exe", .{ meta.app_id, scope_key });
+    defer alloc.free(exe_seed);
+    const exe_guid = try derivedGuid(alloc, exe_seed);
+    defer alloc.free(exe_guid);
+    const menu_seed = try std.fmt.allocPrint(alloc, "{s}.{s}.menu", .{ meta.app_id, scope_key });
+    defer alloc.free(menu_seed);
+    const menu_guid = try derivedGuid(alloc, menu_seed);
+    defer alloc.free(menu_guid);
+
+    // 安装根：per-machine 用 Program Files，per-user 用 LocalAppData\Programs
+    const root_block = if (opts.per_machine)
+        \\      <Directory Id="ProgramFiles64Folder">
+        \\        <Directory Id="INSTALLDIR" Name="@DIRNAME@">
+        \\          <Component Id="AppExe" Guid="@EXE_GUID@">
+        \\            <File Id="ExeFile" Source="@EXE_SRC@" Name="@EXE_NAME@" KeyPath="yes"/>
+        \\            <RemoveFolder Id="RemoveInstallDir" On="uninstall" Directory="INSTALLDIR"/>
+        \\          </Component>
+        \\        </Directory>
+        \\      </Directory>
+    else
+        \\      <Directory Id="LocalAppDataFolder">
+        \\        <Directory Id="ProgramsFolder" Name="Programs">
+        \\          <Directory Id="INSTALLDIR" Name="@DIRNAME@">
+        \\            <Component Id="AppExe" Guid="@EXE_GUID@">
+        \\              <File Id="ExeFile" Source="@EXE_SRC@" Name="@EXE_NAME@"/>
+        \\              <RegistryValue Root="HKCU" Key="Software\@APPID@" Name="exe" Type="integer" Value="1" KeyPath="yes"/>
+        \\              <RemoveFolder Id="RemoveInstallDir" On="uninstall" Directory="INSTALLDIR"/>
+        \\              <RemoveFolder Id="RemoveProgramsFolder" On="uninstall" Directory="ProgramsFolder"/>
+        \\            </Component>
+        \\          </Directory>
+        \\        </Directory>
+        \\      </Directory>
+    ;
+
+    const template =
         \\<?xml version="1.0" encoding="UTF-8"?>
         \\<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
-        \\  <Product Id="*" Name="{s}" Language="1033" Version="{s}" Manufacturer="{s}" UpgradeCode="{s}">
-        \\    <Package InstallerVersion="200" Compressed="yes" InstallScope="perUser" Description="{s}"/>
+        \\  <Product Id="*" Name="@NAME@" Language="1033" Version="@VERSION@" Manufacturer="@MFR@" UpgradeCode="@UPGRADE@">
+        \\    <Package InstallerVersion="200" Compressed="yes" InstallScope="@SCOPE@" Description="@DESC@"/>
         \\    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed."/>
         \\    <MediaTemplate EmbedCab="yes"/>
         \\    <Feature Id="Main" Level="1">
@@ -73,34 +134,50 @@ pub fn generateWxs(alloc: std.mem.Allocator, meta: PackMeta, exe_source_path: []
         \\      <ComponentRef Id="StartMenuShortcut"/>
         \\    </Feature>
         \\    <Directory Id="TARGETDIR" Name="SourceDir">
-        \\      <Directory Id="LocalAppDataFolder">
-        \\        <Directory Id="ZiltPrograms" Name="Programs">
-        \\          <Directory Id="INSTALLDIR" Name="{s}">
-        \\            <Component Id="AppExe" Guid="*">
-        \\              <File Id="ExeFile" Source="{s}" KeyPath="yes"/>
-        \\            </Component>
-        \\          </Directory>
-        \\        </Directory>
-        \\      </Directory>
+        \\@ROOT_BLOCK@
         \\      <Directory Id="ProgramMenuFolder">
-        \\        <Directory Id="AppMenuDir" Name="{s}">
-        \\          <Component Id="StartMenuShortcut" Guid="*">
-        \\            <Shortcut Id="AppShortcut" Name="{s}" Description="{s}" Target="[ZiltPrograms]/{s}/{s}" WorkingDirectory="INSTALLDIR"/>
+        \\        <Directory Id="AppMenuDir" Name="@DIRNAME@">
+        \\          <Component Id="StartMenuShortcut" Guid="@MENU_GUID@">
+        \\            <Shortcut Id="AppShortcut" Name="@NAME@" Description="@DESC@" Target="[#ExeFile]" WorkingDirectory="INSTALLDIR"/>
         \\            <RemoveFolder Id="RemoveMenuDir" On="uninstall"/>
-        \\            <RegistryValue Root="HKCU" Key="Software\{s}" Name="installed" Type="integer" Value="1" KeyPath="yes"/>
+        \\            <RegistryValue Root="@REG_ROOT@" Key="Software\@APPID@" Name="menu" Type="integer" Value="1" KeyPath="yes"/>
         \\          </Component>
         \\        </Directory>
         \\      </Directory>
         \\    </Directory>
         \\  </Product>
         \\</Wix>
-    , .{
-        meta.name,          meta.version,                       meta.maintainer,
-        upgrade_code,       meta.description,                   meta.name,
-        exe_source_path,    meta.name,                          meta.name,
-        meta.description,   "ZiltPrograms",                     meta.name,
-        meta.app_id,
-    });
+        \\
+    ;
+
+    // 顺序很关键：@ROOT_BLOCK@ 插入的片段自身含 @EXE_SRC@ / @APPID@ / @EXE_GUID@
+    // 等占位符，必须放在最前面展开，否则这些占位符会逃过替换（candle/light 会
+    // 把字面量 @EXE_SRC@ 当成文件路径去打开）。
+    const pairs = [_][2][]const u8{
+        .{ "@ROOT_BLOCK@", root_block },
+        .{ "@NAME@", meta.name },
+        .{ "@VERSION@", meta.version },
+        .{ "@MFR@", meta.maintainer },
+        .{ "@UPGRADE@", upgrade_code },
+        .{ "@SCOPE@", scope },
+        .{ "@DESC@", meta.description },
+        .{ "@DIRNAME@", meta.name },
+        .{ "@EXE_SRC@", exe_source_path },
+        .{ "@EXE_NAME@", meta.exe_name },
+        .{ "@APPID@", meta.app_id },
+        .{ "@REG_ROOT@", reg_root },
+        .{ "@EXE_GUID@", exe_guid },
+        .{ "@MENU_GUID@", menu_guid },
+    };
+
+    var cur = try alloc.dupe(u8, template);
+    errdefer alloc.free(cur);
+    for (pairs) |p| {
+        const next = try std.mem.replaceOwned(u8, alloc, cur, p[0], p[1]);
+        alloc.free(cur);
+        cur = next;
+    }
+    return cur;
 }
 
 /// Authenticode 签名命令（signtool；证书/时间戳经环境传入，工具侧执行）。

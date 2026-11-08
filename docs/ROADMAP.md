@@ -341,20 +341,38 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
 - [x] **安装器增强**：setup.exe 图标、per-machine（admin + Program Files + HKLM）、
       安装目录选择、License 页、升级检测、**安装时注册 URL 协议与文件关联**
       （`ZILT_INSTALLER_*` 环境变量控制；makensis 实测两种变体均编译通过）
-- [~] **MSI / MSIX**：WiX 未安装 → 本机无法构建 MSI（`.wxs` 仍生成，`zilt doctor` 会提示）；
-      MSIX 未实现；**Fixed WebView2 已支持**（`Config.environment.browser_directory`，
+- [x] **MSI（WiX 3.14.1 自动 vendor，Tauri 式）**：`wix_vendor.zig` + `tools/wix_tool.zig`
+      首次构建时下载 `wix314-binaries.zip` 到 `%LOCALAPPDATA%\zilt\WixTools`，
+      SHA256 校验（`6ac824e1…`）+ 缓存复用 + `ZILT_WIX_TOOLPATH` 覆盖 + `ZILT_WIX_NO_DOWNLOAD=1`
+      离线模式；`candle -arch x64` + `light` 真实产出 .msi
+      **实测**：19 秒完成下载→校验→解压→构建；静默安装/卸载往返 exit 0，
+      exe 落 `%LOCALAPPDATA%\Programs\Zilt`、开始菜单项创建、卸载后目录与快捷方式清理干净，
+      共用层 `%LOCALAPPDATA%\Programs` 保留（RemoveFolder 只删空目录）
+      同时修掉原 `.wxs` 的三处真实缺陷：快捷方式 `Target` 拼错（`[ZiltPrograms]/…`）、
+      per-user 的文件 KeyPath（ICE38）、user profile 目录未清理（ICE64）
+      —— 现支持 per-user / per-machine 两种 scope（`ZILT_INSTALLER_PER_MACHINE=1`）
+      未做：MSIX；**Fixed WebView2 已支持**（`Config.environment.browser_directory`，
       loader 走 fixed 模式且不回落 Evergreen —— 代码已接线，缺专项 E2E）
-- [x] **代码签名接入**：`codesign.zig` 构造 signtool 命令（PFX/指纹二选一、RFC3161 时间戳、
-      /fd /td 一致、路径引号、指纹规范化）；`zig build bundle` 自动发现 signtool
-      （PATH + Windows Kits `bin\*\x64`）并依次签 exe 与 setup；未装 SDK 时打印可复制命令
-      ⚠ 本机无 Windows SDK/证书，**未做真实签名验证**
+- [x] **代码签名接入（已实测）**：`codesign.zig` 构造 signtool 命令（PFX/指纹/base64 PFX
+      三选一、RFC3161 时间戳、/fd /td 一致、路径引号、指纹规范化）；
+      **凭据来源对齐上游**：`ZILT_SIGN_PFX`（路径）/ `ZILT_SIGN_PFX_BASE64`（CI secret，
+      解到临时 pfx 签完即删，容忍折行/缺 padding/PEM 头尾）/ `ZILT_SIGN_THUMBPRINT`（证书存储）
+      + `ZILT_SIGN_PASSWORD` / `ZILT_SIGN_TIMESTAMP`
+      **工具发现**：PATH → 注册表 `KitsRoot10`（SDK 可装在任意盘，本机在 E 盘）→
+      `App Certification Kit` → `ProgramFiles(x86)` 兜底；只接受以数字开头的版本目录
+      （`bin\` 下混有 x64/x86/arm64，字典序最大的是 x86，会漏掉真正的最新版）
+      **实测**：自签名证书 → `sign` 退出 0 → `Get-AuthenticodeSignature` 报
+      `SignatureType=Authenticode`、signer 正确、`sha256RSA`、
+      时间戳为 `DigiCert SHA256 RSA4096 Timestamp Responder 2026 1`（RFC3161 生效）；
+      `Status=UnknownError` 仅因自签名根不受信（换 CA 证书即 `Valid`）
 - [x] **更新器增强**：通道（stable/beta，`Config.update.channel`；beta 客户端同时接受
       stable 清单，未知通道一律拒绝）+ 崩溃回滚（restart helper 观察 3 秒，非 0 退出即用
       `.zilt-old` 回滚并重拉）+ 健康确认（启动 10 秒后才清理备份，`WM_TIMER` id=3）
-- [~] **验收**：exe 属性 Zilt / 0.1.16、manifest 含 PerMonitorV2；
+- [x] **验收**：exe 属性 Zilt / 0.1.16、manifest 含 PerMonitorV2；
+      MSI 安装/卸载往返 exit 0 且清理干净；签名产物 Authenticode + RFC3161 时间戳；
       setup.exe 814KB / 824KB；通道矩阵与回滚文件语义有单测；
       健康确认实测 `health timer armed (10s)` → `health confirmed, backup cleaned`；
-      真实签名与 MSI 安装/卸载未验证（缺 SDK/WiX）
+      `zilt doctor` 报告 signtool（`bin\10.0.26100.0\x64`）与 WiX 3.14 缓存路径
 
 ### v0.1.16 — 插件 / 服务架构、官方周边 API 与多 WebView（P2）
 
@@ -421,6 +439,44 @@ fs 走 `fs_api.joinChecked` 做 scope 内路径校验。JS 新增 `window.zilt.s
 
 **（2026-11-08 补完）v0.1.16 周边 API**：新增 `path` / `log` / `opener` / `windowState`
 （`store`/`fs` 上轮已接）；冒烟增至 26 项并通过。
+
+**（2026-11-08 晚）MSI 与真实代码签名落地**：
+
+- **WiX vendor**：新建 `wix_vendor.zig`（纯逻辑，11 条单测：候选目录优先级 / SHA256
+  大小写不敏感比对 / 体积合理性窗口 / stamp 内容）+ `tools/wix_tool.zig`（下载、校验、
+  解压、candle+light、退出码）。缓存 `%LOCALAPPDATA%\zilt\WixTools`，
+  标记文件 `.zilt-wix-ok` 避免每次重校验 40 MB。
+- **下载源核实**：`wix3142rtm` 是 404（网络上大量文档写错），正确 tag 是 `wix3141rtm`；
+  实测 41,297,555 字节，SHA256 `6ac824e1…`，与 Scoop manifest 一致。
+- **解压用系统 tar.exe** 而非自研 unzip：Windows 10 1803+ 自带 libarchive 支持 zip，
+  少一处易错的二进制解析；失败时打印 tar 退出码。
+- **修掉 `.wxs` 的三处真实缺陷**（都是 light 的 ICE 校验发现的，之前从未真正构建过 MSI）：
+  `ICE38` per-user 时文件不能当 KeyPath → 改 HKCU 注册表值；
+  `ICE64` user profile 目录未在卸载表 → 加 `RemoveFolder`；
+  快捷方式 `Target` 拼成 `[ZiltPrograms]/ZiltPrograms/Zilt`（目录 ID 重复 + 用应用名
+  当文件名）→ 改 `[#ExeFile]`。
+  另修 `Guid="*"` 在「文件 + 注册表 keypath」组件上非法（`CNDL0230`）→ 改稳定派生 GUID。
+- **占位符顺序陷阱（第二次踩）**：`@ROOT_BLOCK@` 插入的片段自身含 `@EXE_SRC@` 等占位符，
+  若排在后面展开就会逃过替换，candle 把字面量 `@EXE_SRC@` 当文件路径去打开。
+  与 bundler 里 `${UNINST_ROOT}` 那次同一类问题，现已把分支块放第一位展开。
+- **签名工具发现**：本机 SDK 装在 **E 盘**，`ProgramFiles(x86)\Windows Kits\10\bin\*\x64`
+  直接返回 null，曾误报「signtool not found」。改为读注册表
+  `KitsRoot10` → `bin\<最高版本>\x64` → `App Certification Kit` → 默认盘兜底，
+  并只接受以数字开头的版本目录（`bin\` 下 x64/x86/arm64 的字典序会误导）。
+- **签名时机 bug**：`signArtifacts` 原在 makensis 之前调用，那时 setup.exe 还没生成，
+  必然 exit 1。已移到 makensis 成功之后，并对每个文件做存在性检查。
+- **凭据**：新增 `ZILT_SIGN_PFX_BASE64`（对齐 Tauri 的 `WINDOWS_CERTIFICATE`），
+  解码容忍折行 / 缺 padding / PEM 头尾，写临时 pfx 签完即删；
+  `pickSource` 优先级 pfx 路径 > base64 > 指纹，5 条单测。
+- **实测证据**：`[sign] … -> exit 0` ×2；`Get-AuthenticodeSignature` 报
+  `Type=Authenticode`、`Signer=CN=Zilt CI Signing`、`sha256RSA`、时间戳 OK；
+  MSI `install exit=0 → exe 落地 → uninstall exit=0 → 目录与快捷方式清理`；
+  `zig build test` 205/205；GUI 冒烟 26 项 ALL CHECKS PASSED。
+- **一处如实说明**：base64 凭据的**完整**签名往返没能跑完 —— 命令行里出现明文密码
+  被环境安全策略拦截（不重试、不绕过）。已用两条独立证据替代：
+  (a) `decodePfxBase64` 单测覆盖折行/缺 padding/PEM 头尾；
+  (b) 传无效 base64 时日志出现 `[sign] decoded base64 PFX to temp file`，
+  随后 signtool 确实收到该文件并因内容无效返回 1 —— 链路（解码→写临时文件→传参）打通。
 
 **仍未完成**：多 WebView（需重构 backend 单 webview 假设：多 controller 布局、消息来源区分、
 销毁时序——属重构级改动，建议单独一轮并配 WebDriver 回归）、MSIX、http/websocket/sql/

@@ -9,6 +9,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zilt = @import("zilt");
 const meta = @import("app_meta");
+const signtool_locator = @import("signtool_locate.zig");
+const wix_tool = @import("wix_tool.zig");
 
 const win32 = zilt.platform_windows.win32;
 const print = std.debug.print;
@@ -108,17 +110,17 @@ fn runDoctor(alloc: std.mem.Allocator) !u8 {
     }
 
     // 可选工具链：代码签名 / MSI
-    if (findInPath(alloc, "signtool.exe")) |p| {
+    if (signtool_locator.locate(alloc)) |p| {
         defer alloc.free(p);
         print("[ok]   signtool: {s}\n", .{p});
     } else {
         print("[warn] signtool not found — code signing needs Windows SDK (bundle prints the command)\n", .{});
     }
-    if (findInPath(alloc, "wix.exe")) |p| {
+    if (wix_tool.detect(alloc)) |p| {
         defer alloc.free(p);
-        print("[ok]   wix: {s}\n", .{p});
+        print("[ok]   WiX 3.14: {s}\n", .{p});
     } else {
-        print("[warn] WiX not found — MSI build unavailable (.wxs still generated)\n", .{});
+        print("[info] WiX 3 not cached — fetched automatically on first `zig build pack` (MSI)\n", .{});
     }
 
     // 前端 dist
