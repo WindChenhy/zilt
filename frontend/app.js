@@ -373,6 +373,67 @@ async function runChecks() {
       setCheck('c-http', ok, ok ? `http error path ok (${httpErr})` : 'expected failure but resolved');
     } catch (e) { setCheck('c-http', false, String(e)); }
 
+    // 29. v0.1.16：WebSocket 全链路。依赖本机 echo 服务端（scripts/ws_echo.py :8765）：
+    // connect → open 事件 → send → 服务端 welcome + echo 两条 message → close → close 事件。
+    try {
+      // 错误路径：必然拒绝连接的地址 → error 事件（与 http 同策略，不依赖外部环境）
+      let errPathOk = false;
+      try {
+        const errId = await window.zilt.ws.connect('ws://127.0.0.1:1/');
+        const errEvents = [];
+        const errOff = window.zilt.ws.on(errId, (p) => errEvents.push(p));
+        await new Promise((resolve, reject) => {
+          const t0 = Date.now();
+          const tick = () => {
+            if (errEvents.some((e) => e.kind === 'error')) return resolve();
+            if (Date.now() - t0 > 4000) return reject(new Error('no error event: ' + JSON.stringify(errEvents)));
+            setTimeout(tick, 100);
+          };
+          tick();
+        });
+        errOff();
+        errPathOk = true;
+      } catch (e) { errPathOk = false; }
+
+      const wsEvents = [];
+      const wsId = await window.zilt.ws.connect('ws://127.0.0.1:8765/smoke');
+      const wsOff = window.zilt.ws.on(wsId, (p) => wsEvents.push(p));
+      let sent = false;
+      await new Promise((resolve, reject) => {
+        const t0 = Date.now();
+        const tick = () => {
+          if (!sent && wsEvents.some((e) => e.kind === 'open')) {
+            sent = true;
+            window.zilt.ws.send(wsId, 'smoke-payload').catch(reject);
+          }
+          const msgs = wsEvents.filter((e) => e.kind === 'message');
+          if (sent && msgs.length >= 2) return resolve();
+          if (wsEvents.some((e) => e.kind === 'error')) return reject(new Error('ws error: ' + JSON.stringify(wsEvents)));
+          if (Date.now() - t0 > 6000) return reject(new Error('ws timeout: ' + JSON.stringify(wsEvents.map((e) => e.kind))));
+          setTimeout(tick, 100);
+        };
+        tick();
+      });
+      await window.zilt.ws.close(wsId, 1000, 'smoke done');
+      // close 事件到达后再断言（超时不失败 —— 主链路已验证，清理是收尾）
+      await new Promise((resolve) => {
+        const t0 = Date.now();
+        const tick = () => {
+          if (wsEvents.some((e) => e.kind === 'close') || Date.now() - t0 > 3000) resolve();
+          else setTimeout(tick, 100);
+        };
+        tick();
+      });
+      wsOff();
+      const payloadOk = wsEvents.some((e) => e.kind === 'message' && e.data === 'smoke-payload');
+      const welcomeOk = wsEvents.some((e) => e.kind === 'message' && (e.data || '').includes('welcome'));
+      const closeOk = wsEvents.some((e) => e.kind === 'close');
+      const ok = errPathOk && payloadOk && welcomeOk && closeOk;
+      setCheck('c-ws', ok, ok
+        ? 'ws ok (error 路径 + open→welcome→echo→close 全链路)'
+        : `errPathOk=${errPathOk} events=${JSON.stringify(wsEvents.map((e) => e.kind))}`);
+    } catch (e) { setCheck('c-ws', false, String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -405,6 +466,7 @@ async function runChecks() {
       peripheral: $('c-peripheral').className === 'pass',
       services: $('c-services').className === 'pass',
       http: $('c-http').className === 'pass',
+      ws: $('c-ws').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

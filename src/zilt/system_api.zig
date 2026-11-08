@@ -120,6 +120,15 @@ pub const HttpOp = union(enum) {
     request: HttpRequest,
 };
 
+/// WebSocket（v0.1.16）。connect 异步执行：立即返回，握手结果与后续消息
+/// 都走 `wsEvent` 事件（kind: open/message/close/error）。
+pub const WsOp = union(enum) {
+    /// url 仅支持 ws://（wss 需 TLS，明确报错）
+    connect: struct { id: i64, url: []const u8 },
+    send: struct { id: i64, data: []const u8 },
+    close: struct { id: i64, code: u16 = 1000, reason: []const u8 = "" },
+};
+
 pub const Request = union(enum) {
     menu: MenuOp,
     tray: TrayOp,
@@ -141,6 +150,8 @@ pub const Request = union(enum) {
     services: ServicesOp,
     /// v0.1.16：HTTP 请求（异步，结果走 httpResponse 事件）
     http: HttpOp,
+    /// v0.1.16：WebSocket 客户端（事件走 wsEvent）
+    ws: WsOp,
 };
 
 pub const Result = union(enum) {

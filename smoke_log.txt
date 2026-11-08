@@ -1,0 +1,155 @@
+[icon] ready (custom=builtin Zig logo; small=16px big=32px)
+[tray] popup menu built (runtime model, 6 leaves)
+[store] ready (1 keys) C:\Users\Mrchen\AppData\Local\app.zilt\store.json
+[services] 1 registered, 1 started
+[updater] configured (manifest=https://updates.invalid/manifest.json, current=0.1.1)
+[toast] winrt ready (aumid=app.zilt)
+[deep-link] protocol "zilt" registered (ok=true)
+[deep-link] file assoc ".zilt" registered (ok=true)
+[win32] window #1 created: "Zilt — v0.1.16 示例" (https://zilt.app/index.html) decorations=true transparent=false topmost=false taskbar=true visible=true
+[state] restored window #1 (main) 130,130 976x759 max=false full=false
+[win32] window created: "Zilt — v0.1.16 示例" 960x700
+[hotkey] registered 3 hotkeys
+[loader] runtime version: 157.0.4341.42 (channel=evergreen)
+[loader] dll: C:\Program Files (x86)\Microsoft\EdgeWebView\Application\157.0.4341.42\EBWebView\x64\EmbeddedBrowserWebView.dll
+[profile] C:\Users\Mrchen\AppData\Local\app.zilt\WebView2
+[webview] environment created
+[test] smoke timer set: 30000 ms
+[updater] health timer armed (10s)
+[webview] controller created (window #1)
+[webview] core webview attached (window #1)
+[webview] add_WebMessageReceived hr=0x0
+[webview] add_WebResourceRequested hr=0x0
+[webview] AddWebResourceRequestedFilter(https://zilt.app/*) hr=0x0
+[webview] add_NavigationCompleted hr=0x0
+[webview] driver attached (devtools=true, downloads=true, new_window=new_window, recover=true)
+[webview] inject runtime js hr=0x0
+[webview] navigate https://zilt.app/index.html hr=0x0
+[tray] added (ok=true)
+[assets] 200 text/html; charset=utf-8 8412 bytes (gz-store) <- https://zilt.app/index.html
+[assets] 200 text/css; charset=utf-8 1652 bytes <- https://zilt.app/styles.css
+[assets] 200 text/javascript; charset=utf-8 25524 bytes (gz-store) <- https://zilt.app/app.js
+[ipc] invoke greet (id=1, window=1)
+[webview] navigation completed: SUCCESS (window #1)
+[ipc] invoke add (id=2, window=1)
+[ipc] invoke failNow (id=3, window=1)
+[ipc] invoke failNow failed: DemoFailure
+[ipc] invoke queryUser (id=4, window=1)
+[assets] 404 <- https://zilt.app/favicon.ico
+[ipc] invoke startTicker (id=5, window=1)
+[ipc] invoke stopTicker (id=6, window=1)
+[ipc] invoke setMode (id=7, window=1)
+[ipc] invoke clipboardRoundtrip (id=8, window=1)
+[clip] wrote 15 chars
+[clip] read 15 chars
+[ipc] invoke windowTitleDemo (id=9, window=1)
+[ipc] invoke windowTitleDemo (id=10, window=1)
+[ipc] invoke windowControlDemo (id=11, window=1)
+[ipc] invoke windowControlDemo (id=12, window=1)
+[assets] 206 text/css; charset=utf-8 bytes=0-9/1652 <- https://zilt.app/styles.css
+[ipc] invoke notifyMe (id=13, window=1)
+[toast] shortcut exists: C:\Users\Mrchen\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Zilt — v0.1.16 示例.lnk
+[toast] notifier.Setting = DisabledForUser (2)（通知被系统设置抑制，横幅不可见——检查 设置→系统→通知/勿扰）
+[notify] sent (winrt toast)
+[ipc] invoke __zilt.window (id=14, window=1)
+[win32] window #2 created: "Zilt v0.1.11 冒烟" (https://zilt.app/index.html) decorations=true transparent=false topmost=false taskbar=true visible=true
+[webview] controller created (window #2)
+[webview] core webview attached (window #2)
+[webview] add_WebMessageReceived hr=0x0
+[webview] add_WebResourceRequested hr=0x0
+[webview] AddWebResourceRequestedFilter(https://zilt.app/*) hr=0x0
+[webview] add_NavigationCompleted hr=0x0
+[webview] driver attached (devtools=true, downloads=true, new_window=new_window, recover=true)
+[webview] inject runtime js hr=0x0
+[webview] navigate https://zilt.app/index.html hr=0x0
+[assets] 200 text/html; charset=utf-8 8412 bytes (gz-store) <- https://zilt.app/index.html
+[assets] 200 text/css; charset=utf-8 1652 bytes <- https://zilt.app/styles.css
+[assets] 200 text/javascript; charset=utf-8 25524 bytes (gz-store) <- https://zilt.app/app.js
+[ipc] invoke greet (id=1, window=2)
+[webview] navigation completed: SUCCESS (window #2)
+[ipc] invoke add (id=2, window=2)
+[ipc] invoke failNow (id=3, window=2)
+[ipc] invoke failNow failed: DemoFailure
+[ipc] invoke queryUser (id=4, window=2)
+[ipc] invoke startTicker (id=5, window=2)
+[ipc] invoke __zilt.window (id=15, window=1)
+[win32] WM_DESTROY (window)
+[state] saved window #2 (smoke-1794141698483) 26,26 336x299 max=false full=false
+[ipc] invoke __zilt.eval (id=16, window=1)
+[ipc] invoke __zilt.webview (id=17, window=1)
+[assets] 200 application/json 379 bytes <- https://zilt.app/bindings/capabilities.json
+[ipc] invoke __zilt.clipboard (id=18, window=1)
+[ipc] invoke __zilt.clipboard (id=19, window=1)
+[ipc] invoke __zilt.clipboard (id=20, window=1)
+[ipc] invoke __zilt.clipboard (id=21, window=1)
+[ipc] invoke __zilt.notification (id=22, window=1)
+[ipc] invoke blockedDemo (id=23, window=1)
+[acl] command 'blockedDemo' denied (window=main, source=https://zilt.app/index.html)
+[assets] 200 text/html; charset=utf-8 8412 bytes (gz-store) <- https://zilt.app/account/settings
+[assets] 200 text/css; charset=utf-8 1652 bytes <- https://zilt.app/styles.css
+[assets] 304 /app.js (etag match)
+[ipc] invoke __zilt.menu (id=24, window=1)
+[menu] set 'tray-check' (changed=true)
+[ipc] invoke __zilt.menu (id=25, window=1)
+[ipc] invoke __zilt.menu (id=26, window=1)
+[menu] set 'tray-check' (changed=true)
+[ipc] invoke __zilt.taskbar (id=27, window=1)
+[taskbar] ITaskbarList4 ready
+[taskbar] progress normal value=0.5
+[ipc] invoke __zilt.taskbar (id=28, window=1)
+[taskbar] flash (ok=true)
+[ipc] invoke __zilt.hotkey (id=29, window=1)
+[hotkey] runtime registered smoke-hotkey = Ctrl+Alt+F9
+[ipc] invoke __zilt.hotkey (id=30, window=1)
+[ipc] invoke __zilt.hotkey (id=31, window=1)
+[hotkey] runtime unregistered smoke-hotkey
+[ipc] invoke __zilt.hotkey (id=32, window=1)
+[ipc] invoke __zilt.system (id=33, window=1)
+[ipc] invoke __zilt.appearance (id=34, window=1)
+[appearance] dark_titlebar=true backdrop=true
+[ipc] invoke __zilt.autostart (id=35, window=1)
+[autostart] enabled: D:\Projects\ZigProjects\Zilt\zig-out\bin\zilt-app.exe
+[ipc] invoke __zilt.autostart (id=36, window=1)
+[autostart] disabled (ok=true)
+[ipc] invoke __zilt.store (id=37, window=1)
+[store] set smoke (1 keys)
+[ipc] invoke __zilt.store (id=38, window=1)
+[ipc] invoke __zilt.fs (id=39, window=1)
+[fs] wrote 8 bytes -> smoke-note.txt
+[ipc] invoke __zilt.fs (id=40, window=1)
+[ipc] invoke __zilt.fs (id=41, window=1)
+[ipc] invoke __zilt.fs (id=42, window=1)
+[ipc] builtin __zilt.fs failed: PathEscape
+[ipc] invoke __zilt.path (id=43, window=1)
+[ipc] invoke __zilt.path (id=44, window=1)
+[ipc] invoke __zilt.path (id=45, window=1)
+[ipc] invoke __zilt.log (id=46, window=1)
+[fe:info] smoke peripheral api
+[ipc] invoke __zilt.windowState (id=47, window=1)
+[ipc] invoke __zilt.windowState (id=48, window=1)
+[state] saved window #1 (main) 130,130 976x759 max=false full=false
+[window-state] saved on demand
+[ipc] invoke __zilt.services (id=49, window=1)
+[ipc] invoke __zilt.services (id=50, window=1)
+[ipc] invoke __zilt.services (id=51, window=1)
+[ipc] invoke __zilt.http (id=52, window=1)
+[http] GET http://127.0.0.1:1/ (id=1) dispatched
+[ipc] invoke __zilt.taskbar (id=53, window=1)
+[taskbar] progress none value=null
+[http] done id=1 status=0 bytes=0 err=ConnectionRefused
+[ipc] invoke __zilt.ws (id=54, window=1)
+[ws] connect id=1 ws://127.0.0.1:1/ dispatched
+[ws] error id=1: ConnectionRefused
+[ipc] invoke __zilt.ws (id=55, window=1)
+[ws] connect id=2 ws://127.0.0.1:8765/smoke dispatched
+[ws] handshake ok id=2 (127.0.0.1:8765/smoke)
+[ws] open id=2
+[ipc] invoke __zilt.ws (id=56, window=1)
+[ipc] invoke __zilt.ws (id=57, window=1)
+[ws] conn id=2 released
+[ws] closed id=2 code=1000
+[smoke] ALL CHECKS PASSED (29 checks: core-10 + window-api/eval/webview-api/capability/clipboard-multi/notification/acl/spa + tray-check/taskbar/hotkey/sysinfo/appearance/autostart + store/fs + path/log/state + services + http + ws)
+[win32] message loop exited (code 0)
+[state] saved window #1 (main) 130,130 976x759 max=false full=false
+[win32] WM_DESTROY (window)
+[state] saved window #1 (main) 130,130 976x759 max=false full=false

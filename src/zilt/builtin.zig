@@ -89,6 +89,8 @@ pub const Args = struct {
     method: ?[]const u8 = null,
     headers: ?[]const u8 = null,
     timeout_ms: ?u32 = null,
+    /// WebSocket close code（__zilt.ws）；url 复用上面的同名字段
+    code: ?u16 = null,
 };
 
 pub fn isBuiltin(method: []const u8) bool {
@@ -362,7 +364,7 @@ pub fn isSystemMethod(method: []const u8) bool {
         eql(u8, name, "taskbar") or eql(u8, name, "system") or eql(u8, name, "shell") or
         eql(u8, name, "autostart") or eql(u8, name, "appearance") or
         eql(u8, name, "store") or eql(u8, name, "fs") or eql(u8, name, "windowState") or
-        eql(u8, name, "services") or eql(u8, name, "http");
+        eql(u8, name, "services") or eql(u8, name, "http") or eql(u8, name, "ws");
 }
 
 pub fn clickActionFromName(name: ?[]const u8) system_api.ClickAction {
@@ -521,6 +523,23 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
         if (eql(u8, a.action, "get")) return .{ .window_state = .get };
         if (eql(u8, a.action, "save")) return .{ .window_state = .save };
         return error.UnknownWindowStateAction;
+    }
+
+    if (eql(u8, name, "ws")) {
+        if (eql(u8, a.action, "connect")) return .{ .ws = .{ .connect = .{
+            .id = a.id orelse 0,
+            .url = a.url orelse return error.MissingUrl,
+        } } };
+        if (eql(u8, a.action, "send")) return .{ .ws = .{ .send = .{
+            .id = a.id orelse return error.MissingId,
+            .data = a.data orelse a.body orelse "",
+        } } };
+        if (eql(u8, a.action, "close")) return .{ .ws = .{ .close = .{
+            .id = a.id orelse return error.MissingId,
+            .code = a.code orelse 1000,
+            .reason = a.message orelse "",
+        } } };
+        return error.UnknownWsAction;
     }
 
     if (eql(u8, name, "appearance")) {

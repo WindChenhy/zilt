@@ -36,6 +36,7 @@ pub const system_api = @import("system_api.zig");
 pub const codesign = @import("codesign.zig");
 pub const wix_vendor = @import("wix_vendor.zig");
 pub const msix = @import("msix.zig");
+pub const ws = @import("ws.zig");
 pub const store = @import("store.zig");
 pub const fs_api = @import("fs_api.zig");
 pub const services = @import("services.zig");
@@ -71,6 +72,7 @@ test {
     _ = @import("codesign.zig");
     _ = @import("wix_vendor.zig");
     _ = @import("msix.zig");
+    _ = @import("ws.zig");
     _ = @import("store.zig");
     _ = @import("fs_api.zig");
     _ = @import("services.zig");

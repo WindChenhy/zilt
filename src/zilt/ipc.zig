@@ -710,6 +710,7 @@ pub const runtime_js =
     \\  const listeners = new Map();
     \\  let nextId = 1;
     \\  let httpSeq = 0;
+    \\  let wsSeq = 0;
     \\  const post = (m) => window.chrome.webview.postMessage(m);
     \\  window.chrome.webview.addEventListener('message', (e) => {
     \\    const m = e.data;
@@ -914,6 +915,17 @@ pub const runtime_js =
     \\          }).catch((e) => { off(); reject(e); });
     \\        });
     \\      },
+    \\    },
+    \\    // v0.1.16: WebSocket。connect 异步 —— 握手在后台线程执行，立即返回连接 id；
+    \\    // open/message/close/error 全走 wsEvent 事件（kind 字段区分）。
+    \\    ws: {
+    \\      connect: (url) => {
+    \\        const id = ++wsSeq;
+    \\        return builtin('__zilt.ws', { action: 'connect', id, url }).then(() => id);
+    \\      },
+    \\      send: (id, data) => builtin('__zilt.ws', { action: 'send', id, data: String(data) }),
+    \\      close: (id, code, reason) => builtin('__zilt.ws', { action: 'close', id, code: code ?? 1000, reason: reason ?? '' }),
+    \\      on: (id, cb) => window.zilt.on('wsEvent', (p) => { if (p && p.id === id) cb(p); }),
     \\    },
     \\    version: '0.1.16',
     \\  };

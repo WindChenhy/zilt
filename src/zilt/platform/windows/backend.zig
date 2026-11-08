@@ -37,6 +37,7 @@ const shared_sysinfo = @import("../../sysinfo.zig");
 const shared_store = @import("../../store.zig");
 const fs_api_mod = @import("../../fs_api.zig");
 const shared_services = @import("../../services.zig");
+const shared_ws = @import("../../ws.zig");
 const hotkey_mod = @import("hotkey.zig");
 const dialog_mod = @import("dialog.zig");
 const dlgx = @import("dialog_ext.zig");
@@ -75,6 +76,7 @@ const WM_ZILT_ACTION: win32.UINT = win32.WM_APP + 7; // 统一能力动作 marsh
 const WM_ZILT_WAKE: win32.UINT = win32.WM_APP + 8; // WebView driver 延迟派发
 const WM_ZILT_TOAST_EVENT: win32.UINT = win32.WM_APP + 9; // WinRT 线程 → UI 线程
 const WM_ZILT_HTTP: win32.UINT = win32.WM_APP + 10; // HTTP 后台线程 → UI 线程
+const WM_ZILT_WS: win32.UINT = win32.WM_APP + 11; // WebSocket 读线程 → UI 线程
 const WM_CLIPBOARDUPDATE: win32.UINT = 0x031D;
 const TRAY_MENU_BASE: u16 = 100;
 
@@ -815,6 +817,8 @@ fn Backend(comptime config: Config) type {
         store: ?shared_store.Store = null,
         /// v0.1.16：应用服务注册表（生命周期由框架驱动，状态暴露给 JS）
         services: ?shared_services.Registry = null,
+        /// v0.1.16：活跃 WebSocket 连接（仅 UI 线程读写；读线程只发事件不碰容器）
+        ws_conns: std.ArrayListUnmanaged(*WsConn) = .empty,
         watcher: ?*Watcher = null,
         updater_env: ?updater.Env = null,
         updater_url_override: ?[]u8 = null,
@@ -1710,6 +1714,7 @@ fn Backend(comptime config: Config) type {
                 .window_state => |op| return self.runWindowStateOp(w, op, alloc),
                 .services => |op| return self.runServicesOp(op, alloc),
                 .http => |op| return self.runHttpOp(op, alloc),
+                .ws => |op| return self.runWsOp(op, alloc),
             }
         }
 
@@ -1788,6 +1793,89 @@ fn Backend(comptime config: Config) type {
                     };
                     t.detach();
                     log.print("[http] {s} {s} (id={d}) dispatched", .{ job.method, job.url, job.id });
+                    return .{ .ok = true };
+                },
+            }
+        }
+
+        // ---- v0.1.16：WebSocket ----
+
+        fn wsConnById(self: *Self, id: i64) ?*WsConn {
+            for (self.ws_conns.items) |c| {
+                if (c.id == id) return c;
+            }
+            return null;
+        }
+
+        /// UI 线程：移除连接槽并等读线程退出、释放全部资源。
+        /// 只能在 UI 线程调用；幂等 —— conn 不在槽里则什么都不做
+        ///（防两个 close/error 事件重复销毁同一连接）。
+        fn wsRemoveConn(self: *Self, conn: *WsConn) void {
+            var found = false;
+            for (self.ws_conns.items, 0..) |c, i| {
+                if (c == conn) {
+                    _ = self.ws_conns.swapRemove(i);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return;
+            const id = conn.id;
+            conn.read_thread.join();
+            conn.stream.close(conn.io);
+            conn.threaded.deinit();
+            const a = std.heap.page_allocator;
+            a.destroy(conn.threaded);
+            a.destroy(conn);
+            log.print("[ws] conn id={d} released", .{id});
+        }
+
+        /// connect/send/close。connect 异步（握手秒级，不能冻结 UI）；
+        /// send/close 同步执行 —— 帧写是小缓冲阻塞写，通常亚毫秒。
+        fn runWsOp(self: *Self, op: shared_system.WsOp, alloc: std.mem.Allocator) !shared_system.Result {
+            _ = alloc;
+            const a = std.heap.page_allocator;
+            switch (op) {
+                .connect => |req| {
+                    const w = self.mainWindow() orelse return error.NoMainWindow;
+                    const job = a.create(WsJob) catch return error.OutOfMemory;
+                    job.* = .{
+                        .id = req.id,
+                        .hwnd = w.hwnd,
+                        .url = a.dupe(u8, req.url) catch {
+                            a.destroy(job);
+                            return error.OutOfMemory;
+                        },
+                    };
+                    const t = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, wsWorker, .{job}) catch {
+                        a.free(job.url);
+                        a.destroy(job);
+                        log.print("[ws] spawn failed", .{});
+                        return error.WsSpawnFailed;
+                    };
+                    t.detach();
+                    log.print("[ws] connect id={d} {s} dispatched", .{ req.id, req.url });
+                    return .{ .ok = true };
+                },
+                .send => |req| {
+                    const conn = self.wsConnById(req.id) orelse return error.WsNotConnected;
+                    wsWriteFrame(conn, .text, req.data) catch |err| {
+                        log.print("[ws] send id={d} failed: {s}", .{ req.id, @errorName(err) });
+                        return error.WsWriteFailed;
+                    };
+                    return .{ .ok = true };
+                },
+                .close => |req| {
+                    const conn = self.wsConnById(req.id) orelse return error.WsNotConnected;
+                    conn.closing = true;
+                    const cp = shared_ws.closePayload(a, req.code, req.reason) catch return error.OutOfMemory;
+                    defer a.free(cp);
+                    wsWriteFrame(conn, .close, cp) catch |err| {
+                        log.print("[ws] close id={d} write failed: {s}", .{ req.id, @errorName(err) });
+                    };
+                    // 半关写端：读线程会收到对端的 close echo 或 EOF，
+                    // 然后发 close 事件 → UI 线程统一清理（wsRemoveConn）。
+                    conn.stream.shutdown(conn.io, .send) catch {};
                     return .{ .ok = true };
                 },
             }
@@ -3055,6 +3143,16 @@ fn Backend(comptime config: Config) type {
             if (self.taskbar_list) |*tb| tb.deinit();
             if (self.store) |*st| st.deinit();
             if (self.services) |*sv| sv.deinit();
+            // v0.1.16：退出时释放残留的 WebSocket 连接（关闭 socket 唤醒读线程）
+            for (self.ws_conns.items) |c| {
+                c.stream.close(c.io);
+                c.read_thread.join();
+                c.threaded.deinit();
+                const a = std.heap.page_allocator;
+                a.destroy(c.threaded);
+                a.destroy(c);
+            }
+            self.ws_conns.deinit(self.allocator);
             if (self.storage_root) |root| self.allocator.free(root);
             if (self.tray_popup) |*b| b.deinit(self.allocator);
             if (self.menu_state) |*m| m.deinit();
@@ -3435,6 +3533,48 @@ fn Backend(comptime config: Config) type {
                         log.print("[http] done id={d} status={d} bytes={d} err={s}", .{
                             res.id, res.status, res.body.len, res.err orelse "-",
                         });
+                    }
+                    return 0;
+                },
+                WM_ZILT_WS => {
+                    const ev: *WsEvent = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    defer freeWsEvent(ev);
+                    if (instance) |b| {
+                        const w = b.mainWindow();
+                        switch (ev.kind) {
+                            .open => {
+                                if (w) |mw| {
+                                    if (ev.conn) |conn| {
+                                        const t = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, wsReadLoop, .{conn}) catch null;
+                                        if (t) |th| {
+                                            conn.read_thread = th;
+                                            b.ws_conns.append(b.allocator, conn) catch {};
+                                            log.print("[ws] open id={d}", .{ev.id});
+                                            mw.emitEventPayload("wsEvent", .{ .id = ev.id, .kind = "open" });
+                                        } else {
+                                            // 起不了读线程：直接释放，并报 error
+                                            mw.emitEventPayload("wsEvent", .{ .id = ev.id, .kind = "error", .err = "WsSpawnFailed" });
+                                            b.wsRemoveConn(conn);
+                                        }
+                                    }
+                                } else if (ev.conn) |conn| {
+                                    b.wsRemoveConn(conn);
+                                }
+                            },
+                            .message => {
+                                if (w) |mw| mw.emitEventPayload("wsEvent", .{ .id = ev.id, .kind = "message", .data = ev.data });
+                            },
+                            .close => {
+                                if (w) |mw| mw.emitEventPayload("wsEvent", .{ .id = ev.id, .kind = "close", .code = ev.code, .reason = ev.reason });
+                                if (ev.conn) |conn| b.wsRemoveConn(conn);
+                                log.print("[ws] closed id={d} code={d}", .{ ev.id, ev.code });
+                            },
+                            .err => {
+                                if (w) |mw| mw.emitEventPayload("wsEvent", .{ .id = ev.id, .kind = "error", .err = ev.err });
+                                if (ev.conn) |conn| b.wsRemoveConn(conn);
+                                log.print("[ws] error id={d}: {s}", .{ ev.id, ev.err orelse "-" });
+                            },
+                        }
                     }
                     return 0;
                 },
@@ -4203,6 +4343,310 @@ fn httpWorker(job: *HttpJob) void {
         freeHttpResult(res);
     }
     freeHttpJob(job);
+}
+
+// ---------------------------------------------------------------------------
+// v0.1.16：WebSocket 客户端（协议层在 shared ws.zig，这里做线程与连接编排）
+// ---------------------------------------------------------------------------
+
+/// 一个活跃连接。生命周期：worker 握手成功后创建 → UI 线程 open 事件时
+/// 注册到 ws_conns 并起读循环 → close 事件时 wsRemoveConn 统一销毁。
+/// 写端被 UI（send/close）与读循环（自动 pong）共享 → 必须 mutex 串行化，
+/// 否则两个线程的 writeAll 会把帧头和载荷撕开。
+const WsConn = struct {
+    id: i64,
+    hwnd: win32.HWND,
+    io: std.Io,
+    threaded: *std.Io.Threaded,
+    stream: std.Io.net.Stream,
+    /// 每连接一个掩码（RFC 只要求客户端帧带掩码，不要求逐帧不同）
+    mask: [4]u8,
+    wbuf: [4096]u8 = undefined,
+    wr: std.Io.net.Stream.Writer = undefined,
+    write_mutex: std.Io.Mutex = .init,
+    /// 读循环线程句柄；由 UI 线程在 close 清理时 join
+    read_thread: std.Thread = undefined,
+    /// UI 已主动发起关闭 → 读循环不再回 echo close（RFC close 握手只发一次）
+    closing: bool = false,
+};
+
+/// 后台线程 → UI 线程的事件。page_allocator 持有，UI 线程取走后 free。
+const WsEvent = struct {
+    pub const Kind = enum { open, message, close, err };
+    id: i64,
+    kind: Kind,
+    hwnd: win32.HWND,
+    /// open：新连接（所有权移交 UI）；err：握手失败时的半成品连接（UI 清理）
+    conn: ?*WsConn = null,
+    data: ?[]u8 = null,
+    code: u16 = 0,
+    reason: ?[]u8 = null,
+    err: ?[]u8 = null,
+};
+
+const WsJob = struct {
+    id: i64,
+    hwnd: win32.HWND,
+    url: []u8,
+};
+
+fn freeWsEvent(ev: *WsEvent) void {
+    const a = std.heap.page_allocator;
+    if (ev.data) |d| a.free(d);
+    if (ev.reason) |r| a.free(r);
+    if (ev.err) |e| a.free(e);
+    a.destroy(ev);
+}
+
+fn wsPostEvent(ev: *WsEvent) void {
+    if (win32.PostMessageW(ev.hwnd, WM_ZILT_WS, 0, @bitCast(@intFromPtr(ev))) == 0) {
+        freeWsEvent(ev);
+    }
+}
+
+/// 握手错误事件（conn 为 null —— 失败的连接由 worker 自己释放）。
+fn wsPostError(id: i64, hwnd: win32.HWND, name: []const u8) void {
+    const a = std.heap.page_allocator;
+    const ev = a.create(WsEvent) catch return;
+    ev.* = .{ .id = id, .kind = .err, .hwnd = hwnd, .err = a.dupe(u8, name) catch null };
+    if (win32.PostMessageW(hwnd, WM_ZILT_WS, 0, @bitCast(@intFromPtr(ev))) == 0) {
+        freeWsEvent(ev);
+    }
+}
+
+/// 握手失败的本地清理：关 socket + 销毁 Threaded，再发 error 事件。
+fn wsBail(stream: ?std.Io.net.Stream, io: std.Io, threaded: *std.Io.Threaded, id: i64, hwnd: win32.HWND, name: []const u8) void {
+    if (stream) |s| s.close(io);
+    threaded.deinit();
+    const a = std.heap.page_allocator;
+    a.destroy(threaded);
+    wsPostError(id, hwnd, name);
+}
+
+/// 共享写路径：编码帧 + mutex 保护下的整体写出。UI 与读循环都走这里。
+fn wsWriteFrame(conn: *WsConn, opcode: shared_ws.Opcode, payload: []const u8) !void {
+    const a = std.heap.page_allocator;
+    const wire = try shared_ws.encodeFrame(a, opcode, payload, conn.mask);
+    defer a.free(wire);
+    conn.write_mutex.lockUncancelable(conn.io);
+    defer conn.write_mutex.unlock(conn.io);
+    try conn.wr.interface.writeAll(wire);
+    try conn.wr.interface.flush();
+}
+
+/// 握手 + 读循环，跑在独立线程上。握手失败发 error 事件并自清理；
+/// 成功后发 open 事件（conn 所有权移交 UI），然后原地进入读循环，
+/// 结束时发 close 事件 —— conn 的最终销毁一律由 UI 线程完成。
+fn wsWorker(job: *WsJob) void {
+    const a = std.heap.page_allocator;
+
+    const threaded = a.create(std.Io.Threaded) catch {
+        a.free(job.url);
+        a.destroy(job);
+        return;
+    };
+    threaded.* = .init(a, .{});
+    const io = threaded.io();
+
+    const u = shared_ws.parseUrl(job.url) catch |e| {
+        wsBail(null, io, threaded, job.id, job.hwnd, @errorName(e));
+        a.free(job.url);
+        a.destroy(job);
+        return;
+    };
+
+    const addr = std.Io.net.IpAddress.resolve(io, u.host, u.port) catch |e| {
+        wsBail(null, io, threaded, job.id, job.hwnd, @errorName(e));
+        a.free(job.url);
+        a.destroy(job);
+        return;
+    };
+    const stream = addr.connect(io, .{ .mode = .stream }) catch |e| {
+        wsBail(null, io, threaded, job.id, job.hwnd, @errorName(e));
+        a.free(job.url);
+        a.destroy(job);
+        return;
+    };
+
+    var seed: [16]u8 = undefined;
+    io.random(&seed);
+    var mask: [4]u8 = undefined;
+    io.random(&mask);
+
+    const key = shared_ws.encodeKey(a, seed) catch {
+        wsBail(stream, io, threaded, job.id, job.hwnd, "OutOfMemory");
+        a.free(job.url);
+        a.destroy(job);
+        return;
+    };
+    defer a.free(key);
+    const expected = shared_ws.acceptKey(key);
+    const req = shared_ws.handshakeRequest(a, u.host, u.port, u.path, key) catch {
+        wsBail(stream, io, threaded, job.id, job.hwnd, "OutOfMemory");
+        a.free(job.url);
+        a.destroy(job);
+        return;
+    };
+    defer a.free(req);
+
+    const conn = a.create(WsConn) catch {
+        wsBail(stream, io, threaded, job.id, job.hwnd, "OutOfMemory");
+        a.free(job.url);
+        a.destroy(job);
+        return;
+    };
+    conn.* = .{
+        .id = job.id,
+        .hwnd = job.hwnd,
+        .io = io,
+        .threaded = threaded,
+        .stream = stream,
+        .mask = mask,
+    };
+    conn.wr = stream.writer(io, &conn.wbuf);
+
+    // 发送握手请求（defer 已保证 unlock，catch 分支的 return 同样触发）
+    {
+        conn.write_mutex.lockUncancelable(conn.io);
+        defer conn.write_mutex.unlock(conn.io);
+        conn.wr.interface.writeAll(req) catch |e| {
+            wsBail(stream, io, threaded, job.id, job.hwnd, @errorName(e));
+            a.destroy(conn);
+            a.free(job.url);
+            a.destroy(job);
+            return;
+        };
+        conn.wr.interface.flush() catch |e| {
+            wsBail(stream, io, threaded, job.id, job.hwnd, @errorName(e));
+            a.destroy(conn);
+            a.free(job.url);
+            a.destroy(job);
+            return;
+        };
+    }
+
+    // 读响应头（到 \r\n\r\n 为止；之后的数据由读循环继续消费）
+    {
+        var rbuf: [8192]u8 = undefined;
+        var rd = stream.reader(io, &rbuf);
+        var hdr: [2048]u8 = undefined;
+        var hdr_len: usize = 0;
+        while (hdr_len < hdr.len) {
+            const b = rd.interface.takeByte() catch |e| {
+                wsBail(stream, io, threaded, job.id, job.hwnd, @errorName(e));
+                a.destroy(conn);
+                a.free(job.url);
+                a.destroy(job);
+                return;
+            };
+            hdr[hdr_len] = b;
+            hdr_len += 1;
+            if (hdr_len >= 4 and std.mem.eql(u8, hdr[hdr_len - 4 .. hdr_len], "\r\n\r\n")) break;
+        }
+        shared_ws.verifyHandshake(hdr[0..hdr_len], &expected) catch |e| {
+            wsBail(stream, io, threaded, job.id, job.hwnd, @errorName(e));
+            a.destroy(conn);
+            a.free(job.url);
+            a.destroy(job);
+            return;
+        };
+    }
+
+    // 握手成功 → open 事件（conn 所有权移交 UI 线程）
+    const ev = a.create(WsEvent) catch {
+        wsBail(stream, io, threaded, job.id, job.hwnd, "OutOfMemory");
+        a.destroy(conn);
+        a.free(job.url);
+        a.destroy(job);
+        return;
+    };
+    ev.* = .{ .id = job.id, .kind = .open, .hwnd = job.hwnd, .conn = conn };
+    if (win32.PostMessageW(job.hwnd, WM_ZILT_WS, 0, @bitCast(@intFromPtr(ev))) == 0) {
+        // UI 已死：conn 未注册，UI 不会碰它，由本线程自清理
+        freeWsEvent(ev);
+        a.destroy(conn);
+        wsBail(stream, io, threaded, job.id, job.hwnd, "WsPostFailed");
+        a.free(job.url);
+        a.destroy(job);
+        return;
+    }
+
+    log.print("[ws] handshake ok id={d} ({s}:{d}{s})", .{ job.id, u.host, u.port, u.path });
+    // 读循环由 UI 线程在 open 事件里 spawn（conn 所有权已移交）；
+    // worker 在此结束，读循环结束后的 close 事件由读线程发出。
+    a.free(job.url);
+    a.destroy(job);
+}
+
+/// 读循环：解析帧 → 派发事件。文本/二进制转发，ping 自动 pong，
+/// close 回声并发 close 事件，EOF 发 close(1006)。协议错误（分片帧等）
+/// 发 error 事件并终止 —— 与 ws.zig 的「分片不支持」约定一致。
+fn wsReadLoop(conn: *WsConn) void {
+    const a = std.heap.page_allocator;
+    var rbuf: [8192]u8 = undefined;
+    var rd = conn.stream.reader(conn.io, &rbuf);
+
+    var acc: std.ArrayListUnmanaged(u8) = .empty;
+    defer acc.deinit(a);
+
+    var close_code: u16 = 1006;
+    var close_reason: ?[]u8 = null;
+
+    outer: while (true) {
+        // takeByte：缓冲区空时阻塞底层 read，至少 1 字节即返回
+        // （readSliceShort 要填满才返回，会永远卡在帧间隙 —— 探针实测踩过）
+        const b = rd.interface.takeByte() catch break; // EOF / 读错误
+        acc.append(a, b) catch break;
+
+        while (acc.items.len >= 2) {
+            const f = shared_ws.parseFrame(a, acc.items) catch |e| switch (e) {
+                error.NeedMore => break,
+                else => {
+                    log.print("[ws] frame parse error id={d}: {s}", .{ conn.id, @errorName(e) });
+                    break :outer;
+                },
+            };
+            defer a.free(f.payload);
+            const rest = acc.items.len - f.consumed;
+            std.mem.copyForwards(u8, acc.items[0..rest], acc.items[f.consumed..]);
+            acc.shrinkRetainingCapacity(rest);
+
+            switch (f.opcode) {
+                .text, .binary => {
+                    const ev = a.create(WsEvent) catch continue;
+                    ev.* = .{ .id = conn.id, .kind = .message, .hwnd = conn.hwnd, .data = a.dupe(u8, f.payload) catch null };
+                    wsPostEvent(ev);
+                },
+                .ping => {
+                    wsWriteFrame(conn, .pong, f.payload) catch break :outer;
+                },
+                .pong => {},
+                .close => {
+                    if (f.payload.len >= 2) close_code = (@as(u16, f.payload[0]) << 8) | f.payload[1];
+                    if (f.payload.len > 2) close_reason = a.dupe(u8, f.payload[2..]) catch null;
+                    if (!conn.closing) {
+                        wsWriteFrame(conn, .close, f.payload) catch {};
+                    }
+                    break :outer;
+                },
+                .continuation => {
+                    log.print("[ws] fragmented frame unsupported id={d}", .{conn.id});
+                    break :outer;
+                },
+            }
+        }
+    }
+
+    const ev = a.create(WsEvent) catch return;
+    ev.* = .{
+        .id = conn.id,
+        .kind = .close,
+        .hwnd = conn.hwnd,
+        .conn = conn, // UI 收到后负责 join 读线程并销毁连接
+        .code = close_code,
+        .reason = close_reason,
+    };
+    wsPostEvent(ev);
 }
 
 /// HTTP 下载（std.http.Client；每次调用独立 Threaded Io，更新流程低频可接受）。
