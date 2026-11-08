@@ -113,7 +113,7 @@ fn highestVersionDir(alloc: std.mem.Allocator, base: []const u8) ?[]u8 {
     return best;
 }
 
-fn kitsRoot(alloc: std.mem.Allocator) ?[]u8 {
+pub fn kitsRoot(alloc: std.mem.Allocator) ?[]u8 {
     const sub = std.unicode.utf8ToUtf16LeStringLiteral("SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots");
     const val = std.unicode.utf8ToUtf16LeStringLiteral("KitsRoot10");
     var buf: [512]u16 = std.mem.zeroes([512]u16);

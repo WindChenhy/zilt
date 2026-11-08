@@ -15,6 +15,8 @@ const std = @import("std");
 const zilt = @import("zilt");
 const app_meta = @import("app_meta");
 const wix_tool = @import("wix_tool.zig");
+const msix_tool = @import("msix_tool.zig");
+const signtool_locator = @import("signtool_locate.zig");
 
 const PackMeta = zilt.pack_formats.PackMeta;
 
@@ -149,7 +151,7 @@ pub fn main() !void {
     };
 
     const target = getEnv(alloc, "ZILT_PACK_TARGET") orelse {
-        std.debug.print("usage: ZILT_PACK_TARGET=msi|macos|appimage|deb|rpm ZILT_PACK_OUT=<dir> zig build pack\n", .{});
+        std.debug.print("usage: ZILT_PACK_TARGET=msi|msix|macos|appimage|deb|rpm ZILT_PACK_OUT=<dir> zig build pack\n", .{});
         return error.MissingArgs;
     };
 
@@ -198,6 +200,61 @@ pub fn main() !void {
             return err;
         };
         std.debug.print("[pack] msi -> {s}\n", .{msi});
+    } else if (std.mem.eql(u8, target, "msix")) {
+        const exe_arg = exe_path orelse return error.ExeArgRequired;
+        const exe_abs = getFullPathW(alloc, exe_arg) orelse exe_arg;
+        const w32 = zilt.platform_windows.win32;
+
+        // MSIX 版本必须四段式
+        const mver = zilt.msix.normalizeVersion(alloc, meta.version) catch return error.VersionFailed;
+
+        // Logo 直接取 ico 里最大的 PNG 帧（本项目 ico 四帧都是 PNG）
+        const ico_path = "src/zilt/assets/zilt.ico";
+        const ico = w32.readFileAlloc(alloc, ico_path) orelse {
+            std.debug.print("[pack] 找不到图标 {s}\n", .{ico_path});
+            return error.IconMissing;
+        };
+        const frames = zilt.msix.extractPngFrames(alloc, ico) catch |err| {
+            std.debug.print("[pack] 解析 ico 失败：{s}\n", .{@errorName(err)});
+            return err;
+        };
+        const logo = zilt.msix.largestPngFrame(frames) orelse return error.NoPngFrame;
+
+        // Publisher 必须与签名证书 Subject 逐字一致，否则部署报 0x800B0109
+        const publisher = getEnv(alloc, "ZILT_MSIX_PUBLISHER") orelse "CN=Zilt";
+
+        const manifest = try zilt.msix.generateManifest(alloc, .{
+            .identity_name = meta.app_id,
+            .publisher = publisher,
+            .version = mver,
+            .arch = "x64",
+            .display_name = meta.name,
+            .publisher_display_name = meta.maintainer,
+            .description = meta.description,
+            .exe_name = meta.exe_name,
+        });
+
+        const staging = try pathJoin(alloc, out_dir, "msix-staging");
+        try msix_tool.stage(alloc, .{
+            .dir = staging,
+            .exe_path = exe_abs,
+            .exe_name = meta.exe_name,
+            .manifest = manifest,
+            .logo_png = logo.png,
+        });
+        std.debug.print("[pack] manifest -> {s}\\AppxManifest.xml (Publisher={s}, {s})\n", .{ staging, publisher, mver });
+
+        const out_msix = try pathJoin(alloc, out_dir, try std.fmt.allocPrint(alloc, "{s}-{s}-x64.msix", .{ meta.name, meta.version }));
+        msix_tool.pack(alloc, staging, out_msix) catch |err| {
+            std.debug.print(
+                "[pack] MSIX 打包失败：{s}\n" ++
+                    "  · 需要 Windows SDK 的 App Certification Kit（makeappx.exe）\n" ++
+                    "  · staging 已保留：{s}\n",
+                .{ @errorName(err), staging },
+            );
+            return err;
+        };
+        std.debug.print("[pack] msix -> {s}\n", .{out_msix});
     } else if (std.mem.eql(u8, target, "macos")) {
         const exe_src = exe_path orelse return error.ExeArgRequired;
         const exe_bytes = readFileAlloc(alloc, exe_src) orelse return error.ExeReadFailed;
@@ -242,13 +299,62 @@ pub fn main() !void {
         if (!writeFile(alloc, out, spec)) return error.WriteFailed;
         std.debug.print("[pack] spec -> {s}（rpmbuild -bb 可构建）\n", .{out});
     } else if (std.mem.eql(u8, target, "sign")) {
-        // Authenticode：ZILT_PACK_SIGN=<file> ZILT_SIGN_PFX=... ZILT_SIGN_PASS=... ZILT_SIGN_TS=...
+        // 代码签名（v0.1.15）：真正执行，而不是只打印命令。
+        // 凭据：ZILT_SIGN_PFX（路径）/ ZILT_SIGN_PFX_BASE64 / ZILT_SIGN_THUMBPRINT
+        // 目标：ZILT_PACK_SIGN（文件路径；可为 .exe / .msix / .msi）
         const file = getEnv(alloc, "ZILT_PACK_SIGN") orelse return error.SignFileRequired;
-        const pfx = getEnv(alloc, "ZILT_SIGN_PFX") orelse return error.SignPfxRequired;
-        const pass = getEnv(alloc, "ZILT_SIGN_PASS") orelse "";
-        const ts = getEnv(alloc, "ZILT_SIGN_TS") orelse "http://timestamp.digicert.com";
-        const cmd = try zilt.pack_formats.buildSigntoolCommand(alloc, pfx, pass, ts, file);
-        std.debug.print("[pack] signtool cmd:\n  {s}\n（需要 Windows SDK signtool.exe 在 PATH；或自行用本命令签名）\n", .{cmd});
+        const sign = zilt.codesign;
+        const w32 = zilt.platform_windows.win32;
+
+        const pfx = getEnv(alloc, "ZILT_SIGN_PFX");
+        const pfx_b64 = getEnv(alloc, "ZILT_SIGN_PFX_BASE64");
+        const thumb = getEnv(alloc, "ZILT_SIGN_THUMBPRINT");
+        const src_kind = sign.pickSource(pfx, pfx_b64, thumb) orelse {
+            std.debug.print("[pack] 缺少签名凭据：设置 ZILT_SIGN_PFX / ZILT_SIGN_PFX_BASE64 / ZILT_SIGN_THUMBPRINT\n", .{});
+            return error.SignCredentialRequired;
+        };
+
+        const pass = getEnv(alloc, "ZILT_SIGN_PASSWORD") orelse getEnv(alloc, "ZILT_SIGN_PASS");
+        const ts = getEnv(alloc, "ZILT_SIGN_TIMESTAMP") orelse getEnv(alloc, "ZILT_SIGN_TS") orelse "http://timestamp.digicert.com";
+
+        var tmp_pfx: ?[]u8 = null;
+        defer if (tmp_pfx) |tp| {
+            if (std.unicode.utf8ToUtf16LeAllocZ(alloc, tp)) |wz| {
+                _ = w32.DeleteFileW(wz.ptr);
+                alloc.free(wz);
+            } else |_| {}
+            alloc.free(tp);
+        };
+
+        var opts = sign.Options{
+            .pfx_password = pass,
+            .timestamp_url = ts,
+        };
+        switch (src_kind) {
+            .pfx_path => opts.pfx_path = pfx,
+            .thumbprint => opts.cert_thumbprint = thumb,
+            .pfx_base64 => {
+                const der = sign.decodePfxBase64(alloc, pfx_b64.?) catch |err| {
+                    std.debug.print("[pack] base64 PFX 解码失败：{s}\n", .{@errorName(err)});
+                    return err;
+                };
+                const tmp = try std.fmt.allocPrint(alloc, "{s}\\zilt-sign-temp.pfx", .{getEnv(alloc, "TEMP") orelse "."});
+                if (!writeFile(alloc, tmp, der)) return error.WriteFailed;
+                tmp_pfx = tmp;
+                opts.pfx_path = tmp;
+            },
+        }
+
+        const tool = signtool_locator.locate(alloc) orelse {
+            const cmd = sign.fullCommand(alloc, opts, file) catch return error.SignToolMissing;
+            std.debug.print("[pack] signtool.exe 未找到；可手工执行：\n  {s}\n", .{cmd});
+            return error.SignToolMissing;
+        };
+
+        const args = try sign.signArgs(alloc, opts, file);
+        const code = wix_tool.runAndWait(alloc, tool, args, 120_000) catch return error.SignFailed;
+        std.debug.print("[pack] sign {s} -> exit {d}\n", .{ file, code });
+        if (code != 0) return error.SignFailed;
     } else {
         std.debug.print("[pack] unknown target: {s}\n", .{target});
         return error.BadTarget;

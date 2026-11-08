@@ -351,7 +351,18 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
       同时修掉原 `.wxs` 的三处真实缺陷：快捷方式 `Target` 拼错（`[ZiltPrograms]/…`）、
       per-user 的文件 KeyPath（ICE38）、user profile 目录未清理（ICE64）
       —— 现支持 per-user / per-machine 两种 scope（`ZILT_INSTALLER_PER_MACHINE=1`）
-      未做：MSIX；**Fixed WebView2 已支持**（`Config.environment.browser_directory`，
+- [x] **MSIX**：`msix.zig`（AppxManifest 生成 / ICO → PNG 帧提取 / 四段版本规范化，
+      8 条单测）+ `tools/msix_tool.zig`（makeappx 定位 + staging 组织）。
+      `ZILT_PACK_TARGET=msix zig build pack` 产出 `dist/*.msix`（1011 KB）
+      **实测**：makeappx pack exit 0；松散注册 `Add-AppxPackage -Register` 成功
+      （`app.zilt.desktop 0.1.16.0`）→ 卸载干净；签名后 `Type=Authenticode`、时间戳 OK
+      **两条硬约束**（都是实测踩出来的）：`Identity/@Publisher` 必须与证书 Subject
+      逐字一致；`Identity/@Version` 必须四段式（`0.1.16` → `0.1.16.0`，
+      预发布标签 `1.2.3-beta.4` 的 `.4` 不是第四段，必须整段丢弃）
+      ⚠ **签名安装未验证**：MSIX 要求证书链终止于 `LocalMachine\Root`，
+      而 AppX 部署服务以 SYSTEM 身份校验（CurrentUser 下的根证书它看不到），
+      导入本机根证书需要管理员 —— 当前会话非管理员，故止步于「打包 + 签名 + 松散注册」
+      仍支持：**Fixed WebView2**（`Config.environment.browser_directory`，
       loader 走 fixed 模式且不回落 Evergreen —— 代码已接线，缺专项 E2E）
 - [x] **代码签名接入（已实测）**：`codesign.zig` 构造 signtool 命令（PFX/指纹/base64 PFX
       三选一、RFC3161 时间戳、/fd /td 一致、路径引号、指纹规范化）；
@@ -376,8 +387,12 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
 
 ### v0.1.16 — 插件 / 服务架构、官方周边 API 与多 WebView（P2）
 
-- [~] **插件 / 服务模型**：`services.zig` 注册表/顺序启动/失败回滚/逆序销毁/作用域已实现并单测；
-      JS API 未暴露（框架层能力，应用可在 main 里自行注册）
+- [x] **插件 / 服务模型**：`Config.services` 声明 → 框架按序 `init/start`、逆序 `deinit`，
+      并暴露 `window.zilt.services.list/status/start/stop`。
+      **实测**：`[services] 1 registered, 1 started`；冒烟断言 list 含 `demo`
+      （scope=`demo:read`, started=true）、status('nope') 返回 null。
+      设计边界：框架不解释 `state`、不代理方法调用 —— 需要方法级桥接请用 `commands`
+      （对齐 Wails service 的「显式绑定」思路，而不是把任意指针暴露给前端）
 - [x] **官方周边 API**（已接 JS，可冒烟验证）：
       `store`（KV + 落盘 `%LOCALAPPDATA%\<app_id>\store.json`）、
       `fs`（scope 内读写，拒绝 `..`/绝对路径/盘符/UNC/NUL）、
@@ -388,7 +403,7 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
       以及既有的 `system`/`shell`/`autostart`/`appearance`
 - [ ] **未实现的周边 API**：http、websocket、sql、upload、process、os（独立命名空间）
 - [ ] **多 WebView / 数据分区**：同一窗口多 WebView（未实现；每窗口已有独立 WebView2 profile）
-- [~] **验收**：冒烟 26 项含 store set/get + fs 写读 exists + `../` 逃逸被拒（PathEscape）
+- [~] **验收**：冒烟 27 项含 store set/get + fs 写读 exists + `../` 逃逸被拒（PathEscape）
       + path join/basename/extname + log 转发 + windowState get/save；
       多 WebView 未达成（见下）
 

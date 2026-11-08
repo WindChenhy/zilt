@@ -36,6 +36,7 @@ const shared_taskbar = @import("../../taskbar.zig");
 const shared_sysinfo = @import("../../sysinfo.zig");
 const shared_store = @import("../../store.zig");
 const fs_api_mod = @import("../../fs_api.zig");
+const shared_services = @import("../../services.zig");
 const hotkey_mod = @import("hotkey.zig");
 const dialog_mod = @import("dialog.zig");
 const dlgx = @import("dialog_ext.zig");
@@ -811,6 +812,8 @@ fn Backend(comptime config: Config) type {
         /// v0.1.16：KV 存储与受限 fs 的根目录（%LOCALAPPDATA%\<app_id>）
         storage_root: ?[]u8 = null,
         store: ?shared_store.Store = null,
+        /// v0.1.16：应用服务注册表（生命周期由框架驱动，状态暴露给 JS）
+        services: ?shared_services.Registry = null,
         watcher: ?*Watcher = null,
         updater_env: ?updater.Env = null,
         updater_url_override: ?[]u8 = null,
@@ -890,6 +893,7 @@ fn Backend(comptime config: Config) type {
 
             // v0.1.16：本地存储（与 WebView2 profile 同级目录）
             self.initStorage();
+            self.initServices();
         }
 
         const IconBytes = struct {
@@ -1703,6 +1707,7 @@ fn Backend(comptime config: Config) type {
                 .store => |op| return self.runStoreOp(op, alloc),
                 .fs => |op| return self.runFsOp(op, alloc),
                 .window_state => |op| return self.runWindowStateOp(w, op, alloc),
+                .services => |op| return self.runServicesOp(op, alloc),
             }
         }
 
@@ -1737,6 +1742,74 @@ fn Backend(comptime config: Config) type {
             defer self.allocator.free(path);
             if (!win32.writeFileAlloc(self.allocator, path, json)) {
                 log.print("[store] persist failed: {s}", .{path});
+            }
+        }
+
+        // ---- v0.1.16：应用服务 ----
+
+        /// 按 Config 声明的顺序注册并启动；单个失败只记录，不阻断启动
+        /// （服务失败不应该让整个应用起不来，与 startAll 的回滚语义配合）。
+        fn initServices(self: *Self) void {
+            const declared = config.services;
+            self.services = shared_services.Registry.init(self.allocator);
+
+            for (declared) |svc| {
+                self.services.?.register(svc) catch |err| {
+                    log.print("[services] register '{s}' failed: {s}", .{ svc.name, @errorName(err) });
+                };
+            }
+            if (declared.len > 0) {
+                self.services.?.startAll() catch |err| {
+                    log.print("[services] startAll failed: {s}", .{@errorName(err)});
+                };
+                log.print("[services] {d} registered, {d} started", .{ self.services.?.count(), self.startedServiceCount() });
+            }
+        }
+
+        fn startedServiceCount(self: *Self) usize {
+            const reg = if (self.services) |*r| r else return 0;
+            var n: usize = 0;
+            for (reg.slots.items) |slot| {
+                if (slot.started) n += 1;
+            }
+            return n;
+        }
+
+        fn runServicesOp(self: *Self, op: shared_system.ServicesOp, alloc: std.mem.Allocator) !shared_system.Result {
+            const reg = if (self.services) |*r| r else return error.ServicesNotAvailable;
+            switch (op) {
+                .list => {
+                    var out: std.ArrayListUnmanaged(u8) = .empty;
+                    errdefer out.deinit(alloc);
+                    try out.append(alloc, '[');
+                    for (reg.slots.items, 0..) |slot, i| {
+                        if (i != 0) try out.append(alloc, ',');
+                        try appendServiceJson(alloc, &out, slot.service.name, slot.service.scope, slot.started);
+                    }
+                    try out.append(alloc, ']');
+                    return .{ .json = try out.toOwnedSlice(alloc) };
+                },
+                .status => |name| {
+                    const svc = reg.get(name) orelse return .{ .json = try alloc.dupe(u8, "null") };
+                    var out: std.ArrayListUnmanaged(u8) = .empty;
+                    errdefer out.deinit(alloc);
+                    try appendServiceJson(alloc, &out, svc.name, svc.scope, reg.isStarted(name));
+                    return .{ .json = try out.toOwnedSlice(alloc) };
+                },
+                .start => |name| {
+                    reg.start(name) catch |err| {
+                        log.print("[services] start '{s}' failed: {s}", .{ name, @errorName(err) });
+                        return .{ .ok = false };
+                    };
+                    log.print("[services] started '{s}'", .{name});
+                    return .{ .ok = true };
+                },
+                .stop => |name| {
+                    const known = reg.get(name) != null;
+                    reg.stop(name);
+                    log.print("[services] stopped '{s}' (known={})", .{ name, known });
+                    return .{ .ok = known };
+                },
             }
         }
 
@@ -2933,6 +3006,7 @@ fn Backend(comptime config: Config) type {
             }
             if (self.taskbar_list) |*tb| tb.deinit();
             if (self.store) |*st| st.deinit();
+            if (self.services) |*sv| sv.deinit();
             if (self.storage_root) |root| self.allocator.free(root);
             if (self.tray_popup) |*b| b.deinit(self.allocator);
             if (self.menu_state) |*m| m.deinit();
@@ -3920,6 +3994,36 @@ fn tryPatchUpdate(self: anytype, p: *const updater.PatchInfo, m: *const updater.
     };
     log.print("[updater] patched & staged ok ({d} -> {d} bytes)", .{ current.len, new_bytes.len });
     return out;
+}
+
+/// 服务条目 JSON。name/scope 是开发者提供的标识符，仍做最小转义以免坏 JSON。
+fn appendServiceJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    name: []const u8,
+    scope: []const u8,
+    started: bool,
+) !void {
+    try out.appendSlice(alloc, "{\"name\":\"");
+    try appendJsonEscaped(alloc, out, name);
+    try out.appendSlice(alloc, "\",\"scope\":\"");
+    try appendJsonEscaped(alloc, out, scope);
+    try out.appendSlice(alloc, "\",\"started\":");
+    try out.appendSlice(alloc, if (started) "true" else "false");
+    try out.append(alloc, '}');
+}
+
+fn appendJsonEscaped(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(alloc, "\\\""),
+            '\\' => try out.appendSlice(alloc, "\\\\"),
+            '\n' => try out.appendSlice(alloc, "\\n"),
+            '\r' => try out.appendSlice(alloc, "\\r"),
+            '\t' => try out.appendSlice(alloc, "\\t"),
+            else => try out.append(alloc, c),
+        }
+    }
 }
 
 /// HTTP 下载（std.http.Client；每次调用独立 Threaded Io，更新流程低频可接受）。

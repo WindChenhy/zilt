@@ -876,6 +876,13 @@ pub const runtime_js =
     \\      get: () => builtin('__zilt.windowState', { action: 'get' }),
     \\      save: () => builtin('__zilt.windowState', { action: 'save' }),
     \\    },
+    \\    // v0.1.16: 应用服务（只查询状态 + 触发 start/stop；方法调用请用 commands）
+    \\    services: {
+    \\      list: () => builtin('__zilt.services', { action: 'list' }),
+    \\      status: (name) => builtin('__zilt.services', { action: 'status', name }),
+    \\      start: (name) => builtin('__zilt.services', { action: 'start', name }),
+    \\      stop: (name) => builtin('__zilt.services', { action: 'stop', name }),
+    \\    },
     \\    version: '0.1.16',
     \\  };
     \\  window.zilt.on('__zilt.evalResult', (p) => {

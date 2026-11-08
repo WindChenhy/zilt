@@ -83,6 +83,8 @@ pub const Args = struct {
     items: ?[]const []const u8 = null,
     level: ?[]const u8 = null,
     message: ?[]const u8 = null,
+    /// 服务名（__zilt.services）
+    name: ?[]const u8 = null,
 };
 
 pub fn isBuiltin(method: []const u8) bool {
@@ -355,7 +357,8 @@ pub fn isSystemMethod(method: []const u8) bool {
     return eql(u8, name, "menu") or eql(u8, name, "tray") or eql(u8, name, "hotkey") or
         eql(u8, name, "taskbar") or eql(u8, name, "system") or eql(u8, name, "shell") or
         eql(u8, name, "autostart") or eql(u8, name, "appearance") or
-        eql(u8, name, "store") or eql(u8, name, "fs") or eql(u8, name, "windowState");
+        eql(u8, name, "store") or eql(u8, name, "fs") or eql(u8, name, "windowState") or
+        eql(u8, name, "services");
 }
 
 pub fn clickActionFromName(name: ?[]const u8) system_api.ClickAction {
@@ -486,6 +489,14 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
         if (eql(u8, a.action, "exists")) return .{ .fs = .{ .exists = a.path orelse return error.MissingPath } };
         if (eql(u8, a.action, "remove")) return .{ .fs = .{ .remove = a.path orelse return error.MissingPath } };
         return error.UnknownFsAction;
+    }
+
+    if (eql(u8, name, "services")) {
+        if (eql(u8, a.action, "list")) return .{ .services = .list };
+        if (eql(u8, a.action, "status")) return .{ .services = .{ .status = a.name orelse return error.MissingName } };
+        if (eql(u8, a.action, "start")) return .{ .services = .{ .start = a.name orelse return error.MissingName } };
+        if (eql(u8, a.action, "stop")) return .{ .services = .{ .stop = a.name orelse return error.MissingName } };
+        return error.UnknownServicesAction;
     }
 
     if (eql(u8, name, "windowState")) {

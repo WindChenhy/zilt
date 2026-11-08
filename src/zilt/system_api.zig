@@ -94,6 +94,16 @@ pub const FsOp = union(enum) {
 /// 窗口状态（v0.1.16 window-state）：读当前几何 / 立即持久化
 pub const WindowStateOp = enum { get, save };
 
+/// 应用服务（v0.1.16）
+pub const ServicesOp = union(enum) {
+    /// 全部服务：[{name, scope, started}]
+    list,
+    /// 单个服务状态
+    status: []const u8,
+    start: []const u8,
+    stop: []const u8,
+};
+
 pub const Request = union(enum) {
     menu: MenuOp,
     tray: TrayOp,
@@ -111,6 +121,8 @@ pub const Request = union(enum) {
     fs: FsOp,
     /// v0.1.16：窗口状态读写
     window_state: WindowStateOp,
+    /// v0.1.16：服务注册表
+    services: ServicesOp,
 };
 
 pub const Result = union(enum) {

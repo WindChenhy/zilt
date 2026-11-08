@@ -4,6 +4,19 @@ const std = @import("std");
 const zilt = @import("zilt");
 const app = @import("app_config");
 
+// v0.1.16：示例服务 —— 验证「Config 声明 → 框架驱动生命周期 → JS 可查状态」这条链路。
+// 框架不解释 state 的含义，只负责 init/start 与逆序 stop/deinit 的时序。
+var demo_service_state: u32 = 0;
+
+fn demoServiceInit(state: *anyopaque) anyerror!void {
+    const p: *u32 = @ptrCast(@alignCast(state));
+    p.* += 1;
+}
+
+fn demoServiceDeinit(state: *anyopaque) void {
+    _ = state;
+}
+
 pub fn main() !void {
     try zilt.run(.{
         .commands = app.commands,
@@ -14,6 +27,16 @@ pub fn main() !void {
         .width = 960,
         .height = 700,
         .url = "https://zilt.app/index.html",
+        // v0.1.16：服务注册表（框架 init/start，逆序 deinit；状态暴露给 window.zilt.services）
+        .services = &.{
+            .{
+                .name = "demo",
+                .state = @ptrCast(&demo_service_state),
+                .init_fn = demoServiceInit,
+                .deinit_fn = demoServiceDeinit,
+                .scope = "demo:read",
+            },
+        },
         // v0.1.8：按窗口 label 持久化位置/尺寸/最大化/全屏；独立 WebView2 数据目录
         .persist_window_state = true,
         // v0.1.9/v0.1.10：WebView2 事件面 + Settings + 下载/权限 + 运行时 API

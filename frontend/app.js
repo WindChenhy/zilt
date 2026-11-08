@@ -349,6 +349,19 @@ async function runChecks() {
         : `join=${joined} base=${base} ext=${ext} saved=${saved}`);
     } catch (e) { setCheck('c-peripheral', false, String(e)); }
 
+    // 27. v0.1.16：服务注册表（Config 声明 → 框架 init/start → JS 可查）
+    try {
+      const list = await window.zilt.services.list();
+      const demo = (list || []).find(x => x.name === 'demo');
+      const st = await window.zilt.services.status('demo');
+      const unknown = await window.zilt.services.status('nope');
+      const ok = !!demo && demo.started === true && demo.scope === 'demo:read' &&
+        !!st && st.started === true && unknown === null;
+      setCheck('c-services', ok, ok
+        ? `services ok (${list.length} registered, demo started)`
+        : `list=${JSON.stringify(list)} st=${JSON.stringify(st)} unknown=${JSON.stringify(unknown)}`);
+    } catch (e) { setCheck('c-services', false, String(e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -379,6 +392,7 @@ async function runChecks() {
       autostart: $('c-autostart').className === 'pass',
       storage: $('c-storage').className === 'pass',
       peripheral: $('c-peripheral').className === 'pass',
+      services: $('c-services').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

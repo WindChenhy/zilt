@@ -1,5 +1,8 @@
 //! 应用配置。
 
+const service_mod = @import("services.zig");
+pub const Service = service_mod.Service;
+
 pub const Asset = struct {
     /// URL 路径（如 "/index.html"、"/"）
     path: []const u8,
@@ -92,6 +95,12 @@ pub const Config = struct {
     menu: ?[]const MenuItem = null,
     /// 全局快捷键（触发 "hotkey" IPC 事件）
     hotkeys: ?[]const Hotkey = null,
+
+    /// 应用服务（v0.1.16）：框架按注册顺序 init、逆序 deinit，
+    /// 并把名称/作用域/状态暴露给 `window.zilt.services.*`。
+    /// 服务的方法由应用自行持有（框架不解释 state），因此 JS 侧只能查询状态
+    /// 与触发 start/stop，不能直接调用任意方法 —— 需要方法级桥接请用 commands。
+    services: []const Service = &.{},
 
     pub const Dev = struct {
         /// dev 模式：从磁盘目录服务资产（支持热重载事件）
