@@ -412,11 +412,25 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
       `on()` 现返回取消函数（一次性请求必须能摘监听，否则会累积）。
       ⚠ `timeout_ms` 目前只是透传，**未强制生效**（std.http.Client.fetch 无超时参数）；
       要真正超时需额外看门狗线程，留待后续
-- [ ] **未实现的周边 API**：websocket、sql、upload、process、os（独立命名空间）
-- [ ] **多 WebView / 数据分区**：同一窗口多 WebView（未实现；每窗口已有独立 WebView2 profile）
-- [~] **验收**：冒烟 28 项含 store set/get + fs 写读 exists + `../` 逃逸被拒（PathEscape）
-      + path join/basename/extname + log 转发 + windowState get/save；
-      多 WebView 未达成（见下）
+- [x] **websocket**（v0.1.16 补完）：`window.zilt.ws.connect/send/close/on`。
+      协议层 `ws.zig`（握手 + 帧编解码纯逻辑 14 单测）；backend 后台线程握手 + 读循环
+      （`WM_ZILT_WS` 事件回传，ping 自动 pong，close 回声，EOF→close 1006）。
+      wss 明确报 `UnsupportedScheme`（TLS 未接线，不静默降级）。
+      **实测**：echo 服务端对照（scripts/ws_echo.py）——错误路径 `ws://127.0.0.1:1/` →
+      ConnectionRefused→error 事件；全链路 connect→open→welcome（服务端主动推）→
+      echo→close 1000→conn released。**关键坑**：Zig 0.17 `readSliceShort` 填不满
+      buffer 会永久阻塞，帧读取必须 `takeByte`。
+      sql / upload / process / os 仍未实现
+- [x] **多 WebView**（v0.1.16 补完）：`window.zilt.webviews.create/remove/navigate/
+      setBounds/focus/list`。WebView2 每 HWND 只能绑一个 controller → 附加 webview
+      各建 WS_CHILD 子窗口；IPC 回复按 sender 路由（子 webview 的 invoke 回到子页面）；
+      就绪前 navigate 排队；窗口销毁时释放全部子 webview。
+      **实测**：created→ready→navigate(hr=0x0)→removed；就绪前销毁触发官方定义的
+      E_ABORT 中止路径（父窗口销毁中止创建），无崩溃。
+      数据分区（独立 user data folder 隔离 Cookie/存储）留待后续：需独立 Environment
+- [~] **验收**：冒烟 30 项含 store set/get + fs 写读 exists + `../` 逃逸被拒（PathEscape）
+      + path join/basename/extname + log 转发 + windowState get/save + http + ws + webviews；
+      数据分区未达成（见上）
 
 ### v0.1.17 — 工具链、测试与生态（P2）
 
