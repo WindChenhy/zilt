@@ -40,6 +40,8 @@ pub const ws = @import("ws.zig");
 pub const store = @import("store.zig");
 pub const fs_api = @import("fs_api.zig");
 pub const services = @import("services.zig");
+pub const png = @import("png.zig");
+pub const ico = @import("ico.zig");
 
 /// 平台模块（Windows 后端内部使用；用户一般无需直接接触）
 pub const platform_windows = @import("platform/windows/mod.zig");

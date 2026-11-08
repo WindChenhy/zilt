@@ -52,6 +52,7 @@ pub fn main() !u8 {
     }
     if (eql(u8, cmd, "doctor")) return runDoctor(alloc);
     if (eql(u8, cmd, "info")) return runInfo();
+    if (eql(u8, cmd, "icon")) return runIcon(alloc, args.items[1..]);
     if (eql(u8, cmd, "help") or eql(u8, cmd, "--help") or eql(u8, cmd, "-h")) {
         printHelp();
         return 0;
@@ -225,4 +226,87 @@ fn fileExists(alloc: std.mem.Allocator, path: []const u8) bool {
     const attrs = win32.GetFileAttributesW(path_z.ptr);
     if (attrs == INVALID_FILE_ATTRIBUTES) return false;
     return attrs & FILE_ATTRIBUTE_DIRECTORY == 0;
+}
+
+// ---------------------------------------------------------------------------
+// v0.1.16：icon 子命令 —— PNG → 多尺寸 .ico（对齐 tauri icon 的 Windows 面）
+// ---------------------------------------------------------------------------
+
+fn runIcon(alloc: std.mem.Allocator, args: []const []u8) !u8 {
+    var input: ?[]const u8 = null;
+    var output: []const u8 = "icon.ico";
+    var sizes: std.ArrayListUnmanaged(u32) = .empty;
+    defer sizes.deinit(alloc);
+    // 默认尺寸：Windows 桌面/任务栏/Alt-Tab 全覆盖
+    try sizes.appendSlice(alloc, &.{ 16, 24, 32, 48, 64, 128, 256 });
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--out")) {
+            i += 1;
+            if (i >= args.len) {
+                print("zilt icon: -o needs a path\n", .{});
+                return 2;
+            }
+            output = args[i];
+        } else if (std.mem.eql(u8, a, "--sizes")) {
+            i += 1;
+            if (i >= args.len) {
+                print("zilt icon: --sizes needs a list (e.g. 16,32,48,256)\n", .{});
+                return 2;
+            }
+            sizes.clearRetainingCapacity();
+            var it = std.mem.splitScalar(u8, args[i], ',');
+            while (it.next()) |s| {
+                const t = std.mem.trim(u8, s, " \t");
+                const v = std.fmt.parseInt(u32, t, 10) catch {
+                    print("zilt icon: bad size '{s}'\n", .{t});
+                    return 2;
+                };
+                if (v == 0 or v > 256) {
+                    print("zilt icon: size {d} out of range (1..256)\n", .{v});
+                    return 2;
+                }
+                try sizes.append(alloc, v);
+            }
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            print("zilt icon: unknown option '{s}'\n", .{a});
+            return 2;
+        } else {
+            input = a;
+        }
+    }
+    const in_path = input orelse {
+        print("usage: zilt icon <input.png> [-o out.ico] [--sizes 16,32,48,256]\n", .{});
+        return 2;
+    };
+
+    const png_bytes = win32.readFileAlloc(alloc, in_path) orelse {
+        print("zilt icon: cannot read '{s}'\n", .{in_path});
+        return 1;
+    };
+    defer alloc.free(png_bytes);
+
+    const img = zilt.png.decode(alloc, png_bytes) catch |e| {
+        print("zilt icon: decode failed: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    defer alloc.free(img.pixels);
+    print("zilt icon: {s} → {d}x{d} RGBA\n", .{ in_path, img.width, img.height });
+
+    const ico_bytes = zilt.ico.encodeIco(alloc, img, sizes.items) catch |e| {
+        print("zilt icon: encode failed: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    defer alloc.free(ico_bytes);
+
+    if (!win32.writeFileAlloc(alloc, output, ico_bytes)) {
+        print("zilt icon: cannot write '{s}'\n", .{output});
+        return 1;
+    }
+    print("zilt icon: wrote {s} ({d} bytes, sizes ", .{ output, ico_bytes.len });
+    for (sizes.items, 0..) |s, k| print("{s}{d}", .{ if (k == 0) "" else ",", s });
+    print(")\n", .{});
+    return 0;
 }

@@ -77,6 +77,7 @@ const WM_ZILT_WAKE: win32.UINT = win32.WM_APP + 8; // WebView driver 延迟派�
 const WM_ZILT_TOAST_EVENT: win32.UINT = win32.WM_APP + 9; // WinRT 线程 → UI 线程
 const WM_ZILT_HTTP: win32.UINT = win32.WM_APP + 10; // HTTP 后台线程 → UI 线程
 const WM_ZILT_WS: win32.UINT = win32.WM_APP + 11; // WebSocket 读线程 → UI 线程
+const WM_ZILT_PROC: win32.UINT = win32.WM_APP + 12; // 子进程 worker → UI 线程
 const WM_CLIPBOARDUPDATE: win32.UINT = 0x031D;
 const TRAY_MENU_BASE: u16 = 100;
 
@@ -824,6 +825,8 @@ fn Backend(comptime config: Config) type {
         ws_conns: std.ArrayListUnmanaged(*WsConn) = .empty,
         /// v0.1.16：子 webview 专用窗口类名（懒注册）
         child_class_w: ?[:0]u16 = null,
+        /// v0.1.16：子进程槽（仅 UI 线程读写；worker 只发事件）
+        procs: std.ArrayListUnmanaged(*ProcSlot) = .empty,
         watcher: ?*Watcher = null,
         updater_env: ?updater.Env = null,
         updater_url_override: ?[]u8 = null,
@@ -1800,6 +1803,7 @@ fn Backend(comptime config: Config) type {
                 .http => |op| return self.runHttpOp(op, alloc),
                 .ws => |op| return self.runWsOp(op, alloc),
                 .webviews => |op| return self.runWebviewsOp(w, op, alloc),
+                .process => |op| return self.runProcOp(op, alloc),
             }
         }
 
@@ -2120,6 +2124,92 @@ fn Backend(comptime config: Config) type {
                         if (i != 0) try out.append(alloc, ',');
                         try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{{\"id\":{d},\"ready\":{s}}}", .{
                             c.id, if (c.webview != null) "true" else "false",
+                        }));
+                    }
+                    try out.append(alloc, ']');
+                    return .{ .json = try out.toOwnedSlice(alloc) };
+                },
+            }
+        }
+
+        // ---- v0.1.16：子进程执行 ----
+
+        fn procById(self: *Self, id: i64) ?*ProcSlot {
+            for (self.procs.items) |p| {
+                if (p.id == id) return p;
+            }
+            return null;
+        }
+
+        /// spawn/kill/list。spawn 立即返回（worker 线程负责 spawn→读输出→wait，
+        /// stdout/stderr/exit 全走 processEvent 事件）。受 .command ACL 管控。
+        fn runProcOp(self: *Self, op: shared_system.ProcessOp, alloc: std.mem.Allocator) !shared_system.Result {
+            const a = std.heap.page_allocator;
+            switch (op) {
+                .spawn => |req| {
+                    const w = self.mainWindow() orelse return error.NoMainWindow;
+                    if (req.argv.len == 0) return error.MissingCommand;
+                    const slot = a.create(ProcSlot) catch return error.OutOfMemory;
+                    // argv/cwd 拷贝到 page_allocator（worker 生命周期内有效）
+                    const argv_copy = a.alloc([]u8, req.argv.len) catch {
+                        a.destroy(slot);
+                        return error.OutOfMemory;
+                    };
+                    var ok = true;
+                    for (req.argv, 0..) |arg, i| {
+                        argv_copy[i] = a.dupe(u8, arg) catch {
+                            ok = false;
+                            break;
+                        };
+                    }
+                    if (!ok) {
+                        for (argv_copy) |arg| a.free(arg);
+                        a.free(argv_copy);
+                        a.destroy(slot);
+                        return error.OutOfMemory;
+                    }
+                    const cwd_copy: ?[]u8 = if (req.cwd) |c| a.dupe(u8, c) catch null else null;
+                    slot.* = .{ .id = req.id, .hwnd = w.hwnd };
+                    self.procs.append(self.allocator, slot) catch {
+                        for (argv_copy) |arg| a.free(arg);
+                        a.free(argv_copy);
+                        if (cwd_copy) |c| a.free(c);
+                        a.destroy(slot);
+                        return error.OutOfMemory;
+                    };
+                    const t = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, procWorker, .{ slot, argv_copy, cwd_copy }) catch {
+                        for (self.procs.items, 0..) |p, i| {
+                            if (p == slot) {
+                                _ = self.procs.swapRemove(i);
+                                break;
+                            }
+                        }
+                        for (argv_copy) |arg| a.free(arg);
+                        a.free(argv_copy);
+                        if (cwd_copy) |c| a.free(c);
+                        a.destroy(slot);
+                        log.print("[proc] spawn worker failed (id={d})", .{req.id});
+                        return error.ProcSpawnFailed;
+                    };
+                    slot.worker = t;
+                    log.print("[proc] spawn id={d} argv0={s} dispatched", .{ req.id, req.argv[0] });
+                    return .{ .ok = true };
+                },
+                .kill => |req| {
+                    const slot = self.procById(req.id) orelse return .{ .ok = false };
+                    const handle = slot.child.id orelse return .{ .ok = false };
+                    _ = win32.TerminateProcess(handle, req.exit_code);
+                    log.print("[proc] kill id={d} code={d}", .{ req.id, req.exit_code });
+                    return .{ .ok = true };
+                },
+                .list => {
+                    var out: std.ArrayListUnmanaged(u8) = .empty;
+                    errdefer out.deinit(alloc);
+                    try out.append(alloc, '[');
+                    for (self.procs.items, 0..) |p, i| {
+                        if (i != 0) try out.append(alloc, ',');
+                        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{{\"id\":{d},\"alive\":{s}}}", .{
+                            p.id, if (p.dead) "false" else "true",
                         }));
                     }
                     try out.append(alloc, ']');
@@ -3405,6 +3495,21 @@ fn Backend(comptime config: Config) type {
                 a.destroy(c);
             }
             self.ws_conns.deinit(self.allocator);
+            // v0.1.16：残留子进程强杀 + worker 清理（应用退出场景）
+            for (self.procs.items) |p| {
+                if (!p.dead) {
+                    if (p.child.id) |h| _ = win32.TerminateProcess(h, 1);
+                    p.worker.join();
+                }
+                if (p.threaded) |t| {
+                    t.deinit();
+                    const a = std.heap.page_allocator;
+                    a.destroy(t);
+                }
+                const a = std.heap.page_allocator;
+                a.destroy(p);
+            }
+            self.procs.deinit(self.allocator);
             if (self.storage_root) |root| self.allocator.free(root);
             if (self.tray_popup) |*b| b.deinit(self.allocator);
             if (self.menu_state) |*m| m.deinit();
@@ -3826,6 +3931,46 @@ fn Backend(comptime config: Config) type {
                                 if (ev.conn) |conn| b.wsRemoveConn(conn);
                                 log.print("[ws] error id={d}: {s}", .{ ev.id, ev.err orelse "-" });
                             },
+                        }
+                    }
+                    return 0;
+                },
+                WM_ZILT_PROC => {
+                    const ev: *ProcEvent = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    defer {
+                        const a = std.heap.page_allocator;
+                        if (ev.data) |d| a.free(d);
+                        a.destroy(ev);
+                    }
+                    if (instance) |b| {
+                        if (b.mainWindow()) |mw| {
+                            switch (ev.kind) {
+                                .out => mw.emitEventPayload("processEvent", .{
+                                    .id = ev.id,
+                                    .kind = if (ev.which == .stdout) "stdout" else "stderr",
+                                    .data = ev.data,
+                                }),
+                                .exit => mw.emitEventPayload("processEvent", .{
+                                    .id = ev.id,
+                                    .kind = "exit",
+                                    .code = ev.code,
+                                }),
+                            }
+                        }
+                        if (ev.kind == .exit) {
+                            // exit 事件是槽的终点：join worker + 释放 io
+                            for (b.procs.items, 0..) |p, i| {
+                                if (p.id == ev.id) {
+                                    _ = b.procs.swapRemove(i);
+                                    p.worker.join();
+                                    if (p.threaded) |t| {
+                                        t.deinit();
+                                        std.heap.page_allocator.destroy(t);
+                                    }
+                                    std.heap.page_allocator.destroy(p);
+                                    break;
+                                }
+                            }
                         }
                     }
                     return 0;
@@ -4644,6 +4789,125 @@ fn httpWorker(job: *HttpJob) void {
         /// 附加 webview 各有一个 WS_CHILD 子窗口（父 = 应用窗口）。同一 Environment
         /// → 同一 user data folder（Cookie/存储共享）；独立分区需要独立 env，留待后续。
         /// 生命周期：create（HWND 同步创建，controller 异步就绪）→ remove / 窗口销毁时释放。
+
+// ---------------------------------------------------------------------------
+// v0.1.16：子进程执行（协议层 ProcessOp；线程与事件编排在此）
+// ---------------------------------------------------------------------------
+
+/// v0.1.16：子进程槽。worker 线程负责 spawn→读两路输出→wait，
+/// 结束时发 exit 事件 → UI 线程 join worker 并释放。
+const ProcSlot = struct {
+    id: i64,
+    hwnd: win32.HWND,
+    child: std.process.Child = undefined,
+    /// 共享 Threaded io（spawn/读管道/wait 都走它；deinit 在 UI 线程 join 后）
+    threaded: ?*std.Io.Threaded = null,
+    worker: std.Thread = undefined,
+    /// exit 事件已发（slot 已不可 kill）
+    dead: bool = false,
+};
+
+/// worker → UI 线程事件。page_allocator 持有，UI 线程 free。
+const ProcEvent = struct {
+    pub const Kind = enum { out, exit };
+    id: i64,
+    kind: Kind,
+    hwnd: win32.HWND,
+    which: enum { stdout, stderr } = .stdout,
+    data: ?[]u8 = null,
+    code: i64 = 0,
+};
+
+fn procPostEvent(ev: *ProcEvent) void {
+    if (win32.PostMessageW(ev.hwnd, WM_ZILT_PROC, 0, @bitCast(@intFromPtr(ev))) == 0) {
+        const a = std.heap.page_allocator;
+        if (ev.data) |d| a.free(d);
+        a.destroy(ev);
+    }
+}
+
+/// 单路管道读循环：takeByte 填 4KB 缓冲，满/EOF 时发 out 事件。
+fn procReadPipe(slot: *ProcSlot, file: std.Io.File, which: @TypeOf(@as(ProcEvent, undefined).which)) void {
+    const a = std.heap.page_allocator;
+    const io = slot.threaded.?.io();
+    var buf: [8192]u8 = undefined;
+    var rd = file.reader(io, &buf);
+    var chunk: [4096]u8 = undefined;
+    var n: usize = 0;
+    while (true) {
+        const b = rd.interface.takeByte() catch break; // EOF / 错误
+        chunk[n] = b;
+        n += 1;
+        if (n == chunk.len) {
+            const ev = a.create(ProcEvent) catch {
+                n = 0;
+                continue;
+            };
+            ev.* = .{ .id = slot.id, .kind = .out, .hwnd = slot.hwnd, .which = which, .data = a.dupe(u8, chunk[0..n]) catch null };
+            procPostEvent(ev);
+            n = 0;
+        }
+    }
+    if (n > 0) {
+        const ev = a.create(ProcEvent) catch return;
+        ev.* = .{ .id = slot.id, .kind = .out, .hwnd = slot.hwnd, .which = which, .data = a.dupe(u8, chunk[0..n]) catch null };
+        procPostEvent(ev);
+    }
+}
+
+/// 子进程 worker：spawn → 两路读线程 → join → wait → exit 事件。
+/// spawn 失败也发 exit（code=-1），前端凭 id 收尾。
+fn procWorker(slot: *ProcSlot, argv: [][]u8, cwd: ?[]u8) void {
+    const a = std.heap.page_allocator;
+    defer {
+        for (argv) |arg| a.free(arg);
+        a.free(argv);
+        if (cwd) |c| a.free(c);
+    }
+
+    const threaded = a.create(std.Io.Threaded) catch {
+        const ev = a.create(ProcEvent) catch return;
+        ev.* = .{ .id = slot.id, .kind = .exit, .hwnd = slot.hwnd, .code = -1 };
+        procPostEvent(ev);
+        return;
+    };
+    threaded.* = .init(a, .{});
+    slot.threaded = threaded;
+    const io = threaded.io();
+
+    const spawned = std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = if (cwd) |c| .{ .path = c } else .inherit,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |e| {
+        log.print("[proc] spawn failed id={d}: {s}", .{ slot.id, @errorName(e) });
+        const ev = a.create(ProcEvent) catch return;
+        ev.* = .{ .id = slot.id, .kind = .exit, .hwnd = slot.hwnd, .code = -1 };
+        procPostEvent(ev);
+        return;
+    };
+    slot.child = spawned;
+    log.print("[proc] spawned id={d}", .{slot.id});
+
+    const OutWhich = @TypeOf(@as(ProcEvent, undefined).which);
+    const t1: ?std.Thread = std.Thread.spawn(.{}, procReadPipe, .{ slot, slot.child.stdout.?, @as(OutWhich, .stdout) }) catch null;
+    const t2: ?std.Thread = std.Thread.spawn(.{}, procReadPipe, .{ slot, slot.child.stderr.?, @as(OutWhich, .stderr) }) catch null;
+    if (t1) |t| t.join();
+    if (t2) |t| t.join();
+
+    var code: i64 = -1;
+    if (slot.child.wait(io)) |term| {
+        code = switch (term) {
+            .exited => |c| @intCast(c),
+            else => -1,
+        };
+    } else |_| {}
+    const ev = a.create(ProcEvent) catch return;
+    ev.* = .{ .id = slot.id, .kind = .exit, .hwnd = slot.hwnd, .code = code };
+    procPostEvent(ev);
+    log.print("[proc] exited id={d} code={d}", .{ slot.id, code });
+}
 
 const ChildWebview = struct {
     id: u32,

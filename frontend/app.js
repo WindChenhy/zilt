@@ -465,6 +465,29 @@ async function runChecks() {
         : `inList=${inList} ready=${ready} sb=${sb} nav=${nav} removed=${removed} gone=${gone} unknown=${unknown}`);
     } catch (e) { setCheck('c-webviews', false, String(e.message || e)); }
 
+    // 31. v0.1.16：子进程。spawn cmd /c echo → stdout 事件 + exit 事件；
+    // kill/list 走错误路径（list 返回数组）。dialog 为模态 UI，不进自动冒烟。
+    try {
+      const procEvents = [];
+      const pid = 1;
+      const pOff = window.zilt.process.on(pid, (p) => procEvents.push(p));
+      await window.zilt.process.spawn({ id: pid, argv: ['cmd', '/c', 'echo', 'zilt-proc-smoke'] });
+      await new Promise((resolve, reject) => {
+        const t0 = Date.now();
+        const tick = () => {
+          const hasOut = procEvents.some((e) => e.kind === 'stdout' && (e.data || '').includes('zilt-proc-smoke'));
+          if (hasOut && procEvents.some((e) => e.kind === 'exit' && e.code === 0)) return resolve();
+          if (Date.now() - t0 > 8000) return reject(new Error('timeout: ' + JSON.stringify(procEvents.map((e) => e.kind))));
+          setTimeout(tick, 100);
+        };
+        tick();
+      });
+      pOff();
+      const lst = await window.zilt.process.list();
+      const ok = Array.isArray(lst);
+      setCheck('c-proc', ok, ok ? `process ok (stdout→echo 命中, exit code=0, list=${lst.length})` : 'list=' + JSON.stringify(lst));
+    } catch (e) { setCheck('c-proc', false, String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -499,6 +522,7 @@ async function runChecks() {
       http: $('c-http').className === 'pass',
       ws: $('c-ws').className === 'pass',
       webviews: $('c-webviews').className === 'pass',
+      proc: $('c-proc').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

@@ -91,6 +91,13 @@ pub const Args = struct {
     timeout_ms: ?u32 = null,
     /// WebSocket close code（__zilt.ws）；url 复用上面的同名字段
     code: ?u16 = null,
+    /// 对话框（__zilt.dialog）；kind 复用上面的同名字段
+    caption: ?[]const u8 = null,
+    buttons: ?[]const u8 = null,
+    default_name: ?[]const u8 = null,
+    filters: ?[]const ipc.Filter = null,
+    /// 子进程 argv（__zilt.process.spawn）
+    argv: ?[]const []const u8 = null,
 };
 
 pub fn isBuiltin(method: []const u8) bool {
@@ -112,8 +119,93 @@ pub fn dispatch(ctx: ipc.Context, method: []const u8, args_json: []const u8) !?[
     if (std.mem.eql(u8, method, "__zilt.drag")) return try dragCmd(ctx, a);
     if (std.mem.eql(u8, method, "__zilt.path")) return try pathCmd(ctx, a);
     if (std.mem.eql(u8, method, "__zilt.log")) return try logCmd(ctx, a);
+    if (std.mem.eql(u8, method, "__zilt.dialog")) return try dialogCmd(ctx, a);
     if (isSystemMethod(method)) return try systemCmd(ctx, method, a);
     return error.UnknownBuiltin;
+}
+
+/// v0.1.16：前端对话框（window.zilt.dialog）——复用 Context.dialog_fn，
+/// 在 UI 线程模态执行（IPC 在消息循环里分发，与 Tauri 行为一致）。
+/// ---------------------------------------------------------------------------
+
+/// 扁平 JSON 参数 → 对话框请求。filters 用结构数组：[{name, pattern}]。
+fn dialogCmd(ctx: ipc.Context, a: Args) ![]u8 {
+    const eql = std.mem.eql;
+    const dflt = ipc.Filter{ .name = "所有文件", .pattern = "*.*" };
+    const file_opts = ipc.FileDialogOptions{
+        .title = a.title orelse "",
+        .filters = blk: {
+            const raw = a.filters orelse break :blk &[_]ipc.Filter{dflt};
+            if (raw.len == 0) break :blk &[_]ipc.Filter{dflt};
+            break :blk raw;
+        },
+        .default_name = a.default_name orelse "",
+    };
+    const req: ipc.DialogRequest = blk: {
+        if (eql(u8, a.action, "messageBox")) {
+            const k = a.kind orelse "info";
+            const kind: ipc.MsgKind = if (eql(u8, k, "warning")) .warning else if (eql(u8, k, "error")) .err else if (eql(u8, k, "question")) .err else .info;
+            const buttons: ipc.MsgButtons = if (eql(u8, a.buttons orelse "ok", "ok_cancel")) .ok_cancel else if (eql(u8, a.buttons orelse "ok", "yes_no")) .yes_no else .ok;
+            break :blk .{ .message_box = .{
+                .text = a.text orelse a.message orelse "",
+                .caption = a.caption orelse a.title orelse "提示",
+                .kind = kind,
+                .buttons = buttons,
+            } };
+        }
+        if (eql(u8, a.action, "openFile")) break :blk .{ .open_file = file_opts };
+        if (eql(u8, a.action, "saveFile")) break :blk .{ .save_file = file_opts };
+        if (eql(u8, a.action, "pickFolder")) break :blk .{ .pick_folder = .{ .title = a.title orelse "选择文件夹" } };
+        if (eql(u8, a.action, "pickFiles")) break :blk .{ .pick_files = file_opts };
+        return error.UnknownDialogAction;
+    };
+    const resp = try (ctx.dialog_fn orelse return error.DialogNotAvailable)(ctx.backend, ctx.allocator, req);
+    const alloc = ctx.allocator;
+    return switch (resp) {
+        .button => |b| switch (b) {
+            .ok => alloc.dupe(u8, "\"ok\""),
+            .cancel => alloc.dupe(u8, "\"cancel\""),
+            .yes => alloc.dupe(u8, "\"yes\""),
+            .no => alloc.dupe(u8, "\"no\""),
+        },
+        .path => |p| if (p) |path|
+            std.json.Stringify.valueAlloc(alloc, path, .{})
+        else
+            alloc.dupe(u8, "null"),
+        .paths => |ps| if (ps) |list|
+            std.json.Stringify.valueAlloc(alloc, list, .{})
+        else
+            alloc.dupe(u8, "null"),
+        else => error.DialogNotAvailable,
+    };
+}
+
+/// v0.1.16：进程执行（window.zilt.process）。spawn 交给后端进程槽，
+/// stdout/stderr/exit 走 processEvent 事件；kill/等待接口见 backend。
+fn processCmd(ctx: ipc.Context, a: Args) ![]u8 {
+    if (std.mem.eql(u8, a.action, "spawn")) {
+        const argv = a.items orelse return error.MissingCommand;
+        if (argv.len == 0) return error.MissingCommand;
+        // 命令统一经 system_api 通道（backend 持有进程槽与事件线）
+        const req = system_api.Request{ .process = .{ .spawn = .{
+            .id = a.id orelse 0,
+            .argv = argv,
+            .cwd = a.path,
+        } } };
+        return try ctx.request_fn.?(ctx.backend, ctx.window_id, req);
+    }
+    if (std.mem.eql(u8, a.action, "kill")) {
+        const req = system_api.Request{ .process = .{ .kill = .{
+            .id = a.id orelse return error.MissingId,
+            .exit_code = a.code orelse 1,
+        } } };
+        return try ctx.request_fn.?(ctx.backend, ctx.window_id, req);
+    }
+    if (std.mem.eql(u8, a.action, "list")) {
+        const req = system_api.Request{ .process = .list };
+        return try ctx.request_fn.?(ctx.backend, ctx.window_id, req);
+    }
+    return error.UnknownProcessAction;
 }
 
 fn ok(ctx: ipc.Context) ![]u8 {
@@ -365,7 +457,7 @@ pub fn isSystemMethod(method: []const u8) bool {
         eql(u8, name, "autostart") or eql(u8, name, "appearance") or
         eql(u8, name, "store") or eql(u8, name, "fs") or eql(u8, name, "windowState") or
         eql(u8, name, "services") or eql(u8, name, "http") or eql(u8, name, "ws") or
-        eql(u8, name, "webviews");
+        eql(u8, name, "webviews") or eql(u8, name, "process");
 }
 
 pub fn clickActionFromName(name: ?[]const u8) system_api.ClickAction {
@@ -566,6 +658,20 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
         if (eql(u8, a.action, "focus")) return .{ .webviews = .{ .focus = a.id orelse return error.MissingId } };
         if (eql(u8, a.action, "list")) return .{ .webviews = .list };
         return error.UnknownWebviewsAction;
+    }
+
+    if (eql(u8, name, "process")) {
+        if (eql(u8, a.action, "spawn")) return .{ .process = .{ .spawn = .{
+            .id = a.id orelse 0,
+            .argv = a.argv orelse a.items orelse return error.MissingCommand,
+            .cwd = a.path,
+        } } };
+        if (eql(u8, a.action, "kill")) return .{ .process = .{ .kill = .{
+            .id = a.id orelse return error.MissingId,
+            .exit_code = a.code orelse 1,
+        } } };
+        if (eql(u8, a.action, "list")) return .{ .process = .list };
+        return error.UnknownProcessAction;
     }
 
     if (eql(u8, name, "appearance")) {

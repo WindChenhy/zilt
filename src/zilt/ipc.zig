@@ -937,6 +937,21 @@ pub const runtime_js =
     \\      focus: (id) => builtin('__zilt.webviews', { action: 'focus', id }),
     \\      list: () => builtin('__zilt.webviews', { action: 'list' }),
     \\    },
+    \\    // v0.1.16: 原生对话框。模态（UI 线程阻塞），行为与 Tauri 一致。
+    \\    dialog: {
+    \\      messageBox: (opts) => builtin('__zilt.dialog', Object.assign({ action: 'messageBox' }, opts ?? {})),
+    \\      openFile: (opts) => builtin('__zilt.dialog', Object.assign({ action: 'openFile' }, opts ?? {})),
+    \\      saveFile: (opts) => builtin('__zilt.dialog', Object.assign({ action: 'saveFile' }, opts ?? {})),
+    \\      pickFolder: (opts) => builtin('__zilt.dialog', Object.assign({ action: 'pickFolder' }, opts ?? {})),
+    \\      pickFiles: (opts) => builtin('__zilt.dialog', Object.assign({ action: 'pickFiles' }, opts ?? {})),
+    \\    },
+    \\    // v0.1.16: 子进程。spawn({id, argv, cwd}) → stdout/stderr/exit 走 processEvent 事件。
+    \\    process: {
+    \\      spawn: (opts) => builtin('__zilt.process', Object.assign({ action: 'spawn' }, opts ?? {})),
+    \\      kill: (id, exitCode) => builtin('__zilt.process', { action: 'kill', id, code: exitCode ?? 1 }),
+    \\      list: () => builtin('__zilt.process', { action: 'list' }),
+    \\      on: (id, cb) => window.zilt.on('processEvent', (p) => { if (p && p.id === id) cb(p); }),
+    \\    },
     \\    version: '0.1.16',
     \\  };
     \\  window.zilt.on('__zilt.evalResult', (p) => {

@@ -303,6 +303,7 @@ pub extern "shell32" fn DragFinish(hDrop: HANDLE) callconv(.c) void;
 // ---- kernel32 ----
 
 pub extern "kernel32" fn GetModuleHandleW(lpModuleName: ?LPCWSTR) callconv(.c) HINSTANCE;
+pub extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) callconv(.c) BOOL;
 pub extern "kernel32" fn LoadLibraryExW(lpLibFileName: LPCWSTR, hFile: ?*anyopaque, dwFlags: DWORD) callconv(.c) HMODULE;
 pub extern "kernel32" fn GetProcAddress(hModule: HMODULE, lpProcName: [*:0]const u8) callconv(.c) ?*anyopaque;
 pub extern "kernel32" fn FreeLibrary(hLibModule: HMODULE) callconv(.c) BOOL;

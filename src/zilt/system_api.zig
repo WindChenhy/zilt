@@ -148,6 +148,16 @@ pub const WebviewsOp = union(enum) {
     list,
 };
 
+/// 子进程执行（v0.1.16）。spawn 立即返回；stdout/stderr/exit 经 `processEvent`
+/// 事件回传。安全性：spawn 受 .command ACL 管控（capabilities.json 授权后可用），
+/// 应用侧应自行限制 argv 来源。
+pub const ProcessOp = union(enum) {
+    /// argv[0] = 可执行文件，其余为参数；cwd 可空
+    spawn: struct { id: i64, argv: []const []const u8, cwd: ?[]const u8 = null },
+    kill: struct { id: i64, exit_code: u32 = 1 },
+    list,
+};
+
 pub const Request = union(enum) {
     menu: MenuOp,
     tray: TrayOp,
@@ -173,6 +183,8 @@ pub const Request = union(enum) {
     ws: WsOp,
     /// v0.1.16：单窗口多 WebView
     webviews: WebviewsOp,
+    /// v0.1.16：子进程执行（事件走 processEvent）
+    process: ProcessOp,
 };
 
 pub const Result = union(enum) {
