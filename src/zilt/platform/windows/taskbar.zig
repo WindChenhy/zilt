@@ -14,6 +14,10 @@ const log = @import("../../log.zig");
 
 pub const CLSID_TaskbarList: com.GUID = .parse("{56FDF344-FD6D-11D0-958A-006097C9A090}");
 pub const IID_ITaskbarList3: com.GUID = .parse("{EA1AFB91-9E28-4B86-90E9-9E9F8A5EEA84}");
+/// ITaskbarList4 = ITaskbarList3 的超集（仅追加 SetTabProperties）。Win11 25H2 实测：
+/// QI 到 v3 返回 E_NOINTERFACE，而 v4 返回 S_OK，因此 v4 是必须的回退路径；
+/// 由于 v4 的前 21 个 vtable 槽与 v3 完全一致，这里复用同一个 VTable 定义。
+pub const IID_ITaskbarList4: com.GUID = .parse("{C43DC798-95D1-4BEA-9030-BB99E2983A1A}");
 pub const CLSCTX_INPROC_SERVER: u32 = 0x1;
 
 extern "ole32" fn CoCreateInstance(
@@ -104,9 +108,15 @@ pub const Taskbar = struct {
 
     pub fn init() !Taskbar {
         var raw: ?*anyopaque = null;
-        const hr = CoCreateInstance(&CLSID_TaskbarList, null, CLSCTX_INPROC_SERVER, &IID_ITaskbarList3, &raw);
+        var hr = CoCreateInstance(&CLSID_TaskbarList, null, CLSCTX_INPROC_SERVER, &IID_ITaskbarList3, &raw);
+        var version: u8 = 3;
         if (com.failed(hr) or raw == null) {
-            log.print("[taskbar] CoCreateInstance failed hr=0x{x} raw_null={}", .{ @as(u32, @bitCast(hr)), raw == null });
+            // Win11 25H2：v3 的 QI 回 E_NOINTERFACE，v4 可用（前 21 槽与 v3 同布局）
+            hr = CoCreateInstance(&CLSID_TaskbarList, null, CLSCTX_INPROC_SERVER, &IID_ITaskbarList4, &raw);
+            version = 4;
+        }
+        if (com.failed(hr) or raw == null) {
+            log.print("[taskbar] TaskbarList unavailable (hr=0x{x})", .{@as(u32, @bitCast(hr))});
             return error.TaskbarUnavailable;
         }
         const list: *ITaskbarList3 = @ptrCast(@alignCast(raw.?));
@@ -116,6 +126,7 @@ pub const Taskbar = struct {
             list.release();
             return error.TaskbarInitFailed;
         }
+        log.print("[taskbar] ITaskbarList{d} ready", .{version});
         return .{ .list = list };
     }
 

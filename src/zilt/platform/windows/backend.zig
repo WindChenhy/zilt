@@ -1839,6 +1839,15 @@ fn Backend(comptime config: Config) type {
         /// 返回 ITaskbarList3 是否可用（本机可能只暴露 ITaskbarList/2；
         /// 那时进度/overlay 不可用，但调用仍应正常返回 false 而不是报错）。
         fn runTaskbarOp(self: *Self, w: *Window, op: shared_taskbar.Request, alloc: std.mem.Allocator) !bool {
+            // 闪烁走 user32 FlashWindowEx，不依赖 TaskbarList COM，优先处理
+            switch (op) {
+                .flash => |f| {
+                    const ok = win_taskbar.Taskbar.flash(w.hwnd, f);
+                    log.print("[taskbar] flash (ok={})", .{ok});
+                    return ok;
+                },
+                else => {},
+            }
             if (self.taskbar_list == null) {
                 self.taskbar_list = win_taskbar.Taskbar.init() catch |err| {
                     log.print("[taskbar] ITaskbarList3 unavailable: {s}（本机 COM 未暴露该接口）", .{@errorName(err)});
@@ -1864,10 +1873,6 @@ fn Backend(comptime config: Config) type {
                 .tooltip => |text| {
                     tb.setTooltip(w.hwnd, text, alloc);
                 },
-                .flash => |f| {
-                    const ok = win_taskbar.Taskbar.flash(w.hwnd, f);
-                    log.print("[taskbar] flash (ok={})", .{ok});
-                },
                 .thumb_buttons => |buttons| {
                     var icons = std.mem.zeroes([7]win32.HICON);
                     const n = @min(buttons.len, 7);
@@ -1875,6 +1880,7 @@ fn Backend(comptime config: Config) type {
                     const ok = tb.setThumbButtons(w.hwnd, buttons, icons[0..n]);
                     log.print("[taskbar] thumbnail buttons (n={d}, ok={})", .{ n, ok });
                 },
+                else => {},
             }
             return true;
         }

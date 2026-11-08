@@ -285,7 +285,8 @@ GUI 冒烟 `ZILT_SMOKE_EXIT=1` **18 项检查 ALL CHECKS PASSED，exit 0**；
 - [x] **全局快捷键运行时 API**：注册/注销/查询、加速键字符串解析（`accel.zig`）、
       冲突检测（同 VK+修饰符 → `HotkeyConflict`）
 - [x] **任务栏集成**：进度条、overlay 图标、缩略图工具栏按钮、闪烁窗口
-      （ITaskbarList3；Jump List 未实现；本机 COM 仅暴露 ITaskbarList/2 → 运行期降级为 false）
+      （TaskbarList COM：优先 ITaskbarList3，QI 失败回退 ITaskbarList4——Win11 25H2
+      实测只暴露 v1/v2/v4；闪烁走 FlashWindowEx 不依赖 COM；Jump List 未实现）
 - [x] **验收**：托盘勾选态同步（menu.set → list 快照 checked=true）；
       菜单 accelerator 以 `\tCtrl+N` 右对齐显示；任务栏进度 API 往返 + 能力探测
 
@@ -322,10 +323,13 @@ hotkey / taskbar / system / shell / autostart / appearance`。
 `[hotkey] runtime registered smoke-hotkey = Ctrl+Alt+F9`、
 `[appearance] dark_titlebar=true backdrop=true`、`[autostart] enabled/disabled`。
 
-**环境限制（如实记录）**：本机 COM `CoCreateInstance(CLSID_TaskbarList, IID_ITaskbarList3)`
-返回 `0x80004002 E_NOINTERFACE`（外部 API 交叉验证：ITaskbarList 与 ITaskbarList2 可 QI，
-ITaskbarList3 不可），因此任务栏进度/overlay 在本机降级为「API 已接线、能力不可用」，
-冒烟据此判 PASS 并记录原因；在暴露 ITaskbarList3 的系统上直接生效。
+**任务栏接口兼容（更正记录）**：初版只请求 `IID_ITaskbarList3`，在本机（Windows 11 25H2，
+build 26200）返回 `0x80004002 E_NOINTERFACE`，曾误判为「环境不支持任务栏能力」。实测
+QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因此改为「v3 优先、v4 回退」
+（v4 是 v3 超集，前 21 个 vtable 槽布局一致，复用同一 VTable 定义）。修复后日志
+`[taskbar] ITaskbarList4 ready` + `[taskbar] progress normal value=0.5` + `flash (ok=true)`，
+进度条/overlay/缩略图按钮全部真实生效。同时把 `flash` 提前到 COM 初始化之前——
+`FlashWindowEx` 本就只需 user32，不应被 COM 可用性连累。
 
 **未完成项**：v0.1.15 / v0.1.17 未开始；v0.1.16 仅完成三个模块（见其章节）。
 
