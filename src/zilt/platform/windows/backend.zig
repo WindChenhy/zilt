@@ -34,6 +34,8 @@ const autostart_mod = @import("../../autostart.zig");
 const theme_mod = @import("../../theme.zig");
 const shared_taskbar = @import("../../taskbar.zig");
 const shared_sysinfo = @import("../../sysinfo.zig");
+const shared_store = @import("../../store.zig");
+const fs_api_mod = @import("../../fs_api.zig");
 const hotkey_mod = @import("hotkey.zig");
 const dialog_mod = @import("dialog.zig");
 const dlgx = @import("dialog_ext.zig");
@@ -808,6 +810,9 @@ fn Backend(comptime config: Config) type {
         /// v0.1.13：运行时注册的全局快捷键（与编译期 config.hotkeys 的 id 空间分离）
         runtime_hotkeys: std.ArrayListUnmanaged(RuntimeHotkey) = .empty,
         next_runtime_hotkey_id: u32 = 0x8000,
+        /// v0.1.16：KV 存储与受限 fs 的根目录（%LOCALAPPDATA%\<app_id>）
+        storage_root: ?[]u8 = null,
+        store: ?shared_store.Store = null,
         watcher: ?*Watcher = null,
         updater_env: ?updater.Env = null,
         updater_url_override: ?[]u8 = null,
@@ -884,6 +889,9 @@ fn Backend(comptime config: Config) type {
                     log.print("[tray] popup menu built (static fallback)", .{});
                 }
             }
+
+            // v0.1.16：本地存储（与 WebView2 profile 同级目录）
+            self.initStorage();
         }
 
         const IconBytes = struct {
@@ -1693,6 +1701,106 @@ fn Backend(comptime config: Config) type {
                     const r = sys_integration.applyAppearance(w.hwnd, ap);
                     log.print("[appearance] dark_titlebar={} backdrop={}", .{ r.dark, r.backdrop });
                     return .{ .ok = r.dark or r.backdrop };
+                },
+                .store => |op| return self.runStoreOp(op, alloc),
+                .fs => |op| return self.runFsOp(op, alloc),
+            }
+        }
+
+        // ---- v0.1.16：KV 存储 / 受限 fs ----
+
+        fn initStorage(self: *Self) void {
+            const local = win32.getEnvUtf8(self.allocator, "LOCALAPPDATA") orelse return;
+            defer self.allocator.free(local);
+            const root = std.fmt.allocPrint(self.allocator, "{s}\\{s}", .{ local, config.app_id }) catch return;
+            self.storage_root = root;
+
+            const path = std.fmt.allocPrint(self.allocator, "{s}\\store.json", .{root}) catch return;
+            defer self.allocator.free(path);
+
+            var store = shared_store.Store.init(self.allocator);
+            if (win32.readFileAlloc(self.allocator, path)) |bytes| {
+                defer self.allocator.free(bytes);
+                store.fromJson(bytes) catch |err| {
+                    log.print("[store] invalid store.json: {s}", .{@errorName(err)});
+                };
+            }
+            self.store = store;
+            log.print("[store] ready ({d} keys) {s}", .{ store.count(), path });
+        }
+
+        fn persistStore(self: *Self) void {
+            const st = if (self.store) |*v| v else return;
+            const root = self.storage_root orelse return;
+            const json = st.toJson(self.allocator) catch return;
+            defer self.allocator.free(json);
+            const path = std.fmt.allocPrint(self.allocator, "{s}\\store.json", .{root}) catch return;
+            defer self.allocator.free(path);
+            if (!win32.writeFileAlloc(self.allocator, path, json)) {
+                log.print("[store] persist failed: {s}", .{path});
+            }
+        }
+
+        fn runStoreOp(self: *Self, op: shared_system.StoreOp, alloc: std.mem.Allocator) !shared_system.Result {
+            const st = if (self.store) |*v| v else return error.StoreNotAvailable;
+            switch (op) {
+                .get => |key| {
+                    const v = st.get(key) orelse return .{ .json = try alloc.dupe(u8, "null") };
+                    return .{ .json = try std.json.Stringify.valueAlloc(alloc, v, .{}) };
+                },
+                .set => |kv| {
+                    try st.set(kv.key, kv.value);
+                    self.persistStore();
+                    log.print("[store] set {s} ({d} keys)", .{ kv.key, st.count() });
+                    return .{ .ok = true };
+                },
+                .remove => |key| {
+                    const removed = st.remove(key);
+                    if (removed) self.persistStore();
+                    return .{ .ok = removed };
+                },
+                .keys => {
+                    const keys = try st.keys(alloc);
+                    defer alloc.free(keys);
+                    return .{ .json = try std.json.Stringify.valueAlloc(alloc, keys, .{}) };
+                },
+                .all => return .{ .json = try st.toJson(alloc) },
+            }
+        }
+
+        fn fsExists(self: *Self, alloc: std.mem.Allocator, rel: []const u8) bool {
+            const root = self.storage_root orelse return false;
+            const path = fs_api_mod.joinChecked(alloc, root, rel) catch return false;
+            defer alloc.free(path);
+            const wz = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return false;
+            defer alloc.free(wz);
+            return win32.GetFileAttributesW(wz.ptr) != 0xFFFFFFFF;
+        }
+
+        fn runFsOp(self: *Self, op: shared_system.FsOp, alloc: std.mem.Allocator) !shared_system.Result {
+            const root = self.storage_root orelse return error.StoreNotAvailable;
+            switch (op) {
+                .read => |rel| {
+                    const path = try fs_api_mod.joinChecked(alloc, root, rel);
+                    defer alloc.free(path);
+                    const bytes = win32.readFileAlloc(alloc, path) orelse return error.FileNotFound;
+                    defer alloc.free(bytes);
+                    return .{ .json = try std.json.Stringify.valueAlloc(alloc, bytes, .{}) };
+                },
+                .write => |w| {
+                    const path = try fs_api_mod.joinChecked(alloc, root, w.path);
+                    defer alloc.free(path);
+                    if (!win32.writeFileAlloc(alloc, path, w.data)) return error.WriteFailed;
+                    log.print("[fs] wrote {d} bytes -> {s}", .{ w.data.len, w.path });
+                    return .{ .ok = true };
+                },
+                .exists => |rel| return .{ .ok = self.fsExists(alloc, rel) },
+                .remove => |rel| {
+                    const path = try fs_api_mod.joinChecked(alloc, root, rel);
+                    defer alloc.free(path);
+                    const wz = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
+                    defer alloc.free(wz);
+                    return .{ .ok = win32.DeleteFileW(wz.ptr) != 0 };
                 },
             }
         }
@@ -2805,6 +2913,8 @@ fn Backend(comptime config: Config) type {
                 self.runtime_hotkeys.deinit(self.allocator);
             }
             if (self.taskbar_list) |*tb| tb.deinit();
+            if (self.store) |*st| st.deinit();
+            if (self.storage_root) |root| self.allocator.free(root);
             if (self.tray_popup) |*b| b.deinit(self.allocator);
             if (self.menu_state) |*m| m.deinit();
             if (self.toast) |*t| t.deinit();

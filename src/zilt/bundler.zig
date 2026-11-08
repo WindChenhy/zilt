@@ -117,6 +117,17 @@ pub const InstallerConfig = struct {
     out_path: []const u8,
     /// 要打包的 exe 绝对路径（写入 File 指令）
     exe_path: []const u8,
+    // ---- v0.1.15 安装器增强 ----
+    /// per-machine 安装（Program Files + HKLM + 需要管理员）；默认 per-user
+    per_machine: bool = false,
+    /// 许可证文件（编译期 LicenseData，显示 License 页）；null = 不显示
+    license_path: ?[]const u8 = null,
+    /// setup.exe 图标路径；null = 不设置
+    setup_icon: ?[]const u8 = null,
+    /// 安装时注册的 URL 协议（如 "zilt"）
+    schemes: []const []const u8 = &.{},
+    /// 安装时注册的文件关联扩展名（如 ".zilt"）
+    file_exts: []const []const u8 = &.{},
 };
 
 /// NSIS 字符串转义（$\ = 双引号，$$ = 字面 $）。
@@ -161,12 +172,15 @@ pub fn generateNsis(alloc: std.mem.Allocator, cfg: InstallerConfig) ![]u8 {
         \\
         \\Name        "${APP_NAME} ${APP_VERSION}"
         \\OutFile     "{OUT}"
-        \\InstallDir  "$LOCALAPPDATA\Programs\${APP_ID}"
-        \\InstallDirRegKey HKCU "${UNINST_KEY}" "InstallLocation"
-        \\RequestExecutionLevel user
+        \\InstallDir  {INSTDIR_EXPR}
+        \\InstallDirRegKey @UNINST_ROOT@ "${UNINST_KEY}" "InstallLocation"
+        \\RequestExecutionLevel {REQLEVEL}
+        \\{ICON_LINE}
         \\SetCompressor /SOLID lzma
         \\ShowInstDetails show
         \\
+        \\{LICENSE_DATA}
+        \\{LICENSE_PAGE}
         \\Page directory
         \\Page instfiles
         \\UninstPage uninstConfirm
@@ -195,18 +209,20 @@ pub fn generateNsis(alloc: std.mem.Allocator, cfg: InstallerConfig) ![]u8 {
         \\
         \\Section "Install"
         \\  Call MaybeInstallWebView2
+        \\{UPGRADE_CHECK}
         \\  SetOutPath "$INSTDIR"
         \\  File "{EXE}"
         \\  WriteUninstaller "$INSTDIR\Uninstall.exe"
         \\  CreateDirectory "$SMPROGRAMS\${APP_NAME}"
         \\  CreateShortCut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
         \\  CreateShortCut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
-        \\  WriteRegStr HKCU "${UNINST_KEY}" "DisplayName"   "${APP_NAME} ${APP_VERSION}"
-        \\  WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${APP_VERSION}"
-        \\  WriteRegStr HKCU "${UNINST_KEY}" "Publisher"     "${APP_PUBLISHER}"
-        \\  WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon"   "$INSTDIR\${APP_EXE}"
-        \\  WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
-        \\  WriteRegStr HKCU "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
+        \\  WriteRegStr @UNINST_ROOT@ "${UNINST_KEY}" "DisplayName"   "${APP_NAME} ${APP_VERSION}"
+        \\  WriteRegStr @UNINST_ROOT@ "${UNINST_KEY}" "DisplayVersion" "${APP_VERSION}"
+        \\  WriteRegStr @UNINST_ROOT@ "${UNINST_KEY}" "Publisher"     "${APP_PUBLISHER}"
+        \\  WriteRegStr @UNINST_ROOT@ "${UNINST_KEY}" "DisplayIcon"   "$INSTDIR\${APP_EXE}"
+        \\  WriteRegStr @UNINST_ROOT@ "${UNINST_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
+        \\  WriteRegStr @UNINST_ROOT@ "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
+        \\{ASSOC_INSTALL}
         \\SectionEnd
         \\
         \\Section "Uninstall"
@@ -216,7 +232,8 @@ pub fn generateNsis(alloc: std.mem.Allocator, cfg: InstallerConfig) ![]u8 {
         \\  Delete "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk"
         \\  RMDir "$SMPROGRAMS\${APP_NAME}"
         \\  Delete "$DESKTOP\${APP_NAME}.lnk"
-        \\  DeleteRegKey HKCU "${UNINST_KEY}"
+        \\  DeleteRegKey @UNINST_ROOT@ "${UNINST_KEY}"
+        \\{ASSOC_UNINSTALL}
         \\SectionEnd
         \\
     ;
@@ -228,7 +245,127 @@ pub fn generateNsis(alloc: std.mem.Allocator, cfg: InstallerConfig) ![]u8 {
     cur = try repStep(alloc, cur, "{APPID}", app_id);
     cur = try repStep(alloc, cur, "{OUT}", out_path);
     cur = try repStep(alloc, cur, "{EXE}", exe_path);
+
+    // v0.1.15：per-machine / License / 图标 / 协议与文件关联 / 升级检测
+    {
+        cur = try repStep(alloc, cur, "{REQLEVEL}", if (cfg.per_machine) "admin" else "user");
+        cur = try repStep(alloc, cur, "{INSTDIR_EXPR}", if (cfg.per_machine)
+            "$PROGRAMFILES64\\${APP_ID}"
+        else
+            "$LOCALAPPDATA\\Programs\\${APP_ID}");
+        const license_data = if (cfg.license_path) |lp| blk: {
+            const esc = try nsisEscape(alloc, lp);
+            defer alloc.free(esc);
+            break :blk try std.fmt.allocPrint(alloc, "LicenseData \"{s}\"", .{esc});
+        } else try alloc.dupe(u8, "");
+        cur = try repStep(alloc, cur, "{LICENSE_DATA}", license_data);
+        alloc.free(license_data);
+        cur = try repStep(alloc, cur, "{LICENSE_PAGE}", if (cfg.license_path != null) "Page license" else "");
+
+        const icon_line = if (cfg.setup_icon) |ip| blk: {
+            const esc = try nsisEscape(alloc, ip);
+            defer alloc.free(esc);
+            break :blk try std.fmt.allocPrint(alloc, "Icon \"{s}\"", .{esc});
+        } else try alloc.dupe(u8, "");
+        cur = try repStep(alloc, cur, "{ICON_LINE}", icon_line);
+        alloc.free(icon_line);
+
+        const upgrade = try std.fmt.allocPrint(alloc,
+            \\  ReadRegStr $R4 @UNINST_ROOT@ "${{UNINST_KEY}}" "DisplayVersion"
+            \\  ${{If}} $R4 != ""
+            \\    DetailPrint "已安装版本 $R4，将升级到 ${{APP_VERSION}}"
+            \\  ${{EndIf}}
+        , .{});
+        cur = try repStep(alloc, cur, "{UPGRADE_CHECK}", upgrade);
+        alloc.free(upgrade);
+
+        const assoc_install = try buildAssocInstall(alloc, cfg);
+        cur = try repStep(alloc, cur, "{ASSOC_INSTALL}", assoc_install);
+        alloc.free(assoc_install);
+
+        const assoc_uninstall = try buildAssocUninstall(alloc, cfg);
+        cur = try repStep(alloc, cur, "{ASSOC_UNINSTALL}", assoc_uninstall);
+        alloc.free(assoc_uninstall);
+
+        // 最后统一展开卸载键根：此时 assoc / upgrade 片段已插入完毕
+        cur = try repStep(alloc, cur, "@UNINST_ROOT@", if (cfg.per_machine) "HKLM" else "HKCU");
+    }
     return cur;
+}
+
+/// 安装段：URL 协议注册（v0.1.15）。每个 scheme 生成 4 条 WriteRegStr。
+fn buildAssocInstall(alloc: std.mem.Allocator, cfg: InstallerConfig) ![]u8 {
+    const scheme_tpl =
+        \\  WriteRegStr @UNINST_ROOT@ "Software\Classes\@SCHEME@" "" "URL:${APP_NAME}"
+        \\  WriteRegStr @UNINST_ROOT@ "Software\Classes\@SCHEME@" "URL Protocol" ""
+        \\  WriteRegStr @UNINST_ROOT@ "Software\Classes\@SCHEME@\DefaultIcon" "" "$INSTDIR\${APP_EXE},0"
+        \\  WriteRegStr @UNINST_ROOT@ "Software\Classes\@SCHEME@\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
+        \\
+    ;
+    const ext_tpl =
+        \\  WriteRegStr @UNINST_ROOT@ "Software\Classes\@EXT@" "" "@PROGID@"
+        \\  WriteRegStr @UNINST_ROOT@ "Software\Classes\@PROGID@" "" "${APP_NAME} Document"
+        \\  WriteRegStr @UNINST_ROOT@ "Software\Classes\@PROGID@\DefaultIcon" "" "$INSTDIR\${APP_EXE},0"
+        \\  WriteRegStr @UNINST_ROOT@ "Software\Classes\@PROGID@\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
+        \\
+    ;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    for (cfg.schemes) |scheme| {
+        const esc = try nsisEscape(alloc, scheme);
+        defer alloc.free(esc);
+        const chunk = try replaceAll(alloc, scheme_tpl, "@SCHEME@", esc);
+        defer alloc.free(chunk);
+        try out.appendSlice(alloc, chunk);
+    }
+    for (cfg.file_exts) |ext| {
+        const esc = try nsisEscape(alloc, ext);
+        defer alloc.free(esc);
+        const progid = try std.fmt.allocPrint(alloc, "${{APP_NAME}}{s}", .{esc});
+        defer alloc.free(progid);
+        var chunk = try replaceAll(alloc, ext_tpl, "@EXT@", esc);
+        chunk = try repStep(alloc, chunk, "@PROGID@", progid);
+        defer alloc.free(chunk);
+        try out.appendSlice(alloc, chunk);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// 卸载段：删除协议与文件关联键（顺序与安装相反）。
+fn buildAssocUninstall(alloc: std.mem.Allocator, cfg: InstallerConfig) ![]u8 {
+    const scheme_tpl =
+        \\  DeleteRegKey @UNINST_ROOT@ "Software\Classes\@SCHEME@"
+        \\
+    ;
+    const ext_tpl =
+        \\  DeleteRegKey @UNINST_ROOT@ "Software\Classes\@PROGID@"
+        \\  DeleteRegKey @UNINST_ROOT@ "Software\Classes\@EXT@"
+        \\
+    ;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    for (cfg.file_exts) |ext| {
+        const esc = try nsisEscape(alloc, ext);
+        defer alloc.free(esc);
+        const progid = try std.fmt.allocPrint(alloc, "${{APP_NAME}}{s}", .{esc});
+        defer alloc.free(progid);
+        var chunk = try replaceAll(alloc, ext_tpl, "@EXT@", esc);
+        chunk = try repStep(alloc, chunk, "@PROGID@", progid);
+        defer alloc.free(chunk);
+        try out.appendSlice(alloc, chunk);
+    }
+    for (cfg.schemes) |scheme| {
+        const esc = try nsisEscape(alloc, scheme);
+        defer alloc.free(esc);
+        const chunk = try replaceAll(alloc, scheme_tpl, "@SCHEME@", esc);
+        defer alloc.free(chunk);
+        try out.appendSlice(alloc, chunk);
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 /// 替换一步并释放上一步缓冲（失败时也释放）。
@@ -513,4 +650,102 @@ fn cdStartOf(zip_bytes: []const u8) usize {
         }
     }
     unreachable;
+}
+
+test "nsis installer: per-machine uses admin, Program Files and HKLM" {
+    const script = try generateNsis(testing.allocator, .{
+        .app_name = "Zilt",
+        .version = "1.2.3",
+        .publisher = "Zilt",
+        .exe_name = "zilt-app.exe",
+        .app_id = "Zilt.zilt",
+        .out_path = "out-setup.exe",
+        .exe_path = "C://build//zilt-app.exe",
+        .per_machine = true,
+    });
+    defer testing.allocator.free(script);
+
+    try testing.expect(std.mem.indexOf(u8, script, "RequestExecutionLevel admin") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "$PROGRAMFILES64") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "HKLM") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "RequestExecutionLevel user") == null);
+    try testing.expect(std.mem.indexOf(u8, script, "{REQLEVEL}") == null);
+    try testing.expect(std.mem.indexOf(u8, script, "@UNINST_ROOT@") == null);
+    try testing.expect(std.mem.indexOf(u8, script, "WriteRegStr HKLM") != null);
+}
+
+test "nsis installer: per-user keeps HKCU and LOCALAPPDATA" {
+    const script = try generateNsis(testing.allocator, .{
+        .app_name = "Zilt",
+        .version = "1.2.3",
+        .publisher = "Zilt",
+        .exe_name = "zilt-app.exe",
+        .app_id = "Zilt.zilt",
+        .out_path = "out-setup.exe",
+        .exe_path = "C://build//zilt-app.exe",
+    });
+    defer testing.allocator.free(script);
+    try testing.expect(std.mem.indexOf(u8, script, "RequestExecutionLevel user") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "$LOCALAPPDATA\\Programs") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "WriteRegStr HKCU") != null);
+    // WebView2 检测仍读 HKCU（与安装范围无关）
+    try testing.expect(std.mem.indexOf(u8, script, "ReadRegStr $R1 HKCU") != null);
+}
+
+test "nsis installer: license, icon, protocol and file association" {
+    const script = try generateNsis(testing.allocator, .{
+        .app_name = "Zilt",
+        .version = "1.2.3",
+        .publisher = "Zilt",
+        .exe_name = "zilt-app.exe",
+        .app_id = "Zilt.zilt",
+        .out_path = "out-setup.exe",
+        .exe_path = "C://build//zilt-app.exe",
+        .license_path = "LICENSE.txt",
+        .setup_icon = "installer.ico",
+        .schemes = &.{"zilt"},
+        .file_exts = &.{".zilt"},
+    });
+    defer testing.allocator.free(script);
+
+    try testing.expect(std.mem.indexOf(u8, script, "LicenseData \"LICENSE.txt\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "Page license") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "Icon \"installer.ico\"") != null);
+
+    // URL 协议
+    try testing.expect(std.mem.indexOf(u8, script, "\"URL Protocol\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "URL:${APP_NAME}") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "Software\\Classes\\zilt") != null);
+
+    // 文件关联
+    try testing.expect(std.mem.indexOf(u8, script, "Software\\Classes\\.zilt") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "${APP_NAME}.zilt") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "shell\\open\\command") != null);
+
+    // 卸载清理
+    try testing.expect(std.mem.indexOf(u8, script, "DeleteRegKey @UNINST_ROOT@") == null);
+
+    // 升级检测
+    try testing.expect(std.mem.indexOf(u8, script, "ReadRegStr $R4") != null);
+    // 占位符必须全部替换干净
+    try testing.expect(std.mem.indexOf(u8, script, "{ASSOC_INSTALL}") == null);
+    try testing.expect(std.mem.indexOf(u8, script, "{ASSOC_UNINSTALL}") == null);
+    try testing.expect(std.mem.indexOf(u8, script, "{LICENSE_PAGE}") == null);
+    try testing.expect(std.mem.indexOf(u8, script, "{ICON_LINE}") == null);
+    try testing.expect(std.mem.indexOf(u8, script, "{UPGRADE_CHECK}") == null);
+}
+
+test "nsis installer: no license means no license page" {
+    const script = try generateNsis(testing.allocator, .{
+        .app_name = "Zilt",
+        .version = "1.0",
+        .publisher = "Zilt",
+        .exe_name = "zilt-app.exe",
+        .app_id = "Zilt.zilt",
+        .out_path = "o.exe",
+        .exe_path = "a.exe",
+    });
+    defer testing.allocator.free(script);
+    try testing.expect(std.mem.indexOf(u8, script, "Page license") == null);
+    try testing.expect(std.mem.indexOf(u8, script, "LicenseData") == null);
 }

@@ -335,31 +335,36 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
 
 ### v0.1.15 — 打包、安装器与更新（P0/P1）
 
-- [ ] **PE 资源**：VERSIONINFO（CompanyName/ProductName/FileVersion/ProductVersion）、
-      应用 manifest（DPI/UAC/longPath/supportedOS）
-- [ ] **安装器增强**：setup.exe 图标、per-machine 选项、安装目录选择、License 页、
-      升级检测、**安装时注册 URL 协议与文件关联**（多 scheme/多扩展名 + MIME/Open With/
-      关联图标；当前仅运行期注册）、运行时深链事件类型化
-- [ ] **MSI / MSIX**：WiX 实际构建 MSI（当前只生成 .wxs）；MSIX/Store 打包；
-      Fixed WebView2 Runtime 分发选项
-- [ ] **代码签名接入**：证书/时间戳配置，自动签名 exe + setup（当前仅生成 signtool 命令）
-- [ ] **更新器增强**：安装器式更新（MSI/NSIS/UAC）、通道（stable/beta）、
-      回滚与健康检查、前端更新 UI/JS API
-- [ ] **验收**：签名 MSI 安装/卸载；安装包带文件关联；旧版本可更新到新版本
+- [x] **PE 资源**：VERSIONINFO（CompanyName/ProductName/FileVersion/ProductVersion）、
+      应用 manifest（PerMonitorV2 / longPathAware / supportedOS / asInvoker）
+      —— `src/tools/win_res.zig` 构建期生成 rc + manifest（rc 内嵌 manifest 哈希避免缓存陷阱）
+- [x] **安装器增强**：setup.exe 图标、per-machine（admin + Program Files + HKLM）、
+      安装目录选择、License 页、升级检测、**安装时注册 URL 协议与文件关联**
+      （`ZILT_INSTALLER_*` 环境变量控制；makensis 实测两种变体均编译通过）
+- [ ] **MSI / MSIX**：WiX 实际构建 MSI；MSIX/Store 打包；Fixed WebView2 分发（未实现）
+- [ ] **代码签名接入**：证书/时间戳自动签名（未实现，仍只生成 signtool 命令）
+- [ ] **更新器增强**：安装器式更新、通道（stable/beta）、回滚与健康检查、前端更新 UI（未实现）
+- [~] **验收**：exe 属性显示 Zilt / 0.1.16、manifest 含 PerMonitorV2；
+      setup.exe 814KB（默认）/ 824KB（per-machine + license + 协议 + 关联）；
+      签名 MSI 与旧版本升级链未验证
 
 ### v0.1.16 — 插件 / 服务架构、官方周边 API 与多 WebView（P2）
 
-- [~] **插件 / 服务模型**：`services.zig` 已实现注册表、顺序启动/失败回滚、逆序销毁、
-      capability 作用域字段（对齐 Wails services / Tauri State 的最小形态）；尚未接 JS API
-- [~] **官方周边 API**：`store.zig`（KV + JSON 往返）、`fs_api.zig`（scope 内路径校验，
-      拒绝 `..`/绝对路径/盘符/UNC/NUL）已实现并单测；http/websocket/sql/upload/process 未实现
-- [ ] **多 WebView / 数据分区**：同一窗口多 WebView、每 WebView 独立数据分区
-      （未实现；当前每窗口已独立 WebView2 profile，同窗多 WebView 仍缺）
-- [ ] **验收**：两个插件并列加载；fs API 受 capability 限制；同窗多 WebView（未达成）
+- [~] **插件 / 服务模型**：`services.zig` 注册表/顺序启动/失败回滚/逆序销毁/作用域已实现并单测；
+      JS API 未暴露（框架层能力，应用可在 main 里自行注册）
+- [~] **官方周边 API**：`store`（KV + 落盘 `%LOCALAPPDATA%\<app_id>\store.json`）与
+      `fs`（scope 内读写，拒绝 `..`/绝对路径/盘符/UNC/NUL）已接 JS：
+      `window.zilt.store.get/set/remove/keys/all`、`window.zilt.fs.read/write/exists/remove`；
+      http/websocket/sql/upload/process/path/os/opener 未实现
+- [ ] **多 WebView / 数据分区**：同一窗口多 WebView（未实现；每窗口已有独立 WebView2 profile）
+- [~] **验收**：冒烟 25 项含 store set/get + fs 写读 exists + `../` 逃逸被拒（PathEscape）；
+      多 WebView 未达成
 
 ### v0.1.17 — 工具链、测试与生态（P2）
 
-- [ ] **CLI `zilt`**：dev/build/doctor/info/config 覆盖（包装现有 zig build step）
+- [x] **CLI `zilt`**：`version` / `doctor`（Zig、WebView2（含 WOW6432Node）、makensis、
+      frontend dist、图标）/ `info`（project 配置摘要）；`zig build doctor|info` 快捷 step
+      （dev/build/config 子命令包装未做，仍直接用 zig build）
 - [ ] **后端热重启 dev**：监听 Zig 源码自动重建 + 重启应用；错误覆盖层；日志轮转
 - [ ] **npm 运行时与脚手架**：`@zilt/runtime`（或等价包）+ `create-zilt-app`
 - [ ] **图标生成 CLI**：一张 PNG → 多尺寸 .ico/.icns/PNG（对齐 `tauri icon`）
@@ -368,6 +373,36 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
 - [ ] **Server / headless 模式**：无窗口跑 HTTP 服务（对齐 Wails v3 server build）
 - [ ] **CI / 签名流水线**：构建、签名、打包、发布的 CI 模板
 - [ ] **验收**：改 Zig 自动重启；`zilt doctor/info`；WebDriver 跑通示例；headless 服务可访问
+
+#### v0.1.15 / v0.1.16 / v0.1.17 实施记录（2026-11-08）
+
+**v0.1.15（打包链路）**：新增 `src/tools/win_res.zig`（VERSIONINFO + manifest 生成，
+7 条单测）；`build.zig` 改为构建期生成 rc + manifest，并把 manifest 哈希写进 rc 注释——
+否则 resinator 不把 include 的 manifest 当依赖，改 manifest 后仍命中旧缓存（实测踩到，
+exe 内嵌的仍是旧 XML）。NSIS 生成器参数化：`per_machine` / `license_path` / `setup_icon` /
+`schemes` / `file_exts`，新增协议与文件关联的安装/卸载片段与升级检测（4 条新单测）。
+`bundle.zig` 支持 `ZILT_INSTALLER_PER_MACHINE|LICENSE|ICON|SCHEME|EXT` 环境变量。
+
+**实测**：`zig build bundle` → setup.exe 814KB；带 per-machine + license + scheme + ext →
+824KB，两次 makensis 均 exit 0。exe 属性 `CompanyName=Zilt / ProductVersion=0.1.16`，
+manifest 含 `PerMonitorV2` 与 `longPathAware`。
+**踩坑（重要）**：manifest 的 `<assemblyIdentity>` 必须带 `version`，否则运行时报
+`side-by-side configuration is incorrect`，exe 完全无法启动（bash 表现为 Permission denied）；
+单测发现不了，只有真实启动才暴露。
+
+**v0.1.16（周边 API）**：`store` / `fs` 经 `system_api` 统一通道接到后端；
+存储根 `%LOCALAPPDATA%\<app_id>`，落盘 `store.json`（Win32 `readFileAlloc`/`writeFileAlloc`）；
+fs 走 `fs_api.joinChecked` 做 scope 内路径校验。JS 新增 `window.zilt.store.*` / `fs.*`。
+
+**v0.1.17（CLI）**：`src/tools/cli.zig` → `zig-out/bin/zilt.exe`，含 `doctor` / `info` / `version`；
+`zig build doctor` / `zig build info` 两个 step。doctor 实测输出：
+`Zig 0.17.1` / `WebView2 runtime 157.0.4341.42` / `makensis: D://Scoop//shims//makensis.exe` /
+`frontend dist: frontend` / `app icon: builtin Zig logo` → exit 0。
+**踩坑**：WebView2 版本在 32 位安装器写入 `WOW6432Node`，64 位进程读
+`HKLM\SOFTWARE` 不会自动重定向，必须显式尝试两条路径。
+
+**未完成（如实记录）**：MSI/MSIX 构建、代码签名自动签名、更新器通道/回滚、多 WebView、
+npm 脚手架、图标生成 CLI、模板扩充、WebDriver、headless 模式、CI 流水线模板。
 
 ## v0.1.6（2026-11-07）
 

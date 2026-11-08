@@ -74,6 +74,23 @@ pub const AutostartOp = union(enum) {
     toggle,
 };
 
+pub const StoreSet = struct { key: []const u8, value: []const u8 };
+pub const StoreOp = union(enum) {
+    get: []const u8,
+    set: StoreSet,
+    remove: []const u8,
+    keys,
+    all,
+};
+
+pub const FsWrite = struct { path: []const u8, data: []const u8 };
+pub const FsOp = union(enum) {
+    read: []const u8,
+    write: FsWrite,
+    exists: []const u8,
+    remove: []const u8,
+};
+
 pub const Request = union(enum) {
     menu: MenuOp,
     tray: TrayOp,
@@ -85,6 +102,10 @@ pub const Request = union(enum) {
     admin_restart: ?[]const u8,
     autostart: AutostartOp,
     appearance: theme.Appearance,
+    /// v0.1.16：KV 存储（app_data 下 store.json）
+    store: StoreOp,
+    /// v0.1.16：受限文件访问（scope = app_data，路径禁止逃逸）
+    fs: FsOp,
 };
 
 pub const Result = union(enum) {

@@ -76,6 +76,9 @@ pub const Args = struct {
     dark_titlebar: ?bool = null,
     exe_args: ?[]const u8 = null,
     count: ?u32 = null,
+    key: ?[]const u8 = null,
+    value: ?[]const u8 = null,
+    data: ?[]const u8 = null,
 };
 
 pub fn isBuiltin(method: []const u8) bool {
@@ -345,7 +348,8 @@ pub fn isSystemMethod(method: []const u8) bool {
     const eql = std.mem.eql;
     return eql(u8, name, "menu") or eql(u8, name, "tray") or eql(u8, name, "hotkey") or
         eql(u8, name, "taskbar") or eql(u8, name, "system") or eql(u8, name, "shell") or
-        eql(u8, name, "autostart") or eql(u8, name, "appearance");
+        eql(u8, name, "autostart") or eql(u8, name, "appearance") or
+        eql(u8, name, "store") or eql(u8, name, "fs");
 }
 
 pub fn clickActionFromName(name: ?[]const u8) system_api.ClickAction {
@@ -453,6 +457,29 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
         if (eql(u8, a.action, "disable")) return .{ .autostart = .disable };
         if (eql(u8, a.action, "toggle")) return .{ .autostart = .toggle };
         return error.UnknownAutostartAction;
+    }
+
+    if (eql(u8, name, "store")) {
+        if (eql(u8, a.action, "get")) return .{ .store = .{ .get = a.key orelse return error.MissingKey } };
+        if (eql(u8, a.action, "set")) return .{ .store = .{ .set = .{
+            .key = a.key orelse return error.MissingKey,
+            .value = a.value orelse return error.MissingValue,
+        } } };
+        if (eql(u8, a.action, "remove")) return .{ .store = .{ .remove = a.key orelse return error.MissingKey } };
+        if (eql(u8, a.action, "keys")) return .{ .store = .keys };
+        if (eql(u8, a.action, "all")) return .{ .store = .all };
+        return error.UnknownStoreAction;
+    }
+
+    if (eql(u8, name, "fs")) {
+        if (eql(u8, a.action, "read")) return .{ .fs = .{ .read = a.path orelse return error.MissingPath } };
+        if (eql(u8, a.action, "write")) return .{ .fs = .{ .write = .{
+            .path = a.path orelse return error.MissingPath,
+            .data = a.data orelse a.text orelse "",
+        } } };
+        if (eql(u8, a.action, "exists")) return .{ .fs = .{ .exists = a.path orelse return error.MissingPath } };
+        if (eql(u8, a.action, "remove")) return .{ .fs = .{ .remove = a.path orelse return error.MissingPath } };
+        return error.UnknownFsAction;
     }
 
     if (eql(u8, name, "appearance")) {

@@ -77,6 +77,38 @@ pub fn main() !void {
     const setup_path = try std.fmt.allocPrint(alloc, "dist/{s}-setup.exe", .{dir_name});
     defer alloc.free(setup_path);
 
+    // v0.1.15：安装器范围与附加项可由环境变量覆盖（CI / 发布流水线用）
+    const env_pm = win32.getEnvUtf8(alloc, "ZILT_INSTALLER_PER_MACHINE");
+    defer if (env_pm) |v| alloc.free(v);
+    const per_machine = if (env_pm) |v| v.len > 0 and v[0] == '1' else false;
+
+    const env_license = win32.getEnvUtf8(alloc, "ZILT_INSTALLER_LICENSE");
+    defer if (env_license) |v| alloc.free(v);
+    const license_path: ?[]const u8 = if (env_license) |v| (if (v.len > 0) v else null) else null;
+
+    const env_icon = win32.getEnvUtf8(alloc, "ZILT_INSTALLER_ICON");
+    defer if (env_icon) |v| alloc.free(v);
+    const setup_icon: ?[]const u8 = if (env_icon) |v| (if (v.len > 0) v else null) else null;
+
+    const env_scheme = win32.getEnvUtf8(alloc, "ZILT_INSTALLER_SCHEME");
+    defer if (env_scheme) |v| alloc.free(v);
+    const env_ext = win32.getEnvUtf8(alloc, "ZILT_INSTALLER_EXT");
+    defer if (env_ext) |v| alloc.free(v);
+
+    var scheme_buf: [1][]const u8 = undefined;
+    const schemes: []const []const u8 = if (env_scheme) |v| blk: {
+        if (v.len == 0) break :blk &.{};
+        scheme_buf[0] = v;
+        break :blk scheme_buf[0..1];
+    } else &.{};
+
+    var ext_buf: [1][]const u8 = undefined;
+    const file_exts: []const []const u8 = if (env_ext) |v| blk: {
+        if (v.len == 0) break :blk &.{};
+        ext_buf[0] = v;
+        break :blk ext_buf[0..1];
+    } else &.{};
+
     const script = try bundler.generateNsis(alloc, .{
         .app_name = meta.app_name,
         .version = meta.version,
@@ -85,6 +117,11 @@ pub fn main() !void {
         .app_id = meta.app_id,
         .out_path = setup_path,
         .exe_path = exe_abs,
+        .per_machine = per_machine,
+        .license_path = license_path,
+        .setup_icon = setup_icon,
+        .schemes = schemes,
+        .file_exts = file_exts,
     });
     // makensis 以 UTF-8 BOM 识别编码（脚本含非 ASCII 注释）
     const bom = "\xEF\xBB\xBF";

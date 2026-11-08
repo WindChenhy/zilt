@@ -317,6 +317,23 @@ async function runChecks() {
       setCheck('c-autostart', ok, ok ? 'enable → disable' : 'state mismatch');
     } catch (e) { setCheck('c-autostart', false, String(e)); }
 
+    // 25. v0.1.16：KV 存储 + 受限 fs（含路径逃逸拒绝）
+    try {
+      await window.zilt.store.set('smoke', 'ok');
+      const stored = await window.zilt.store.get('smoke');
+      await window.zilt.fs.write('smoke-note.txt', 'hello-fs');
+      const text = await window.zilt.fs.read('smoke-note.txt');
+      const exists = await window.zilt.fs.exists('smoke-note.txt');
+      let escapeDenied = false;
+      try {
+        await window.zilt.fs.read('../outside.txt');
+      } catch (e) {
+        escapeDenied = String(e.message).includes('PathEscape');
+      }
+      const ok = stored === 'ok' && text === 'hello-fs' && exists === true && escapeDenied;
+      setCheck('c-storage', ok, ok ? 'store+fs ok, escape denied' : `store=${stored} fs=${text} exists=${exists} escape=${escapeDenied}`);
+    } catch (e) { setCheck('c-storage', false, String(e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -345,6 +362,7 @@ async function runChecks() {
       sysinfo: $('c-sysinfo').className === 'pass',
       appearance: $('c-appearance').className === 'pass',
       autostart: $('c-autostart').className === 'pass',
+      storage: $('c-storage').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

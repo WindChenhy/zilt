@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.14（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离/导航 + WebView2 事件面/Settings/环境 + capability ACL/运行时 API + 剪贴板/拖放/通知 + 托盘与菜单运行时模型/快捷键运行时 API/任务栏/系统信息/主题效果/Shell/自启）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.1.16（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs 周边 API + `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 v0.1.8–v0.1.12 新增（2026-11-08，均已实现、验证并提交）：
 
@@ -16,7 +16,7 @@ v0.1.8–v0.1.12 新增（2026-11-08，均已实现、验证并提交）：
 - **v0.1.11**：`window.zilt.window` 全量窗口 API、capability ACL（构建期生成 `capabilities.json`、运行时强制、未授权返回 `PermissionDenied`）、远程内容边界与隔离模式
 - **v0.1.12**：剪贴板多格式（文本/图片/HTML/文件）+ 变化监听、OLE `IDropTarget` 拖放（含坐标与自定义格式）+ 文件拖出、Toast 交互（按钮/输入/进度/点击深链/分组/状态查询）
 - 前端运行时新增 `window.zilt.eval` / `webview` / `clipboard` / `drag` / `notification`；Zig 侧对应 `zilt.Context` 方法
-- **验收**：单元测试 176/176；`zig build` / `zig build gen` / 模板 init→build→test 回归全通过；GUI 冒烟 24 项 `ALL CHECKS PASSED`（exit 0）
+- **验收**：单元测试 184/184；`zig build` / `zig build gen` / 模板 init→build→test 回归全通过；GUI 冒烟 25 项 `ALL CHECKS PASSED`（exit 0）；`zilt doctor` 全绿
 
 v0.1.7 新增：
 
@@ -51,7 +51,7 @@ ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=my-app zig build init
 ```sh
 zig build gen      # 生成前端 TS 绑定（frontend/bindings/zilt.ts）
 zig build run      # 启动示例应用（embedded 模式）
-zig build test    # 单元测试（176/176：协议/更新器/打包器/系统能力/codegen/模板/图标/深链接/Range/窗口模型/安全 ACL/SPA 回退/WebView2 驱动 ABI/剪贴板编解码/OLE 拖放/Toast/能力清单/内置命令/加速键/运行时菜单/任务栏 ABI/系统信息/自启/存储/受限 fs/服务注册表）
+zig build test    # 单元测试（184/184：协议/更新器/打包器/系统能力/codegen/模板/图标/深链接/Range/窗口模型/安全 ACL/SPA 回退/WebView2 驱动 ABI/剪贴板编解码/OLE 拖放/Toast/能力清单/内置命令/加速键/运行时菜单/任务栏 ABI/系统信息/自启/存储/受限 fs/服务注册表/VERSIONINFO/manifest/NSIS 增强/存储/受限 fs）
 ```
 
 dev 模式：
@@ -75,7 +75,24 @@ zig build bundle --release=safe   # dist/Zilt-<ver>-x64.zip + -setup.exe（便�
 Windows 构建已设 `subsystem = .windows`：双击/安装后不会弹出 cmd 窗口；运行日志写入
 `zilt.log`。exe 图标默认内置 Zig logo，自定义见 `project.zig` 的 `icon` 字段。
 
-GUI 冒烟测试（24 项前端检查 + Zig 侧 `smokeResult` 断言，日志 `ALL CHECKS PASSED` 且 exit 0）：
+CLI 自检：
+
+```sh
+zig build                       # 产出 zig-out/bin/zilt.exe
+./zig-out/bin/zilt.exe doctor   # Zig / WebView2 / makensis / dist / 图标 全链路检查
+./zig-out/bin/zilt.exe info     # 项目配置摘要
+zig build doctor                # 等价快捷 step
+```
+
+安装器（per-machine / License / 协议与文件关联 由环境变量控制）：
+
+```sh
+zig build bundle
+ZILT_INSTALLER_PER_MACHINE=1 ZILT_INSTALLER_LICENSE=LICENSE.txt \
+ZILT_INSTALLER_SCHEME=zilt ZILT_INSTALLER_EXT=.zilt zig build bundle
+```
+
+GUI 冒烟测试（25 项前端检查 + Zig 侧 `smokeResult` 断言，日志 `ALL CHECKS PASSED` 且 exit 0）：
 
 ```sh
 zig build                            # 生成 frontend/bindings/capabilities.json 并嵌入资产

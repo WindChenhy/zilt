@@ -2,22 +2,54 @@ const std = @import("std");
 const project = @import("src/project.zig");
 const codegen = @import("src/tools/frontend_codegen.zig");
 
-/// 应用 exe 图标（Windows PE 资源）：
-/// project.icon 指定自定义 .ico（相对项目根）时生成临时 .rc；null = 内置 Zig 图标。
+/// 应用 exe 图标与 VERSIONINFO（Windows PE 资源，v0.1.15）：
+/// 资源脚本在 build 期由 project.zig 插值生成（版本号不会漂移），
+/// manifest 固定在 src/zilt/assets/app.manifest；project.icon 非空时 icon 指向自定义 .ico。
 fn addAppIconResource(b: *std.Build, module: *std.Build.Module, icon_path: ?[]const u8) void {
+    const res = @import("src/tools/win_res.zig");
+    const assets_dir = "src/zilt/assets";
+
+    var include: std.ArrayListUnmanaged(std.Build.LazyPath) = .empty;
+    include.append(b.allocator, b.path(assets_dir)) catch @panic("OOM");
+
+    var icon_file: ?[]const u8 = "zilt.ico";
     if (icon_path) |p| {
-        const base = std.fs.path.basename(p);
+        icon_file = std.fs.path.basename(p);
         const dir = std.fs.path.dirname(p) orelse ".";
-        const wf = b.addWriteFiles();
-        const rc_text = std.fmt.allocPrint(b.allocator, "1 ICON \"{s}\"\n", .{base}) catch @panic("OOM");
-        const rc = wf.add("zilt-app-icon.rc", rc_text);
-        module.addWin32ResourceFile(.{ .file = rc, .include_paths = &.{b.path(dir)} });
-    } else {
-        module.addWin32ResourceFile(.{
-            .file = b.path("src/zilt/assets/zilt.rc"),
-            .include_paths = &.{b.path("src/zilt/assets")},
-        });
+        if (!std.mem.eql(u8, dir, assets_dir)) include.append(b.allocator, b.path(dir)) catch @panic("OOM");
     }
+
+    // manifest 与 rc 都在构建期生成：rc 里带上 manifest 的内容哈希，
+    // 否则 resinator 不把 include 的 manifest 当依赖，改了 manifest 仍会命中旧缓存
+    // （实测：改 manifest 后 exe 内嵌的仍是旧内容）。
+    const manifest_text = res.renderManifest(b.allocator, .{
+        .app_name = project.app_name,
+        .publisher = project.publisher,
+        .version = project.version,
+        .exe_name = project.exe_name,
+    }) catch @panic("OOM");
+
+    const hash_comment = std.fmt.allocPrint(
+        b.allocator,
+        "manifest-hash {x}",
+        .{std.hash.Wyhash.hash(0, manifest_text)},
+    ) catch "manifest";
+
+    const rc_text = res.renderRc(b.allocator, .{
+        .app_name = project.app_name,
+        .publisher = project.publisher,
+        .version = project.version,
+        .exe_name = project.exe_name,
+        .icon_file = icon_file,
+        .manifest_file = "app.manifest",
+        .extra_comment = hash_comment,
+    }) catch @panic("OOM");
+
+    const wf = b.addWriteFiles();
+    _ = wf.add("app.manifest", manifest_text);
+    const rc = wf.add("zilt-app.rc", rc_text);
+    include.append(b.allocator, wf.getDirectory()) catch @panic("OOM");
+    module.addWin32ResourceFile(.{ .file = rc, .include_paths = include.items });
 }
 
 pub fn build(b: *std.Build) void {
@@ -284,6 +316,33 @@ pub fn build(b: *std.Build) void {
     rel_app_mod.linkSystemLibrary("comdlg32", .{});
     rel_app_mod.linkSystemLibrary("shell32", .{});
     addAppIconResource(b, rel_app_mod, project.icon);
+
+    // ---- v0.1.17：zilt CLI（doctor / info / version）----
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zilt", .module = zilt_mod },
+            .{ .name = "app_meta", .module = app_meta_mod },
+        },
+    });
+    cli_mod.linkSystemLibrary("user32", .{});
+    cli_mod.linkSystemLibrary("advapi32", .{});
+    cli_mod.linkSystemLibrary("shell32", .{});
+    const cli_exe = b.addExecutable(.{ .name = "zilt", .root_module = cli_mod });
+    b.installArtifact(cli_exe);
+
+    // 便捷 step（0.17 的 Build 无 args 字段，故按子命令各建一个 step）
+    const doctor_run = b.addRunArtifact(cli_exe);
+    doctor_run.addArg("doctor");
+    const doctor_step = b.step("doctor", "Run `zilt doctor` (build environment check)");
+    doctor_step.dependOn(&doctor_run.step);
+
+    const info_run = b.addRunArtifact(cli_exe);
+    info_run.addArg("info");
+    const info_step = b.step("info", "Run `zilt info` (project config summary)");
+    info_step.dependOn(&info_run.step);
 
     const bundle_mod = b.createModule(.{
         .root_source_file = b.path("src/tools/bundle.zig"),

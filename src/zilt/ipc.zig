@@ -844,7 +844,21 @@ pub const runtime_js =
     \\    appearance: {
     \\      apply: (opts) => builtin('__zilt.appearance', Object.assign({ action: 'apply' }, opts ?? {})),
     \\    },
-    \\    version: '0.1.14',
+    \\    // v0.1.16: KV store / scoped fs
+    \\    store: {
+    \\      get: (key) => builtin('__zilt.store', { action: 'get', key }),
+    \\      set: (key, value) => builtin('__zilt.store', { action: 'set', key, value: String(value) }),
+    \\      remove: (key) => builtin('__zilt.store', { action: 'remove', key }),
+    \\      keys: () => builtin('__zilt.store', { action: 'keys' }),
+    \\      all: () => builtin('__zilt.store', { action: 'all' }),
+    \\    },
+    \\    fs: {
+    \\      read: (path) => builtin('__zilt.fs', { action: 'read', path }),
+    \\      write: (path, data) => builtin('__zilt.fs', { action: 'write', path, data }),
+    \\      exists: (path) => builtin('__zilt.fs', { action: 'exists', path }),
+    \\      remove: (path) => builtin('__zilt.fs', { action: 'remove', path }),
+    \\    },
+    \\    version: '0.1.16',
     \\  };
     \\  window.zilt.on('__zilt.evalResult', (p) => {
     \\    const w = evalWaiters.get(p.id);
