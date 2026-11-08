@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.16（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs/path/log/opener/windowState 周边 API + 更新器通道/崩溃回滚/健康确认 + 代码签名（签名产物已实测 Authenticode + RFC3161）+ MSI（WiX 3.14 自动 vendor，安装/卸载实测）+ MSIX（makeappx，松散注册实测）+ services 生命周期 + http（异步）+ websocket 客户端 + 单窗口多 WebView + `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.1.17（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs/path/log/opener/windowState 周边 API + 更新器通道/崩溃回滚/健康确认 + 代码签名（签名产物已实测 Authenticode + RFC3161）+ MSI（WiX 3.14 自动 vendor，安装/卸载实测）+ MSIX（makeappx，松散注册实测）+ services 生命周期 + http（异步）+ websocket 客户端 + 单窗口多 WebView + 前端对话框/子进程/图标生成 CLI + SQL（SQLite 动态加载）+ headless/server 模式 + 热重启 dev + npm 运行时包 + `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 
@@ -15,6 +15,15 @@ v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 - **v0.1.15**：PE VERSIONINFO + manifest（PerMonitorV2/longPathAware）、安装器增强（per-machine/License/URL 协议与文件关联/升级检测）、MSI（WiX 3.14.1 自动 vendor + SHA256 校验 + 安装/卸载往返实测）、MSIX（AppxManifest 生成 + ICO→PNG 帧提取 + makeappx + 松散注册实测）、代码签名（signtool 自动定位 + RFC3161 时间戳，签名产物 Get-AuthenticodeSignature 实测）、更新器通道 + restart helper 崩溃回滚 + 健康确认
 - **v0.1.16**：`services`（声明式服务注册表，init/start 逆序 deinit，状态暴露给 JS）、`http`（后台线程异步，错误穿透全链路实测）、`websocket`（协议层手写 RFC6455 必需子集 + 后台线程握手/读循环 + echo 服务端对照实测，wss 明确报错不静默降级）、**单窗口多 WebView**（附加子 webview：WS_CHILD 子窗口 + 独立 controller + IPC 按 sender 路由，created→ready→navigate→remove 全链路实测）、`path`/`log`/`opener`/`windowState`、`zilt` CLI（doctor/info/version）
 - **验收**：单元测试 226/226（框架核心 209 + 工具链 17）；GUI 冒烟 **30 项** `ALL CHECKS PASSED`（exit 0，含 http/ws/webviews 全链路检查）；Release 构建冒烟同过；NSIS 升级安装覆盖 + 卸载干净实测；MSI/MSIX 重打成功
+
+v0.1.17 新增（2026-11-08，均已实现、验证并提交）：
+
+- **P0 补齐**（对齐 Wails3/Tauri2 差距）：`window.zilt.dialog`（messageBox/openFile/saveFile/pickFolder/pickFiles，UI 线程模态）、`window.zilt.process`（spawn/kill/list，stdout/stderr/exit 走事件流，kill=TerminateProcess，应用退出强杀残留）、`zilt icon`（PNG→多尺寸 .ico，纯 Zig PNG 解码 + ICO 编码，CreateIconFromResourceEx 实测返回真实 HICON）
+- **SQL**：`window.zilt.sql.query/execute`——sqlite3.dll 运行时动态加载（ZILT_SQLITE_PATH → exe 目录 → 默认搜索，对齐 WebView2 loader 模式），行集 JSON 序列化，`{text}/{int}/{real}/{nul}` 绑定参数
+- **headless/server 模式**：`ZILT_HEADLESS=1` 跳过窗口/COM 跑 HTTP 服务（127.0.0.1，默认 8790）——`/zilt/health`、`/zilt/info`、POST `/zilt/ipc`（与前端 invoke 同一 dispatch 链路）、`/*` 资产服务；services 生命周期同 GUI；四路端点实测全通
+- **热重启 dev**：`ZILT_DEV_WATCH=1 zig build dev`——spawn `zig build --watch` + 自盯 `src/**.zig` mtime，变更→先杀应用解锁 exe→等 install→重新拉起（实测 restart #1 全链路）；修复 FILETIME 4 字节对齐陷阱与 .zig-cache hash 路径漂移
+- **npm 运行时包**：`zilt npm-pack` 生成 `@zilt/runtime`（package.json/index.js 内嵌 runtime 源/index.d.ts 全接口声明/README），Node require 实测通过
+- **验收**：单元测试 231/231（框架 214 + 工具 17）；GUI 冒烟 **31 项** ALL PASSED（exit 0，新增子进程检查）；`zilt version` 报 0.1.17
 
 v0.1.8–v0.1.12 新增（2026-11-08，均已实现、验证并提交）：
 
@@ -124,7 +133,7 @@ ZILT_SIGN_PFX=cert.pfx ZILT_SIGN_PASSWORD=*** zig build bundle
 ZILT_SIGN_PFX_BASE64=<base64> ZILT_SIGN_PASSWORD=*** zig build bundle   # CI secret
 ```
 
-GUI 冒烟测试（30 项前端检查 + Zig 侧 `smokeResult` 断言，日志 `ALL CHECKS PASSED` 且 exit 0）：
+GUI 冒烟测试（31 项前端检查 + Zig 侧 `smokeResult` 断言，日志 `ALL CHECKS PASSED` 且 exit 0）：
 
 ```sh
 zig build                            # 生成 frontend/bindings/capabilities.json 并嵌入资产

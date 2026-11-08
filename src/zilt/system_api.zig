@@ -9,6 +9,7 @@ const sysinfo = @import("sysinfo.zig");
 const shell = @import("shell.zig");
 const autostart = @import("autostart.zig");
 const theme = @import("theme.zig");
+const shared_sql = @import("sql.zig");
 
 pub const MenuAdd = struct {
     parent: ?[]const u8 = null,
@@ -185,6 +186,20 @@ pub const Request = union(enum) {
     webviews: WebviewsOp,
     /// v0.1.16：子进程执行（事件走 processEvent）
     process: ProcessOp,
+    /// v0.1.17：SQL（SQLite，动态加载 sqlite3.dll）
+    sql: SqlOp,
+};
+
+/// v0.1.17：SQL 操作。query 返回行集 JSON；execute 返回 {changes,last_id}。
+pub const SqlOp = union(enum) {
+    query: SqlQuery,
+    execute: SqlQuery,
+};
+pub const SqlQuery = struct {
+    /// 数据库文件路径（不存在时按 SQLite 惯例创建）
+    db: []const u8,
+    sql: []const u8,
+    params: []const shared_sql.SqlValue = &.{},
 };
 
 pub const Result = union(enum) {

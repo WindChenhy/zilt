@@ -12,6 +12,7 @@ const notification = @import("notification.zig");
 const system_api = @import("system_api.zig");
 const taskbar = @import("taskbar.zig");
 const theme = @import("theme.zig");
+const shared_sql = @import("sql.zig");
 const log = @import("log.zig");
 
 const Allocator = std.mem.Allocator;
@@ -98,6 +99,10 @@ pub const Args = struct {
     filters: ?[]const ipc.Filter = null,
     /// 子进程 argv（__zilt.process.spawn）
     argv: ?[]const []const u8 = null,
+    /// SQL（__zilt.sql）
+    db: ?[]const u8 = null,
+    sql: ?[]const u8 = null,
+    params: ?[]const shared_sql.SqlValue = null,
 };
 
 pub fn isBuiltin(method: []const u8) bool {
@@ -457,7 +462,7 @@ pub fn isSystemMethod(method: []const u8) bool {
         eql(u8, name, "autostart") or eql(u8, name, "appearance") or
         eql(u8, name, "store") or eql(u8, name, "fs") or eql(u8, name, "windowState") or
         eql(u8, name, "services") or eql(u8, name, "http") or eql(u8, name, "ws") or
-        eql(u8, name, "webviews") or eql(u8, name, "process");
+        eql(u8, name, "webviews") or eql(u8, name, "process") or eql(u8, name, "sql");
 }
 
 pub fn clickActionFromName(name: ?[]const u8) system_api.ClickAction {
@@ -658,6 +663,17 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
         if (eql(u8, a.action, "focus")) return .{ .webviews = .{ .focus = a.id orelse return error.MissingId } };
         if (eql(u8, a.action, "list")) return .{ .webviews = .list };
         return error.UnknownWebviewsAction;
+    }
+
+    if (eql(u8, name, "sql")) {
+        const q = system_api.SqlQuery{
+            .db = a.db orelse return error.MissingDb,
+            .sql = a.sql orelse return error.MissingSql,
+            .params = a.params orelse &.{},
+        };
+        if (eql(u8, a.action, "query")) return .{ .sql = .{ .query = q } };
+        if (eql(u8, a.action, "execute")) return .{ .sql = .{ .execute = q } };
+        return error.UnknownSqlAction;
     }
 
     if (eql(u8, name, "process")) {

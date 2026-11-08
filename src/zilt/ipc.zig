@@ -952,7 +952,13 @@ pub const runtime_js =
     \\      list: () => builtin('__zilt.process', { action: 'list' }),
     \\      on: (id, cb) => window.zilt.on('processEvent', (p) => { if (p && p.id === id) cb(p); }),
     \\    },
-    \\    version: '0.1.16',
+    \\    // v0.1.17: SQL（SQLite）。params 取值形态：{text}/{int}/{real}/{nul}。
+    \\    // query 返回行集数组；execute 返回 {changes,last_id}。sqlite3.dll 缺失时 reject。
+    \\    sql: {
+    \\      query: (db, sql, params) => builtin('__zilt.sql', { action: 'query', db, sql, params: params ?? [] }),
+    \\      execute: (db, sql, params) => builtin('__zilt.sql', { action: 'execute', db, sql, params: params ?? [] }),
+    \\    },
+    \\    version: '0.1.17',
     \\  };
     \\  window.zilt.on('__zilt.evalResult', (p) => {
     \\    const w = evalWaiters.get(p.id);

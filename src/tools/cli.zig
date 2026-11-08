@@ -53,6 +53,7 @@ pub fn main() !u8 {
     if (eql(u8, cmd, "doctor")) return runDoctor(alloc);
     if (eql(u8, cmd, "info")) return runInfo();
     if (eql(u8, cmd, "icon")) return runIcon(alloc, args.items[1..]);
+    if (eql(u8, cmd, "npm-pack")) return runNpmPack(alloc, args.items[1..]);
     if (eql(u8, cmd, "help") or eql(u8, cmd, "--help") or eql(u8, cmd, "-h")) {
         printHelp();
         return 0;
@@ -76,6 +77,10 @@ fn printHelp() void {
         \\  zilt doctor    检查构建环境（Zig / WebView2 / makensis / frontend dist / 图标）
         \\  zilt info      打印当前项目配置摘要
         \\  zilt version   打印版本
+        \\  zilt icon <in.png> [-o out.ico] [--sizes 16,32,48,256]
+        \\                 PNG → 多尺寸 .ico（Windows 发布图标）
+        \\  zilt npm-pack [-o npm] [--name @zilt/runtime] [--version 0.1.17]
+        \\                 生成 @zilt/runtime npm 包（package.json/index.js/index.d.ts）
         \\
         \\构建/运行仍走 zig build:
         \\  zig build           编译应用
@@ -308,5 +313,81 @@ fn runIcon(alloc: std.mem.Allocator, args: []const []u8) !u8 {
     print("zilt icon: wrote {s} ({d} bytes, sizes ", .{ output, ico_bytes.len });
     for (sizes.items, 0..) |s, k| print("{s}{d}", .{ if (k == 0) "" else ",", s });
     print(")\n", .{});
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// v0.1.17：npm-pack 子命令 —— 生成 @zilt/runtime npm 包（package.json /
+// index.js / index.d.ts / README.md），可直接 npm pack / publish。
+// ---------------------------------------------------------------------------
+
+fn runNpmPack(alloc: std.mem.Allocator, args: []const []u8) !u8 {
+    var out_dir: []const u8 = "npm";
+    var version: []const u8 = "0.1.17";
+    var name: []const u8 = "@zilt/runtime";
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--out")) {
+            i += 1;
+            if (i >= args.len) {
+                print("zilt npm-pack: -o needs a directory\n", .{});
+                return 2;
+            }
+            out_dir = args[i];
+        } else if (std.mem.eql(u8, a, "--version")) {
+            i += 1;
+            if (i >= args.len) {
+                print("zilt npm-pack: --version needs a value\n", .{});
+                return 2;
+            }
+            version = args[i];
+        } else if (std.mem.eql(u8, a, "--name")) {
+            i += 1;
+            if (i >= args.len) {
+                print("zilt npm-pack: --name needs a value\n", .{});
+                return 2;
+            }
+            name = args[i];
+        } else {
+            print("zilt npm-pack: unknown argument '{s}'\n", .{a});
+            return 2;
+        }
+    }
+
+    var files = zilt.npm_pack.generate(alloc, .{
+        .name = name,
+        .version = version,
+        .runtime_js = zilt.ipc.runtime_js,
+    }) catch |e| {
+        print("zilt npm-pack: generate failed: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    defer files.deinit(alloc);
+
+    const targets = [_]struct { name: []const u8, data: []const u8 }{
+        .{ .name = "package.json", .data = files.package_json },
+        .{ .name = "index.js", .data = files.index_js },
+        .{ .name = "index.d.ts", .data = files.index_d_ts },
+        .{ .name = "README.md", .data = files.readme_md },
+    };
+
+    // 目录不存在则创建（CreateDirectoryW，已存在视为成功）
+    {
+        const dir_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, out_dir) catch return 1;
+        defer alloc.free(dir_w);
+        _ = win32.CreateDirectoryW(dir_w.ptr, null);
+    }
+    for (targets) |t| {
+        const path = std.fmt.allocPrint(alloc, "{s}\\{s}", .{ out_dir, t.name }) catch return 1;
+        defer alloc.free(path);
+        if (!win32.writeFileAlloc(alloc, path, t.data)) {
+            print("zilt npm-pack: cannot write '{s}'\n", .{path});
+            return 1;
+        }
+        print("zilt npm-pack: wrote {s} ({d} bytes)\n", .{ path, t.data.len });
+    }
+    print("zilt npm-pack: package ready -> cd {s} && npm pack\n", .{out_dir});
     return 0;
 }

@@ -38,6 +38,8 @@ const shared_store = @import("../../store.zig");
 const fs_api_mod = @import("../../fs_api.zig");
 const shared_services = @import("../../services.zig");
 const shared_ws = @import("../../ws.zig");
+const win_sqlite = @import("sqlite.zig");
+const headless = @import("headless.zig");
 const hotkey_mod = @import("hotkey.zig");
 const dialog_mod = @import("dialog.zig");
 const dlgx = @import("dialog_ext.zig");
@@ -100,6 +102,15 @@ pub fn run(comptime config: Config) !void {
     const B = Backend(config);
     log.initFileLog("zilt.log");
     const alloc = std.heap.page_allocator;
+
+    // v0.1.17：headless/server 模式（ZILT_HEADLESS=1）——无窗口跑 HTTP 服务，
+    // 资产 + /zilt/ipc 与 GUI 同一分发链路。在 COM/窗口初始化之前分流。
+    if (win32.getEnvUtf8(alloc, "ZILT_HEADLESS")) |h| {
+        defer alloc.free(h);
+        if (std.mem.eql(u8, h, "1")) {
+            return headless.run(config, alloc);
+        }
+    }
 
     const argv: []const []const u8 = collectArgs(alloc) catch &.{};
     defer freeArgv(alloc, argv);
@@ -1804,6 +1815,7 @@ fn Backend(comptime config: Config) type {
                 .ws => |op| return self.runWsOp(op, alloc),
                 .webviews => |op| return self.runWebviewsOp(w, op, alloc),
                 .process => |op| return self.runProcOp(op, alloc),
+                .sql => |op| return self.runSqlOp(op, alloc),
             }
         }
 
@@ -2139,6 +2151,25 @@ fn Backend(comptime config: Config) type {
                 if (p.id == id) return p;
             }
             return null;
+        }
+
+        /// v0.1.17：SQL（SQLite）。UI 线程同步执行（典型查询毫秒级）；
+        /// sqlite3.dll 动态加载，缺失返回 SqliteNotFound → 前端收到明确错误。
+        fn runSqlOp(self: *Self, op: shared_system.SqlOp, alloc: std.mem.Allocator) !shared_system.Result {
+            _ = self;
+            const q = switch (op) {
+                .query => |x| x,
+                .execute => |x| x,
+            };
+            const want_rows = switch (op) {
+                .query => true,
+                .execute => false,
+            };
+            const out = win_sqlite.run(alloc, q.db, q.sql, q.params, want_rows) catch |e| {
+                log.print("[sql] {s} failed: {s} (db={s})", .{ @tagName(op), @errorName(e), q.db });
+                return error.SqliteFailed;
+            };
+            return .{ .json = out };
         }
 
         /// spawn/kill/list。spawn 立即返回（worker 线程负责 spawn→读输出→wait，

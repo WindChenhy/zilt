@@ -437,14 +437,36 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
 - [x] **CLI `zilt`**：`version` / `doctor`（Zig、WebView2（含 WOW6432Node）、makensis、
       frontend dist、图标）/ `info`（project 配置摘要）；`zig build doctor|info` 快捷 step
       （dev/build/config 子命令包装未做，仍直接用 zig build）
-- [ ] **后端热重启 dev**：监听 Zig 源码自动重建 + 重启应用；错误覆盖层；日志轮转
-- [ ] **npm 运行时与脚手架**：`@zilt/runtime`（或等价包）+ `create-zilt-app`
-- [ ] **图标生成 CLI**：一张 PNG → 多尺寸 .ico/.icns/PNG（对齐 `tauri icon`）
+- [x] **后端热重启 dev**（2026-11-08）：`ZILT_DEV_WATCH=1 zig build dev`——dev 工具
+      spawn `zig build --watch`（重建/错误输出在控制台），自盯 `src/**.zig` mtime
+      （递归 FindFirstFileW 扫描），变更→**先杀应用解锁 exe**→等 install 覆盖→重新拉起。
+      实测：改 src/main.zig → `restart #1` → `rebuild finished -> relaunching`。
+      两个实测踩坑：① FILETIME 在 C 是 4 字节对齐两连 DWORD，Zig u64 字段插 padding 读错位；
+      ② dev 原跑 .zig-cache 内 hash 目录副本，重建后路径漂移——改跑 zig-out/bin 稳定产物
+      （build.zig addArtifactArg → addArg）。错误覆盖层=控制台输出（--watch 打印）；日志轮转未做
+- [x] **npm 运行时包**（2026-11-08）：`zilt npm-pack [-o npm] [--name --version]` →
+      生成 `@zilt/runtime` 包（package.json / index.js（内嵌 runtime 源）/
+      index.d.ts（window.zilt 全接口 TS 声明）/ README.md）；纯逻辑 `npm_pack.zig` 3 单测；
+      实测 Node require 加载 index.js 成功（runtime 源 14414 字节）。
+      `create-zilt-app` 独立脚手架未做（模板 init 已覆盖同职责）
+- [x] **图标生成 CLI**（2026-11-08，P0 阶段完成）：`zilt icon <in.png> [-o out.ico]
+      [--sizes …]`——纯 Zig PNG 解码（zlib inflate + 5 行滤波 + RGB/RGBA/palette）
+      + nearest 缩放 + ICO 编码（BMP 条目双高度 + AND mask）；png.zig/ico.zig 单测；
+      实测 CreateIconFromResourceEx 返回真实 HICON。icns/PNG 面未做（Windows 够用）
+- [x] **Server / headless 模式**（2026-11-08）：`ZILT_HEADLESS=1`（端口
+      `ZILT_HEADLESS_PORT`，默认 8790，仅绑 127.0.0.1）——跳过窗口/COM，
+      HTTP 服务：GET `/zilt/health`·`/zilt/info`、POST `/zilt/ipc`（与前端 invoke
+      同一 dispatch 链路）、GET `/*` 资产（asset_routes 候选 + gzip 惰性解压）；
+      services 生命周期同 GUI。实测四路端点全通（greet 命令返回真结果）
+- [x] **SQL（P1 增补，超出原规划）**（2026-11-08）：`window.zilt.sql.query/execute`——
+      sqlite3.dll 动态加载（对齐 WebView2 loader 模式：ZILT_SQLITE_PATH → exe 目录 →
+      默认搜索），prepare/step/bind v2 API 表，行集 JSON 序列化；`sql.zig` 纯逻辑 2 单测。
+      本机无 sqlite3.dll，E2E 待环境提供 DLL 后补测（错误路径已实测 SqliteFailed）
 - [ ] **模板扩充**：htmx / solid / preact / angular 等，补齐与 Tauri/Wails 的模板面差距
 - [ ] **UI 自动化测试**：WebDriver（zilt-driver）替代仅注入 JS 的冒烟
-- [ ] **Server / headless 模式**：无窗口跑 HTTP 服务（对齐 Wails v3 server build）
 - [ ] **CI / 签名流水线**：构建、签名、打包、发布的 CI 模板
-- [ ] **验收**：改 Zig 自动重启；`zilt doctor/info`；WebDriver 跑通示例；headless 服务可访问
+- [~] **验收**：改 Zig 自动重启 ✅；`zilt doctor/info/icon/npm-pack` ✅；
+      headless 服务可访问 ✅；WebDriver ❌（未做，见上）
 
 #### v0.1.15 / v0.1.16 / v0.1.17 实施记录（2026-11-08）
 

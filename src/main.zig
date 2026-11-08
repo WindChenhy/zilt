@@ -23,7 +23,7 @@ pub fn main() !void {
         .events = app.events,
         .assets = &app.assets,
         .security = app.security,
-        .title = "Zilt — v0.1.16 示例",
+        .title = "Zilt — v0.1.17 示例",
         .width = 960,
         .height = 700,
         .url = "https://zilt.app/index.html",

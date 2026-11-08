@@ -260,7 +260,9 @@ pub fn build(b: *std.Build) void {
         .root_module = dev_mod,
     });
     const dev_run = b.addRunArtifact(dev_exe);
-    dev_run.addArtifactArg(exe);
+    // v0.1.17：跑 zig-out/bin 的真实产物（而非 .zig-cache 内的 hash 目录副本）——
+    // 热重启监视/重启都指向同一稳定路径；重建后 install 覆盖该文件即可触发。
+    dev_run.addArg(b.fmt("zig-out\\bin\\{s}.exe", .{exe.name}));
     dev_run.addArg(frontend.dev_command orelse "-");
     dev_run.addArg(frontend.dev_url orelse "-");
     dev_run.addArg(std.fmt.allocPrint(b.allocator, "{d}", .{frontend.wait_timeout_secs}) catch "90");
