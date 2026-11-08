@@ -41,6 +41,8 @@ pub const COLOR_WINDOW: usize = 5;
 
 pub const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF0000;
 pub const WS_VISIBLE: DWORD = 0x10000000;
+pub const WS_CHILD: DWORD = 0x40000000;
+pub const WS_CLIPSIBLINGS: DWORD = 0x04000000;
 pub const WS_THICKFRAME: DWORD = 0x00040000;
 pub const WS_CAPTION: DWORD = 0x00C00000;
 pub const WS_MINIMIZEBOX: DWORD = 0x00020000;
@@ -232,6 +234,7 @@ pub const TIMERPROC = ?*const fn (HWND, UINT, WPARAM, LPARAM) callconv(.c) void;
 
 // ---- user32 ----
 
+pub extern "user32" fn SetFocus(hWnd: HWND) callconv(.c) HWND;
 pub extern "user32" fn SetProcessDpiAwarenessContext(value: *anyopaque) callconv(.c) BOOL;
 pub extern "user32" fn RegisterClassExW(lpWndClass: *const WNDCLASSEXW) callconv(.c) ATOM;
 pub extern "user32" fn CreateWindowExW(

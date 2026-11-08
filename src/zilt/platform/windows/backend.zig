@@ -731,6 +731,9 @@ fn Backend(comptime config: Config) type {
             driver: ?*webview_driver.Driver = null,
             drop_target: ?*win_drag.DropTarget = null,
             clipboard_listening: bool = false,
+            // ---- v0.1.16：单窗口多 WebView（附加子 webview；主 webview 不动）----
+            child_webviews: std.ArrayListUnmanaged(*ChildWebview) = .empty,
+            next_child_webview_id: u32 = 1,
 
             fn updateBounds(self: *Window) void {
                 const controller = self.controller orelse return;
@@ -819,6 +822,8 @@ fn Backend(comptime config: Config) type {
         services: ?shared_services.Registry = null,
         /// v0.1.16：活跃 WebSocket 连接（仅 UI 线程读写；读线程只发事件不碰容器）
         ws_conns: std.ArrayListUnmanaged(*WsConn) = .empty,
+        /// v0.1.16：子 webview 专用窗口类名（懒注册）
+        child_class_w: ?[:0]u16 = null,
         watcher: ?*Watcher = null,
         updater_env: ?updater.Env = null,
         updater_url_override: ?[]u8 = null,
@@ -1272,6 +1277,69 @@ fn Backend(comptime config: Config) type {
             if (w.id == 1) self.onMainReady(w);
         }
 
+        /// v0.1.16：附加子 webview 的 controller 就绪。与主 webview 相同的
+        /// IPC sink / 资产拦截 / 运行时注入，但不挂 driver（devtools/下载等
+        /// 事件面属于主内容区，子 webview 保持最小面）。
+        fn onChildControllerReady(self: *Self, w: *Window, c: *ChildWebview, controller: *wv2.ICoreWebView2Controller) void {
+            c.controller = controller;
+            _ = controller.lpVtbl.AddRef(controller);
+            _ = controller.putIsVisible(1);
+
+            var rc: win32.RECT = undefined;
+            if (win32.GetClientRect(c.hwnd, &rc) != 0) {
+                _ = controller.putBounds(.{ .left = 0, .top = 0, .right = rc.right, .bottom = rc.bottom });
+            }
+
+            const wv_result = controller.getCoreWebView2();
+            if (com.failed(wv_result.hr) or wv_result.webview == null) {
+                log.print("[webviews] child get_CoreWebView2 failed hr=0x{x}", .{@as(u32, @bitCast(wv_result.hr))});
+                return;
+            }
+            const webview = wv_result.webview.?;
+            c.webview = webview;
+
+            // IPC sink（回复按 sender 路由：见 onWebMessage 的 sendJsonTo）
+            if (MessageHandler.create(w)) |mh| {
+                var token: com.EventRegistrationToken = .{ .value = 0 };
+                _ = webview.addWebMessageReceived(mh, &token);
+            } else |_| {}
+
+            // 资产服务（与主 webview 同一 origin 拦截）
+            if (self.dev_url == null) {
+                if (WebResourceHandler.create(w)) |rh| {
+                    var token2: com.EventRegistrationToken = .{ .value = 0 };
+                    _ = webview.addWebResourceRequested(rh, &token2);
+                    if (std.fmt.allocPrint(self.allocator, "{s}/*", .{originOf(config.url)})) |filter| {
+                        defer self.allocator.free(filter);
+                        if (std.unicode.utf8ToUtf16LeAllocZ(self.allocator, filter)) |filter_w| {
+                            defer self.allocator.free(filter_w);
+                            _ = webview.addWebResourceRequestedFilter(filter_w.ptr, wv2.WEB_RESOURCE_CONTEXT_ALL);
+                        } else |_| {}
+                    } else |_| {}
+                } else |_| {}
+            }
+
+            // 注入 zilt 运行时（invoke 可用；Zig→JS 事件只广播主 webview）
+            if (IgnoreCompletedHandler(wv2.IID_AddScriptToExecuteOnDocumentCreatedCompletedHandler).create(w)) |sh| {
+                defer sh.dropRef();
+                if (std.unicode.utf8ToUtf16LeAllocZ(self.allocator, ipc.runtime_js)) |js_w| {
+                    defer self.allocator.free(js_w);
+                    _ = webview.addScriptToExecuteOnDocumentCreated(js_w.ptr, sh);
+                } else |_| {}
+            } else |_| {}
+
+            // 排队的目标 URL（create 时给的就绪后导航；pending_url 归 page_allocator）
+            if (c.pending_url) |pending| {
+                if (std.unicode.utf8ToUtf16LeAllocZ(self.allocator, pending)) |url_w| {
+                    defer self.allocator.free(url_w);
+                    _ = webview.navigate(url_w.ptr);
+                } else |_| {}
+                std.heap.page_allocator.free(pending);
+                c.pending_url = null;
+            }
+            log.print("[webviews] child #{d} ready (window #{d})", .{ c.id, w.id });
+        }
+
         /// 主窗口 WebView 就绪后的应用级挂载（托盘 / watcher / 更新器自动流）。
         fn onMainReady(self: *Self, w: *Window) void {
             if (config.tray) |tc| {
@@ -1458,8 +1526,24 @@ fn Backend(comptime config: Config) type {
             return false;
         }
 
-        /// UI 线程：WebMessageReceived 分发。
-        fn onWebMessage(w: *Window, args: *wv2.ICoreWebView2WebMessageReceivedEventArgs) void {
+        /// v0.1.16：回复落点路由。sender 是消息来源 webview（主/子通用）；
+        /// null 或等于主 webview 时走原路径（行为不变），否则 postWebMessageAsJson
+        /// 直达来源 webview。msg 所有权转移。
+        fn sendJsonTo(w: *Window, msg: []u8, sender: ?*wv2.ICoreWebView2) void {
+            const b = w.backend;
+            if (sender == null or w.webview == sender) {
+                w.sendJson(msg); // 所有权转移
+                return;
+            }
+            defer b.allocator.free(msg);
+            if (!w.alive) return;
+            const wide = std.unicode.utf8ToUtf16LeAllocZ(b.allocator, msg) catch return;
+            defer b.allocator.free(wide);
+            _ = sender.?.postWebMessageAsJson(wide.ptr);
+        }
+
+        /// UI 线程：WebMessageReceived 分发（sender = 消息来源 webview）。
+        fn onWebMessage(w: *Window, args: *wv2.ICoreWebView2WebMessageReceivedEventArgs, sender: ?*wv2.ICoreWebView2) void {
             const self = w.backend;
             // origin 校验：非允许来源的消息一律丢弃
             var src_u8_owned: ?[]u8 = null;
@@ -1510,14 +1594,14 @@ fn Backend(comptime config: Config) type {
                         const ok = runWindowCmd(w.backend, w.id, .start_dragging);
                         const result_json = if (ok) "true" else "false";
                         const resp = ipc.encodeResolve(self.allocator, inv.id, result_json) catch return;
-                        w.sendJson(resp);
+                        sendJsonTo(w, resp, sender);
                         return;
                     }
 
                     if (enforce_acl and !security.allowed(config.security, config.url, self.dev_url, source_url, w.label, .command, inv.method)) {
                         log.print("[acl] command '{s}' denied (window={s}, source={s})", .{ inv.method, w.label, source_url });
                         const rej = ipc.encodeReject(self.allocator, inv.id, "PermissionDenied") catch return;
-                        w.sendJson(rej);
+                        sendJsonTo(w, rej, sender);
                         return;
                     }
 
@@ -1528,18 +1612,18 @@ fn Backend(comptime config: Config) type {
                         } else |err| {
                             log.print("[ipc] builtin {s} failed: {s}", .{ inv.method, @errorName(err) });
                             const rej = ipc.encodeReject(self.allocator, inv.id, @errorName(err)) catch return;
-                            w.sendJson(rej);
+                            sendJsonTo(w, rej, sender);
                             return;
                         }
                         break :blk ipc.dispatch(config.commands, ctx, inv.method, inv.args_json) catch |err| {
                             log.print("[ipc] invoke {s} failed: {s}", .{ inv.method, @errorName(err) });
                             const rej = ipc.encodeReject(self.allocator, inv.id, @errorName(err)) catch return;
-                            w.sendJson(rej);
+                            sendJsonTo(w, rej, sender);
                             return;
                         };
                     };
                     const resp = ipc.encodeResolve(self.allocator, inv.id, result_json) catch return;
-                    w.sendJson(resp);
+                    sendJsonTo(w, resp, sender);
                 },
                 .event => |ev| {
                     if (enforce_acl and !security.allowed(config.security, config.url, self.dev_url, source_url, w.label, .event, ev.name)) {
@@ -1715,6 +1799,7 @@ fn Backend(comptime config: Config) type {
                 .services => |op| return self.runServicesOp(op, alloc),
                 .http => |op| return self.runHttpOp(op, alloc),
                 .ws => |op| return self.runWsOp(op, alloc),
+                .webviews => |op| return self.runWebviewsOp(w, op, alloc),
             }
         }
 
@@ -1877,6 +1962,168 @@ fn Backend(comptime config: Config) type {
                     // 然后发 close 事件 → UI 线程统一清理（wsRemoveConn）。
                     conn.stream.shutdown(conn.io, .send) catch {};
                     return .{ .ok = true };
+                },
+            }
+        }
+
+        // ---- v0.1.16：单窗口多 WebView ----
+
+        /// 子 webview 专用窗口类（DefWindowProc）。不用系统 STATIC 类：
+        /// STATIC 对 WM_PAINT/WM_ERASEBKGND 的特殊处理会干扰 Chromium
+        /// 合成器挂钩（实测 controller 异步完成回调报 E_ABORT）。
+        fn registerChildWebviewClass(self: *Self) bool {
+            const name_z = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, "ZiltChildWebView") catch return false;
+            var wc: win32.WNDCLASSEXW = .{
+                .cbSize = @sizeOf(win32.WNDCLASSEXW),
+                .style = 0,
+                .lpfnWndProc = win32.DefWindowProcW,
+                .cbClsExtra = 0,
+                .cbWndExtra = 0,
+                .hInstance = win32.GetModuleHandleW(null),
+                .hIcon = null,
+                .hCursor = win32.LoadCursorW(null, @ptrFromInt(win32.IDC_ARROW)),
+                .hbrBackground = @ptrFromInt(win32.COLOR_WINDOW + 1),
+                .lpszMenuName = null,
+                .lpszClassName = name_z.ptr,
+                .hIconSm = null,
+            };
+            const atom = win32.RegisterClassExW(&wc);
+            if (atom == 0) {
+                // 类名全局：已注册视为成功（ERROR_CLASS_ALREADY_EXISTS = 1410）
+                const err = win32.GetLastError();
+                if (err != 1410) {
+                    log.print("[webviews] register child class failed err={d}", .{err});
+                    self.allocator.free(name_z);
+                    return false;
+                }
+            }
+            self.child_class_w = name_z;
+            return true;
+        }
+
+        fn createChildHwnd(self: *Self, parent: win32.HWND, x: i32, y: i32, width: i32, height: i32) ?win32.HWND {
+            const class_w = self.child_class_w orelse return null;
+            const empty_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, "") catch return null;
+            defer self.allocator.free(empty_w);
+            return win32.CreateWindowExW(
+                0,
+                class_w.ptr,
+                empty_w.ptr,
+                win32.WS_CHILD | win32.WS_VISIBLE | win32.WS_CLIPSIBLINGS,
+                x,
+                y,
+                width,
+                height,
+                parent,
+                null,
+                win32.GetModuleHandleW(null),
+                null,
+            );
+        }
+
+        fn childWebviewById(w: *Window, id: i64) ?*ChildWebview {
+            for (w.child_webviews.items) |c| {
+                if (c.id == id) return c;
+            }
+            return null;
+        }
+
+        /// UI 线程：释放子 webview（COM 引用 + 子 HWND）。从槽移除后调用。
+        fn destroyChildWebview(c: *ChildWebview) void {
+            if (c.webview) |wv| _ = wv.lpVtbl.Release(wv);
+            if (c.controller) |ctl| _ = ctl.lpVtbl.Release(ctl);
+            if (c.pending_url) |u| std.heap.page_allocator.free(u);
+            if (c.hwnd != null) _ = win32.DestroyWindow(c.hwnd);
+            std.heap.page_allocator.destroy(c);
+        }
+
+        /// create/remove/navigate/setBounds/focus/list。create 同步建子 HWND 并返回
+        /// id；controller 异步就绪（见 onChildControllerReady），期间的 navigate 排队。
+        fn runWebviewsOp(self: *Self, w: *Window, op: shared_system.WebviewsOp, alloc: std.mem.Allocator) !shared_system.Result {
+            const env = self.env orelse return error.WebviewEnvNotReady;
+            switch (op) {
+                .create => |req| {
+                    const id = w.next_child_webview_id;
+                    w.next_child_webview_id += 1;
+                    if (self.child_class_w == null and !self.registerChildWebviewClass()) {
+                        return error.WebviewChildFailed;
+                    }
+                    const child_hwnd = self.createChildHwnd(w.hwnd, req.x, req.y, req.width, req.height) orelse return error.WebviewChildFailed;
+                    const c = std.heap.page_allocator.create(ChildWebview) catch {
+                        _ = win32.DestroyWindow(child_hwnd);
+                        return error.OutOfMemory;
+                    };
+                    c.* = .{ .id = id, .hwnd = child_hwnd };
+                    if (req.url.len > 0) {
+                        c.pending_url = std.heap.page_allocator.dupe(u8, req.url) catch null;
+                    }
+                    w.child_webviews.append(self.allocator, c) catch {
+                        std.heap.page_allocator.destroy(c);
+                        _ = win32.DestroyWindow(child_hwnd);
+                        return error.OutOfMemory;
+                    };
+
+                    const handler = ControllerCompletedHandler.createChild(self, w, c) catch {
+                        log.print("[webviews] child handler alloc failed", .{});
+                        return .{ .json = try std.fmt.allocPrint(alloc, "{{\"id\":{d}}}", .{id}) };
+                    };
+                    const hr = env.createController(child_hwnd, handler);
+                    handler.dropRef();
+                    if (com.failed(hr)) {
+                        log.print("[webviews] child controller create failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+                    }
+                    log.print("[webviews] child #{d} created on window #{d} ({d}x{d}@{d},{d}) url={s}", .{
+                        id, w.id, req.width, req.height, req.x, req.y, req.url,
+                    });
+                    return .{ .json = try std.fmt.allocPrint(alloc, "{{\"id\":{d}}}", .{id}) };
+                },
+                .remove => |id| {
+                    for (w.child_webviews.items, 0..) |c, i| {
+                        if (c.id == id) {
+                            _ = w.child_webviews.swapRemove(i);
+                            destroyChildWebview(c);
+                            log.print("[webviews] child #{d} removed", .{id});
+                            return .{ .ok = true };
+                        }
+                    }
+                    return .{ .ok = false };
+                },
+                .navigate => |req| {
+                    const c = childWebviewById(w, req.id) orelse return .{ .ok = false };
+                    const url_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, req.url) catch return error.OutOfMemory;
+                    defer self.allocator.free(url_w);
+                    if (c.webview) |wv| {
+                        const hr = wv.lpVtbl.Navigate(wv, url_w.ptr);
+                        log.print("[webviews] child #{d} navigate {s} hr=0x{x}", .{ req.id, req.url, @as(u32, @bitCast(hr)) });
+                        return .{ .ok = com.failed(hr) == false };
+                    }
+                    // controller 未就绪：排队，onChildControllerReady 里导航
+                    if (c.pending_url) |old| self.allocator.free(old);
+                    c.pending_url = self.allocator.dupe(u8, req.url) catch null;
+                    return .{ .ok = true };
+                },
+                .set_bounds => |req| {
+                    const c = childWebviewById(w, req.id) orelse return .{ .ok = false };
+                    _ = win32.SetWindowPos(c.hwnd, null, req.x, req.y, req.width, req.height, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
+                    return .{ .ok = true };
+                },
+                .focus => |id| {
+                    const c = childWebviewById(w, id) orelse return .{ .ok = false };
+                    _ = win32.SetFocus(c.hwnd);
+                    return .{ .ok = true };
+                },
+                .list => {
+                    var out: std.ArrayListUnmanaged(u8) = .empty;
+                    errdefer out.deinit(alloc);
+                    try out.append(alloc, '[');
+                    for (w.child_webviews.items, 0..) |c, i| {
+                        if (i != 0) try out.append(alloc, ',');
+                        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{{\"id\":{d},\"ready\":{s}}}", .{
+                            c.id, if (c.webview != null) "true" else "false",
+                        }));
+                    }
+                    try out.append(alloc, ']');
+                    return .{ .json = try out.toOwnedSlice(alloc) };
                 },
             }
         }
@@ -3100,6 +3347,11 @@ fn Backend(comptime config: Config) type {
             if (w.clipboard_listening) win_clipboard.stopListening(w.hwnd);
             w.clipboard_listening = false;
             if (w.webview) |wv| _ = wv.lpVtbl.Release(wv);
+            // v0.1.16：附加子 webview 随窗口释放（子 HWND 由父窗口销毁自动回收，
+            // COM 引用在这里显式释放）
+            for (w.child_webviews.items) |c| destroyChildWebview(c);
+            w.child_webviews.deinit(w.backend.allocator);
+            w.child_webviews = .empty;
             if (w.msg_handler) |h| h.dropRef();
             if (w.res_handler) |h| h.dropRef();
             if (w.nav_handler) |h| h.dropRef();
@@ -3813,6 +4065,8 @@ fn Backend(comptime config: Config) type {
             refs: u32,
             backend: *Self,
             window: *Window,
+            /// 非 null = 附加子 webview 的 controller（v0.1.16）
+            child: ?*ChildWebview = null,
 
             pub const COM_IIDS = [_]com.GUID{wv2.IID_ControllerCompletedHandler};
 
@@ -3834,6 +4088,11 @@ fn Backend(comptime config: Config) type {
                 h.* = .{ .lpVtbl = &vtable, .refs = 1, .backend = backend, .window = window };
                 return h;
             }
+            fn createChild(backend: *Self, window: *Window, child: *ChildWebview) !*ControllerCompletedHandler {
+                const h = try backend.allocator.create(ControllerCompletedHandler);
+                h.* = .{ .lpVtbl = &vtable, .refs = 1, .backend = backend, .window = window, .child = child };
+                return h;
+            }
             pub fn comDestroy(self: *ControllerCompletedHandler) void {
                 self.backend.allocator.destroy(self);
             }
@@ -3843,6 +4102,7 @@ fn Backend(comptime config: Config) type {
 
             fn invoke(self_: *anyopaque, error_code: HRESULT, controller: ?*wv2.ICoreWebView2Controller) callconv(.c) HRESULT {
                 const self: *ControllerCompletedHandler = @ptrCast(@alignCast(self_));
+                if (self.child) |c| return self.invokeChild(c, error_code, controller);
                 if (com.failed(error_code) or controller == null) {
                     // 窗口在异步 controller 创建期间被关闭属于正常生命周期
                     // （如前端 create→close 的冒烟），不得终止整个应用。
@@ -3861,6 +4121,32 @@ fn Backend(comptime config: Config) type {
                     return com.S_OK;
                 }
                 self.backend.onControllerReady(self.window, controller.?);
+                return com.S_OK;
+            }
+
+            fn invokeChild(self: *ControllerCompletedHandler, c: *ChildWebview, error_code: HRESULT, controller: ?*wv2.ICoreWebView2Controller) HRESULT {
+                if (!self.window.alive) {
+                    // 窗口已销毁：child 已随窗口释放，controller 无人认领，直接释放
+                    if (controller) |ctl| _ = ctl.lpVtbl.Release(ctl);
+                    return com.S_OK;
+                }
+                if (com.failed(error_code) or controller == null) {
+                    log.print("[webviews] child controller failed hr=0x{x}", .{@as(u32, @bitCast(error_code))});
+                    return com.S_OK;
+                }
+                // child 可能已在就绪前被 remove：从窗口槽里查不到就放弃
+                var found = false;
+                for (self.window.child_webviews.items) |slot| {
+                    if (slot == c) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    _ = controller.?.lpVtbl.Release(controller.?);
+                    return com.S_OK;
+                }
+                self.backend.onChildControllerReady(self.window, c, controller.?);
                 return com.S_OK;
             }
         };
@@ -3899,10 +4185,11 @@ fn Backend(comptime config: Config) type {
             }
 
             fn invoke(self_: *anyopaque, sender: ?*wv2.ICoreWebView2, args: ?*wv2.ICoreWebView2WebMessageReceivedEventArgs) callconv(.c) HRESULT {
-                _ = sender;
                 const self: *MessageHandler = @ptrCast(@alignCast(self_));
                 const a = args orelse return com.E_POINTER;
-                onWebMessage(self.window, a);
+                // v0.1.16：sender 即消息来源 webview（主/子通用）——
+                // onWebMessage 的回复按 sender 落点路由
+                onWebMessage(self.window, a, sender);
                 return com.S_OK;
             }
         };
@@ -4348,6 +4635,24 @@ fn httpWorker(job: *HttpJob) void {
 // ---------------------------------------------------------------------------
 // v0.1.16：WebSocket 客户端（协议层在 shared ws.zig，这里做线程与连接编排）
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// v0.1.16：单窗口多 WebView
+// ---------------------------------------------------------------------------
+
+        /// 附加子 WebView。WebView2 一个 HWND 只能绑一个 controller，所以每个
+        /// 附加 webview 各有一个 WS_CHILD 子窗口（父 = 应用窗口）。同一 Environment
+        /// → 同一 user data folder（Cookie/存储共享）；独立分区需要独立 env，留待后续。
+        /// 生命周期：create（HWND 同步创建，controller 异步就绪）→ remove / 窗口销毁时释放。
+
+const ChildWebview = struct {
+    id: u32,
+    hwnd: win32.HWND,
+    controller: ?*wv2.ICoreWebView2Controller = null,
+    webview: ?*wv2.ICoreWebView2 = null,
+    /// controller 尚未就绪时排队的目标 URL（create/navigate 都可能早于 ready）
+    pending_url: ?[]u8 = null,
+};
 
 /// 一个活跃连接。生命周期：worker 握手成功后创建 → UI 线程 open 事件时
 /// 注册到 ws_conns 并起读循环 → close 事件时 wsRemoveConn 统一销毁。

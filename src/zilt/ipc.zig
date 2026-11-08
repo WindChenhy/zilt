@@ -927,6 +927,16 @@ pub const runtime_js =
     \\      close: (id, code, reason) => builtin('__zilt.ws', { action: 'close', id, code: code ?? 1000, reason: reason ?? '' }),
     \\      on: (id, cb) => window.zilt.on('wsEvent', (p) => { if (p && p.id === id) cb(p); }),
     \\    },
+    \\    // v0.1.16: 单窗口多 WebView。create 返回 {id}；controller 异步就绪，
+    \\    // 早于就绪的 navigate 会排队。子 webview 的 invoke 可用，事件只广播主页面。
+    \\    webviews: {
+    \\      create: (opts) => builtin('__zilt.webviews', Object.assign({ action: 'create' }, opts ?? {})),
+    \\      remove: (id) => builtin('__zilt.webviews', { action: 'remove', id }),
+    \\      navigate: (id, url) => builtin('__zilt.webviews', { action: 'navigate', id, url }),
+    \\      setBounds: (id, x, y, width, height) => builtin('__zilt.webviews', { action: 'setBounds', id, x, y, width, height }),
+    \\      focus: (id) => builtin('__zilt.webviews', { action: 'focus', id }),
+    \\      list: () => builtin('__zilt.webviews', { action: 'list' }),
+    \\    },
     \\    version: '0.1.16',
     \\  };
     \\  window.zilt.on('__zilt.evalResult', (p) => {

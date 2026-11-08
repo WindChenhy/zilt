@@ -364,7 +364,8 @@ pub fn isSystemMethod(method: []const u8) bool {
         eql(u8, name, "taskbar") or eql(u8, name, "system") or eql(u8, name, "shell") or
         eql(u8, name, "autostart") or eql(u8, name, "appearance") or
         eql(u8, name, "store") or eql(u8, name, "fs") or eql(u8, name, "windowState") or
-        eql(u8, name, "services") or eql(u8, name, "http") or eql(u8, name, "ws");
+        eql(u8, name, "services") or eql(u8, name, "http") or eql(u8, name, "ws") or
+        eql(u8, name, "webviews");
 }
 
 pub fn clickActionFromName(name: ?[]const u8) system_api.ClickAction {
@@ -540,6 +541,31 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
             .reason = a.message orelse "",
         } } };
         return error.UnknownWsAction;
+    }
+
+    if (eql(u8, name, "webviews")) {
+        if (eql(u8, a.action, "create")) return .{ .webviews = .{ .create = .{
+            .x = a.x orelse 0,
+            .y = a.y orelse 0,
+            .width = @intCast(a.width orelse 400),
+            .height = @intCast(a.height orelse 300),
+            .url = a.url orelse "",
+        } } };
+        if (eql(u8, a.action, "remove")) return .{ .webviews = .{ .remove = a.id orelse return error.MissingId } };
+        if (eql(u8, a.action, "navigate")) return .{ .webviews = .{ .navigate = .{
+            .id = a.id orelse return error.MissingId,
+            .url = a.url orelse return error.MissingUrl,
+        } } };
+        if (eql(u8, a.action, "setBounds")) return .{ .webviews = .{ .set_bounds = .{
+            .id = a.id orelse return error.MissingId,
+            .x = a.x orelse 0,
+            .y = a.y orelse 0,
+            .width = @intCast(a.width orelse 400),
+            .height = @intCast(a.height orelse 300),
+        } } };
+        if (eql(u8, a.action, "focus")) return .{ .webviews = .{ .focus = a.id orelse return error.MissingId } };
+        if (eql(u8, a.action, "list")) return .{ .webviews = .list };
+        return error.UnknownWebviewsAction;
     }
 
     if (eql(u8, name, "appearance")) {

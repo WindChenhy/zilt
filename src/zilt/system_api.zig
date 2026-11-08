@@ -129,6 +129,25 @@ pub const WsOp = union(enum) {
     close: struct { id: i64, code: u16 = 1000, reason: []const u8 = "" },
 };
 
+/// 单窗口多 WebView（v0.1.16）。create 同步返回 id（HWND 即刻创建，
+/// controller 异步就绪；早于就绪的 navigate 会排队）。
+pub const WebviewCreate = struct {
+    x: i32 = 0,
+    y: i32 = 0,
+    width: i32 = 400,
+    height: i32 = 300,
+    /// 就绪后导航的目标；空 = about:blank
+    url: []const u8 = "",
+};
+pub const WebviewsOp = union(enum) {
+    create: WebviewCreate,
+    remove: i64,
+    navigate: struct { id: i64, url: []const u8 },
+    set_bounds: struct { id: i64, x: i32, y: i32, width: i32, height: i32 },
+    focus: i64,
+    list,
+};
+
 pub const Request = union(enum) {
     menu: MenuOp,
     tray: TrayOp,
@@ -152,6 +171,8 @@ pub const Request = union(enum) {
     http: HttpOp,
     /// v0.1.16：WebSocket 客户端（事件走 wsEvent）
     ws: WsOp,
+    /// v0.1.16：单窗口多 WebView
+    webviews: WebviewsOp,
 };
 
 pub const Result = union(enum) {

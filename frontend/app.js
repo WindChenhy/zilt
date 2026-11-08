@@ -434,6 +434,37 @@ async function runChecks() {
         : `errPathOk=${errPathOk} events=${JSON.stringify(wsEvents.map((e) => e.kind))}`);
     } catch (e) { setCheck('c-ws', false, String(e.message || e)); }
 
+    // 30. v0.1.16：单窗口多 WebView。create → 等 controller ready → setBounds/navigate →
+    // remove → list 移除；未知 id 的 remove 返回 false。
+    // 注意时序：controller 异步就绪需百毫秒级；在就绪前 remove 子 HWND 会让
+    // WebView2 完成回调报 E_ABORT（官方文档行为：父窗口销毁中止创建）。
+    try {
+      const created = await window.zilt.webviews.create({ x: 300, y: 100, width: 320, height: 200, url: 'about:blank' });
+      const id = created && created.id;
+      if (!id) throw new Error('no id returned: ' + JSON.stringify(created));
+      const list1 = await window.zilt.webviews.list();
+      const inList = (list1 || []).some((c) => c.id === id);
+      // 等 controller 就绪（ready 字段由 Zig 侧 webview 非空驱动）
+      let ready = false;
+      const t0 = Date.now();
+      while (Date.now() - t0 < 8000) {
+        const l = await window.zilt.webviews.list();
+        const c = (l || []).find((x) => x.id === id);
+        if (c && c.ready) { ready = true; break; }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const sb = await window.zilt.webviews.setBounds(id, 300, 100, 400, 260);
+      const nav = await window.zilt.webviews.navigate(id, 'about:blank');
+      const removed = await window.zilt.webviews.remove(id);
+      const list2 = await window.zilt.webviews.list();
+      const gone = !(list2 || []).some((c) => c.id === id);
+      const unknown = await window.zilt.webviews.remove(999999);
+      const ok = inList && ready && sb && nav && removed && gone && unknown === false;
+      setCheck('c-webviews', ok, ok
+        ? `webviews ok (create→ready→bounds→navigate→remove, unknown=${unknown})`
+        : `inList=${inList} ready=${ready} sb=${sb} nav=${nav} removed=${removed} gone=${gone} unknown=${unknown}`);
+    } catch (e) { setCheck('c-webviews', false, String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -467,6 +498,7 @@ async function runChecks() {
       services: $('c-services').className === 'pass',
       http: $('c-http').className === 'pass',
       ws: $('c-ws').className === 'pass',
+      webviews: $('c-webviews').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });
