@@ -103,6 +103,10 @@ pub const Args = struct {
     db: ?[]const u8 = null,
     sql: ?[]const u8 = null,
     params: ?[]const shared_sql.SqlValue = null,
+    /// 子 webview 数据分区名（__zilt.webviews.create）
+    partition: ?[]const u8 = null,
+    /// 子 webview eval 的请求 id（__zilt.webviews.eval，用于事件匹配）
+    rid: ?i64 = null,
 };
 
 pub fn isBuiltin(method: []const u8) bool {
@@ -647,6 +651,7 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
             .width = @intCast(a.width orelse 400),
             .height = @intCast(a.height orelse 300),
             .url = a.url orelse "",
+            .partition = a.partition,
         } } };
         if (eql(u8, a.action, "remove")) return .{ .webviews = .{ .remove = a.id orelse return error.MissingId } };
         if (eql(u8, a.action, "navigate")) return .{ .webviews = .{ .navigate = .{
@@ -662,6 +667,11 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
         } } };
         if (eql(u8, a.action, "focus")) return .{ .webviews = .{ .focus = a.id orelse return error.MissingId } };
         if (eql(u8, a.action, "list")) return .{ .webviews = .list };
+        if (eql(u8, a.action, "eval")) return .{ .webviews = .{ .eval = .{
+            .id = a.id orelse return error.MissingId,
+            .script = a.script orelse return error.MissingScript,
+            .rid = a.rid orelse 0,
+        } } };
         return error.UnknownWebviewsAction;
     }
 

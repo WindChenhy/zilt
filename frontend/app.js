@@ -488,6 +488,73 @@ async function runChecks() {
       setCheck('c-proc', ok, ok ? `process ok (stdout→echo 命中, exit code=0, list=${lst.length})` : 'list=' + JSON.stringify(lst));
     } catch (e) { setCheck('c-proc', false, String(e.message || e)); }
 
+    // 32. v0.1.17：多 WebView 数据分区（独立 Environment）。三个子 webview 载入
+    // 同 origin 的 partition-probe.html：两个各带分区（alpha/beta），一个不带（共享）。
+    // 断言：alpha 写入后 beta 读不到（隔离）；alpha 自己仍读得到（持久）；
+    // 共享实例写入后主页面能读到（同 Environment 共享存储）。
+    try {
+      const probeUrl = 'https://zilt.app/partition-probe.html';
+      const mk = async (partition) => {
+        const r = await window.zilt.webviews.create({ x: 20, y: 20, width: 220, height: 160, url: probeUrl, partition });
+        return r && r.id;
+      };
+      const waitReady = async (id) => {
+        const t0 = Date.now();
+        while (Date.now() - t0 < 12000) {
+          const l = await window.zilt.webviews.list();
+          const c = (l || []).find((x) => x.id === id);
+          if (c && c.ready) return true;
+          await new Promise((r) => setTimeout(r, 120));
+        }
+        return false;
+      };
+      const aId = await mk('alpha');
+      const bId = await mk('beta');
+      const sId = await mk(null);
+      if (!aId || !bId || !sId) throw new Error('create failed: ' + JSON.stringify([aId, bId, sId]));
+      const rA = await waitReady(aId);
+      const rB = await waitReady(bId);
+      const rS = await waitReady(sId);
+      // 等首帧文档就绪（eval 前把 readyState 打完）
+      const settle = async (id) => {
+        const t0 = Date.now();
+        while (Date.now() - t0 < 8000) {
+          const v = await window.zilt.webviews.eval(id, 'document.readyState');
+          if (v === 'complete' || v === 'interactive') return true;
+          await new Promise((r) => setTimeout(r, 120));
+        }
+        return false;
+      };
+      const sA = await settle(aId), sB = await settle(bId), sS = await settle(sId);
+
+      // 分区数据会跨运行持久化（这正是分区该有的行为）→ 每次用唯一 key，
+      // 避免上一轮的残留把「隔离」断言污染成假失败
+      const probeKey = 'zilt_part_' + Date.now();
+      const js = (code) => `${code}`;
+      const writeA = await window.zilt.webviews.eval(aId, `localStorage.setItem('${probeKey}','alpha'); localStorage.getItem('${probeKey}')`);
+      const readB = await window.zilt.webviews.eval(bId, `localStorage.getItem('${probeKey}')`);
+      const writeB = await window.zilt.webviews.eval(bId, `localStorage.setItem('${probeKey}','beta'); localStorage.getItem('${probeKey}')`);
+      const readA2 = await window.zilt.webviews.eval(aId, `localStorage.getItem('${probeKey}')`);
+      const writeS = await window.zilt.webviews.eval(sId, `localStorage.setItem('${probeKey}','shared'); localStorage.getItem('${probeKey}')`);
+      const readMain = localStorage.getItem(probeKey);
+
+      const listAll = await window.zilt.webviews.list();
+      const parts = (listAll || []).map((c) => c.partition).filter((p) => p);
+      const hasParts = parts.includes('alpha') && parts.includes('beta');
+
+      await window.zilt.webviews.remove(aId);
+      await window.zilt.webviews.remove(bId);
+      await window.zilt.webviews.remove(sId);
+      localStorage.removeItem(probeKey);
+
+      const ok = rA && rB && rS && sA && sB && sS &&
+        writeA === 'alpha' && readB === null && writeB === 'beta' && readA2 === 'alpha' &&
+        writeS === 'shared' && readMain === 'shared' && hasParts;
+      setCheck('c-partition', ok, ok
+        ? 'partition ok (alpha/beta 隔离 + 共享 env 互通)'
+        : `ready=${rA},${rB},${rS} settle=${sA},${sB},${sS} A=${writeA} B0=${readB} B=${writeB} A2=${readA2} S=${writeS} main=${readMain} parts=${JSON.stringify(parts)}`);
+    } catch (e) { setCheck('c-partition', false, String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -523,6 +590,7 @@ async function runChecks() {
       ws: $('c-ws').className === 'pass',
       webviews: $('c-webviews').className === 'pass',
       proc: $('c-proc').className === 'pass',
+      partition: $('c-partition').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

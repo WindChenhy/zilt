@@ -125,6 +125,7 @@ TS 工程：`zig build gen` 生成 `frontend/bindings/zilt.ts`（全类型命令
 | 资产服务 | custom scheme 拦截（`AddWebResourceRequestedFilter`）+ 内存 IStream 响应；压缩资产首次请求惰性解压 + 进程内缓存，恒以 identity 下发（custom scheme 不走网络栈内容解码，实测见 reference §G.6/G.7）；If-None-Match→304 逻辑就绪（当前通道不回传验证器，休眠） |
 | 反代 dev 模式 | `ZILT_DEV_PROXY=<dev_url>`（config `frontend.dev_proxy`）：应用保持自身 origin，资产请求经 custom scheme 处理器同步转发上游（Content-Type 透传）；keep-alive 死连接重建连接池重试一次；HMR 由模板预置的显式 `server.hmr` 直连 vite ws，热更新模块经代理 `?t=` 重取 |
 | 前端工程化 | `project.zig` Config.Frontend（dir/dist/build_command/dev_command/dev_url/dev_proxy，单一配置源）；`zig build frontend` spawn build_command（cwd=frontend）；`zig build dev` spawn dev_command → TCP 直连 127.0.0.1 探测 → 注入 ZILT_DEV_URL（或 ZILT_DEV_PROXY）→ Job Object 整树清理 |
+| 多 WebView 数据分区 | `webviews.create({partition})` → 独立 `ICoreWebView2Environment` + `<profile>\WebView2-partitions\<name>` UDF；同名复用；子页面脚本经 `eval`（WM_ZILT_EVAL 延后 + 事件回传，禁止在 IPC 回调里重入 ExecuteScript） |
 | WebDriver 自动化 | `zilt-driver`：msedgedriver（W3C 协议）+ 应用 `--remote-debugging-port`（`ZILT_WEBVIEW2_ARGS`）→ `/session` + `/execute/sync` 断言；无驱动 SKIP(3) |
 | CI 流水线 | `.github/workflows/ci.yml`：test（构建/单测/冒烟/WebDriver）→ package（NSIS+zip）→ tag 签名发布；Edge 版本自动匹配驱动 |
 | 日志轮转 | `log.initFileLog` 启动时 4MB 阈值轮转（`.1/.2/.3`，MoveFileExW） |

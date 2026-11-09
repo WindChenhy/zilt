@@ -427,15 +427,17 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
       就绪前 navigate 排队；窗口销毁时释放全部子 webview。
       **实测**：created→ready→navigate(hr=0x0)→removed；就绪前销毁触发官方定义的
       E_ABORT 中止路径（父窗口销毁中止创建），无崩溃。
-      数据分区（独立 user data folder 隔离 Cookie/存储）留待后续：需独立 Environment
-- [~] **验收**：冒烟 30 项含 store set/get + fs 写读 exists + `../` 逃逸被拒（PathEscape）
-      + path join/basename/extname + log 转发 + windowState get/save + http + ws + webviews；
-      数据分区未达成（见上）
+      **数据分区（v0.1.17 完成）**：`create({partition:'name'})` → 独立 Environment +
+      `<profile>\WebView2-partitions\<name>` user data folder；同名分区复用；
+      `webviews.eval(id, script)`（异步事件回传，见下）
+- [x] **验收**：冒烟 32 项含 store/fs/path/log/windowState + http + ws + webviews +
+      **partition 隔离**（alpha/beta localStorage 互不可见、共享实例与主页面互通）
 
 ### v0.1.17 — 工具链、测试与生态（P2）
 
-> 状态（2026-11-08 收尾）：CLI / 图标 CLI / headless / 热重启 / npm 运行时包 /
-> create-zilt-app / SQL / 模板扩充 / WebDriver / CI **全部完成并实测**。
+> 状态（2026-11-09 收尾）：CLI / 图标 CLI / headless / 热重启 / npm 运行时包 /
+> create-zilt-app / SQL / 模板扩充 / WebDriver / CI / **多 WebView 数据分区**
+> **全部完成并实测**。
 
 - [x] **CLI `zilt`**：`version` / `doctor`（Zig、WebView2（含 WOW6432Node）、makensis、
       frontend dist、图标）/ `info`（project 配置摘要）；`zig build doctor|info` 快捷 step

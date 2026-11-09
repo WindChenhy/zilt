@@ -80,6 +80,7 @@ const WM_ZILT_TOAST_EVENT: win32.UINT = win32.WM_APP + 9; // WinRT 线程 → UI
 const WM_ZILT_HTTP: win32.UINT = win32.WM_APP + 10; // HTTP 后台线程 → UI 线程
 const WM_ZILT_WS: win32.UINT = win32.WM_APP + 11; // WebSocket 读线程 → UI 线程
 const WM_ZILT_PROC: win32.UINT = win32.WM_APP + 12; // 子进程 worker → UI 线程
+const WM_ZILT_EVAL: win32.UINT = win32.WM_APP + 13; // 子 webview eval（延后到回调外执行）
 const WM_CLIPBOARDUPDATE: win32.UINT = 0x031D;
 const TRAY_MENU_BASE: u16 = 100;
 
@@ -254,6 +255,8 @@ pub fn run(comptime config: Config) !void {
 
     // v0.1.10：运行时通道 / 固定版本目录 / UA / 语言 / 代理 / 浏览器参数。
     var runtime = try loader.findRuntimeWithOptions(alloc, config.environment);
+    // v0.1.17：存一份到 backend —— 数据分区要按需另建 Environment
+    backend.runtime = runtime;
     log.print("[loader] runtime version: {s} (channel={s})", .{ runtime.version, @tagName(config.environment.channel) });
     if (std.unicode.utf16LeToUtf8Alloc(alloc, runtime.dll_path)) |dll_u8| {
         defer alloc.free(dll_u8);
@@ -817,6 +820,11 @@ fn Backend(comptime config: Config) type {
         windows: std.ArrayListUnmanaged(*Window) = .empty,
         next_id: u32 = 1,
         env: ?*wv2.ICoreWebView2Environment = null,
+        /// v0.1.17：WebView2 运行时（数据分区要另建 Environment 时复用）
+        runtime: ?loader.Runtime = null,
+        /// v0.1.17：已创建的分区 Environment（key = 分区名，值 = env 引用）。
+        /// 同名分区复用同一 Environment → 同一 partition 的多个 webview 共享存储。
+        partitions: std.ArrayListUnmanaged(PartitionEnv) = .empty,
         tray_menu: ?win32.HMENU = null,
         icon_big: win32.HICON = null,
         icon_small: win32.HICON = null,
@@ -1357,7 +1365,7 @@ fn Backend(comptime config: Config) type {
                 std.heap.page_allocator.free(pending);
                 c.pending_url = null;
             }
-            log.print("[webviews] child #{d} ready (window #{d})", .{ c.id, w.id });
+            log.print("[webviews] child #{d} ready (window #{d}, partition={s})", .{ c.id, w.id, c.partition orelse "-" });
         }
 
         /// 主窗口 WebView 就绪后的应用级挂载（托盘 / watcher / 更新器自动流）。
@@ -2054,13 +2062,119 @@ fn Backend(comptime config: Config) type {
         fn destroyChildWebview(c: *ChildWebview) void {
             if (c.webview) |wv| _ = wv.lpVtbl.Release(wv);
             if (c.controller) |ctl| _ = ctl.lpVtbl.Release(ctl);
+            if (c.env) |e| _ = e.lpVtbl.Release(e);
             if (c.pending_url) |u| std.heap.page_allocator.free(u);
+            if (c.partition) |p| std.heap.page_allocator.free(p);
             if (c.hwnd != null) _ = win32.DestroyWindow(c.hwnd);
             std.heap.page_allocator.destroy(c);
         }
 
-        /// create/remove/navigate/setBounds/focus/list。create 同步建子 HWND 并返回
-        /// id；controller 异步就绪（见 onChildControllerReady），期间的 navigate 排队。
+        /// v0.1.17：查找已创建的分区 Environment（同名复用 → 同分区共享存储）。
+        fn findPartition(self: *Self, name: []const u8) ?*wv2.ICoreWebView2Environment {
+            for (self.partitions.items) |pe| {
+                if (std.mem.eql(u8, pe.name, name)) return pe.env;
+            }
+            return null;
+        }
+
+        /// v0.1.17：为子 webview 建独立 Environment（独立 user data folder）。
+        /// 目录：`<profile 目录>\WebView2-partitions\<name>`；profile 目录形如
+        /// `%LOCALAPPDATA%\<app_id>\WebView2`。
+        fn beginPartitionEnv(self: *Self, w: *Window, c: *ChildWebview, name: []const u8) void {
+            const rt = if (self.runtime) |*r| r else {
+                log.print("[webviews] partition '{s}' failed: runtime missing", .{name});
+                return;
+            };
+            const profile = app_data.profileDirectory(self.allocator, config.app_id, config.migrate_legacy_profile) catch {
+                log.print("[webviews] partition '{s}' failed: profile dir", .{name});
+                return;
+            };
+            defer self.allocator.free(profile);
+            const root = std.fmt.allocPrint(self.allocator, "{s}\\WebView2-partitions", .{profile}) catch return;
+            defer self.allocator.free(root);
+            const dir = std.fmt.allocPrint(self.allocator, "{s}\\{s}", .{ root, name }) catch return;
+            defer self.allocator.free(dir);
+            // 父目录 + 分区目录（已存在返回 false，忽略）
+            {
+                const root_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, root) catch return;
+                defer self.allocator.free(root_w);
+                _ = win32.CreateDirectoryW(root_w.ptr, null);
+                const dir_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, dir) catch return;
+                defer self.allocator.free(dir_w);
+                _ = win32.CreateDirectoryW(dir_w.ptr, null);
+            }
+            const dir_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, dir) catch return;
+            defer self.allocator.free(dir_w);
+
+            const handler = PartitionEnvCompletedHandler.create(self, w, c, name) catch return;
+            const hr = loader.createEnvironment(rt, dir_w.ptr, null, handler);
+            handler.dropRef();
+            if (com.failed(hr)) {
+                log.print("[webviews] partition '{s}' createEnvironment hr=0x{x}", .{ name, @as(u32, @bitCast(hr)) });
+            }
+        }
+
+        /// 用指定 Environment 给子 HWND 建 controller（共享/分区共用）。
+        fn beginChildController(self: *Self, w: *Window, c: *ChildWebview, env: *wv2.ICoreWebView2Environment) void {
+            const handler = ControllerCompletedHandler.createChild(self, w, c) catch {
+                log.print("[webviews] child handler alloc failed", .{});
+                return;
+            };
+            const hr = env.createController(c.hwnd, handler);
+            handler.dropRef();
+            if (com.failed(hr)) {
+                log.print("[webviews] child controller create failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+            }
+        }
+
+        /// v0.1.17：在子 webview 内执行脚本。**异步 + 延后**：立即返回
+        /// {pending:true}，真正的 ExecuteScript 用 WM_ZILT_EVAL marshal 到消息循环，
+        /// 结果经 `webviewEval` 事件回传。
+        /// 直接在 WebMessageReceived 回调里调 ExecuteScript 会触发 WebView2 内部
+        /// 重入（实测 segfault in EmbeddedBrowserWebView.dll），所以必须延后。
+        fn beginChildEval(self: *Self, w: *Window, c: *ChildWebview, req: shared_system.WebviewEval, alloc: std.mem.Allocator) !shared_system.Result {
+            _ = self;
+            _ = alloc;
+            const a = std.heap.page_allocator;
+            const job = a.create(EvalJob) catch return error.OutOfMemory;
+            job.* = .{
+                .window_id = w.id,
+                .child_id = c.id,
+                .rid = req.rid,
+                .script = a.dupe(u8, req.script) catch {
+                    a.destroy(job);
+                    return error.OutOfMemory;
+                },
+            };
+            if (win32.PostMessageW(w.hwnd, WM_ZILT_EVAL, 0, @bitCast(@intFromPtr(job))) == 0) {
+                a.free(job.script);
+                a.destroy(job);
+                return error.WebviewEvalFailed;
+            }
+            return .{ .json = try std.fmt.allocPrint(a, "{{\"pending\":true,\"rid\":{d}}}", .{req.rid}) };
+        }
+
+        /// WM_ZILT_EVAL 处理：在消息循环里执行子 webview 脚本（无 COM 重入）。
+        fn runEvalJob(self: *Self, job: *EvalJob) void {
+            const a = std.heap.page_allocator;
+            defer {
+                a.free(job.script);
+                a.destroy(job);
+            }
+            const w = self.windowById(job.window_id) orelse return;
+            const c = childWebviewById(w, job.child_id) orelse return;
+            const wv = c.webview orelse return;
+            const script_w = std.unicode.utf8ToUtf16LeAllocZ(a, job.script) catch return;
+            defer a.free(script_w);
+            const handler = EvalCompletedHandler.create(a, w, job.rid, c.id) catch return;
+            const hr = wv.lpVtbl.ExecuteScript(wv, script_w.ptr, handler);
+            handler.dropRef();
+            if (com.failed(hr)) log.print("[webviews] child #{d} eval hr=0x{x}", .{ c.id, @as(u32, @bitCast(hr)) });
+        }
+
+        /// create/remove/navigate/setBounds/focus/list/eval。create 同步建子 HWND
+        /// 并返回 id；controller 异步就绪（见 onChildControllerReady），期间的
+        /// navigate 排队。带 partition 时先异步建独立 Environment（更慢一步）。
         fn runWebviewsOp(self: *Self, w: *Window, op: shared_system.WebviewsOp, alloc: std.mem.Allocator) !shared_system.Result {
             const env = self.env orelse return error.WebviewEnvNotReady;
             switch (op) {
@@ -2079,11 +2193,33 @@ fn Backend(comptime config: Config) type {
                     if (req.url.len > 0) {
                         c.pending_url = std.heap.page_allocator.dupe(u8, req.url) catch null;
                     }
+                    // v0.1.17：数据分区（同名复用已有 Environment）
+                    const part_name: ?[]u8 = blk: {
+                        const raw = req.partition orelse break :blk null;
+                        if (raw.len == 0) break :blk null;
+                        const sane = sanitizePartition(self.allocator, raw) catch break :blk null;
+                        break :blk std.heap.page_allocator.dupe(u8, sane) catch null;
+                    };
+                    c.partition = part_name;
                     w.child_webviews.append(self.allocator, c) catch {
+                        if (part_name) |p| std.heap.page_allocator.free(p);
                         std.heap.page_allocator.destroy(c);
                         _ = win32.DestroyWindow(child_hwnd);
                         return error.OutOfMemory;
                     };
+
+                    if (part_name) |pname| {
+                        if (self.findPartition(pname)) |pe| {
+                            c.env = pe;
+                            _ = pe.lpVtbl.AddRef(pe);
+                            log.print("[webviews] child #{d} reuse partition '{s}'", .{ id, pname });
+                            self.beginChildController(w, c, pe);
+                            return .{ .json = try std.fmt.allocPrint(alloc, "{{\"id\":{d},\"partition\":\"{s}\",\"queued\":false}}", .{ id, pname }) };
+                        }
+                        self.beginPartitionEnv(w, c, pname);
+                        log.print("[webviews] child #{d} created with partition '{s}' (env pending)", .{ id, pname });
+                        return .{ .json = try std.fmt.allocPrint(alloc, "{{\"id\":{d},\"partition\":\"{s}\",\"queued\":true}}", .{ id, pname }) };
+                    }
 
                     const handler = ControllerCompletedHandler.createChild(self, w, c) catch {
                         log.print("[webviews] child handler alloc failed", .{});
@@ -2140,12 +2276,18 @@ fn Backend(comptime config: Config) type {
                     try out.append(alloc, '[');
                     for (w.child_webviews.items, 0..) |c, i| {
                         if (i != 0) try out.append(alloc, ',');
-                        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{{\"id\":{d},\"ready\":{s}}}", .{
-                            c.id, if (c.webview != null) "true" else "false",
+                        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{{\"id\":{d},\"ready\":{s},\"partition\":{s}}}", .{
+                            c.id,
+                            if (c.webview != null) "true" else "false",
+                            if (c.partition) |p| try std.json.Stringify.valueAlloc(alloc, p, .{}) else "null",
                         }));
                     }
                     try out.append(alloc, ']');
                     return .{ .json = try out.toOwnedSlice(alloc) };
+                },
+                .eval => |req| {
+                    const c = childWebviewById(w, req.id) orelse return .{ .ok = false };
+                    return self.beginChildEval(w, c, req, alloc);
                 },
             }
         }
@@ -3532,6 +3674,12 @@ fn Backend(comptime config: Config) type {
                 a.destroy(c);
             }
             self.ws_conns.deinit(self.allocator);
+            // v0.1.17：释放分区 Environment（名字 + 引用）
+            for (self.partitions.items) |pe| {
+                _ = pe.env.lpVtbl.Release(pe.env);
+                self.allocator.free(pe.name);
+            }
+            self.partitions.deinit(self.allocator);
             // v0.1.16：残留子进程强杀 + worker 清理（应用退出场景）
             for (self.procs.items) |p| {
                 if (!p.dead) {
@@ -3972,6 +4120,15 @@ fn Backend(comptime config: Config) type {
                     }
                     return 0;
                 },
+                WM_ZILT_EVAL => {
+                    const job: *EvalJob = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    if (instance) |b| b.runEvalJob(job) else {
+                        const a = std.heap.page_allocator;
+                        a.free(job.script);
+                        a.destroy(job);
+                    }
+                    return 0;
+                },
                 WM_ZILT_PROC => {
                     const ev: *ProcEvent = @ptrFromInt(@as(usize, @bitCast(lparam)));
                     defer {
@@ -4329,6 +4486,151 @@ fn Backend(comptime config: Config) type {
                     return com.S_OK;
                 }
                 self.backend.onChildControllerReady(self.window, c, controller.?);
+                return com.S_OK;
+            }
+        };
+
+        /// v0.1.17：分区 Environment 创建回调（异步）——成功后建 controller，
+        /// 并把 env 记入 backend.partitions（同名复用）。
+        const PartitionEnvCompletedHandler = extern struct {
+            lpVtbl: *const VTable,
+            refs: u32,
+            backend: *Self,
+            window: *Window,
+            child: *ChildWebview,
+            /// extern struct 不能放 slice：name 用 ptr + len 存
+            name_ptr: [*]const u8,
+            name_len: usize,
+
+            fn name(self: *const PartitionEnvCompletedHandler) []const u8 {
+                return self.name_ptr[0..self.name_len];
+            }
+
+            pub const COM_IIDS = [_]com.GUID{wv2.IID_EnvironmentCompletedHandler};
+
+            pub const VTable = extern struct {
+                QueryInterface: *const fn (*anyopaque, *const com.GUID, *?*anyopaque) callconv(.c) HRESULT,
+                AddRef: *const fn (*anyopaque) callconv(.c) u32,
+                Release: *const fn (*anyopaque) callconv(.c) u32,
+                Invoke: *const fn (*anyopaque, HRESULT, ?*wv2.ICoreWebView2Environment) callconv(.c) HRESULT,
+            };
+            pub const vtable = VTable{
+                .QueryInterface = com.ComVTableMixin(PartitionEnvCompletedHandler).queryInterface,
+                .AddRef = com.ComVTableMixin(PartitionEnvCompletedHandler).addRef,
+                .Release = com.ComVTableMixin(PartitionEnvCompletedHandler).release,
+                .Invoke = invoke,
+            };
+
+            fn create(backend: *Self, window: *Window, child: *ChildWebview, part: []const u8) !*PartitionEnvCompletedHandler {
+                const h = try backend.allocator.create(PartitionEnvCompletedHandler);
+                h.* = .{
+                    .lpVtbl = &vtable,
+                    .refs = 1,
+                    .backend = backend,
+                    .window = window,
+                    .child = child,
+                    .name_ptr = (try backend.allocator.dupe(u8, part)).ptr,
+                    .name_len = part.len,
+                };
+                return h;
+            }
+            pub fn comDestroy(self: *PartitionEnvCompletedHandler) void {
+                self.backend.allocator.free(self.name_ptr[0..self.name_len]);
+                self.backend.allocator.destroy(self);
+            }
+            pub fn dropRef(self: *PartitionEnvCompletedHandler) void {
+                _ = com.ComVTableMixin(PartitionEnvCompletedHandler).release(@ptrCast(self));
+            }
+
+            fn invoke(self_: *anyopaque, error_code: HRESULT, env: ?*wv2.ICoreWebView2Environment) callconv(.c) HRESULT {
+                const self: *PartitionEnvCompletedHandler = @ptrCast(@alignCast(self_));
+                const backend = self.backend;
+                const c = self.child;
+                if (com.failed(error_code) or env == null) {
+                    log.print("[webviews] partition '{s}' env failed hr=0x{x}", .{ self.name(), @as(u32, @bitCast(error_code)) });
+                    return com.S_OK;
+                }
+                if (!self.window.alive) {
+                    _ = env.?.lpVtbl.Release(env.?);
+                    return com.S_OK;
+                }
+                const e = env.?;
+                _ = e.lpVtbl.AddRef(e);
+                c.env = e;
+                // 记入分区表（同名已存在则复用旧的、释放本次引用）
+                if (backend.findPartition(self.name())) |existing| {
+                    _ = e.lpVtbl.Release(e);
+                    c.env = existing;
+                    _ = existing.lpVtbl.AddRef(existing);
+                    backend.beginChildController(self.window, c, existing);
+                } else {
+                    backend.partitions.append(backend.allocator, .{
+                        .name = backend.allocator.dupe(u8, self.name()) catch return com.S_OK,
+                        .env = e,
+                    }) catch return com.S_OK;
+                    _ = e.lpVtbl.AddRef(e); // 表里持有一份
+                    log.print("[webviews] partition '{s}' env ready", .{self.name()});
+                    backend.beginChildController(self.window, c, e);
+                }
+                return com.S_OK;
+            }
+        };
+
+        /// v0.1.17：子 webview ExecuteScript 结果 → `webviewEval` 事件。
+        /// ExecuteScript 的 JSON 串由 WebView2 分配（不可 free），这里只读拷贝。
+        const EvalCompletedHandler = extern struct {
+            lpVtbl: *const VTable,
+            refs: u32,
+            window: *Window,
+            rid: i64,
+            child_id: u32,
+
+            pub const COM_IIDS = [_]com.GUID{wv2.IID_ExecuteScriptCompletedHandler};
+
+            pub const VTable = extern struct {
+                QueryInterface: *const fn (*anyopaque, *const com.GUID, *?*anyopaque) callconv(.c) HRESULT,
+                AddRef: *const fn (*anyopaque) callconv(.c) u32,
+                Release: *const fn (*anyopaque) callconv(.c) u32,
+                Invoke: *const fn (*anyopaque, HRESULT, ?[*:0]const u16) callconv(.c) HRESULT,
+            };
+            pub const vtable = VTable{
+                .QueryInterface = com.ComVTableMixin(EvalCompletedHandler).queryInterface,
+                .AddRef = com.ComVTableMixin(EvalCompletedHandler).addRef,
+                .Release = com.ComVTableMixin(EvalCompletedHandler).release,
+                .Invoke = invoke,
+            };
+
+            fn create(alloc: std.mem.Allocator, w: *Window, rid: i64, child_id: u32) !*EvalCompletedHandler {
+                const h = try alloc.create(EvalCompletedHandler);
+                h.* = .{ .lpVtbl = &vtable, .refs = 1, .window = w, .rid = rid, .child_id = child_id };
+                return h;
+            }
+            pub fn comDestroy(self: *EvalCompletedHandler) void {
+                self.window.backend.allocator.destroy(self);
+            }
+            pub fn dropRef(self: *EvalCompletedHandler) void {
+                _ = com.ComVTableMixin(EvalCompletedHandler).release(@ptrCast(self));
+            }
+
+            fn invoke(self_: *anyopaque, error_code: HRESULT, result: ?[*:0]const u16) callconv(.c) HRESULT {
+                const self: *EvalCompletedHandler = @ptrCast(@alignCast(self_));
+                const w = self.window;
+                const a = w.backend.allocator;
+                if (com.failed(error_code) or result == null) {
+                    const payload = std.fmt.allocPrint(a, "{{\"rid\":{d},\"id\":{d},\"ok\":false,\"error\":\"JavaScriptException\"}}", .{ self.rid, self.child_id }) catch return com.S_OK;
+                    defer a.free(payload);
+                    if (ipc.encodeEvent(a, "webviewEval", payload)) |msg| {
+                        w.emitJsonUi(msg); // 所有权转移给 emitJsonUi（它负责 free）
+                    } else |_| {}
+                    return com.S_OK;
+                }
+                const value = std.unicode.utf16LeToUtf8Alloc(a, std.mem.span(result.?)) catch return com.S_OK;
+                defer a.free(value);
+                const payload = std.fmt.allocPrint(a, "{{\"rid\":{d},\"id\":{d},\"ok\":true,\"value\":{s}}}", .{ self.rid, self.child_id, value }) catch return com.S_OK;
+                defer a.free(payload);
+                if (ipc.encodeEvent(a, "webviewEval", payload)) |msg| {
+                    w.emitJsonUi(msg); // 所有权转移给 emitJsonUi（它负责 free）
+                } else |_| {}
                 return com.S_OK;
             }
         };
@@ -4953,7 +5255,55 @@ const ChildWebview = struct {
     webview: ?*wv2.ICoreWebView2 = null,
     /// controller 尚未就绪时排队的目标 URL（create/navigate 都可能早于 ready）
     pending_url: ?[]u8 = null,
+    /// v0.1.17：数据分区名（page_allocator 持有）。null = 共享主 Environment。
+    partition: ?[]u8 = null,
+    /// 分区 Environment（本 child 持有的一份引用，销毁时 Release）
+    env: ?*wv2.ICoreWebView2Environment = null,
 };
+
+/// v0.1.17：子 webview eval 的延后任务（WM_ZILT_EVAL 携带，UI 线程执行）
+const EvalJob = struct {
+    window_id: u32,
+    child_id: u32,
+    rid: i64,
+    script: []u8,
+};
+
+/// v0.1.17：分区 Environment 表项（key 为规范化后的分区名）
+const PartitionEnv = struct {
+    name: []u8,
+    env: *wv2.ICoreWebView2Environment,
+};
+
+/// 分区名规范化为可安全做目录名：保留字母/数字/-/_，其余转 '_'，最长 64。
+pub fn sanitizePartition(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (raw) |c| {
+        if (out.items.len >= 64) break;
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '-' or c == '_';
+        try out.append(alloc, if (ok) c else '_');
+    }
+    if (out.items.len == 0) try out.appendSlice(alloc, "default");
+    return out.toOwnedSlice(alloc);
+}
+
+test "sanitizePartition keeps safe chars and replaces the rest" {
+    const a = std.testing.allocator;
+    const p1 = try sanitizePartition(a, "login-oauth_2");
+    defer a.free(p1);
+    try std.testing.expectEqualStrings("login-oauth_2", p1);
+    const p2 = try sanitizePartition(a, "a/b c:d");
+    defer a.free(p2);
+    try std.testing.expectEqualStrings("a_b_c_d", p2);
+    const p3 = try sanitizePartition(a, "");
+    defer a.free(p3);
+    try std.testing.expectEqualStrings("default", p3);
+    const long: [80]u8 = @splat('x');
+    const p4 = try sanitizePartition(a, &long);
+    defer a.free(p4);
+    try std.testing.expectEqual(@as(usize, 64), p4.len);
+}
 
 /// 一个活跃连接。生命周期：worker 握手成功后创建 → UI 线程 open 事件时
 /// 注册到 ws_conns 并起读循环 → close 事件时 wsRemoveConn 统一销毁。

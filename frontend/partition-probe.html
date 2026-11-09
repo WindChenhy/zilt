@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Zilt · partition probe</title>
+<style>
+  body { font: 13px/1.5 Consolas, monospace; background: #0f1115; color: #c9d1d9; margin: 12px; }
+  b { color: #58a6ff; }
+</style>
+</head>
+<body>
+  <!-- 数据分区探针页：只提供一个同 origin（zilt.app）的文档上下文，
+       供主页面通过 webviews.eval 读写 localStorage，验证分区隔离。
+       不在页面内自动做任何事——所有操作由外部脚本驱动，避免误触发。 -->
+  <div>partition probe</div>
+  <div id="origin"></div>
+  <script>document.getElementById('origin').textContent = location.origin;</script>
+</body>
+</html>

@@ -711,6 +711,8 @@ pub const runtime_js =
     \\  let nextId = 1;
     \\  let httpSeq = 0;
     \\  let wsSeq = 0;
+    \\  let webviewEvalSeq = 0;
+    \\  const webviewEvalWaiters = new Map();
     \\  // SQL 参数编码：原生值 → Zig 侧 {kind:'text'|'int'|'real'|'nul', ...}
     \\  const ziltSqlParam = (v) => {
     \\    if (v === null || v === undefined) return { kind: 'nul' };
@@ -938,6 +940,9 @@ pub const runtime_js =
     \\    },
     \\    // v0.1.16: 单窗口多 WebView。create 返回 {id}；controller 异步就绪，
     \\    // 早于就绪的 navigate 会排队。子 webview 的 invoke 可用，事件只广播主页面。
+    \\    // v0.1.17: create({partition:'login'}) → 独立 Environment + 独立 user data
+    \\    // folder（Cookie/localStorage/IndexedDB 与主页面隔离；同名分区复用同一 env）。
+    \\    // eval(id, script) 在子 webview 内执行脚本，返回结果（Promise）。
     \\    webviews: {
     \\      create: (opts) => builtin('__zilt.webviews', Object.assign({ action: 'create' }, opts ?? {})),
     \\      remove: (id) => builtin('__zilt.webviews', { action: 'remove', id }),
@@ -945,6 +950,17 @@ pub const runtime_js =
     \\      setBounds: (id, x, y, width, height) => builtin('__zilt.webviews', { action: 'setBounds', id, x, y, width, height }),
     \\      focus: (id) => builtin('__zilt.webviews', { action: 'focus', id }),
     \\      list: () => builtin('__zilt.webviews', { action: 'list' }),
+    \\      // eval 异步：Zig 侧 ExecuteScript 完成后发 webviewEval 事件，这里包成 Promise
+    \\      eval: (id, script) => {
+    \\        const rid = ++webviewEvalSeq;
+    \\        return new Promise((resolve, reject) => {
+    \\          webviewEvalWaiters.set(rid, { resolve, reject });
+    \\          builtin('__zilt.webviews', { action: 'eval', id, rid, script: String(script) }).catch((e) => {
+    \\            webviewEvalWaiters.delete(rid);
+    \\            reject(e);
+    \\          });
+    \\        });
+    \\      },
     \\    },
     \\    // v0.1.16: 原生对话框。模态（UI 线程阻塞），行为与 Tauri 一致。
     \\    dialog: {
@@ -969,6 +985,12 @@ pub const runtime_js =
     \\    },
     \\    version: '0.1.17',
     \\  };
+    \\  window.zilt.on('webviewEval', (p) => {
+    \\    const wait = webviewEvalWaiters.get(p && p.rid);
+    \\    if (!wait) return;
+    \\    webviewEvalWaiters.delete(p.rid);
+    \\    if (p.ok) wait.resolve(p.value); else wait.reject(new Error(p.error || 'eval failed'));
+    \\  });
     \\  window.zilt.on('__zilt.evalResult', (p) => {
     \\    const w = evalWaiters.get(p.id);
     \\    if (!w) return;

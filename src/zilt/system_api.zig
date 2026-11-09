@@ -139,6 +139,11 @@ pub const WebviewCreate = struct {
     height: i32 = 300,
     /// 就绪后导航的目标；空 = about:blank
     url: []const u8 = "",
+    /// v0.1.17：数据分区名。null/空 = 与主 webview 共享 Environment（Cookie/
+    /// localStorage/IndexedDB 共享）；非空 = 独立 Environment + 独立 user data
+    /// folder（`<profile>\WebView2-partitions\<name>`），该 webview 的 Web 存储
+    /// 与主页面完全隔离。同一 partition 名在多次 create 间复用同一个 Environment。
+    partition: ?[]const u8 = null,
 };
 pub const WebviewsOp = union(enum) {
     create: WebviewCreate,
@@ -147,7 +152,11 @@ pub const WebviewsOp = union(enum) {
     set_bounds: struct { id: i64, x: i32, y: i32, width: i32, height: i32 },
     focus: i64,
     list,
+    /// v0.1.17：在子 webview 内执行脚本。异步：结果走 `webviewEval` 事件
+    /// （payload {rid,id,ok,value|error}）。rid 由前端生成，用于匹配 Promise。
+    eval: WebviewEval,
 };
+pub const WebviewEval = struct { id: i64, script: []const u8, rid: i64 = 0 };
 
 /// 子进程执行（v0.1.16）。spawn 立即返回；stdout/stderr/exit 经 `processEvent`
 /// 事件回传。安全性：spawn 受 .command ACL 管控（capabilities.json 授权后可用），

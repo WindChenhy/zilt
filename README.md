@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.17（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs/path/log/opener/windowState 周边 API + 更新器通道/崩溃回滚/健康确认 + 代码签名（签名产物已实测 Authenticode + RFC3161）+ MSI（WiX 3.14 自动 vendor，安装/卸载实测）+ MSIX（makeappx，松散注册实测）+ services 生命周期 + http（异步）+ websocket 客户端 + 单窗口多 WebView + 前端对话框/子进程/图标生成 CLI + SQL（SQLite 动态加载）+ headless/server 模式 + 热重启 dev + npm 运行时包/脚手架 + SQL + 8 套模板 + WebDriver 自动化 + CI 流水线 + `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.1.17（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs/path/log/opener/windowState 周边 API + 更新器通道/崩溃回滚/健康确认 + 代码签名（签名产物已实测 Authenticode + RFC3161）+ MSI（WiX 3.14 自动 vendor，安装/卸载实测）+ MSIX（makeappx，松散注册实测）+ services 生命周期 + http（异步）+ websocket 客户端 + 单窗口多 WebView + 前端对话框/子进程/图标生成 CLI + SQL（SQLite 动态加载）+ headless/server 模式 + 热重启 dev + npm 运行时包/脚手架 + SQL + 多 WebView 数据分区 + 8 套模板 + WebDriver 自动化 + CI 流水线 + `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 
@@ -26,8 +26,9 @@ v0.1.17 新增（2026-11-08，均已实现、验证并提交）：
 - **模板扩充**：4 → 8 个模板——新增 **htmx**（离线内嵌 htmx.min.js + 资产服务真实请求）、**solid**、**preact**、**angular 19**（standalone + application builder）；顺带修复占位符从未替换/从未赋值两处既有缺陷
 - **WebDriver 自动化**：`zilt-driver`（新 exe）走 msedgedriver W3C 协议直驱 WebView2（`ZILT_WEBVIEW2_ARGS` 注入调试端口 + `ms:edgeOptions.debuggerAddress`），默认 4 条断言 + `--script` 自定义，无驱动 SKIP(3)；**实测 4/4 passed**；`zig build e2e` 接入
 - **CI / 签名流水线**：`.github/workflows/ci.yml`（test 构建+单测+冒烟+可选 WebDriver → package NSIS+zip → tag 签名发布）+ `docs/CI.md`
+- **多 WebView 数据分区**（2026-11-09）：`webviews.create({partition:'login'})` → 独立 WebView2 Environment + 独立 user data folder（`<profile>\WebView2-partitions\<name>`），Cookie/localStorage/IndexedDB 与主页面隔离；同名分区复用同一 Environment；新增 `webviews.eval(id, script)`（异步事件回传，包成 Promise）。**实测**：alpha/beta 分区 localStorage 互不可见、共享实例与主页面互通，两个 user data 目录真实落盘（12M/7.7M）
 - **日志轮转**：4MB 阈值，zilt.log → .1 → .2 → .3（实测 5MB 日志轮转）
-- **验收**：单元测试 **233/233**（框架 215 + 工具 18）；GUI 冒烟 **31 项** ALL PASSED（exit 0）；WebDriver 4/4；headless 四端点 + SQL 真 E2E；日志轮转实测；`zilt version` 报 0.1.17
+- **验收**：单元测试 **234/234**（框架 216 + 工具 18）；GUI 冒烟 **32 项** ALL PASSED（exit 0，含数据分区隔离）；WebDriver 4/4；headless 四端点 + SQL 真 E2E；日志轮转实测；`zilt version` 报 0.1.17
 
 v0.1.8–v0.1.12 新增（2026-11-08，均已实现、验证并提交）：
 
@@ -137,7 +138,7 @@ ZILT_SIGN_PFX=cert.pfx ZILT_SIGN_PASSWORD=*** zig build bundle
 ZILT_SIGN_PFX_BASE64=<base64> ZILT_SIGN_PASSWORD=*** zig build bundle   # CI secret
 ```
 
-GUI 冒烟测试（31 项前端检查 + Zig 侧 `smokeResult` 断言，日志 `ALL CHECKS PASSED` 且 exit 0）：
+GUI 冒烟测试（32 项前端检查 + Zig 侧 `smokeResult` 断言，日志 `ALL CHECKS PASSED` 且 exit 0）：
 
 ```sh
 zig build                            # 生成 frontend/bindings/capabilities.json 并嵌入资产
