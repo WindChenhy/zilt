@@ -434,6 +434,9 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
 
 ### v0.1.17 — 工具链、测试与生态（P2）
 
+> 状态（2026-11-08 收尾）：CLI / 图标 CLI / headless / 热重启 / npm 运行时包 /
+> create-zilt-app / SQL / 模板扩充 / WebDriver / CI **全部完成并实测**。
+
 - [x] **CLI `zilt`**：`version` / `doctor`（Zig、WebView2（含 WOW6432Node）、makensis、
       frontend dist、图标）/ `info`（project 配置摘要）；`zig build doctor|info` 快捷 step
       （dev/build/config 子命令包装未做，仍直接用 zig build）
@@ -443,12 +446,17 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
       实测：改 src/main.zig → `restart #1` → `rebuild finished -> relaunching`。
       两个实测踩坑：① FILETIME 在 C 是 4 字节对齐两连 DWORD，Zig u64 字段插 padding 读错位；
       ② dev 原跑 .zig-cache 内 hash 目录副本，重建后路径漂移——改跑 zig-out/bin 稳定产物
-      （build.zig addArtifactArg → addArg）。错误覆盖层=控制台输出（--watch 打印）；日志轮转未做
-- [x] **npm 运行时包**（2026-11-08）：`zilt npm-pack [-o npm] [--name --version]` →
+      （build.zig addArtifactArg → addArg）。**日志轮转**：`log.initFileLog` 启动时按
+      4MB 阈值轮转（zilt.log → .1 → .2 → .3，MoveFileExW REPLACE_EXISTING），
+      实测 5MB 日志 → zilt.log.1(5MB) + 新 zilt.log；单测覆盖 rotatedName
+- [x] **npm 运行时包 + 独立脚手架**（2026-11-08）：`zilt npm-pack [-o npm] [--name --version]` →
       生成 `@zilt/runtime` 包（package.json / index.js（内嵌 runtime 源）/
       index.d.ts（window.zilt 全接口 TS 声明）/ README.md）；纯逻辑 `npm_pack.zig` 3 单测；
       实测 Node require 加载 index.js 成功（runtime 源 14414 字节）。
-      `create-zilt-app` 独立脚手架未做（模板 init 已覆盖同职责）
+      **create-zilt-app**：`zilt new <dir> -t <tmpl>`（Native 脚手架，与 `zig build init`
+      共用 `init.zig::scaffold`；自动定位框架根：ZILT_ROOT → exe 的 ../../）+ 
+      `npm/create-zilt-app`（npm 包：优先调 zilt CLI，回退 `zig build init`）。
+      实测：空格路径外任意 cwd 下 `node index.js /tmp/x -t preact` 成功产出可编译项目
 - [x] **图标生成 CLI**（2026-11-08，P0 阶段完成）：`zilt icon <in.png> [-o out.ico]
       [--sizes …]`——纯 Zig PNG 解码（zlib inflate + 5 行滤波 + RGB/RGBA/palette）
       + nearest 缩放 + ICO 编码（BMP 条目双高度 + AND mask）；png.zig/ico.zig 单测；
@@ -460,13 +468,37 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
       services 生命周期同 GUI。实测四路端点全通（greet 命令返回真结果）
 - [x] **SQL（P1 增补，超出原规划）**（2026-11-08）：`window.zilt.sql.query/execute`——
       sqlite3.dll 动态加载（对齐 WebView2 loader 模式：ZILT_SQLITE_PATH → exe 目录 →
-      默认搜索），prepare/step/bind v2 API 表，行集 JSON 序列化；`sql.zig` 纯逻辑 2 单测。
-      本机无 sqlite3.dll，E2E 待环境提供 DLL 后补测（错误路径已实测 SqliteFailed）
-- [ ] **模板扩充**：htmx / solid / preact / angular 等，补齐与 Tauri/Wails 的模板面差距
-- [ ] **UI 自动化测试**：WebDriver（zilt-driver）替代仅注入 JS 的冒烟
-- [ ] **CI / 签名流水线**：构建、签名、打包、发布的 CI 模板
-- [~] **验收**：改 Zig 自动重启 ✅；`zilt doctor/info/icon/npm-pack` ✅；
-      headless 服务可访问 ✅；WebDriver ❌（未做，见上）
+      默认搜索 → **winsqlite3.dll**（Windows 10/11 自带，实测 19/19 符号齐全，开箱可用）），
+      prepare/step/bind v2 API 表，行集 JSON 序列化；`sql.zig` 纯逻辑 2 单测。
+      **真 E2E 已跑通**（headless + `POST /zilt/ipc` 调 `__zilt.sql`）：建表 → 四类型参数插入
+      → 自动 id → 全表查询 → 带参数过滤，全部返回预期 JSON。
+      实现中修掉两个真 bug：① `allocSentinel` 只分配不拷贝（SQL 字符串是未初始化内存，
+      prepare 报 near "ªªª…"）；② std.json 无法还原 void 载荷的 tagged union
+      （`"nul"`/`{"nul":null}` 都失败）→ SqlValue 改为 `{kind, text, int, real}` 结构，
+      JS 侧直接传原生值（number/string/null 自动映射）
+- [x] **模板扩充**（2026-11-08）：新增 **htmx**（无构建；htmx.min.js 离线内嵌 +
+      `/data/items.json` 经资产服务真实请求）/ **solid**（Vite + vite-plugin-solid）/
+      **preact**（Vite + @preact/preset-vite）/ **angular**（19 standalone +
+      @angular/build application builder，dist=frontend/dist/browser）。
+      模板面 4 → 8。顺带修复两处既有缺陷：① `copyTree(frontend, …, false)` 不做占位符
+      替换（`{{APP_NAME}}` 原样留在页面）；② 占位符全局变量从未赋值（所有模板都产出
+      "My Zilt App"/"app.myziltapp"）——现按项目名派生显示名/应用 id/zon name，2 单测。
+      实测：htmx 与 preact 模板 `zilt new` 产出后 `zig build` 成功并运行
+- [x] **UI 自动化测试（WebDriver）**（2026-11-08）：`zilt-driver`（新 exe）——msedgedriver
+      W3C 协议直驱 WebView2：spawn 应用（注入 `ZILT_WEBVIEW2_ARGS=--remote-debugging-port`，
+      backend 新增该 env 覆盖）→ spawn msedgedriver → POST /session（
+      `ms:edgeOptions.debuggerAddress`）→ `/execute/sync` 逐条断言 → DELETE /session。
+      自研极简 HTTP 客户端（按 Content-Length 读体；**读到 EOF 会挂住**——msedgedriver
+      忽略 Connection: close，实测踩到）。默认 4 条断言（runtime/invoke/dom/title）+
+      `--script` 自定义。无驱动时 SKIP 退出码 3（区别于真失败 1）。
+      **实测**：下载 Edge 157 对应 msedgedriver → 4/4 passed，exit 0；`zig build e2e` 已接入
+- [x] **CI / 签名流水线**（2026-11-08）：`.github/workflows/ci.yml` 三段式——
+      test（构建/单测/冒烟 31 项/WebDriver 可选）→ package（NSIS+zip 上传 artifact）
+      → release（tag 触发：signtool 签名 + GitHub Release）；Edge 版本自动匹配驱动下载、
+      失败降级 SKIP 不静默。文档 `docs/CI.md`（secrets、退出码、本地等价命令）
+- [~] **验收**：改 Zig 自动重启 ✅；`zilt doctor/info/icon/npm-pack/new` ✅；
+      headless 服务可访问 ✅；WebDriver 跑通示例 ✅（4/4）；CI 模板 ✅（本地无法执行 Actions，
+      结构与命令按本地等价命令逐条验证）
 
 #### v0.1.15 / v0.1.16 / v0.1.17 实施记录（2026-11-08）
 

@@ -1,0 +1,24 @@
+{
+  "name": "create-zilt-app",
+  "version": "0.1.17",
+  "description": "Scaffold a Zilt desktop app (Zig + system WebView)",
+  "type": "module",
+  "bin": {
+    "create-zilt-app": "index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "zilt",
+    "zig",
+    "desktop",
+    "webview",
+    "scaffold"
+  ],
+  "license": "MIT"
+}

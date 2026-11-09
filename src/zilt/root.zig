@@ -82,6 +82,7 @@ test {
     _ = @import("services.zig");
     _ = @import("sql.zig");
     _ = @import("npm_pack.zig");
+    _ = @import("log.zig");
     _ = @import("ipc.zig");
     _ = @import("bindings.zig");
     _ = @import("bundler.zig");

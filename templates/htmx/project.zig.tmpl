@@ -1,0 +1,21 @@
+//! 项目元数据与前端工程配置（htmx：无构建步骤，frontend/ 即 dist）。
+
+pub const app_name = "{{APP_NAME}}";
+pub const publisher = "{{APP_NAME}}";
+pub const version = "{{VERSION}}";
+pub const app_id = "{{APP_ID}}";
+pub const exe_name = "app.exe";
+
+// 应用图标（.ico，相对项目根）。null = 内置 Zig 官方图标（窗口/托盘/exe 资源共用）。
+pub const icon: ?[]const u8 = null;
+
+pub const frontend = .{
+    .dir = "frontend",
+    .dist = "frontend",
+    .dev_command = @as(?[]const u8, null),
+    .dev_url = @as(?[]const u8, null),
+    .build_command = @as(?[]const u8, null),
+    // 反代 dev 模式（Phase C）：true = 注入 ZILT_DEV_PROXY——应用保持自身 origin，资产请求转发 dev_url
+    .dev_proxy = false,
+    .wait_timeout_secs = 90,
+};

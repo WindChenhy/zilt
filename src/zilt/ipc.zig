@@ -711,6 +711,15 @@ pub const runtime_js =
     \\  let nextId = 1;
     \\  let httpSeq = 0;
     \\  let wsSeq = 0;
+    \\  // SQL 参数编码：原生值 → Zig 侧 {kind:'text'|'int'|'real'|'nul', ...}
+    \\  const ziltSqlParam = (v) => {
+    \\    if (v === null || v === undefined) return { kind: 'nul' };
+    \\    if (typeof v === 'number') return Number.isInteger(v) ? { kind: 'int', int: v } : { kind: 'real', real: v };
+    \\    if (typeof v === 'string') return { kind: 'text', text: v };
+    \\    if (typeof v === 'boolean') return { kind: 'int', int: v ? 1 : 0 };
+    \\    if (v instanceof Date) return { kind: 'text', text: v.toISOString() };
+    \\    return v;
+    \\  };
     \\  const post = (m) => window.chrome.webview.postMessage(m);
     \\  window.chrome.webview.addEventListener('message', (e) => {
     \\    const m = e.data;
@@ -952,11 +961,11 @@ pub const runtime_js =
     \\      list: () => builtin('__zilt.process', { action: 'list' }),
     \\      on: (id, cb) => window.zilt.on('processEvent', (p) => { if (p && p.id === id) cb(p); }),
     \\    },
-    \\    // v0.1.17: SQL（SQLite）。params 取值形态：{text}/{int}/{real}/{nul}。
-    \\    // query 返回行集数组；execute 返回 {changes,last_id}。sqlite3.dll 缺失时 reject。
+    \\    // v0.1.17: SQL（SQLite）。params 直接传原生值：number→int/real、string→text、
+    \\    // null→nul；也可显式传 {text}/{int}/{real}/'nul' 标记形态。
     \\    sql: {
-    \\      query: (db, sql, params) => builtin('__zilt.sql', { action: 'query', db, sql, params: params ?? [] }),
-    \\      execute: (db, sql, params) => builtin('__zilt.sql', { action: 'execute', db, sql, params: params ?? [] }),
+    \\      query: (db, sql, params) => builtin('__zilt.sql', { action: 'query', db, sql: String(sql), params: (params ?? []).map(ziltSqlParam) }),
+    \\      execute: (db, sql, params) => builtin('__zilt.sql', { action: 'execute', db, sql: String(sql), params: (params ?? []).map(ziltSqlParam) }),
     \\    },
     \\    version: '0.1.17',
     \\  };

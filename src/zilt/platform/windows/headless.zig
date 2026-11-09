@@ -18,6 +18,34 @@ const services_mod = @import("../../services.zig");
 
 const log = zilt.log;
 const ipc = zilt.ipc;
+const builtin_commands = zilt.builtin_commands;
+const shared_system = zilt.system_api;
+const win_sqlite = @import("sqlite.zig");
+
+/// headless 的系统能力：SQL 直接本地执行（无窗口可依赖）；其余一律 Unsupported。
+/// 前端在 GUI 模式拿到的系统 API 面不变，headless 只是最小可用子集。
+fn headlessSystem(backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator, req: shared_system.Request) anyerror!shared_system.Result {
+    _ = backend;
+    _ = window_id;
+    return switch (req) {
+        .sql => |op| {
+            const q = switch (op) {
+                .query => |x| x,
+                .execute => |x| x,
+            };
+            const want_rows = switch (op) {
+                .query => true,
+                .execute => false,
+            };
+            const out = win_sqlite.run(alloc, q.db, q.sql, q.params, want_rows) catch |e| {
+                log.print("[headless:sql] failed: {s} (db={s})", .{ @errorName(e), q.db });
+                return e;
+            };
+            return .{ .json = out };
+        },
+        else => error.UnsupportedInHeadless,
+    };
+}
 
 const DEFAULT_PORT: u16 = 8790;
 const MAX_HEADER: usize = 16 * 1024;
@@ -197,7 +225,25 @@ fn handleIpc(
         .window_id = 0,
         .emit_fn = headlessEmit,
         .quit_fn = headlessQuit,
+        .system_fn = headlessSystem,
     };
+
+    // 与 GUI 一致：内建方法（__zilt.*）优先，其次应用命令。
+    if (builtin_commands.isBuiltin(method)) {
+        const builtin_result = builtin_commands.dispatch(ctx, method, args_json) catch |e| {
+            log.print("[headless:ipc] builtin {s} failed: {s}", .{ method, @errorName(e) });
+            const msg = std.fmt.allocPrint(alloc, "{{\"error\":\"{s}\"}}", .{@errorName(e)}) catch "{}";
+            defer alloc.free(msg);
+            try respond(out, 500, "application/json", msg);
+            return;
+        };
+        if (builtin_result) |res| {
+            defer alloc.free(res);
+            log.print("[headless:ipc] {s} (builtin) -> {d} bytes", .{ method, res.len });
+            try respond(out, 200, "application/json", res);
+            return;
+        }
+    }
 
     const result = ipc.dispatch(config.commands, ctx, method, args_json) catch |e| {
         log.print("[headless:ipc] {s} failed: {s}", .{ method, @errorName(e) });

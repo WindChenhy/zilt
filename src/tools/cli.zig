@@ -54,6 +54,7 @@ pub fn main() !u8 {
     if (eql(u8, cmd, "info")) return runInfo();
     if (eql(u8, cmd, "icon")) return runIcon(alloc, args.items[1..]);
     if (eql(u8, cmd, "npm-pack")) return runNpmPack(alloc, args.items[1..]);
+    if (eql(u8, cmd, "new")) return runNew(alloc, args.items[1..]);
     if (eql(u8, cmd, "help") or eql(u8, cmd, "--help") or eql(u8, cmd, "-h")) {
         printHelp();
         return 0;
@@ -390,4 +391,84 @@ fn runNpmPack(alloc: std.mem.Allocator, args: []const []u8) !u8 {
     }
     print("zilt npm-pack: package ready -> cd {s} && npm pack\n", .{out_dir});
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// v0.1.17：new 子命令 —— 独立脚手架（create-zilt-app 的 Zig 侧实现）。
+// 与 `zig build init` 共用 init.zig 的 scaffold；必须在框架仓库根执行。
+// ---------------------------------------------------------------------------
+
+fn runNew(alloc: std.mem.Allocator, args: []const []u8) !u8 {
+    const init_mod = @import("init.zig");
+    var template: []const u8 = "vanilla";
+    var name: []const u8 = "my-zilt-app";
+    var dest: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "-t") or std.mem.eql(u8, a, "--template")) {
+            i += 1;
+            if (i >= args.len) {
+                print("zilt new: -t needs a template name\n", .{});
+                return 2;
+            }
+            template = args[i];
+        } else if (std.mem.eql(u8, a, "-n") or std.mem.eql(u8, a, "--name")) {
+            i += 1;
+            if (i >= args.len) {
+                print("zilt new: -n needs a name\n", .{});
+                return 2;
+            }
+            name = args[i];
+        } else if (std.mem.eql(u8, a, "--list")) {
+            print("templates:", .{});
+            for (init_mod.templates_available, 0..) |t, j| {
+                print("{s}{s}", .{ if (j == 0) " " else "/", t });
+            }
+            print("\n", .{});
+            return 0;
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            print("zilt new: unknown option '{s}'\n", .{a});
+            return 2;
+        } else {
+            dest = a;
+        }
+    }
+    if (dest) |d| {
+        // 目录名即默认项目名（未显式 -n 时）
+        if (std.mem.eql(u8, name, "my-zilt-app")) name = std.fs.path.basename(d);
+    }
+    // 脚手架源是「框架仓库根」下的 src/zilt、src/tools、templates/：
+    // 若当前目录不在根上，尝试从 exe 位置推导（<root>/zig-out/bin/zilt.exe）。
+    chdirToFrameworkRoot(alloc);
+    init_mod.scaffold(template, name, dest) catch |e| {
+        print("zilt new: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    return 0;
+}
+
+/// 把 cwd 切到框架仓库根。优先 ZILT_ROOT，其次 exe 的 ../../（zig-out/bin 布局）。
+/// 找不到时保持原 cwd（scaffold 会以 SourceMissing 报错）。
+fn chdirToFrameworkRoot(alloc: std.mem.Allocator) void {
+    if (win32.getEnvUtf8(alloc, "ZILT_ROOT")) |root| {
+        defer alloc.free(root);
+        const w = std.unicode.utf8ToUtf16LeAllocZ(alloc, root) catch return;
+        defer alloc.free(w);
+        _ = win32.SetCurrentDirectoryW(w.ptr);
+        return;
+    }
+    var buf: [win32.MAX_PATH_W]u16 = undefined;
+    const n = win32.GetModuleFileNameW(null, &buf, buf.len);
+    if (n == 0 or n >= buf.len) return;
+    const exe = std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..n]) catch return;
+    defer alloc.free(exe);
+    // <root>\zig-out\bin\zilt.exe → <root>
+    var dir = std.fs.path.dirname(exe) orelse return; // ...\zig-out\bin
+    dir = std.fs.path.dirname(dir) orelse return; // ...\zig-out
+    const root = std.fs.path.dirname(dir) orelse return; // <root>
+    const w = std.unicode.utf8ToUtf16LeAllocZ(alloc, root) catch return;
+    defer alloc.free(w);
+    _ = win32.SetCurrentDirectoryW(w.ptr);
 }

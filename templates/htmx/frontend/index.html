@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>{{APP_NAME}}</title>
+<link rel="stylesheet" href="/styles.css">
+<!-- htmx 已随模板内嵌（离线可用），见 frontend/htmx.min.js -->
+<script src="/htmx.min.js"></script>
+</head>
+<body>
+  <h1>{{APP_NAME}}</h1>
+  <p class="sub">Zilt · htmx 前端（无构建步骤）· 纯 Zig 后端</p>
+
+  <section>
+    <h2>htmx 请求本地资产</h2>
+    <p>htmx 的 GET 直接打到 Zilt 资产服务（<code>/data/items.json</code>），无需外部服务器。</p>
+    <button hx-get="/data/items.json" hx-target="#items" hx-swap="innerHTML"
+            hx-trigger="click, load">加载 items</button>
+    <ul id="items"></ul>
+  </section>
+
+  <section>
+    <h2>htmx ↔ Zig 命令</h2>
+    <button hx-on:click="ziltGreet()">greet → Zig</button>
+    <button hx-on:click="window.zilt.invoke('notifyMe',{title:'{{APP_NAME}}',body:'来自 Zig 的系统通知'})">系统通知</button>
+    <div id="out" class="mono"></div>
+  </section>
+
+  <!-- items.json 渲染钩子：htmx 拿到 JSON 后由 hx-swap 直接插入不友好，
+       这里用 afterRequest 事件把 JSON 转成列表 -->
+  <script src="/main.js"></script>
+</body>
+</html>

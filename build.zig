@@ -247,6 +247,27 @@ pub fn build(b: *std.Build) void {
     gen_step.dependOn(&cap_run.step);
     b.getInstallStep().dependOn(&cap_run.step);
 
+    // ---- v0.1.17：WebDriver 自动化驱动（msedgedriver W3C 协议） ----
+    const driver_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/driver.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    driver_mod.linkSystemLibrary("shell32", .{});
+    const driver_exe = b.addExecutable(.{
+        .name = "zilt-driver",
+        .root_module = driver_mod,
+    });
+    const driver_install = b.addInstallArtifact(driver_exe, .{});
+    b.getInstallStep().dependOn(&driver_install.step);
+
+    // e2e：对构建产物跑 WebDriver（无 msedgedriver 时 SKIP）
+    const e2e_run = b.addRunArtifact(driver_exe);
+    e2e_run.addArg(b.fmt("zig-out\\bin\\{s}.exe", .{exe.name}));
+    e2e_run.step.dependOn(b.getInstallStep());
+    const e2e_step = b.step("e2e", "Run WebDriver E2E against the built app (SKIP without msedgedriver)");
+    e2e_step.dependOn(&e2e_run.step);
+
     // ---- dev：spawn dev 命令 → TCP 等待 → 应用直连 devUrl（HMR） ----
     const dev_mod = b.createModule(.{
         .root_source_file = b.path("src/tools/dev.zig"),
@@ -259,6 +280,8 @@ pub fn build(b: *std.Build) void {
         .name = "zilt-dev",
         .root_module = dev_mod,
     });
+    // v0.1.17：dev 工具也装到 zig-out/bin（此前只在 zig-cache 里，用户拿不到）
+    b.getInstallStep().dependOn(&b.addInstallArtifact(dev_exe, .{}).step);
     const dev_run = b.addRunArtifact(dev_exe);
     // v0.1.17：跑 zig-out/bin 的真实产物（而非 .zig-cache 内的 hash 目录副本）——
     // 热重启监视/重启都指向同一稳定路径；重建后 install 覆盖该文件即可触发。

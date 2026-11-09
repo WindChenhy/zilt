@@ -8,6 +8,7 @@
 const std = @import("std");
 const win32 = @import("win32.zig");
 const sql = @import("../../sql.zig");
+const log = @import("../../log.zig");
 
 pub const load_error = error{SqliteNotFound};
 
@@ -125,7 +126,8 @@ pub fn load(alloc: std.mem.Allocator) load_error!Lib {
     return error.SqliteNotFound;
 }
 
-/// 候选路径列表（纯逻辑，可单测）：env 覆盖 → exe 目录 → cwd 裸名（默认搜索）。
+/// 候选路径列表（纯逻辑，可单测）：env 覆盖 → exe 目录 → sqlite3.dll
+/// → winsqlite3.dll（Windows 10/11 自带，实测 19/19 符号齐全，开箱可用）。
 pub fn buildCandidates(alloc: std.mem.Allocator) ![]const []u8 {
     var list: std.ArrayListUnmanaged([]u8) = .empty;
     errdefer {
@@ -140,6 +142,7 @@ pub fn buildCandidates(alloc: std.mem.Allocator) ![]const []u8 {
         try list.append(alloc, try std.fmt.allocPrint(alloc, "{s}\\sqlite3.dll", .{dir}));
     }
     try list.append(alloc, try alloc.dupe(u8, "sqlite3.dll"));
+    try list.append(alloc, try alloc.dupe(u8, "winsqlite3.dll"));
     return list.toOwnedSlice(alloc);
 }
 
@@ -180,20 +183,29 @@ pub fn run(
     const db = try open(lib_ptr, db_path, alloc);
     defer close(db);
 
+    // allocSentinel 只分配（末尾补 0），不拷贝内容——必须显式 memcpy
+    // （漏掉会得到未初始化内存，prepare 报 near "ªªª…" 语法错误）
     const stmt_sql_z = try alloc.allocSentinel(u8, stmt_sql.len, 0);
     defer alloc.free(stmt_sql_z);
+    @memcpy(stmt_sql_z[0..stmt_sql.len], stmt_sql);
     var stmt: StmtHandle = null;
-    if (db.lib.prepare(db.handle, stmt_sql_z.ptr, @intCast(stmt_sql_z.len), &stmt, null) != sql.SQLITE_OK) {
+    const rc_prepare = db.lib.prepare(db.handle, stmt_sql_z.ptr, @intCast(stmt_sql_z.len), &stmt, null);
+    if (rc_prepare != sql.SQLITE_OK) {
+        const msg = db.lib.errmsg(db.handle) orelse "";
+        log.print("[sql] prepare failed rc={d} msg={s} sql={s}", .{ rc_prepare, std.mem.span(msg), stmt_sql });
         return error.SqlitePrepareFailed;
     }
     defer _ = db.lib.finalize(stmt);
 
     for (params, 0..) |p, i| {
         const idx: SqlInt = @intCast(i + 1);
-        const rc: SqlInt = switch (p) {
-            .text => |t| db.lib.bind_text(stmt, idx, t.ptr, @intCast(t.len), transient),
-            .int => |v| db.lib.bind_int(stmt, idx, v),
-            .real => |v| db.lib.bind_double(stmt, idx, v),
+        const rc: SqlInt = switch (p.kind) {
+            .text => blk: {
+                const t = p.text orelse "";
+                break :blk db.lib.bind_text(stmt, idx, t.ptr, @intCast(t.len), transient);
+            },
+            .int => db.lib.bind_int(stmt, idx, p.int),
+            .real => db.lib.bind_double(stmt, idx, p.real),
             .nul => db.lib.bind_null(stmt, idx),
         };
         if (rc != sql.SQLITE_OK) return error.SqliteBindFailed;
@@ -235,14 +247,14 @@ pub fn run(
         for (0..ncols) |i| {
             const t = db.lib.column_type(stmt, @intCast(i));
             row[i] = switch (t) {
-                1 => .{ .int = db.lib.column_int64(stmt, @intCast(i)) },
-                2 => .{ .real = db.lib.column_double(stmt, @intCast(i)) },
+                1 => sql.SqlValue.intOf(db.lib.column_int64(stmt, @intCast(i))),
+                2 => sql.SqlValue.realOf(db.lib.column_double(stmt, @intCast(i))),
                 3 => blk: {
-                    const txt = db.lib.column_text(stmt, @intCast(i)) orelse break :blk .{ .nul = {} };
+                    const txt = db.lib.column_text(stmt, @intCast(i)) orelse break :blk sql.SqlValue.nul();
                     const n: usize = @intCast(@max(0, db.lib.column_bytes(stmt, @intCast(i))));
-                    break :blk .{ .text = try alloc.dupe(u8, txt[0..n]) };
+                    break :blk sql.SqlValue.textOf(try alloc.dupe(u8, txt[0..n]));
                 },
-                else => .{ .nul = {} },
+                else => sql.SqlValue.nul(),
             };
         }
         try rows.append(alloc, row);

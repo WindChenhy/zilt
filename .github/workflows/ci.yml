@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: "0.17.1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 构建 + 单测 + 冒烟（Windows runner 自带 WebView2 / Edge，可跑 GUI 冒烟）
+  # ---------------------------------------------------------------------------
+  test:
+    name: Build / Test / Smoke (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Setup Node (frontend build)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: |
+          if (Test-Path package.json) { npm ci --no-audit --no-fund } else { Write-Host "no package.json (vanilla assets)" }
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            ~\AppData\Local\zig
+          key: zig-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+
+      - name: Build (Debug)
+        run: zig build
+
+      - name: Release build
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Smoke test (31 GUI checks)
+        run: |
+          $env:ZILT_SMOKE_TEST_MS = "30000"
+          $env:ZILT_SMOKE_EXIT = "1"
+          & .\zig-out\bin\zilt-app.exe 2> smoke_log.txt
+          $code = $LASTEXITCODE
+          Get-Content smoke_log.txt | Select-String "\[smoke\]" | Select-Object -Last 2
+          if ($code -ne 0) { throw "smoke failed with exit $code" }
+
+      - name: WebDriver E2E (optional — SKIP when driver missing)
+        shell: pwsh
+        run: |
+          # msedgedriver 版本必须匹配 runner 的 Edge：按 Edge 版本下载
+          $edge = @(
+            "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            "C:\Program Files\Microsoft\Edge\Application\msedge.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $edge) { Write-Host "Edge not found — skipping driver E2E"; exit 0 }
+          $ver = (Get-Item $edge).VersionInfo.ProductVersion
+          $dir = "$env:RUNNER_TEMP\edgedriver"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          try {
+            Invoke-WebRequest -UseBasicParsing -Uri "https://msedgedriver.microsoft.com/$ver/edgedriver_win64.zip" -OutFile "$dir\driver.zip" -TimeoutSec 120
+            Expand-Archive -Force "$dir\driver.zip" -DestinationPath $dir
+            $env:ZILT_EDGEDRIVER_PATH = "$dir\msedgedriver.exe"
+          } catch {
+            Write-Host "msedgedriver download failed ($($_.Exception.Message)) — driver E2E SKIP"
+            exit 0
+          }
+          & .\zig-out\bin\zilt-driver.exe .\zig-out\bin\zilt-app.exe 2>&1 | Tee-Object driver.log
+          $code = $LASTEXITCODE
+          if ($code -eq 3) { Write-Host "driver E2E SKIP (no driver)"; exit 0 }
+          if ($code -ne 0) { throw "driver E2E failed with exit $code" }
+
+      - name: Upload smoke/driver logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            smoke_log.txt
+            driver.log
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # 打包（NSIS setup.exe + zip；可选 MSI/MSIX 需要 WiX / Windows SDK）
+  # ---------------------------------------------------------------------------
+  package:
+    name: Package (NSIS + zip)
+    runs-on: windows-latest
+    needs: test
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build frontend
+        run: |
+          if (Test-Path frontend/package.json) { cd frontend; npm ci --no-audit --no-fund; npm run build; cd .. }
+
+      - name: Bundle (NSIS + zip)
+        run: |
+          choco install nsis -y --no-progress
+          zig build -Doptimize=ReleaseFast bundle
+
+      - name: Collect artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zilt-windows-x64
+          path: |
+            dist/*.exe
+            dist/*.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 签名 + 发布（tag 推送时；需要仓库 secrets）
+  #   WINDOWS_CERTIFICATE_BASE64  PFX 的 base64
+  #   WINDOWS_CERTIFICATE_PASSWORD PFX 密码
+  # ---------------------------------------------------------------------------
+  release:
+    name: Sign & Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    needs: package
+    permissions:
+      contents: write
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: zilt-windows-x64
+          path: dist
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Sign artifacts (signtool, RFC3161)
+        if: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' }}
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          # signtool 来自 Windows SDK（runner 预装）
+          $pfx = "$env:RUNNER_TEMP\cert.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
+          $env:ZILT_SIGN_PFX = $pfx
+          $env:ZILT_SIGN_PFX_BASE64 = $env:WINDOWS_CERTIFICATE_BASE64
+          $env:ZILT_SIGN_PASSWORD = $env:WINDOWS_CERTIFICATE_PASSWORD
+          Get-ChildItem dist\*.exe | ForEach-Object {
+            & .\zig-out\bin\zilt-sign.exe $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "sign failed: $($_.Name)" }
+          }
+          Get-ChildItem dist\*.exe | ForEach-Object { Get-AuthenticodeSignature $_.FullName | Select-Object Status, SignerCertificate }
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.exe
+            dist/*.zip
+          draft: false
+          generate_release_notes: true

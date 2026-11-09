@@ -472,6 +472,7 @@ pub fn utf16zFrom(s: []const u8) [:0]u16 {
     return std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, s) catch unreachable;
 }
 pub extern "kernel32" fn GetModuleFileNameW(hModule: HMODULE, lpFilename: [*]u16, nSize: DWORD) callconv(.c) DWORD;
+pub extern "kernel32" fn SetCurrentDirectoryW(lpPathName: LPCWSTR) callconv(.c) BOOL;
 pub extern "kernel32" fn CreateProcessW(
     lpApplicationName: ?LPCWSTR,
     lpCommandLine: ?[*:0]u16,

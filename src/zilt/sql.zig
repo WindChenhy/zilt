@@ -6,13 +6,30 @@
 
 const std = @import("std");
 
-/// 绑定参数值。JSON 形态：{"text":"a"} / {"int":1} / {"real":1.5} / {"nul":null}
-/// （std.json 对 tagged union 的标准映射，JS 侧直接构造对象）。
-pub const SqlValue = union(enum) {
-    text: []const u8,
-    int: i64,
-    real: f64,
-    nul: void,
+/// 绑定参数 / 结果值。用 kind + 可选字段的普通结构（而非 tagged union）——
+/// std.json 对 void 载荷的 union 无法从 JSON 还原（"nul" / {"nul":null} 都失败，
+/// 实测确认），结构形态对前端最友好：{kind:'text',text:'a'} / {kind:'int',int:1}
+/// / {kind:'nul'}。
+pub const SqlValue = struct {
+    kind: Kind = .text,
+    text: ?[]const u8 = null,
+    int: i64 = 0,
+    real: f64 = 0,
+
+    pub const Kind = enum { text, int, real, nul };
+
+    pub fn textOf(s: []const u8) SqlValue {
+        return .{ .kind = .text, .text = s };
+    }
+    pub fn intOf(v: i64) SqlValue {
+        return .{ .kind = .int, .int = v };
+    }
+    pub fn realOf(v: f64) SqlValue {
+        return .{ .kind = .real, .real = v };
+    }
+    pub fn nul() SqlValue {
+        return .{ .kind = .nul };
+    }
 };
 
 /// 一次 query 的结果（全部内存归调用方 allocator）。
@@ -27,15 +44,15 @@ pub const SQLITE_OK: c_int = 0;
 /// sqlite3_open_v2 flags：READWRITE | CREATE
 pub const OPEN_FLAGS: c_int = 0x2 | 0x4;
 
-/// 列值 → JSON 标量（不带列名）。blob 按 text 处理（SQL v1 不区分）。
+/// 列值 → JSON 标量（不带列名）。
 pub fn appendValueJson(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, v: SqlValue) !void {
-    switch (v) {
+    switch (v.kind) {
         .nul => try out.appendSlice(alloc, "null"),
-        .int => |i| try out.print(alloc, "{d}", .{i}),
-        .real => |r| try out.print(alloc, "{d}", .{r}),
-        .text => |t| {
+        .int => try out.print(alloc, "{d}", .{v.int}),
+        .real => try out.print(alloc, "{d}", .{v.real}),
+        .text => {
             try out.append(alloc, '"');
-            try appendJsonEscaped(out, alloc, t);
+            try appendJsonEscaped(out, alloc, v.text orelse "");
             try out.append(alloc, '"');
         },
     }
@@ -83,8 +100,8 @@ pub fn appendJsonEscaped(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Alloca
 test "serializeRows builds named JSON array" {
     const a = std.testing.allocator;
     const columns = [_][]const u8{ "id", "name", "score" };
-    const r0 = [_]SqlValue{ .{ .int = 1 }, .{ .text = "Alice" }, .{ .real = 9.5 } };
-    const r1 = [_]SqlValue{ .{ .int = 2 }, .{ .text = "Bo\"b" }, .{ .nul = {} } };
+    const r0 = [_]SqlValue{ SqlValue.intOf(1), SqlValue.textOf("Alice"), SqlValue.realOf(9.5) };
+    const r1 = [_]SqlValue{ SqlValue.intOf(2), SqlValue.textOf("Bo\"b"), SqlValue.nul() };
     const rows = [_][]const SqlValue{ &r0, &r1 };
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(a);

@@ -266,7 +266,13 @@ pub fn run(comptime config: Config) !void {
     defer alloc.free(udf.utf16);
 
     var env_opts: ?*env_options.EnvironmentOptions = null;
-    const eo = config.environment;
+    var eo = config.environment;
+    // v0.1.17：WebDriver 自动化需要给 WebView2 附加 --remote-debugging-port。
+    // 环境变量覆盖（不重编译）：ZILT_WEBVIEW2_ARGS="--remote-debugging-port=9223"
+    if (win32.getEnvUtf8(alloc, "ZILT_WEBVIEW2_ARGS")) |browser_args| {
+        eo.additional_browser_arguments = browser_args;
+        log.print("[env] ZILT_WEBVIEW2_ARGS={s}", .{browser_args});
+    }
     if (eo.language != null or eo.proxy_server != null or eo.additional_browser_arguments != null or eo.channel != .evergreen or eo.browser_directory != null) {
         env_opts = env_options.EnvironmentOptions.create(alloc, eo) catch |err| blk: {
             log.print("[env] environment options unavailable: {s}", .{@errorName(err)});

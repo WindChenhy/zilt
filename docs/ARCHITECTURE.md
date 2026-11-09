@@ -125,6 +125,9 @@ TS 工程：`zig build gen` 生成 `frontend/bindings/zilt.ts`（全类型命令
 | 资产服务 | custom scheme 拦截（`AddWebResourceRequestedFilter`）+ 内存 IStream 响应；压缩资产首次请求惰性解压 + 进程内缓存，恒以 identity 下发（custom scheme 不走网络栈内容解码，实测见 reference §G.6/G.7）；If-None-Match→304 逻辑就绪（当前通道不回传验证器，休眠） |
 | 反代 dev 模式 | `ZILT_DEV_PROXY=<dev_url>`（config `frontend.dev_proxy`）：应用保持自身 origin，资产请求经 custom scheme 处理器同步转发上游（Content-Type 透传）；keep-alive 死连接重建连接池重试一次；HMR 由模板预置的显式 `server.hmr` 直连 vite ws，热更新模块经代理 `?t=` 重取 |
 | 前端工程化 | `project.zig` Config.Frontend（dir/dist/build_command/dev_command/dev_url/dev_proxy，单一配置源）；`zig build frontend` spawn build_command（cwd=frontend）；`zig build dev` spawn dev_command → TCP 直连 127.0.0.1 探测 → 注入 ZILT_DEV_URL（或 ZILT_DEV_PROXY）→ Job Object 整树清理 |
+| WebDriver 自动化 | `zilt-driver`：msedgedriver（W3C 协议）+ 应用 `--remote-debugging-port`（`ZILT_WEBVIEW2_ARGS`）→ `/session` + `/execute/sync` 断言；无驱动 SKIP(3) |
+| CI 流水线 | `.github/workflows/ci.yml`：test（构建/单测/冒烟/WebDriver）→ package（NSIS+zip）→ tag 签名发布；Edge 版本自动匹配驱动 |
+| 日志轮转 | `log.initFileLog` 启动时 4MB 阈值轮转（`.1/.2/.3`，MoveFileExW） |
 | 项目脚手架 | `zig build init`（ZILT_INIT_TEMPLATE=vanilla\|vue\|react\|svelte ZILT_INIT_NAME=…）：复制模板 + vendored src/zilt、src/tools（项目自包含）+ 占位符替换（APP_NAME/APP_ID/VERSION/ZON_NAME/FINGERPRINT）；指纹算法对齐 Zig 包管理器（高 32 位随机 id + 低 32 位 crc32(zon name)） |
 | 系统能力通道 | `window.zilt.*` 全部归一到 `system_api.Request` union → UI 线程单次 marshal（`WM_ZILT_ACTION`）→ 类型化 `Result` → JSON；新能力只扩一个分支，不给 ipc.Context 加函数指针；capability ACL 在通道入口统一强制 |
 | http（异步） | 后台线程 `std.http.Client.fetch` → `PostMessageW(WM_ZILT_HTTP)` → `httpResponse` 事件 → JS Promise。同步实现会冻结 UI 数秒（IPC 在消息循环里处理）；错误穿透线程→消息→事件→reject 全链路实测 |

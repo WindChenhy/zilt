@@ -50,7 +50,7 @@ const CREATE_ALWAYS: DWORD = 2;
 const alloc = std.heap.page_allocator;
 const BS = "\\"; // 单个反斜杠
 
-pub const templates_available = [_][]const u8{ "vanilla", "vue", "react", "svelte" };
+pub const templates_available = [_][]const u8{ "vanilla", "vue", "react", "svelte", "solid", "preact", "htmx", "angular" };
 
 fn getEnv(alloc2: std.mem.Allocator, name: [:0]const u8) ?[]u8 {
     const nw = std.unicode.utf8ToUtf16LeAllocZ(alloc2, name) catch return null;
@@ -70,6 +70,12 @@ pub fn main() !void {
     const name: []const u8 = getEnv(alloc, "ZILT_INIT_NAME") orelse "my-zilt-app";
     const dest: ?[]const u8 = getEnv(alloc, "ZILT_INIT_DEST");
 
+    return scaffold(template, name, dest);
+}
+
+/// 脚手架核心（`zig build init` 与 `zilt new` 共用）。cwd 必须是框架仓库根
+/// （需要 src/zilt、src/tools、templates/ 作为源）。返回错误由调用方决定退出码。
+pub fn scaffold(template: []const u8, name: []const u8, dest: ?[]const u8) !void {
     var ok = false;
     for (templates_available) |t| {
         if (std.mem.eql(u8, t, template)) ok = true;
@@ -87,6 +93,12 @@ pub fn main() !void {
         return error.BadName;
     }
 
+    // 占位符值由项目名派生（此前全局变量从未赋值，所有模板都产出
+    // "My Zilt App"/"app.myziltapp"——v0.1.17 修复）
+    app_name_value = try displayNameAlloc(alloc, name);
+    app_id_value = try appIdAlloc(alloc, name);
+    zon_name_value = try zonNameAlloc(alloc, name);
+
     const dest_dir = dest orelse try alloc.dupe(u8, name);
     const dest_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, dest_dir);
     _ = CreateDirectoryW(dest_w.ptr, null); // 已存在则报错由后续目录创建兜底
@@ -100,7 +112,7 @@ pub fn main() !void {
 
     // 3) 模板前端 + 模板专属 project.zig（frontend 段按模板差异）
     const tmpl_root = try join2("templates", template);
-    try copyTree(try join2(tmpl_root, "frontend"), try join2(dest_dir, "frontend"), false);
+    try copyTree(try join2(tmpl_root, "frontend"), try join2(dest_dir, "frontend"), true);
     {
         const pz_data = try readFile(try join2(tmpl_root, "project.zig.tmpl"));
         defer alloc.free(pz_data);
@@ -142,9 +154,41 @@ pub fn zonNameAlloc(alloc2: std.mem.Allocator, name: []const u8) ![]u8 {
     return alloc2.dupe(u8, fixed[0..len]);
 }
 
+/// 显示名：按 -/_ 分词，每词首字母大写，空格连接（my-app → My App）。
+pub fn displayNameAlloc(alloc2: std.mem.Allocator, name: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc2);
+    var at_word_start = true;
+    for (name) |c| {
+        if (c == '-' or c == '_') {
+            try out.append(alloc2, ' ');
+            at_word_start = true;
+            continue;
+        }
+        if (at_word_start and c >= 'a' and c <= 'z') {
+            try out.append(alloc2, std.ascii.toUpper(c));
+        } else {
+            try out.append(alloc2, c);
+        }
+        at_word_start = false;
+    }
+    return out.toOwnedSlice(alloc2);
+}
+
+/// 应用 id：app. + 小写去分隔符（my-app → app.myapp）。
+pub fn appIdAlloc(alloc2: std.mem.Allocator, name: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc2);
+    try out.appendSlice(alloc2, "app.");
+    for (name) |c| {
+        if (c == '-' or c == '_') continue;
+        try out.append(alloc2, std.ascii.toLower(c));
+    }
+    return out.toOwnedSlice(alloc2);
+}
+
 /// build.zig.zon 的 name 字段（合法标识符）：小写、非字母数字转 _、数字开头加前缀。
-pub fn zonName(name: []const u8) [64]u8 {
-    var out: [64]u8 = undefined;
+pub fn zonName(name: []const u8) [64]u8 {    var out: [64]u8 = undefined;
     var n: usize = 0;
     for (name) |c| {
         if (n >= out.len) break;
@@ -190,8 +234,10 @@ fn copyTree(src: []const u8, dst: []const u8, replace: bool) !void {
             const dst_path = try join2(dst, name);
             if (is_dir) {
                 try copyTree(src_path, dst_path, replace);
-            } else if (replace and std.mem.endsWith(u8, name, ".tmpl")) {
-                const out_name = name[0 .. name.len - 5];
+            } else if (replace and isTextPlaceholderFile(name)) {
+                // 文本文件同样做占位符替换（此前只处理 .tmpl，frontend/index.html
+                // 里的 {{APP_NAME}} 会原样留在产出页面——实测缺陷，v0.1.17 修复）
+                const out_name = if (std.mem.endsWith(u8, name, ".tmpl")) name[0 .. name.len - 5] else name;
                 const out_path = try join2(dst, out_name);
                 const data = try readFile(src_path);
                 defer alloc.free(data);
@@ -209,6 +255,15 @@ fn copyTree(src: []const u8, dst: []const u8, replace: bool) !void {
 }
 
 /// 占位符替换（Zig shell 文件）。
+/// 仅对文本类扩展名启用（含 .tmpl），二进制资产原样复制。
+fn isTextPlaceholderFile(name: []const u8) bool {
+    const exts = [_][]const u8{ ".tmpl", ".html", ".htm", ".js", ".jsx", ".ts", ".tsx", ".json", ".css", ".vue", ".svelte", ".md", ".txt", ".xml", ".yml", ".yaml" };
+    for (exts) |e| {
+        if (std.mem.endsWith(u8, name, e)) return true;
+    }
+    return false;
+}
+
 pub fn replacePlaceholders(alloc2: std.mem.Allocator, data: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc2);
@@ -357,4 +412,20 @@ fn writeFile(path: []const u8, data: []const u8) !void {
     defer _ = CloseHandle(f);
     var written: DWORD = 0;
     if (WriteFile(f, data.ptr, @intCast(data.len), &written, null) == 0) return error.WriteFailed;
+}
+
+test "displayNameAlloc / appIdAlloc 派生" {
+    const a = std.testing.allocator;
+    const d1 = try displayNameAlloc(a, "my-app");
+    defer a.free(d1);
+    try testing.expectEqualStrings("My App", d1);
+    const d2 = try displayNameAlloc(a, "zilt_demo");
+    defer a.free(d2);
+    try testing.expectEqualStrings("Zilt Demo", d2);
+    const id1 = try appIdAlloc(a, "my-app");
+    defer a.free(id1);
+    try testing.expectEqualStrings("app.myapp", id1);
+    const id2 = try appIdAlloc(a, "Zilt_Demo");
+    defer a.free(id2);
+    try testing.expectEqualStrings("app.ziltdemo", id2);
 }

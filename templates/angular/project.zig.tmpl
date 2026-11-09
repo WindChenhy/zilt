@@ -1,0 +1,20 @@
+//! 项目元数据与前端工程配置（Angular 19 standalone + application builder）。
+
+pub const app_name = "{{APP_NAME}}";
+pub const publisher = "{{APP_NAME}}";
+pub const version = "{{VERSION}}";
+pub const app_id = "{{APP_ID}}";
+pub const exe_name = "app.exe";
+
+pub const icon: ?[]const u8 = null;
+
+pub const frontend = .{
+    .dir = "frontend",
+    // @angular/build:application + outputPath.base=dist → dist/browser
+    .dist = "frontend/dist/browser",
+    .dev_command = @as(?[]const u8, "npm start -- --port 4200"),
+    .dev_url = @as(?[]const u8, "http://localhost:4200"),
+    .build_command = @as(?[]const u8, "npm run build"),
+    .dev_proxy = false,
+    .wait_timeout_secs = 120,
+};

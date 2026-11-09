@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.17（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs/path/log/opener/windowState 周边 API + 更新器通道/崩溃回滚/健康确认 + 代码签名（签名产物已实测 Authenticode + RFC3161）+ MSI（WiX 3.14 自动 vendor，安装/卸载实测）+ MSIX（makeappx，松散注册实测）+ services 生命周期 + http（异步）+ websocket 客户端 + 单窗口多 WebView + 前端对话框/子进程/图标生成 CLI + SQL（SQLite 动态加载）+ headless/server 模式 + 热重启 dev + npm 运行时包 + `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.1.17（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs/path/log/opener/windowState 周边 API + 更新器通道/崩溃回滚/健康确认 + 代码签名（签名产物已实测 Authenticode + RFC3161）+ MSI（WiX 3.14 自动 vendor，安装/卸载实测）+ MSIX（makeappx，松散注册实测）+ services 生命周期 + http（异步）+ websocket 客户端 + 单窗口多 WebView + 前端对话框/子进程/图标生成 CLI + SQL（SQLite 动态加载）+ headless/server 模式 + 热重启 dev + npm 运行时包/脚手架 + SQL + 8 套模板 + WebDriver 自动化 + CI 流水线 + `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 
@@ -19,11 +19,15 @@ v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 v0.1.17 新增（2026-11-08，均已实现、验证并提交）：
 
 - **P0 补齐**（对齐 Wails3/Tauri2 差距）：`window.zilt.dialog`（messageBox/openFile/saveFile/pickFolder/pickFiles，UI 线程模态）、`window.zilt.process`（spawn/kill/list，stdout/stderr/exit 走事件流，kill=TerminateProcess，应用退出强杀残留）、`zilt icon`（PNG→多尺寸 .ico，纯 Zig PNG 解码 + ICO 编码，CreateIconFromResourceEx 实测返回真实 HICON）
-- **SQL**：`window.zilt.sql.query/execute`——sqlite3.dll 运行时动态加载（ZILT_SQLITE_PATH → exe 目录 → 默认搜索，对齐 WebView2 loader 模式），行集 JSON 序列化，`{text}/{int}/{real}/{nul}` 绑定参数
+- **SQL**：`window.zilt.sql.query/execute`——sqlite3.dll 运行时动态加载（ZILT_SQLITE_PATH → exe 目录 → **winsqlite3.dll**，Windows 10/11 自带开箱可用），行集 JSON 序列化，参数直接传原生值（number/string/null 自动映射）；headless 下 `POST /zilt/ipc` 调 `__zilt.sql` 完成真 E2E（建表/四类型插入/自动 id/参数过滤）
 - **headless/server 模式**：`ZILT_HEADLESS=1` 跳过窗口/COM 跑 HTTP 服务（127.0.0.1，默认 8790）——`/zilt/health`、`/zilt/info`、POST `/zilt/ipc`（与前端 invoke 同一 dispatch 链路）、`/*` 资产服务；services 生命周期同 GUI；四路端点实测全通
 - **热重启 dev**：`ZILT_DEV_WATCH=1 zig build dev`——spawn `zig build --watch` + 自盯 `src/**.zig` mtime，变更→先杀应用解锁 exe→等 install→重新拉起（实测 restart #1 全链路）；修复 FILETIME 4 字节对齐陷阱与 .zig-cache hash 路径漂移
-- **npm 运行时包**：`zilt npm-pack` 生成 `@zilt/runtime`（package.json/index.js 内嵌 runtime 源/index.d.ts 全接口声明/README），Node require 实测通过
-- **验收**：单元测试 231/231（框架 214 + 工具 17）；GUI 冒烟 **31 项** ALL PASSED（exit 0，新增子进程检查）；`zilt version` 报 0.1.17
+- **npm 运行时包 + 脚手架**：`zilt npm-pack` 生成 `@zilt/runtime`（Node require 实测）；`zilt new <dir> -t <tmpl>` 与 `npm/create-zilt-app`（优先 zilt CLI，回退 `zig build init`），自动定位框架根
+- **模板扩充**：4 → 8 个模板——新增 **htmx**（离线内嵌 htmx.min.js + 资产服务真实请求）、**solid**、**preact**、**angular 19**（standalone + application builder）；顺带修复占位符从未替换/从未赋值两处既有缺陷
+- **WebDriver 自动化**：`zilt-driver`（新 exe）走 msedgedriver W3C 协议直驱 WebView2（`ZILT_WEBVIEW2_ARGS` 注入调试端口 + `ms:edgeOptions.debuggerAddress`），默认 4 条断言 + `--script` 自定义，无驱动 SKIP(3)；**实测 4/4 passed**；`zig build e2e` 接入
+- **CI / 签名流水线**：`.github/workflows/ci.yml`（test 构建+单测+冒烟+可选 WebDriver → package NSIS+zip → tag 签名发布）+ `docs/CI.md`
+- **日志轮转**：4MB 阈值，zilt.log → .1 → .2 → .3（实测 5MB 日志轮转）
+- **验收**：单元测试 **233/233**（框架 215 + 工具 18）；GUI 冒烟 **31 项** ALL PASSED（exit 0）；WebDriver 4/4；headless 四端点 + SQL 真 E2E；日志轮转实测；`zilt version` 报 0.1.17
 
 v0.1.8–v0.1.12 新增（2026-11-08，均已实现、验证并提交）：
 

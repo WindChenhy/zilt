@@ -1,0 +1,5 @@
+[
+  { "name": "Zilt", "desc": "Zig + 系统 WebView 桌面框架" },
+  { "name": "htmx", "desc": "HTML 属性驱动的交互，无需构建" },
+  { "name": "IPC", "desc": "window.zilt.invoke → Zig 命令" }
+]
