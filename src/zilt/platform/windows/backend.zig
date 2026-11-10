@@ -471,6 +471,158 @@ fn isEditClass(cls_utf16: []const u16) bool {
     return std.mem.eql(u8, name, "Edit") or std.mem.startsWith(u8, name, "RichEdit");
 }
 
+// ---- v0.1.19：文件系统辅助（fs 全量操作） ----
+
+/// FILETIME（1601 起 100ns）→ Unix 毫秒。
+fn fileTimeToUnixMs(ft: win32.FILETIME) i64 {
+    const v = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    if (v == 0) return 0;
+    const ms: i64 = @intCast(v / 10_000);
+    return ms - 11_644_473_600_000;
+}
+
+/// 逐段创建目录（PowerShell 风格 mkdir -p）。
+fn mkdirAllPath(alloc: std.mem.Allocator, path: []const u8) bool {
+    if (path.len == 0) return false;
+    const buf = alloc.dupe(u8, path) catch return false;
+    defer alloc.free(buf);
+    var start: usize = 0;
+    // 跳过盘符（C:）与 UNC 前缀
+    if (buf.len >= 2 and buf[1] == ':') start = 2;
+    var i = start;
+    while (i < buf.len) : (i += 1) {
+        if (buf[i] != '\\' or i == start) continue;
+        if (i + 1 >= buf.len) break;
+        const cut = i;
+        const w = std.unicode.utf8ToUtf16LeAllocZ(alloc, buf[0..cut]) catch return false;
+        defer alloc.free(w);
+        _ = win32.CreateDirectoryW(w.ptr, null);
+    }
+    const w = std.unicode.utf8ToUtf16LeAllocZ(alloc, buf) catch return false;
+    defer alloc.free(w);
+    if (win32.CreateDirectoryW(w.ptr, null) != 0) return true;
+    return win32.GetLastError() == win32.ERROR_ALREADY_EXISTS;
+}
+
+/// 递归删除（文件或目录树）。
+fn deleteTree(alloc: std.mem.Allocator, path: []const u8) bool {
+    const w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return false;
+    defer alloc.free(w);
+    if (win32.DeleteFileW(w.ptr) != 0) return true;
+
+    const pattern = std.fmt.allocPrint(alloc, "{s}\\*", .{path}) catch return false;
+    defer alloc.free(pattern);
+    const pw = std.unicode.utf8ToUtf16LeAllocZ(alloc, pattern) catch return false;
+    defer alloc.free(pw);
+
+    var fd: win32.WIN32_FIND_DATAW = undefined;
+    const h = win32.FindFirstFileW(pw.ptr, &fd);
+    if (h == win32.INVALID_HANDLE_VALUE) return win32.RemoveDirectoryW(w.ptr) != 0;
+    defer _ = win32.FindClose(h);
+
+    var ok = true;
+    while (true) {
+        const name = std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.sliceTo(&fd.cFileName, 0)) catch {
+            ok = false;
+            break;
+        };
+        defer alloc.free(name);
+        if (!std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..")) {
+            const child = std.fmt.allocPrint(alloc, "{s}\\{s}", .{ path, name }) catch {
+                ok = false;
+                break;
+            };
+            defer alloc.free(child);
+            if (fd.dwFileAttributes & win32.FILE_ATTRIBUTE_DIRECTORY != 0) {
+                if (!deleteTree(alloc, child)) ok = false;
+            } else {
+                const cw = std.unicode.utf8ToUtf16LeAllocZ(alloc, child) catch {
+                    ok = false;
+                    break;
+                };
+                defer alloc.free(cw);
+                if (win32.DeleteFileW(cw.ptr) == 0) ok = false;
+            }
+        }
+        if (win32.FindNextFileW(h, &fd) == 0) break;
+    }
+    if (!ok) return false;
+    return win32.RemoveDirectoryW(w.ptr) != 0;
+}
+
+/// exe 所在目录（fs scope = exe）。
+fn exeDirAlloc(alloc: std.mem.Allocator) ?[]u8 {
+    var buf: [1024]u16 = @splat(0);
+    const n = win32.GetModuleFileNameW(null, &buf, buf.len);
+    if (n == 0) return null;
+    const path = std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..n]) catch return null;
+    defer alloc.free(path);
+    const idx = std.mem.lastIndexOfScalar(u8, path, '\\') orelse return null;
+    return alloc.dupe(u8, path[0..idx]) catch null;
+}
+
+/// 文件大小（不存在/是目录返回 null）。
+fn fileSizeOf(alloc: std.mem.Allocator, path: []const u8) ?u64 {
+    const w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return null;
+    defer alloc.free(w);
+    var data: win32.WIN32_FILE_ATTRIBUTE_DATA = std.mem.zeroes(win32.WIN32_FILE_ATTRIBUTE_DATA);
+    if (win32.GetFileAttributesExW(w.ptr, 0, &data) == 0) return null;
+    if (data.dwFileAttributes & win32.FILE_ATTRIBUTE_DIRECTORY != 0) return null;
+    return (@as(u64, data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+}
+
+/// 目录列表 JSON：[{name,dir,size,modified}]
+fn listDirJson(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '[');
+
+    const pattern = try std.fmt.allocPrint(alloc, "{s}\\*", .{path});
+    defer alloc.free(pattern);
+    const pw = try std.unicode.utf8ToUtf16LeAllocZ(alloc, pattern);
+    defer alloc.free(pw);
+
+    var fd: win32.WIN32_FIND_DATAW = undefined;
+    const h = win32.FindFirstFileW(pw.ptr, &fd);
+    if (h != win32.INVALID_HANDLE_VALUE) {
+        defer _ = win32.FindClose(h);
+        var first = true;
+        while (true) {
+            const name = try std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.sliceTo(&fd.cFileName, 0));
+            defer alloc.free(name);
+            if (!std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..")) {
+                const is_dir = fd.dwFileAttributes & win32.FILE_ATTRIBUTE_DIRECTORY != 0;
+                const size: u64 = if (is_dir) 0 else (@as(u64, fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+                const modified = fileTimeToUnixMs(fd.ftLastWriteTime);
+                if (!first) try out.append(alloc, ',');
+                first = false;
+                const name_json = try std.json.Stringify.valueAlloc(alloc, name, .{});
+                defer alloc.free(name_json);
+                try out.print(alloc, "{{\"name\":{s},\"dir\":{s},\"size\":{d},\"modified\":{d}}}", .{
+                    name_json, if (is_dir) "true" else "false", size, modified,
+                });
+            }
+            if (win32.FindNextFileW(h, &fd) == 0) break;
+        }
+    }
+    try out.append(alloc, ']');
+    return out.toOwnedSlice(alloc);
+}
+
+/// 单文件/目录 stat JSON。
+fn statJson(alloc: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return null;
+    defer alloc.free(w);
+    var data: win32.WIN32_FILE_ATTRIBUTE_DATA = std.mem.zeroes(win32.WIN32_FILE_ATTRIBUTE_DATA);
+    if (win32.GetFileAttributesExW(w.ptr, 0, &data) == 0) return null;
+    const is_dir = data.dwFileAttributes & win32.FILE_ATTRIBUTE_DIRECTORY != 0;
+    const size: u64 = if (is_dir) 0 else (@as(u64, data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    return std.fmt.allocPrint(alloc,
+        "{{\"dir\":{s},\"size\":{d},\"modified\":{d},\"created\":{d},\"attributes\":{d}}}",
+        .{ if (is_dir) "true" else "false", size, fileTimeToUnixMs(data.ftLastWriteTime), fileTimeToUnixMs(data.ftCreationTime), data.dwFileAttributes },
+    ) catch null;
+}
+
 /// 0 视为「清除约束」（JSON 里省略字段 = null = 不改）。
 fn nonZero(v: ?u32) ?u32 {
     const x = v orelse return null;
@@ -1366,6 +1518,11 @@ fn Backend(comptime config: Config) type {
                 log.print("[webview] inject runtime js hr=0x{x}", .{@as(u32, @bitCast(hr_js))});
             }
 
+            // v0.1.19：用户初始化脚本（document-start，runtime 之后）
+            for (config.init_scripts) |script| {
+                self.injectScript(w, webview, script);
+            }
+
             // 导航
             const nav_url = if (w.id == 1) (self.dev_url orelse w.url) else w.url;
             const url_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, nav_url) catch return;
@@ -1902,6 +2059,7 @@ fn Backend(comptime config: Config) type {
                 .webviews => |op| return self.runWebviewsOp(w, op, alloc),
                 .process => |op| return self.runProcOp(op, alloc),
                 .sql => |op| return self.runSqlOp(op, alloc),
+                .updater => |op| return self.runUpdaterOp(op, alloc),
             }
         }
 
@@ -2593,30 +2751,242 @@ fn Backend(comptime config: Config) type {
             return win32.GetFileAttributesW(wz.ptr) != 0xFFFFFFFF;
         }
 
+        /// v0.1.19：解析 scope 根目录（绝对路径）。
+        fn scopeRoot(self: *Self, scope: fs_api_mod.Scope, alloc: std.mem.Allocator) ?[]u8 {
+            switch (scope) {
+                .app_data => {
+                    const base = self.storage_root orelse return null;
+                    return alloc.dupe(u8, base) catch null;
+                },
+                .app_cache => {
+                    const base = self.storage_root orelse return null;
+                    return std.fmt.allocPrint(alloc, "{s}\\cache", .{base}) catch null;
+                },
+                .app_config => {
+                    const appdata = win32.getEnvUtf8(alloc, "APPDATA") orelse return null;
+                    defer alloc.free(appdata);
+                    return std.fmt.allocPrint(alloc, "{s}\\{s}", .{ appdata, config.app_id }) catch null;
+                },
+                .temp => return win32.getEnvUtf8(alloc, "TEMP"),
+                .exe => return exeDirAlloc(alloc),
+                .home => return win32.getEnvUtf8(alloc, "USERPROFILE"),
+                else => {
+                    const home = win32.getEnvUtf8(alloc, "USERPROFILE") orelse return null;
+                    defer alloc.free(home);
+                    const sub = fs_api_mod.userSubdir(scope) orelse return null;
+                    return std.fmt.allocPrint(alloc, "{s}\\{s}", .{ home, sub }) catch null;
+                },
+            }
+        }
+
+        /// v0.1.19：fs scope 授权。appData/appConfig/appCache 默认可用；其它根目录
+        /// 需要 capability 显式声明 `"fs:documents/**"` 之类的模式。
+        fn fsAllowed(self: *Self, scope: fs_api_mod.Scope, rel: []const u8, alloc: std.mem.Allocator) bool {
+            _ = self;
+            if (scope.isAppPrivate()) return true;
+            if (!security.scopesDeclared(config.security)) return false;
+            const res = fs_api_mod.resourceString(alloc, scope, rel) catch return false;
+            defer alloc.free(res);
+            return security.scopeAllowed(config.security, "fs", res);
+        }
+
+        fn fsScopeOf(name: ?[]const u8) !fs_api_mod.Scope {
+            const n = name orelse return .app_data;
+            if (n.len == 0) return .app_data;
+            return fs_api_mod.Scope.fromName(n) catch error.UnknownScope;
+        }
+
+        /// v0.1.19：fs 全量操作（读/写/追加/存在/删除/建目录/递归删目录/列目录/
+        /// stat/改名/复制/根目录清单）。所有相对路径都经过 scope 校验与逃逸检查。
         fn runFsOp(self: *Self, op: shared_system.FsOp, alloc: std.mem.Allocator) !shared_system.Result {
-            const root = self.storage_root orelse return error.StoreNotAvailable;
             switch (op) {
-                .read => |rel| {
-                    const path = try fs_api_mod.joinChecked(alloc, root, rel);
+                .roots => {
+                    var out: std.ArrayListUnmanaged(u8) = .empty;
+                    errdefer out.deinit(alloc);
+                    try out.append(alloc, '{');
+                    const scopes = [_]fs_api_mod.Scope{ .app_data, .app_config, .app_cache, .home, .desktop, .documents, .downloads, .pictures, .videos, .temp, .exe };
+                    var first = true;
+                    for (scopes) |s| {
+                        const r = self.scopeRoot(s, alloc) orelse continue;
+                        defer alloc.free(r);
+                        if (!first) try out.append(alloc, ',');
+                        first = false;
+                        try out.print(alloc, "\"{s}\":", .{s.name()});
+                        const lit = try std.json.Stringify.valueAlloc(alloc, r, .{});
+                        defer alloc.free(lit);
+                        try out.appendSlice(alloc, lit);
+                    }
+                    try out.append(alloc, '}');
+                    return .{ .json = try out.toOwnedSlice(alloc) };
+                },
+                .read => |t| {
+                    const scope = try fsScopeOf(t.scope);
+                    if (!self.fsAllowed(scope, t.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, t.path);
                     defer alloc.free(path);
+                    const size = fileSizeOf(alloc, path) orelse return error.FileNotFound;
+                    if (size > (fs_api_mod.Limits{}).max_read) return error.FileTooLarge;
                     const bytes = win32.readFileAlloc(alloc, path) orelse return error.FileNotFound;
                     defer alloc.free(bytes);
                     return .{ .json = try std.json.Stringify.valueAlloc(alloc, bytes, .{}) };
                 },
-                .write => |w| {
-                    const path = try fs_api_mod.joinChecked(alloc, root, w.path);
+                .write => |w| return self.fsWriteOp(w, false, alloc),
+                .append => |w| return self.fsWriteOp(w, true, alloc),
+                .rename => |m| return self.fsTransferOp(m, false, alloc),
+                .copy => |m| return self.fsTransferOp(m, true, alloc),
+                .exists => |t| {
+                    const scope = try fsScopeOf(t.scope);
+                    if (!self.fsAllowed(scope, t.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, t.path);
                     defer alloc.free(path);
-                    if (!win32.writeFileAlloc(alloc, path, w.data)) return error.WriteFailed;
-                    log.print("[fs] wrote {d} bytes -> {s}", .{ w.data.len, w.path });
-                    return .{ .ok = true };
+                    const w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
+                    defer alloc.free(w);
+                    return .{ .ok = win32.GetFileAttributesW(w.ptr) != win32.INVALID_FILE_ATTRIBUTES };
                 },
-                .exists => |rel| return .{ .ok = self.fsExists(alloc, rel) },
-                .remove => |rel| {
-                    const path = try fs_api_mod.joinChecked(alloc, root, rel);
+                .remove => |t| {
+                    const scope = try fsScopeOf(t.scope);
+                    if (!self.fsAllowed(scope, t.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, t.path);
                     defer alloc.free(path);
-                    const wz = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
-                    defer alloc.free(wz);
-                    return .{ .ok = win32.DeleteFileW(wz.ptr) != 0 };
+                    const w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
+                    defer alloc.free(w);
+                    return .{ .ok = win32.DeleteFileW(w.ptr) != 0 };
+                },
+                .mkdir => |t| {
+                    const scope = try fsScopeOf(t.scope);
+                    if (!self.fsAllowed(scope, t.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, t.path);
+                    defer alloc.free(path);
+                    return .{ .ok = mkdirAllPath(alloc, path) };
+                },
+                .remove_dir => |t| {
+                    const scope = try fsScopeOf(t.scope);
+                    if (!self.fsAllowed(scope, t.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, t.path);
+                    defer alloc.free(path);
+                    return .{ .ok = deleteTree(alloc, path) };
+                },
+                .read_dir => |t| {
+                    const scope = try fsScopeOf(t.scope);
+                    if (!self.fsAllowed(scope, t.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, t.path);
+                    defer alloc.free(path);
+                    return .{ .json = try listDirJson(alloc, path) };
+                },
+                .stat => |t| {
+                    const scope = try fsScopeOf(t.scope);
+                    if (!self.fsAllowed(scope, t.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, t.path);
+                    defer alloc.free(path);
+                    return .{ .json = statJson(alloc, path) orelse return error.FileNotFound };
+                },
+
+            }
+        }
+
+        /// fs write / append 共用实现。
+        fn fsWriteOp(self: *Self, w: shared_system.FsWrite, append: bool, alloc: std.mem.Allocator) !shared_system.Result {
+            const scope = try fsScopeOf(w.scope);
+            if (!self.fsAllowed(scope, w.path, alloc)) return error.PermissionDenied;
+            if (w.data.len > (fs_api_mod.Limits{}).max_write) return error.FileTooLarge;
+            const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+            defer alloc.free(root);
+            const path = try fs_api_mod.joinChecked(alloc, root, w.path);
+            defer alloc.free(path);
+            if (std.mem.lastIndexOfScalar(u8, path, '\\')) |sep| {
+                _ = mkdirAllPath(alloc, path[0..sep]);
+            }
+            if (append and fileSizeOf(alloc, path) != null) {
+                const old = win32.readFileAlloc(alloc, path) orelse return error.WriteFailed;
+                defer alloc.free(old);
+                const merged = try std.mem.concat(alloc, u8, &.{ old, w.data });
+                defer alloc.free(merged);
+                if (!win32.writeFileAlloc(alloc, path, merged)) return error.WriteFailed;
+            } else if (!win32.writeFileAlloc(alloc, path, w.data)) {
+                return error.WriteFailed;
+            }
+            log.print("[fs] {s} {d} bytes -> {s}/{s}", .{
+                if (append) "appended" else "wrote", w.data.len, scope.name(), w.path,
+            });
+            return .{ .ok = true };
+        }
+
+        /// fs rename / copy 共用实现。
+        fn fsTransferOp(self: *Self, m: shared_system.FsMove, is_copy: bool, alloc: std.mem.Allocator) !shared_system.Result {
+            const from_scope = try fsScopeOf(m.scope);
+            const to_scope = try fsScopeOf(m.to_scope orelse m.scope);
+            if (!self.fsAllowed(from_scope, m.from, alloc)) return error.PermissionDenied;
+            if (!self.fsAllowed(to_scope, m.to, alloc)) return error.PermissionDenied;
+            const from_root = self.scopeRoot(from_scope, alloc) orelse return error.ScopeUnavailable;
+            defer alloc.free(from_root);
+            const to_root = self.scopeRoot(to_scope, alloc) orelse return error.ScopeUnavailable;
+            defer alloc.free(to_root);
+            const from = try fs_api_mod.joinChecked(alloc, from_root, m.from);
+            defer alloc.free(from);
+            const to = try fs_api_mod.joinChecked(alloc, to_root, m.to);
+            defer alloc.free(to);
+            if (std.mem.lastIndexOfScalar(u8, to, '\\')) |sep| {
+                _ = mkdirAllPath(alloc, to[0..sep]);
+            }
+            const fw = try std.unicode.utf8ToUtf16LeAllocZ(alloc, from);
+            defer alloc.free(fw);
+            const tw = try std.unicode.utf8ToUtf16LeAllocZ(alloc, to);
+            defer alloc.free(tw);
+            const ok = if (is_copy)
+                win32.CopyFileW(fw.ptr, tw.ptr, 0) != 0
+            else
+                win32.MoveFileExW(fw.ptr, tw.ptr, win32.MOVEFILE_REPLACE_EXISTING) != 0;
+            return .{ .ok = ok };
+        }
+
+        /// v0.1.19：更新器 JS API。info 读当前配置与「是否已有待重启的替换」；
+        /// check 复用启动时的 updaterFlow（后台线程，结果走 updateInfo/updaterFailed 事件）。
+        fn runUpdaterOp(self: *Self, op: shared_system.UpdaterOp, alloc: std.mem.Allocator) !shared_system.Result {
+            switch (op) {
+                .info => {
+                    const env = self.updater_env orelse {
+                        return .{ .json = try alloc.dupe(u8, "{\"configured\":false}") };
+                    };
+                    const exe_path = try currentExePath(alloc);
+                    defer alloc.free(exe_path);
+                    const old_path = try std.fmt.allocPrint(alloc, "{s}.zilt-old", .{exe_path});
+                    defer alloc.free(old_path);
+                    const ow = try std.unicode.utf8ToUtf16LeAllocZ(alloc, old_path);
+                    defer alloc.free(ow);
+                    const restart_required = win32.GetFileAttributesW(ow.ptr) != win32.INVALID_FILE_ATTRIBUTES;
+
+                    const url_json = try std.json.Stringify.valueAlloc(alloc, env.manifest_url, .{});
+                    defer alloc.free(url_json);
+                    const ver_json = try std.json.Stringify.valueAlloc(alloc, env.current_version, .{});
+                    defer alloc.free(ver_json);
+                    return .{ .json = try std.fmt.allocPrint(alloc,
+                        "{{\"configured\":true,\"manifest_url\":{s},\"current_version\":{s},\"channel\":\"{s}\",\"restart_required\":{s}}}",
+                        .{ url_json, ver_json, @tagName(env.channel), if (restart_required) "true" else "false" },
+                    ) };
+                },
+                .check => {
+                    if (self.updater_env == null) return .{ .ok = false };
+                    const t = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, updaterFlow, .{self}) catch |err| {
+                        log.print("[updater] manual check spawn failed: {s}", .{@errorName(err)});
+                        return .{ .ok = false };
+                    };
+                    t.detach();
+                    log.print("[updater] manual check started (from JS)", .{});
+                    return .{ .ok = true };
                 },
             }
         }
@@ -3329,6 +3699,19 @@ fn Backend(comptime config: Config) type {
                 },
                 .state => return true, // 由 runWindowQuery 处理，不会走到这里
             }
+        }
+
+        /// v0.1.19：向 webview 注入 document-start 脚本（失败只记日志）。
+        fn injectScript(self: *Self, w: *Window, webview: *wv2.ICoreWebView2, script: []const u8) void {
+            const handler = IgnoreCompletedHandler(wv2.IID_AddScriptToExecuteOnDocumentCreatedCompletedHandler).create(w) catch return;
+            const js_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, script) catch {
+                handler.dropRef();
+                return;
+            };
+            defer self.allocator.free(js_w);
+            const hr = webview.addScriptToExecuteOnDocumentCreated(js_w.ptr, handler);
+            handler.dropRef();
+            log.print("[webview] inject init script ({d} bytes) hr=0x{x}", .{ script.len, @as(u32, @bitCast(hr)) });
         }
 
         /// v0.1.18：执行菜单预定义角色。焦点在原生编辑控件时发 WM_* 消息；

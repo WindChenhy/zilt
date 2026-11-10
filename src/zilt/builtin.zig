@@ -93,6 +93,10 @@ pub const Args = struct {
     max_height: ?u32 = null,
     monitor: ?u32 = null,
     role: ?[]const u8 = null,
+    // ---- v0.1.19：fs scope / 目标路径 ----
+    scope: ?[]const u8 = null,
+    to: ?[]const u8 = null,
+    to_scope: ?[]const u8 = null,
     key: ?[]const u8 = null,
     value: ?[]const u8 = null,
     data: ?[]const u8 = null,
@@ -514,7 +518,8 @@ pub fn isSystemMethod(method: []const u8) bool {
         eql(u8, name, "autostart") or eql(u8, name, "appearance") or
         eql(u8, name, "store") or eql(u8, name, "fs") or eql(u8, name, "windowState") or
         eql(u8, name, "services") or eql(u8, name, "http") or eql(u8, name, "ws") or
-        eql(u8, name, "webviews") or eql(u8, name, "process") or eql(u8, name, "sql");
+        eql(u8, name, "webviews") or eql(u8, name, "process") or eql(u8, name, "sql") or
+        eql(u8, name, "updater");
 }
 
 pub fn clickActionFromName(name: ?[]const u8) system_api.ClickAction {
@@ -637,14 +642,45 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
     }
 
     if (eql(u8, name, "fs")) {
-        if (eql(u8, a.action, "read")) return .{ .fs = .{ .read = a.path orelse return error.MissingPath } };
+        if (eql(u8, a.action, "roots")) return .{ .fs = .roots };
+        const target = system_api.FsTarget{ .path = a.path orelse return error.MissingPath, .scope = a.scope };
+        if (eql(u8, a.action, "read")) return .{ .fs = .{ .read = target } };
         if (eql(u8, a.action, "write")) return .{ .fs = .{ .write = .{
-            .path = a.path orelse return error.MissingPath,
+            .path = target.path,
             .data = a.data orelse a.text orelse "",
+            .scope = target.scope,
         } } };
-        if (eql(u8, a.action, "exists")) return .{ .fs = .{ .exists = a.path orelse return error.MissingPath } };
-        if (eql(u8, a.action, "remove")) return .{ .fs = .{ .remove = a.path orelse return error.MissingPath } };
+        if (eql(u8, a.action, "append")) return .{ .fs = .{ .append = .{
+            .path = target.path,
+            .data = a.data orelse a.text orelse "",
+            .scope = target.scope,
+        } } };
+        if (eql(u8, a.action, "exists")) return .{ .fs = .{ .exists = target } };
+        if (eql(u8, a.action, "remove")) return .{ .fs = .{ .remove = target } };
+        if (eql(u8, a.action, "mkdir")) return .{ .fs = .{ .mkdir = target } };
+        if (eql(u8, a.action, "removeDir") or eql(u8, a.action, "remove_dir")) return .{ .fs = .{ .remove_dir = target } };
+        if (eql(u8, a.action, "readDir") or eql(u8, a.action, "read_dir")) return .{ .fs = .{ .read_dir = target } };
+        if (eql(u8, a.action, "stat")) return .{ .fs = .{ .stat = target } };
+        if (eql(u8, a.action, "rename")) return .{ .fs = .{ .rename = .{
+            .from = target.path,
+            .to = a.to orelse return error.MissingPath,
+            .scope = target.scope,
+            .to_scope = a.to_scope,
+        } } };
+        if (eql(u8, a.action, "copy")) return .{ .fs = .{ .copy = .{
+            .from = target.path,
+            .to = a.to orelse return error.MissingPath,
+            .scope = target.scope,
+            .to_scope = a.to_scope,
+        } } };
+        if (eql(u8, a.action, "roots")) return .{ .fs = .roots };
         return error.UnknownFsAction;
+    }
+
+    if (eql(u8, name, "updater")) {
+        if (eql(u8, a.action, "info")) return .{ .updater = .info };
+        if (eql(u8, a.action, "check")) return .{ .updater = .check };
+        return error.UnknownUpdaterAction;
     }
 
     if (eql(u8, name, "http")) {

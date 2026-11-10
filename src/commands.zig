@@ -417,3 +417,33 @@ pub fn dragStartDemo(ctx: Context, args: struct { file: []const u8 }) !void {
     const files = [_][]const u8{args.file};
     try ctx.startDrag(&files);
 }
+
+// ---- v0.1.19：流式通道 demo（后台线程按 seq 推送，结束后 close）----
+
+const StreamState = struct {
+    ctx: Context,
+    id: u32,
+    count: u32,
+};
+
+/// 通过 `window.zilt.channel` 建立的通道推送 count 个分片。
+pub fn streamDemo(ctx: Context, args: struct { id: u32, count: u32 = 5 }) !struct { ok: bool } {
+    const st = try ctx.msg_allocator.create(StreamState);
+    st.* = .{ .ctx = ctx, .id = args.id, .count = args.count };
+    _ = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, streamMain, .{st}) catch |err| {
+        ctx.msg_allocator.destroy(st);
+        return err;
+    };
+    return .{ .ok = true };
+}
+
+fn streamMain(st: *StreamState) void {
+    const win32 = zilt.platform_windows.win32;
+    defer st.ctx.msg_allocator.destroy(st);
+    var i: u32 = 0;
+    while (i < st.count) : (i += 1) {
+        win32.Sleep(20);
+        st.ctx.channelSend(st.id, i, .{ .n = i, .label = "chunk" });
+    }
+    st.ctx.channelClose(st.id, null);
+}

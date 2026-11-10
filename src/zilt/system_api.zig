@@ -88,12 +88,39 @@ pub const StoreOp = union(enum) {
     all,
 };
 
-pub const FsWrite = struct { path: []const u8, data: []const u8 };
+pub const FsTarget = struct {
+    path: []const u8,
+    /// v0.1.19：根目录（appData/appConfig/appCache/home/desktop/documents/
+    /// downloads/pictures/videos/temp/exe）。null = appData（v0.1.16 行为）。
+    scope: ?[]const u8 = null,
+};
+pub const FsWrite = struct {
+    path: []const u8,
+    data: []const u8,
+    scope: ?[]const u8 = null,
+};
+pub const FsMove = struct {
+    from: []const u8,
+    to: []const u8,
+    scope: ?[]const u8 = null,
+    to_scope: ?[]const u8 = null,
+};
 pub const FsOp = union(enum) {
-    read: []const u8,
+    read: FsTarget,
     write: FsWrite,
-    exists: []const u8,
-    remove: []const u8,
+    append: FsWrite,
+    exists: FsTarget,
+    remove: FsTarget,
+    /// 递归创建目录
+    mkdir: FsTarget,
+    /// 递归删除目录
+    remove_dir: FsTarget,
+    read_dir: FsTarget,
+    stat: FsTarget,
+    rename: FsMove,
+    copy: FsMove,
+    /// 各 scope 解析出的绝对路径（调试/授权可视化）
+    roots,
 };
 
 /// 窗口状态（v0.1.16 window-state）：读当前几何 / 立即持久化
@@ -201,7 +228,11 @@ pub const Request = union(enum) {
     process: ProcessOp,
     /// v0.1.17：SQL（SQLite，动态加载 sqlite3.dll）
     sql: SqlOp,
+    /// v0.1.19：更新器（info = 状态；check = 触发检查/下载/替换）
+    updater: UpdaterOp,
 };
+
+pub const UpdaterOp = enum { info, check };
 
 /// v0.1.17：SQL 操作。query 返回行集 JSON；execute 返回 {changes,last_id}。
 pub const SqlOp = union(enum) {

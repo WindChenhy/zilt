@@ -361,6 +361,7 @@ pub extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.c) BOOL;
 pub extern "kernel32" fn CreateMutexW(lpMutexAttributes: ?*anyopaque, bInitialOwner: BOOL, lpName: LPCWSTR) callconv(.c) HANDLE;
 pub extern "kernel32" fn GetLastError() callconv(.c) DWORD;
 pub extern "kernel32" fn MoveFileExW(lpExistingFileName: LPCWSTR, lpNewFileName: LPCWSTR, dwFlags: DWORD) callconv(.c) BOOL;
+pub extern "kernel32" fn CopyFileW(lpExistingFileName: LPCWSTR, lpNewFileName: LPCWSTR, bFailIfExists: BOOL) callconv(.c) BOOL;
 pub extern "kernel32" fn DeleteFileW(lpFileName: LPCWSTR) callconv(.c) BOOL;
 pub extern "kernel32" fn RemoveDirectoryW(lpPathName: LPCWSTR) callconv(.c) BOOL;
 

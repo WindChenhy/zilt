@@ -433,6 +433,40 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
 - [x] **验收**：冒烟 32 项含 store/fs/path/log/windowState + http + ws + webviews +
       **partition 隔离**（alpha/beta localStorage 互不可见、共享实例与主页面互通）
 
+### v0.1.19 — 结构性能力补齐（P1，2026-11-10）
+
+> 目标：补「权限 scope / 流式 IPC / fs 标准库 / 更新器 API / 初始化脚本」，
+> 并加 MCP 服务端。**9 项完成，2 项明确未做**（见末尾）。
+
+- [x] **fs 全量 + 多根目录**：`window.zilt.fs` 从 4 个操作扩到 12 个——
+      read/write/append/exists/remove/mkdir/removeDir/readDir/stat/rename/copy/roots；
+      scope 11 个：appData/appConfig/appCache/home/desktop/documents/downloads/
+      pictures/videos/temp/exe（对齐 Tauri BaseDirectory 的 Windows 子集）；
+      读写上限 32MB，写/复制自动建父目录，removeDir 递归删树
+- [x] **capability scope 层**：`Capability.scopes = ["fs:documents/**", "shell:git",
+      "http:https://api.example.com/*"]`；`security.scopesDeclared` / `scopeAllowed`
+      + glob（`*` 不跨段、`**` 跨段、`?` 单字符）与尾部 `*` 前缀语义。
+      **opt-in**：未声明 scopes 时保持 v0.1.16 行为（仅应用私有目录）
+- [x] **流式通道 `window.zilt.channel`**：`create({onmessage,onclose})` → `{id,close}`；
+      Zig 侧 `ctx.channelSend(id, seq, data)` / `channelSendText` / `channelClose(id, err)`；
+      分片按 seq 有序、close 可带错误。**已知限制：仍走事件管道，没有背压**
+- [x] **更新器 JS API**：`updater.info()`（configured / manifest_url / current_version /
+      channel / restart_required，后者由 `<exe>.zilt-old` 是否存在判定）与
+      `updater.check()`（复用后台 updaterFlow，结果走 updateInfo/updaterStaged 事件）
+- [x] **自定义初始化脚本**：`Config.init_scripts`（document-start 注入，runtime 之后，
+      可直接用 `window.zilt`），对齐 Tauri `initialization_script`
+- [x] **MCP 服务端（headless）**：`POST /mcp` JSON-RPC 2.0——initialize / ping /
+      tools/list / tools/call；tools 由 `ipc.commandMetas` **comptime 生成**（含
+      inputSchema：properties/required/类型映射）；GET /mcp 返回工具数。
+      实测：32 tools、greet 调用返回真实结果、未知工具 isError
+- [x] **单测**：225 全过（+5：scope opt-in/匹配、glob 边界、fs 资源串、MCP schema）
+- [x] **冒烟**：36 项 exit 0（新增 c-fs 12 操作 + 越权拒绝、c-channel 5 分片有序、
+      c-init 初始化脚本 + updater.info）
+- [x] **版本** 0.1.18 → 0.1.19；README/ARCHITECTURE 同步
+- [ ] **未做（明确记录）**：`wss`（需 WinHTTP WebSocket 或 Schannel，当前仅 ws://）、
+      HTTP 流式/上传/代理、Tauri isolation pattern、InPrivate/浏览器扩展、
+      每窗口 UA/代理（需 Settings2 绑定）
+
 ### v0.1.18 — Windows 窗口层对齐 Tauri（P0，2026-11-10）
 
 > 目标：把「窗口层差 ~15 个 Win32 小 API」补齐到与 Tauri 2 同级。

@@ -23,7 +23,7 @@ pub fn main() !void {
         .events = app.events,
         .assets = &app.assets,
         .security = app.security,
-        .title = "Zilt — v0.1.18 示例",
+        .title = "Zilt — v0.1.19 示例",
         .width = 960,
         .height = 700,
         .url = "https://zilt.app/index.html",
@@ -48,6 +48,10 @@ pub fn main() !void {
         },
         // v0.1.10：环境选项（UA/语言/代理/浏览器参数/通道）默认关闭，可按需开启
         .environment = .{},
+        // v0.1.19：document-start 用户脚本（对齐 Tauri initialization_script）
+        .init_scripts = &.{
+            "window.__ziltInit = { version: window.zilt.version, at: Date.now() };",
+        },
         // v0.1.12：剪贴板变化事件 + OLE 自定义拖放格式
         .clipboard_change_event = true,
         .drag_formats = &.{"ZiltDemoFormat"},

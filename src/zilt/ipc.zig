@@ -511,9 +511,41 @@ pub const Context = struct {
         self.emitJsonTo(window_id, name, "null");
     }
 
-    fn emitJsonTo(self: Context, window_id: u32, name: []const u8, payload_json: []const u8) void {
+    pub fn emitJsonTo(self: Context, window_id: u32, name: []const u8, payload_json: []const u8) void {
         const msg = encodeEvent(self.msg_allocator, name, payload_json) catch return;
         self.emit_fn(self.backend, window_id, msg); // 所有权转移给后端（UI 线程用完用 msg_allocator 释放）
+    }
+
+    /// v0.1.19：流式通道——推送一段数据（data_json 必须是已序列化的 JSON 值）。
+    /// 语义对齐 Tauri `Channel`：同一 id 内按 seq 有序，结束时 close（可带 error）。
+    /// 传输仍走事件管道（窗口投递），**没有背压**——调用方需自行控制速率。
+    pub fn channelSendJson(self: Context, id: u32, seq: u32, data_json: []const u8) void {
+        const payload = std.fmt.allocPrint(self.msg_allocator, "{{\"id\":{d},\"seq\":{d},\"done\":false,\"data\":{s}}}", .{ id, seq, data_json }) catch return;
+        defer self.msg_allocator.free(payload);
+        self.emitJsonTo(self.window_id, "__zilt.channel", payload);
+    }
+
+    pub fn channelSend(self: Context, id: u32, seq: u32, data: anytype) void {
+        const json = std.json.Stringify.valueAlloc(self.msg_allocator, data, .{}) catch return;
+        defer self.msg_allocator.free(json);
+        self.channelSendJson(id, seq, json);
+    }
+
+    pub fn channelSendText(self: Context, id: u32, seq: u32, text: []const u8) void {
+        const json = std.json.Stringify.valueAlloc(self.msg_allocator, text, .{}) catch return;
+        defer self.msg_allocator.free(json);
+        self.channelSendJson(id, seq, json);
+    }
+
+    pub fn channelClose(self: Context, id: u32, err: ?[]const u8) void {
+        const err_json = if (err) |e|
+            (std.json.Stringify.valueAlloc(self.msg_allocator, e, .{}) catch return)
+        else
+            (self.msg_allocator.dupe(u8, "null") catch return);
+        defer self.msg_allocator.free(err_json);
+        const payload = std.fmt.allocPrint(self.msg_allocator, "{{\"id\":{d},\"done\":true,\"err\":{s}}}", .{ id, err_json }) catch return;
+        defer self.msg_allocator.free(payload);
+        self.emitJsonTo(self.window_id, "__zilt.channel", payload);
     }
 
     /// 请求退出应用（在 UI 线程的命令/事件回调内调用）。
@@ -789,6 +821,7 @@ pub const runtime_js =
     \\  let httpSeq = 0;
     \\  let wsSeq = 0;
     \\  let webviewEvalSeq = 0;
+    \\  let channelSeq = 0;
     \\  const webviewEvalWaiters = new Map();
     \\  // SQL 参数编码：原生值 → Zig 侧 {kind:'text'|'int'|'real'|'nul', ...}
     \\  const ziltSqlParam = (v) => {
@@ -971,11 +1004,45 @@ pub const runtime_js =
     \\      keys: () => builtin('__zilt.store', { action: 'keys' }),
     \\      all: () => builtin('__zilt.store', { action: 'all' }),
     \\    },
+    \\    // v0.1.19：更新器（info = 当前配置/是否需要重启；check = 立即检查）
+    \\    updater: {
+    \\      info: () => builtin('__zilt.updater', { action: 'info' }),
+    \\      check: () => builtin('__zilt.updater', { action: 'check' }),
+    \\    },
+    \\    // v0.1.19：流式通道（对齐 Tauri Channel 的最小语义）。Zig 侧用
+    \\    // ctx.channelSend(id, seq, data) / ctx.channelClose(id, err) 推送。
+    \\    channel: {
+    \\      create: (opts) => {
+    \\        const o = opts ?? {};
+    \\        const id = ++channelSeq;
+    \\        const off = window.zilt.on('__zilt.channel', (p) => {
+    \\          if (!p || p.id !== id) return;
+    \\          if (p.done) {
+    \\            off();
+    \\            if (typeof o.onclose === 'function') o.onclose(p.err == null ? null : p.err);
+    \\          } else if (typeof o.onmessage === 'function') {
+    \\            o.onmessage(p.data, p.seq);
+    \\          }
+    \\        });
+    \\        return { id: id, close: () => off() };
+    \\      },
+    \\    },
+    \\    // v0.1.19：fs 全量。scope = appData（默认）/appConfig/appCache/home/desktop/
+    \\    // documents/downloads/pictures/videos/temp/exe；非私有目录需 capability 的
+    \\    // `scopes` 声明（如 "fs:documents/**"）。
     \\    fs: {
-    \\      read: (path) => builtin('__zilt.fs', { action: 'read', path }),
-    \\      write: (path, data) => builtin('__zilt.fs', { action: 'write', path, data }),
-    \\      exists: (path) => builtin('__zilt.fs', { action: 'exists', path }),
-    \\      remove: (path) => builtin('__zilt.fs', { action: 'remove', path }),
+    \\      read: (path, scope) => builtin('__zilt.fs', { action: 'read', path, scope }),
+    \\      write: (path, data, scope) => builtin('__zilt.fs', { action: 'write', path, data, scope }),
+    \\      append: (path, data, scope) => builtin('__zilt.fs', { action: 'append', path, data, scope }),
+    \\      exists: (path, scope) => builtin('__zilt.fs', { action: 'exists', path, scope }),
+    \\      remove: (path, scope) => builtin('__zilt.fs', { action: 'remove', path, scope }),
+    \\      mkdir: (path, scope) => builtin('__zilt.fs', { action: 'mkdir', path, scope }),
+    \\      removeDir: (path, scope) => builtin('__zilt.fs', { action: 'removeDir', path, scope }),
+    \\      readDir: (path, scope) => builtin('__zilt.fs', { action: 'readDir', path, scope }),
+    \\      stat: (path, scope) => builtin('__zilt.fs', { action: 'stat', path, scope }),
+    \\      rename: (from, to, scope) => builtin('__zilt.fs', { action: 'rename', path: from, to, scope }),
+    \\      copy: (from, to, scope) => builtin('__zilt.fs', { action: 'copy', path: from, to, scope }),
+    \\      roots: () => builtin('__zilt.fs', { action: 'roots' }),
     \\    },
     \\    // v0.1.16: path / log / opener / windowState
     \\    path: {
@@ -1082,7 +1149,7 @@ pub const runtime_js =
     \\      query: (db, sql, params) => builtin('__zilt.sql', { action: 'query', db, sql: String(sql), params: (params ?? []).map(ziltSqlParam) }),
     \\      execute: (db, sql, params) => builtin('__zilt.sql', { action: 'execute', db, sql: String(sql), params: (params ?? []).map(ziltSqlParam) }),
     \\    },
-    \\    version: '0.1.18',
+    \\    version: '0.1.19',
     \\  };
     \\  window.zilt.on('webviewEval', (p) => {
     \\    const wait = webviewEvalWaiters.get(p && p.rid);

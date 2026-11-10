@@ -44,6 +44,7 @@ pub const png = @import("png.zig");
 pub const ico = @import("ico.zig");
 pub const sql = @import("sql.zig");
 pub const npm_pack = @import("npm_pack.zig");
+pub const mcp = @import("mcp.zig");
 
 /// 平台模块（Windows 后端内部使用；用户一般无需直接接触）
 pub const platform_windows = @import("platform/windows/mod.zig");
@@ -82,6 +83,7 @@ test {
     _ = @import("services.zig");
     _ = @import("sql.zig");
     _ = @import("npm_pack.zig");
+    _ = @import("mcp.zig");
     _ = @import("log.zig");
     _ = @import("ipc.zig");
     _ = @import("bindings.zig");

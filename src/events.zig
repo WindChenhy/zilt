@@ -76,6 +76,9 @@ pub fn smokeResult(ctx: Context, payload: struct {
     proc: bool = false,
     partition: bool = false,
     wincontrol: bool = false,
+    fsops: bool = false,
+    channel: bool = false,
+    initupd: bool = false,
     fatal: ?[]const u8 = null,
 }) void {
     var ok = false;
@@ -84,19 +87,19 @@ pub fn smokeResult(ctx: Context, payload: struct {
     } else {
         ok = payload.greet and payload.add and payload.fail and payload.user and payload.event and payload.mode and payload.clip and payload.win and payload.range and payload.winevent and
             payload.windowapi and payload.eval and payload.webview and payload.capability and payload.clipmulti and payload.notification and payload.acl and payload.spa and
-            payload.traycheck and payload.taskbar and payload.hotkey and payload.sysinfo and payload.appearance and payload.autostart and payload.storage and payload.peripheral and payload.services and payload.http and payload.ws and payload.webviews and payload.proc and payload.partition and payload.wincontrol;
+            payload.traycheck and payload.taskbar and payload.hotkey and payload.sysinfo and payload.appearance and payload.autostart and payload.storage and payload.peripheral and payload.services and payload.http and payload.ws and payload.webviews and payload.proc and payload.partition and payload.wincontrol and payload.fsops and payload.channel and payload.initupd;
         if (ok) {
-            zilt.log.print("[smoke] ALL CHECKS PASSED (33 checks: core-10 + window-api/eval/webview-api/capability/clipboard-multi/notification/acl/spa + tray-check/taskbar/hotkey/sysinfo/appearance/autostart + store/fs + path/log/state + services + http + ws + webviews + proc + partition + wincontrol)", .{});
+            zilt.log.print("[smoke] ALL CHECKS PASSED (36 checks: core-10 + window-api/eval/webview-api/capability/clipboard-multi/notification/acl/spa + tray-check/taskbar/hotkey/sysinfo/appearance/autostart + store/fs + path/log/state + services + http + ws + webviews + proc + partition + wincontrol + fsops + channel + initupd)", .{});
         } else {
             zilt.log.print("[smoke] FAILED greet={} add={} fail={} user={} event={} mode={} clip={} win={} range={} winevent={} windowapi={} eval={} webview={} capability={} clipmulti={} notification={}", .{
                 payload.greet, payload.add, payload.fail, payload.user, payload.event, payload.mode, payload.clip,
                 payload.win, payload.range, payload.winevent, payload.windowapi, payload.eval, payload.webview,
                 payload.capability, payload.clipmulti, payload.notification,
             });
-            zilt.log.print("[smoke] FAILED(2) acl={} spa={} traycheck={} taskbar={} hotkey={} sysinfo={} appearance={} autostart={} storage={} peripheral={} services={} http={} ws={} webviews={} proc={} partition={} wincontrol={}", .{
+            zilt.log.print("[smoke] FAILED(2) acl={} spa={} traycheck={} taskbar={} hotkey={} sysinfo={} appearance={} autostart={} storage={} peripheral={} services={} http={} ws={} webviews={} proc={} partition={} wincontrol={} fsops={} channel={} initupd={}", .{
                 payload.acl, payload.spa, payload.traycheck, payload.taskbar, payload.hotkey, payload.sysinfo,
                 payload.appearance, payload.autostart, payload.storage, payload.peripheral, payload.services,
-                payload.http, payload.ws, payload.webviews, payload.proc, payload.partition, payload.wincontrol,
+                payload.http, payload.ws, payload.webviews, payload.proc, payload.partition, payload.wincontrol, payload.fsops, payload.channel, payload.initupd,
             });
         }
     }

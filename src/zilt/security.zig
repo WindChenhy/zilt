@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs_api = @import("fs_api.zig");
 
 pub const ExternalLinks = enum { allow, system_browser, deny };
 pub const Header = struct { name: []const u8, value: []const u8 };
@@ -10,6 +11,9 @@ pub const Capability = struct {
     commands: []const []const u8 = &.{},
     events: []const []const u8 = &.{},
     receive_events: []const []const u8 = &.{},
+    /// v0.1.19：资源 scope 模式（`"fs:documents/**"` / `"shell:git"` /
+    /// `"http:https://api.example.com/*"`）。声明了 scopes 的能力才触发 scope 校验。
+    scopes: []const []const u8 = &.{},
 };
 pub const Options = struct {
     csp: ?[]const u8 = null,
@@ -89,6 +93,43 @@ pub fn allowed(options: Options, app_url: []const u8, dev_url: ?[]const u8, sour
     }
     return false;
 }
+/// v0.1.19：是否有任何 capability 声明了 scopes。
+/// 没声明时保持 v0.1.16 的行为（仅应用私有目录可用），避免破坏既有项目。
+pub fn scopesDeclared(options: Options) bool {
+    for (options.capabilities) |cap| {
+        if (cap.scopes.len != 0) return true;
+    }
+    return false;
+}
+
+/// v0.1.19：资源是否被授权。kind = fs/shell/http/sql…
+/// 未声明任何 scope 时返回 true（opt-in）。
+pub fn scopeAllowed(options: Options, kind: []const u8, resource: []const u8) bool {
+    if (!scopesDeclared(options)) return true;
+    for (options.capabilities) |cap| {
+        for (cap.scopes) |pat| {
+            const sep = std.mem.indexOfScalar(u8, pat, ':') orelse continue;
+            if (!std.ascii.eqlIgnoreCase(pat[0..sep], kind)) continue;
+            if (matchScopeBody(pat[sep + 1 ..], resource)) return true;
+        }
+    }
+    return false;
+}
+
+fn matchScopeBody(body: []const u8, resource: []const u8) bool {
+    if (body.len == 0) return false;
+    // 尾部 * 当作前缀（"documents/**" → "documents/"；"https://api.x/*" → "https://api.x/"）
+    if (body[body.len - 1] == '*') {
+        var end = body.len;
+        while (end > 0 and body[end - 1] == '*') end -= 1;
+        return std.mem.startsWith(u8, resource, body[0..end]);
+    }
+    if (std.mem.indexOfAny(u8, body, "*?") != null) return fs_api.globMatch(body, resource);
+    if (std.mem.eql(u8, body, resource)) return true;
+    // 目录前缀（"documents/"）
+    return body[body.len - 1] == '/' and std.mem.startsWith(u8, resource, body);
+}
+
 pub fn validateHeaders(options: Options) !void {
     if (options.csp) |csp| if (std.mem.indexOfAny(u8, csp, "\r\n\x00") != null) return error.InvalidHeader;
     for (options.headers) |header| {
@@ -147,4 +188,26 @@ test "headers reject injection and CSP hash is stable" {
     const hash = try cspHash(std.testing.allocator, "");
     defer std.testing.allocator.free(hash);
     try std.testing.expectEqualStrings("'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='", hash);
+}
+
+test "v0.1.19: scope opt-in and matching" {
+    const no_scopes_caps = [_]Capability{.{ .name = "main", .commands = &.{"a"} }};
+    const no_scopes = Options{ .capabilities = &no_scopes_caps };
+    try std.testing.expect(!scopesDeclared(no_scopes));
+    try std.testing.expect(scopeAllowed(no_scopes, "fs", "documents/secret.txt"));
+
+    const caps = [_]Capability{
+        .{ .name = "main", .scopes = &.{ "fs:documents/**", "fs:appData/**", "shell:git", "http:https://api.example.com/*" } },
+    };
+    const opts = Options{ .capabilities = &caps };
+    try std.testing.expect(scopesDeclared(opts));
+    try std.testing.expect(scopeAllowed(opts, "fs", "documents/notes/a.txt"));
+    try std.testing.expect(scopeAllowed(opts, "fs", "appData/store.json"));
+    try std.testing.expect(!scopeAllowed(opts, "fs", "downloads/x.zip"));
+    try std.testing.expect(!scopeAllowed(opts, "fs", "home/Desktop/x"));
+    try std.testing.expect(scopeAllowed(opts, "shell", "git"));
+    try std.testing.expect(!scopeAllowed(opts, "shell", "powershell"));
+    try std.testing.expect(scopeAllowed(opts, "http", "https://api.example.com/v1/x"));
+    try std.testing.expect(!scopeAllowed(opts, "http", "https://evil.example.com/x"));
+    try std.testing.expect(!scopeAllowed(opts, "sql", "app.db"));
 }

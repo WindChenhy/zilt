@@ -18,6 +18,7 @@ const services_mod = @import("../../services.zig");
 
 const log = zilt.log;
 const ipc = zilt.ipc;
+const mcp = zilt.mcp;
 const builtin_commands = zilt.builtin_commands;
 const shared_system = zilt.system_api;
 const win_sqlite = @import("sqlite.zig");
@@ -177,6 +178,17 @@ fn handleConnection(
         try handleIpc(config, alloc, out, body);
         return;
     }
+    // v0.1.19：MCP（JSON-RPC 2.0，tools = 应用命令）
+    if (std.mem.eql(u8, path_only, "/mcp")) {
+        if (std.mem.eql(u8, method, "POST")) {
+            try handleMcp(config, alloc, out, body);
+        } else {
+            const info = try std.fmt.allocPrint(alloc, "{{\"server\":\"zilt\",\"protocolVersion\":\"{s}\",\"tools\":{d}}}", .{ mcp.PROTOCOL_VERSION, comptime ipc.commandMetas(config.commands).len });
+            defer alloc.free(info);
+            try respond(out, 200, "application/json", info);
+        }
+        return;
+    }
     if (std.mem.eql(u8, method, "GET")) {
         try serveAsset(config, alloc, out, path_only);
         return;
@@ -255,6 +267,37 @@ fn handleIpc(
     log.print("[headless:ipc] {s} -> {d} bytes", .{ method, result.len });
     try respond(out, 200, "application/json", result);
     alloc.free(result);
+}
+
+/// POST /mcp：MCP JSON-RPC（initialize / tools/list / tools/call / ping）。
+fn handleMcp(
+    comptime config: zilt.Config,
+    alloc: std.mem.Allocator,
+    out: anytype,
+    body: []const u8,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var dummy: u8 = 0;
+    const ctx = ipc.Context{
+        .allocator = alloc,
+        .msg_allocator = arena_state.allocator(),
+        .backend = @ptrCast(&dummy),
+        .window_id = 0,
+        .emit_fn = headlessEmit,
+        .quit_fn = headlessQuit,
+        .system_fn = headlessSystem,
+    };
+    const resp = mcp.handle(alloc, body, ctx, config.commands) catch |e| {
+        log.print("[headless:mcp] {s}", .{@errorName(e)});
+        const msg = std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":-32603,\"message\":\"{s}\"}}}}", .{@errorName(e)}) catch "{}";
+        defer alloc.free(msg);
+        try respond(out, 200, "application/json", msg);
+        return;
+    };
+    defer alloc.free(resp);
+    log.print("[headless:mcp] {d} bytes", .{resp.len});
+    try respond(out, 200, "application/json", resp);
 }
 
 /// GET 资产：asset_routes 候选匹配 + gzip 惰性解压（身份编码输出）。

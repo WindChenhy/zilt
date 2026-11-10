@@ -14,3 +14,6 @@ frontend/bindings/
 smoke_log.txt
 dev_watch_log.txt
 smoke_log.txt
+mcp_e2e*.log
+headless_final.log
+driver_e2e.log

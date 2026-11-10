@@ -601,6 +601,70 @@ async function runChecks() {
         : `state0=${JSON.stringify(s0)} ignore=${sIgnore.ignore_cursor} protect=${sProtect.content_protected} focusable=${sFocus.focusable} bottom=${sBottom.always_on_bottom} limits=${JSON.stringify(sLimits)} disabled=${sDisabled.enabled} fs=${sFs.fullscreen} r=${JSON.stringify([rCursor,rIgnore,rProtect,rFocus,rBottom,rLimits,rShadow,rTheme,rIcon,rVis,rEnabled,rFs])}`);
     } catch (e) { setCheck('c-wincontrol', false, String(e.message || e)); }
 
+    // 34. v0.1.19：fs 全量（多目录 scope + 目录树操作 + 越权拒绝）
+    try {
+      const roots = await window.zilt.fs.roots();
+      const base = 'e2e_fs_' + Date.now();
+      const f1 = base + '/a.txt';
+      const w1 = await window.zilt.fs.write(f1, 'hello');
+      const w2 = await window.zilt.fs.append(f1, ' world');
+      const txt = await window.zilt.fs.read(f1);
+      const st = await window.zilt.fs.stat(f1);
+      await window.zilt.fs.mkdir(base + '/deep/nested');
+      await window.zilt.fs.write(base + '/deep/nested/b.bin', 'z');
+      const entries = await window.zilt.fs.readDir(base + '/deep');
+      const nested = (entries || []).find((e) => e.name === 'nested');
+      const renamed = await window.zilt.fs.rename(f1, base + '/c.txt');
+      const copied = await window.zilt.fs.copy(base + '/c.txt', base + '/d.txt');
+      const existsC = await window.zilt.fs.exists(base + '/c.txt');
+      const existsD = await window.zilt.fs.exists(base + '/d.txt');
+      let denied = false;
+      try { await window.zilt.fs.read('any.txt', 'documents'); } catch (e) { denied = String(e && e.message || e).includes('PermissionDenied'); }
+      const cleaned = await window.zilt.fs.removeDir(base);
+      const existsAfter = await window.zilt.fs.exists(base);
+
+      const ok = !!roots && typeof roots.appData === 'string' && roots.appData.length > 0 &&
+        w1 === true && w2 === true && txt === 'hello world' &&
+        !!st && st.size === 11 && st.dir === false &&
+        !!nested && nested.dir === true && entries.length === 1 &&
+        renamed === true && copied === true && existsC === true && existsD === true &&
+        denied === true && cleaned === true && existsAfter === false;
+      setCheck('c-fs', ok, ok
+        ? 'fs ok (write/append/read/stat/mkdir/readDir/rename/copy/removeDir + scope 拒绝)'
+        : `roots=${!!roots} r=${JSON.stringify([w1,w2,renamed,copied,existsC,existsD,denied,cleaned,existsAfter])} txt=${txt} st=${JSON.stringify(st)} entries=${JSON.stringify(entries)}`);
+    } catch (e) { setCheck('c-fs', false, String(e.message || e)); }
+
+    // 35. v0.1.19：流式通道（后台线程推送 → JS onmessage/onclose 有序到达）
+    try {
+      const chunks = [];
+      let closed = null;
+      const ch = window.zilt.channel.create({
+        onmessage: (data, seq) => chunks.push({ seq, n: data.n, label: data.label }),
+        onclose: (err) => { closed = err == null ? 'ok' : String(err); },
+      });
+      await window.zilt.invoke('streamDemo', { id: ch.id, count: 5 });
+      const t0 = Date.now();
+      while (closed === null && Date.now() - t0 < 8000) await new Promise((r) => setTimeout(r, 40));
+      const ordered = chunks.length === 5 && chunks.every((c, i) => c.seq === i && c.n === i && c.label === 'chunk');
+      const ok = ordered && closed === 'ok';
+      setCheck('c-channel', ok, ok
+        ? 'channel ok (5 chunks in order, closed)'
+        : `chunks=${JSON.stringify(chunks)} closed=${closed}`);
+    } catch (e) { setCheck('c-channel', false, String(e.message || e)); }
+
+    // 36. v0.1.19：初始化脚本（document-start）+ 更新器状态
+    try {
+      const init = window.__ziltInit;
+      const initOk = !!init && typeof init.version === 'string' && init.version === window.zilt.version;
+      const u = await window.zilt.updater.info();
+      const updaterOk = !!u && typeof u.configured === 'boolean' &&
+        (u.configured === false || (typeof u.current_version === 'string' && typeof u.restart_required === 'boolean'));
+      const ok = initOk && updaterOk;
+      setCheck('c-init', ok, ok
+        ? `init-script ok (version=${init.version}) + updater configured=${u.configured}`
+        : `init=${JSON.stringify(init)} updater=${JSON.stringify(u)}`);
+    } catch (e) { setCheck('c-init', false, String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -638,6 +702,9 @@ async function runChecks() {
       proc: $('c-proc').className === 'pass',
       partition: $('c-partition').className === 'pass',
       wincontrol: $('c-wincontrol').className === 'pass',
+      fsops: $('c-fs').className === 'pass',
+      channel: $('c-channel').className === 'pass',
+      initupd: $('c-init').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });
