@@ -78,6 +78,21 @@ pub const Args = struct {
     dark_titlebar: ?bool = null,
     exe_args: ?[]const u8 = null,
     count: ?u32 = null,
+    // ---- v0.1.18：窗口精细控制 ----
+    cursor: ?[]const u8 = null,
+    visible: ?bool = null,
+    grab: ?bool = null,
+    ignore: ?bool = null,
+    dark: ?bool = null,
+    caption_color: ?u32 = null,
+    text_color: ?u32 = null,
+    border_color: ?u32 = null,
+    min_width: ?u32 = null,
+    min_height: ?u32 = null,
+    max_width: ?u32 = null,
+    max_height: ?u32 = null,
+    monitor: ?u32 = null,
+    role: ?[]const u8 = null,
     key: ?[]const u8 = null,
     value: ?[]const u8 = null,
     data: ?[]const u8 = null,
@@ -241,6 +256,32 @@ pub fn windowCmdFromArgs(a: Args, current_window: u32) !ipc.WindowCmd {
     if (eql(u8, a.action, "setTitle")) return .{ .set_title = a.title orelse "" };
     if (eql(u8, a.action, "setSize")) return .{ .size = .{ .width = a.width orelse return error.MissingSize, .height = a.height orelse return error.MissingSize } };
     if (eql(u8, a.action, "setPosition")) return .{ .position = .{ .x = a.x orelse return error.MissingPosition, .y = a.y orelse return error.MissingPosition } };
+    // v0.1.18
+    if (eql(u8, a.action, "setCursor")) return .{ .cursor = ipc.CursorKind.fromName(a.cursor orelse "default") orelse return error.UnknownCursor };
+    if (eql(u8, a.action, "setCursorVisible")) return .{ .cursor_visible = a.visible orelse true };
+    if (eql(u8, a.action, "setCursorGrab")) return .{ .cursor_grab = a.grab orelse true };
+    if (eql(u8, a.action, "setCursorPosition")) return .{ .cursor_position = .{ .x = a.x orelse return error.MissingPosition, .y = a.y orelse return error.MissingPosition } };
+    if (eql(u8, a.action, "setIgnoreCursorEvents")) return .{ .ignore_cursor = a.ignore orelse true };
+    if (eql(u8, a.action, "setContentProtected")) return .{ .content_protected = a.enabled orelse true };
+    if (eql(u8, a.action, "setShadow")) return .{ .shadow = a.enabled orelse true };
+    if (eql(u8, a.action, "setAlwaysOnBottom")) return .{ .always_on_bottom = a.enabled orelse true };
+    if (eql(u8, a.action, "setFocusable")) return .{ .focusable = a.enabled orelse true };
+    if (eql(u8, a.action, "setEnabled")) return .{ .enabled = a.enabled orelse true };
+    if (eql(u8, a.action, "setTheme")) return .{ .theme = .{
+        .dark = a.dark,
+        .caption = a.caption_color,
+        .text = a.text_color,
+        .border = a.border_color,
+    } };
+    if (eql(u8, a.action, "setMinMax")) return .{ .limits = .{
+        .min_width = a.min_width,
+        .min_height = a.min_height,
+        .max_width = a.max_width,
+        .max_height = a.max_height,
+    } };
+    if (eql(u8, a.action, "fullscreenOnMonitor")) return .{ .fullscreen_monitor = a.monitor orelse 0 };
+    if (eql(u8, a.action, "setIcon")) return .{ .icon = a.icon };
+    if (eql(u8, a.action, "state")) return .state;
     _ = current_window;
     return error.UnknownWindowAction;
 }
@@ -267,9 +308,16 @@ fn windowCmd(ctx: ipc.Context, a: Args) ![]u8 {
         else
             ctx.allocator.dupe(u8, "{\"id\":null}");
     }
-    const f = ctx.window_fn orelse return error.WindowNotAvailable;
     const cmd = try windowCmdFromArgs(a, ctx.window_id);
     const target = a.window_id orelse ctx.window_id;
+    switch (cmd) {
+        .state => {
+            const q = ctx.window_query_fn orelse return error.WindowNotAvailable;
+            return q(ctx.backend, target, ctx.allocator) orelse error.WindowNotAvailable;
+        },
+        else => {},
+    }
+    const f = ctx.window_fn orelse return error.WindowNotAvailable;
     const success = f(ctx.backend, target, cmd);
     return ctx.allocator.dupe(u8, if (success) "true" else "false");
 }

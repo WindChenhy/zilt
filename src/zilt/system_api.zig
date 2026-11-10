@@ -20,6 +20,10 @@ pub const MenuAdd = struct {
     accel: ?[]const u8 = null,
     checked: bool = false,
     enabled: bool = true,
+    /// v0.1.18：预定义角色（undo/redo/cut/copy/paste/delete/select_all）
+    role: ?[]const u8 = null,
+    /// v0.1.18：菜单项图标（.ico/.bmp 路径）
+    icon: ?[]const u8 = null,
 };
 
 pub const MenuSet = struct {

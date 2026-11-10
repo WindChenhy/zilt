@@ -9,6 +9,18 @@ pub const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
 pub const DWMWA_USE_IMMERSIVE_DARK_MODE_OLD: u32 = 19;
 /// DWMWA_SYSTEMBACKDROP_TYPE（38，Win11 22H2+）。
 pub const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
+/// v0.1.18：Win11 标题栏配色（COLORREF，0x00BBGGRR）。
+pub const DWMWA_BORDER_COLOR: u32 = 34;
+pub const DWMWA_CAPTION_COLOR: u32 = 35;
+pub const DWMWA_TEXT_COLOR: u32 = 36;
+
+/// 0xRRGGBB → COLORREF(0x00BBGGRR)。DWM 的 COLORREF 属性不接受 alpha。
+pub fn colorRef(rgb: u32) u32 {
+    const r = (rgb >> 16) & 0xFF;
+    const g = (rgb >> 8) & 0xFF;
+    const b = rgb & 0xFF;
+    return (b << 16) | (g << 8) | r;
+}
 
 /// DWM_SYSTEMBACKDROP_TYPE
 pub const Backdrop = enum(u32) {
@@ -39,6 +51,10 @@ pub const Appearance = struct {
     dark_titlebar: ?bool = null,
     /// 背景效果（null = 不修改）
     backdrop: ?Backdrop = null,
+    /// v0.1.18：标题栏/文字/边框颜色（0xRRGGBB，Win11 生效）
+    caption_color: ?u32 = null,
+    text_color: ?u32 = null,
+    border_color: ?u32 = null,
 };
 
 /// 应用顺序：先背景效果再标题栏（Win11 上 swapchain 背景与标题栏相互独立）。
@@ -67,4 +83,11 @@ test "attribute values are optional" {
     const dark = attributeValue(.{ .dark_titlebar = true, .backdrop = .mica });
     try testing.expectEqual(@as(?u32, 1), dark.dark);
     try testing.expectEqual(@as(?u32, 2), dark.backdrop);
+}
+
+test "v0.1.18: rgb to COLORREF" {
+    // 0x112233 → COLORREF 0x00332211
+    try testing.expectEqual(@as(u32, 0x00332211), colorRef(0x112233));
+    try testing.expectEqual(@as(u32, 0x00000000), colorRef(0x000000));
+    try testing.expectEqual(@as(u32, 0x00FFFFFF), colorRef(0xFFFFFF));
 }

@@ -316,6 +316,8 @@ pub fn run(comptime config: Config) !void {
     // 消息泵
     var msg: win32.MSG = undefined;
     while (win32.GetMessageW(&msg, null, 0, 0) > 0) {
+        // v0.1.18：菜单加速键（ACCEL 表）优先于页面内的按键处理
+        if (backend.translateAccel(&msg)) continue;
         _ = win32.TranslateMessage(&msg);
         _ = win32.DispatchMessageW(&msg);
     }
@@ -452,6 +454,60 @@ fn colorRefOf(rgb: u32) win32.DWORD {
     const g = (rgb >> 8) & 0xff;
     const b = rgb & 0xff;
     return @intCast((b << 16) | (g << 8) | r);
+}
+
+// ---- v0.1.18：窗口精细控制辅助 ----
+
+const LWA_ALPHA: win32.DWORD = 0x00000002;
+
+fn boolStr(v: bool) []const u8 {
+    return if (v) "true" else "false";
+}
+
+/// 判断窗口类名是否原生编辑控件（Edit / RichEdit20W 等）。
+fn isEditClass(cls_utf16: []const u16) bool {
+    const name = std.unicode.utf16LeToUtf8Alloc(std.heap.page_allocator, cls_utf16) catch return false;
+    defer std.heap.page_allocator.free(name);
+    return std.mem.eql(u8, name, "Edit") or std.mem.startsWith(u8, name, "RichEdit");
+}
+
+/// 0 视为「清除约束」（JSON 里省略字段 = null = 不改）。
+fn nonZero(v: ?u32) ?u32 {
+    const x = v orelse return null;
+    return if (x == 0) null else x;
+}
+
+/// 光标种类 → 系统光标句柄（LoadCursorW 使用系统共享光标，无需销毁）。
+fn cursorHandle(kind: ipc.CursorKind) win32.HCURSOR {
+    const id: usize = switch (kind) {
+        .default, .arrow => win32.IDC_ARROW,
+        .ibeam => win32.IDC_IBEAM,
+        .crosshair => win32.IDC_CROSS,
+        .hand => win32.IDC_HAND,
+        .wait => win32.IDC_WAIT,
+        .help => win32.IDC_HELP,
+        .not_allowed => win32.IDC_NO,
+        .size_ns => win32.IDC_SIZENS,
+        .size_ew => win32.IDC_SIZEWE,
+        .size_nwse => win32.IDC_SIZENWSE,
+        .size_nesw => win32.IDC_SIZENESW,
+        .move => win32.IDC_SIZEALL,
+        .up_arrow => win32.IDC_UPARROW,
+    };
+    return win32.LoadCursorW(null, @ptrFromInt(id));
+}
+
+/// 窗口当前所在显示器的矩形（虚拟屏坐标）；失败返回 null。
+fn currentMonitorRect(hwnd: win32.HWND) ?win32.RECT {
+    const mon = win32.MonitorFromWindow(hwnd, win32.MONITOR_DEFAULTTONEAREST) orelse return null;
+    var mi = win32.MONITORINFO{
+        .cbSize = @sizeOf(win32.MONITORINFO),
+        .rcMonitor = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+        .rcWork = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+        .dwFlags = 0,
+    };
+    if (win32.GetMonitorInfoW(mon, &mi) == 0) return null;
+    return mi.rcMonitor;
 }
 
 /// Windows 应用主题：true = 浅色（AppsUseLightTheme）。
@@ -755,6 +811,15 @@ fn Backend(comptime config: Config) type {
             // ---- v0.1.16：单窗口多 WebView（附加子 webview；主 webview 不动）----
             child_webviews: std.ArrayListUnmanaged(*ChildWebview) = .empty,
             next_child_webview_id: u32 = 1,
+            // ---- v0.1.18：窗口精细控制 ----
+            cursor: win32.HCURSOR = null,
+            cursor_hidden: bool = false,
+            ignore_cursor: bool = false,
+            content_protected: bool = false,
+            focusable: bool = true,
+            always_on_bottom: bool = false,
+            accel: win32.HACCEL = null,
+            menu_bitmaps: std.ArrayListUnmanaged(win32.HBITMAP) = .empty,
 
             fn updateBounds(self: *Window) void {
                 const controller = self.controller orelse return;
@@ -833,6 +898,8 @@ fn Backend(comptime config: Config) type {
         /// v0.1.13：托盘右键菜单的运行时模型（支持增删/勾选/禁用）
         menu_state: ?shared_menu_model.Model = null,
         tray_popup: ?menu_runtime.Built = null,
+        /// v0.1.18：托盘 hover 状态（TrackMouseEvent 只需登记一次）
+        tray_hovering: bool = false,
         tray_click_left: shared_system.ClickAction = .toggle_window,
         tray_click_middle: shared_system.ClickAction = .none,
         tray_click_double: shared_system.ClickAction = .toggle_window,
@@ -1075,7 +1142,9 @@ fn Backend(comptime config: Config) type {
             const style = windowStyleFor(opts);
             const ex_style = windowExStyleFor(opts);
             const has_menu = opts.decorations and !opts.child and menu_items.len != 0;
-            if (has_menu) w.menu = try menu_mod.buildWin32(self.allocator, menu_items);
+            if (has_menu) {
+                w.menu = try menu_mod.buildWin32WithIcons(self.allocator, menu_items, &w.menu_bitmaps);
+            }
             errdefer { if (w.menu) |menu| _ = win32.DestroyMenu(menu); }
             try self.windows.ensureUnusedCapacity(self.allocator, 1);
 
@@ -1134,6 +1203,8 @@ fn Backend(comptime config: Config) type {
             if (w.icon_small) |ic| {
                 _ = win32.SendMessageW(w.hwnd, win32.WM_SETICON, win32.ICON_SMALL, @bitCast(@intFromPtr(ic)));
             }
+            // v0.1.18：菜单加速键表（TranslateAccelerator 在消息循环里生效）
+            if (has_menu) w.accel = menu_mod.buildAccel(self.allocator, menu_items);
 
             if (opts.always_on_top) {
                 _ = win32.SetWindowPos(w.hwnd, win32.HWND_TOPMOST, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
@@ -1475,6 +1546,7 @@ fn Backend(comptime config: Config) type {
                 .updater_env = self.updater_env,
                 .restart_fn = restartToApplyDispatch,
                 .window_fn = runWindowCmd,
+                .window_query_fn = runWindowQuery,
                 .spawn_window_fn = spawnWindowFromBackend,
                 .clipboard_write_fn = clipboardWriteFromBackend,
                 .clipboard_read_fn = clipboardReadFromBackend,
@@ -2572,6 +2644,8 @@ fn Backend(comptime config: Config) type {
                         .accel = spec.accel,
                         .checked = spec.checked,
                         .enabled = spec.enabled,
+                        .role = spec.role,
+                        .icon = spec.icon,
                     });
                     self.rebuildTrayPopup();
                     log.print("[menu] added '{s}' under {s}", .{ spec.label, spec.parent orelse "<root>" });
@@ -2604,6 +2678,10 @@ fn Backend(comptime config: Config) type {
                     const menu_id: u16 = @intCast(cmd & 0xffff);
                     if (built.idFor(menu_id)) |id| {
                         log.print("[menu] popup pick {s}", .{id});
+                        if (built.roleFor(menu_id)) |role| {
+                            _ = self.dispatchRole(w, role);
+                            w.emitEventPayload("menuRole", .{ .id = id, .role = role });
+                        }
                         w.emitEventPayload("menu", .{ .id = id });
                     }
                     return .{ .ok = true };
@@ -3122,24 +3200,289 @@ fn Backend(comptime config: Config) type {
                     _ = win32.SetWindowPos(w.hwnd, null, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOZORDER | win32.SWP_FRAMECHANGED);
                     return true;
                 },
+                // ---- v0.1.18：窗口精细控制 ----
+                .cursor => |kind| {
+                    w.cursor = cursorHandle(kind);
+                    _ = win32.SetCursor(w.cursor);
+                    return w.cursor != null;
+                },
+                .cursor_visible => |visible| {
+                    if (visible and w.cursor_hidden) {
+                        _ = win32.ShowCursor(1);
+                        w.cursor_hidden = false;
+                    } else if (!visible and !w.cursor_hidden) {
+                        _ = win32.ShowCursor(0);
+                        w.cursor_hidden = true;
+                    }
+                    return true;
+                },
+                .cursor_grab => |grab| {
+                    if (grab) {
+                        _ = win32.SetCapture(w.hwnd);
+                    } else {
+                        _ = win32.ReleaseCapture();
+                    }
+                    return true;
+                },
+                .cursor_position => |p| return win32.SetCursorPos(p.x, p.y) != 0,
+                .ignore_cursor => |ignore| {
+                    var ex: win32.DWORD = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_EXSTYLE));
+                    if (ignore) {
+                        // WS_EX_LAYERED 是命中测试穿透的前提；层窗口必须先给 alpha=255，
+                        // 否则窗口会变成完全透明（实测坑）。
+                        ex |= win32.WS_EX_LAYERED | win32.WS_EX_TRANSPARENT;
+                    } else {
+                        ex &= ~(win32.WS_EX_TRANSPARENT);
+                        if (!w.transparent) ex &= ~win32.WS_EX_LAYERED;
+                    }
+                    _ = win32.SetWindowLongW(w.hwnd, win32.GWL_EXSTYLE, @bitCast(ex));
+                    _ = win32.SetLayeredWindowAttributes(w.hwnd, 0, 255, LWA_ALPHA);
+                    _ = win32.SetWindowPos(w.hwnd, null, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOZORDER | win32.SWP_FRAMECHANGED);
+                    w.ignore_cursor = ignore;
+                    return true;
+                },
+                .content_protected => |on| {
+                    const ok = win32.SetWindowDisplayAffinity(w.hwnd, if (on) win32.WDA_EXCLUDEFROMCAPTURE else win32.WDA_NONE) != 0;
+                    if (ok) w.content_protected = on;
+                    return ok;
+                },
+                .shadow => |on| return sys_integration.applyShadow(w.hwnd, on),
+                .always_on_bottom => |on| {
+                    w.always_on_bottom = on;
+                    _ = win32.SetWindowPos(w.hwnd, if (on) win32.HWND_BOTTOM else win32.HWND_NOTOPMOST, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
+                    return true;
+                },
+                .focusable => |on| {
+                    var ex: win32.DWORD = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_EXSTYLE));
+                    if (on) {
+                        ex &= ~win32.WS_EX_NOACTIVATE;
+                    } else {
+                        ex |= win32.WS_EX_NOACTIVATE;
+                    }
+                    _ = win32.SetWindowLongW(w.hwnd, win32.GWL_EXSTYLE, @bitCast(ex));
+                    w.focusable = on;
+                    return true;
+                },
+                .enabled => |on| return win32.EnableWindow(w.hwnd, if (on) 1 else 0) != 0 or !on,
+                .theme => |t| {
+                    const r = sys_integration.applyAppearance(w.hwnd, .{
+                        .dark_titlebar = t.dark,
+                        .caption_color = t.caption,
+                        .text_color = t.text,
+                        .border_color = t.border,
+                    });
+                    return r.dark or r.colors or (t.dark == null and t.caption == null and t.text == null and t.border == null);
+                },
+                .limits => |lim| {
+                    w.min_width = nonZero(lim.min_width);
+                    w.min_height = nonZero(lim.min_height);
+                    w.max_width = nonZero(lim.max_width);
+                    w.max_height = nonZero(lim.max_height);
+                    // 让新的约束立即生效（当前尺寸超限时会被系统夹紧）
+                    _ = win32.SetWindowPos(w.hwnd, null, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOZORDER);
+                    var rc: win32.RECT = undefined;
+                    if (win32.GetWindowRect(w.hwnd, &rc) != 0) {
+                        var wpx: i32 = rc.right - rc.left;
+                        var hpx: i32 = rc.bottom - rc.top;
+                        if (w.max_width) |mw| {
+                            if (wpx > @as(i32, @intCast(mw))) wpx = @intCast(mw);
+                        }
+                        if (w.max_height) |mh| {
+                            if (hpx > @as(i32, @intCast(mh))) hpx = @intCast(mh);
+                        }
+                        _ = win32.SetWindowPos(w.hwnd, null, 0, 0, wpx, hpx, win32.SWP_NOMOVE | win32.SWP_NOZORDER);
+                    }
+                    return true;
+                },
+                .fullscreen_monitor => |idx| {
+                    self.setFullscreenOnMonitor(w, idx);
+                    return true;
+                },
+                .icon => |path| {
+                    const cx_big = clampIconPx(win32.GetSystemMetrics(win32.SM_CXICON), 32);
+                    const cx_small = clampIconPx(win32.GetSystemMetrics(win32.SM_CXSMICON), 16);
+                    if (path) |p| {
+                        const ib = self.makeIcon(p, cx_big, cx_big) orelse return false;
+                        const is = self.makeIcon(p, cx_small, cx_small) orelse {
+                            _ = win32.DestroyIcon(ib);
+                            return false;
+                        };
+                        if (w.owns_icons) {
+                            if (w.icon_big) |old| _ = win32.DestroyIcon(old);
+                            if (w.icon_small) |old| _ = win32.DestroyIcon(old);
+                        }
+                        w.icon_big = ib;
+                        w.icon_small = is;
+                        w.owns_icons = true;
+                    } else {
+                        if (w.owns_icons) {
+                            if (w.icon_big) |old| _ = win32.DestroyIcon(old);
+                            if (w.icon_small) |old| _ = win32.DestroyIcon(old);
+                        }
+                        w.icon_big = self.icon_big;
+                        w.icon_small = self.icon_small;
+                        w.owns_icons = false;
+                    }
+                    _ = win32.SendMessageW(w.hwnd, win32.WM_SETICON, win32.ICON_BIG, @bitCast(@intFromPtr(w.icon_big)));
+                    _ = win32.SendMessageW(w.hwnd, win32.WM_SETICON, win32.ICON_SMALL, @bitCast(@intFromPtr(w.icon_small)));
+                    return true;
+                },
+                .state => return true, // 由 runWindowQuery 处理，不会走到这里
             }
+        }
+
+        /// v0.1.18：执行菜单预定义角色。焦点在原生编辑控件时发 WM_* 消息；
+        /// 否则在页面内用 document.execCommand（WebView2 场景）。
+        fn dispatchRole(self: *Self, w: *Window, role: []const u8) bool {
+            const eql = std.mem.eql;
+            const focus = win32.GetFocus();
+            if (focus != null and focus != w.hwnd) {
+                var buf: [128]u16 = @splat(0);
+                const n = win32.GetClassNameW(focus, &buf, buf.len);
+                if (n > 0 and isEditClass(buf[0..@intCast(n)])) {
+                    if (eql(u8, role, "select_all")) return win32.SendMessageW(focus, win32.EM_SETSEL, 0, -1) != 0;
+                    const msg: win32.UINT = if (eql(u8, role, "undo"))
+                        win32.WM_UNDO
+                    else if (eql(u8, role, "cut"))
+                        win32.WM_CUT
+                    else if (eql(u8, role, "copy"))
+                        win32.WM_COPY
+                    else if (eql(u8, role, "paste"))
+                        win32.WM_PASTE
+                    else if (eql(u8, role, "delete"))
+                        win32.WM_CLEAR
+                    else
+                        return false;
+                    _ = win32.SendMessageW(focus, msg, 0, 0);
+                    return true;
+                }
+            }
+
+            // paste：Chromium 禁止非用户手势的 execCommand('paste')，改为
+            // 原生读剪贴板 + insertText（实测可用的路径）。
+            if (eql(u8, role, "paste")) {
+                const text = self.getClipboardText(w, self.allocator) orelse return false;
+                defer self.allocator.free(text);
+                const lit = std.json.Stringify.valueAlloc(self.allocator, text, .{}) catch return false;
+                defer self.allocator.free(lit);
+                const js = std.fmt.allocPrint(self.allocator, "document.execCommand('insertText', false, {s})", .{lit}) catch return false;
+                defer self.allocator.free(js);
+                return self.execInWebview(w, js);
+            }
+
+            const js: []const u8 = if (eql(u8, role, "undo"))
+                "document.execCommand('undo')"
+            else if (eql(u8, role, "redo"))
+                "document.execCommand('redo')"
+            else if (eql(u8, role, "cut"))
+                "document.execCommand('cut')"
+            else if (eql(u8, role, "copy"))
+                "document.execCommand('copy')"
+            else if (eql(u8, role, "delete"))
+                "document.execCommand('delete')"
+            else if (eql(u8, role, "select_all"))
+                "document.execCommand('selectAll')"
+            else
+                return false;
+            return self.execInWebview(w, js);
+        }
+
+        /// 在窗口主 webview 内执行脚本（忽略结果）。
+        fn execInWebview(self: *Self, w: *Window, js: []const u8) bool {
+            const wv = w.webview orelse return false;
+            const js_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, js) catch return false;
+            defer self.allocator.free(js_w);
+            const handler = IgnoreCompletedHandler(wv2.IID_ExecuteScriptCompletedHandler).create(w) catch return false;
+            const hr = wv.lpVtbl.ExecuteScript(wv, js_w.ptr, @ptrCast(handler));
+            handler.dropRef();
+            if (!com.succeeded(hr)) log.print("[script] execute failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+            return com.succeeded(hr);
         }
 
         fn setFullscreen(self: *Self, w: *Window, on: bool) void {
             _ = self;
             if (on and !w.fullscreen) {
+                // v0.1.18：全屏到窗口当前所在显示器（原先固定主屏）
+                var rect: win32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+                if (currentMonitorRect(w.hwnd)) |r| {
+                    rect = r;
+                } else {
+                    rect = .{ .left = 0, .top = 0, .right = win32.GetSystemMetrics(win32.SM_CXSCREEN), .bottom = win32.GetSystemMetrics(win32.SM_CYSCREEN) };
+                }
                 w.saved_style = win32.GetWindowLongW(w.hwnd, win32.GWL_STYLE);
                 _ = win32.GetWindowRect(w.hwnd, &w.saved_rect);
                 _ = win32.SetWindowLongW(w.hwnd, win32.GWL_STYLE, @bitCast(win32.WS_POPUP | win32.WS_VISIBLE));
-                const cx = win32.GetSystemMetrics(win32.SM_CXSCREEN);
-                const cy = win32.GetSystemMetrics(win32.SM_CYSCREEN);
-                _ = win32.SetWindowPos(w.hwnd, null, 0, 0, cx, cy, win32.SWP_FRAMECHANGED | win32.SWP_SHOWWINDOW);
+                _ = win32.SetWindowPos(w.hwnd, null, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, win32.SWP_FRAMECHANGED | win32.SWP_SHOWWINDOW);
                 w.fullscreen = true;
             } else if (!on and w.fullscreen) {
                 _ = win32.SetWindowLongW(w.hwnd, win32.GWL_STYLE, w.saved_style);
                 _ = win32.SetWindowPos(w.hwnd, null, w.saved_rect.left, w.saved_rect.top, w.saved_rect.right - w.saved_rect.left, w.saved_rect.bottom - w.saved_rect.top, win32.SWP_FRAMECHANGED | win32.SWP_SHOWWINDOW);
                 w.fullscreen = false;
             }
+        }
+
+        /// v0.1.18：全屏到指定显示器（索引按 EnumDisplayMonitors 顺序）；越界回退当前显示器。
+        fn setFullscreenOnMonitor(self: *Self, w: *Window, index: u32) void {
+            if (w.fullscreen) self.setFullscreen(w, false);
+            const monitors = win_sysinfo.collectMonitors(self.allocator) catch {
+                self.setFullscreen(w, true);
+                return;
+            };
+            defer self.allocator.free(monitors);
+
+            var rect: win32.RECT = undefined;
+            if (index < monitors.len) {
+                const m = monitors[index];
+                const mw: i32 = @intCast(m.width);
+                const mh: i32 = @intCast(m.height);
+                rect = .{ .left = m.x, .top = m.y, .right = m.x + mw, .bottom = m.y + mh };
+            } else {
+                rect = currentMonitorRect(w.hwnd) orelse .{ .left = 0, .top = 0, .right = win32.GetSystemMetrics(win32.SM_CXSCREEN), .bottom = win32.GetSystemMetrics(win32.SM_CYSCREEN) };
+            }
+            w.saved_style = win32.GetWindowLongW(w.hwnd, win32.GWL_STYLE);
+            _ = win32.GetWindowRect(w.hwnd, &w.saved_rect);
+            _ = win32.SetWindowLongW(w.hwnd, win32.GWL_STYLE, @bitCast(win32.WS_POPUP | win32.WS_VISIBLE));
+            _ = win32.SetWindowPos(w.hwnd, null, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, win32.SWP_FRAMECHANGED | win32.SWP_SHOWWINDOW);
+            w.fullscreen = true;
+            log.print("[window] #{d} fullscreen on monitor {d} rect=({d},{d})-({d},{d})", .{ w.id, index, rect.left, rect.top, rect.right, rect.bottom });
+        }
+
+        /// v0.1.18：窗口状态快照（JSON）。必须在 UI 线程调用（读 Win32 状态）。
+        fn runWindowQuery(backend_ptr: *anyopaque, window_id: u32, alloc: std.mem.Allocator) ?[]u8 {
+            const self: *Self = @ptrCast(@alignCast(backend_ptr));
+            const w = self.windowById(if (window_id == 0) 1 else window_id) orelse return null;
+            if (!w.alive) return null;
+            var rc: win32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+            _ = win32.GetWindowRect(w.hwnd, &rc);
+            const style: u32 = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_STYLE));
+            const ex: u32 = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_EXSTYLE));
+            return std.fmt.allocPrint(alloc,
+                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":{d},"ex_style":{d},"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":{s},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d}}}
+            , .{
+                w.id,
+                rc.left,
+                rc.top,
+                rc.right - rc.left,
+                rc.bottom - rc.top,
+                style,
+                ex,
+                boolStr(win32.IsWindowEnabled(w.hwnd) != 0),
+                boolStr(win32.IsWindowVisible(w.hwnd) != 0),
+                boolStr(win32.GetFocus() == w.hwnd),
+                boolStr(win32.IsZoomed(w.hwnd) != 0),
+                boolStr(win32.IsIconic(w.hwnd) != 0),
+                boolStr(w.fullscreen),
+                boolStr(ex & win32.WS_EX_TOPMOST != 0),
+                boolStr(w.always_on_bottom),
+                boolStr(w.ignore_cursor),
+                boolStr(w.focusable),
+                boolStr(w.content_protected),
+                w.min_width orelse 0,
+                w.min_height orelse 0,
+                w.max_width orelse 0,
+                w.max_height orelse 0,
+                w.child_webviews.items.len,
+            }) catch null;
         }
 
         fn setClipboardText(self: *Self, w: *Window, text: []const u8) bool {
@@ -3735,6 +4078,13 @@ fn Backend(comptime config: Config) type {
 
         // ---- 消息循环 ----
 
+        /// v0.1.18：把按键消息交给当前窗口的菜单 ACCEL 表；命中则消费（产生 WM_COMMAND）。
+        fn translateAccel(self: *Self, msg: *win32.MSG) bool {
+            const w = self.focusedWindow() orelse self.mainWindow() orelse return false;
+            if (!w.alive or w.accel == null) return false;
+            return win32.TranslateAcceleratorW(w.hwnd, w.accel, msg) != 0;
+        }
+
         fn wndProc(hwnd: win32.HWND, msg: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.c) win32.LRESULT {
             switch (msg) {
                 win32.WM_MOVE => {
@@ -3834,6 +4184,36 @@ fn Backend(comptime config: Config) type {
                         return 0;
                     }
                 },
+                // v0.1.18：自定义光标 / 置底 / 托盘 hover 结束
+                win32.WM_SETCURSOR => {
+                    if (instance) |b| {
+                        if (b.windowOfHwnd(hwnd)) |w| {
+                            if (w.cursor) |c| {
+                                _ = win32.SetCursor(c);
+                                return 1;
+                            }
+                        }
+                    }
+                },
+                win32.WM_WINDOWPOSCHANGING => {
+                    if (instance) |b| {
+                        if (b.windowOfHwnd(hwnd)) |w| {
+                            if (w.always_on_bottom and lparam != 0) {
+                                const wp: *win32.WINDOWPOS = @ptrCast(@alignCast(@as(*anyopaque, @ptrFromInt(@as(usize, @bitCast(lparam))))));
+                                if ((wp.flags & win32.SWP_NOZORDER) == 0) wp.hwndInsertAfter = win32.HWND_BOTTOM;
+                            }
+                        }
+                    }
+                },
+                win32.WM_MOUSELEAVE => {
+                    if (instance) |b| {
+                        if (b.tray_hovering) {
+                            b.tray_hovering = false;
+                            if (b.mainWindow()) |mw| mw.emitEventPayload("trayHover", .{ .phase = "leave" });
+                        }
+                    }
+                    return 0;
+                },
                 win32.WM_CLOSE => {
                     if (instance) |b| {
                         if (b.windowOfHwnd(hwnd)) |w| {
@@ -3861,6 +4241,13 @@ fn Backend(comptime config: Config) type {
                             w.driver = null;
                             if (w.drop_target) |t| t.destroy();
                             w.drop_target = null;
+                            // v0.1.18：加速键表与菜单位图
+                            if (w.accel) |h| _ = win32.DestroyAcceleratorTable(h);
+                            w.accel = null;
+                            for (w.menu_bitmaps.items) |bmp| {
+                                if (bmp) |h| _ = win32.DeleteObject(@ptrCast(h));
+                            }
+                            w.menu_bitmaps.deinit(b.allocator);
                             if (w.clipboard_listening) win_clipboard.stopListening(w.hwnd);
                             w.clipboard_listening = false;
                             w.alive = false;
@@ -3922,6 +4309,11 @@ fn Backend(comptime config: Config) type {
                             const mid: u16 = @intCast(wparam & 0xffff);
                             if (menu_mod.idFromPopup(w.menu_items, 0, mid)) |id| {
                                 log.print("[menu] {s}", .{id});
+                                // v0.1.18：预定义角色先执行（copy/paste/…），同时发事件便于观测
+                                if (menu_mod.roleForId(w.menu_items, id)) |role| {
+                                    _ = b.dispatchRole(w, role);
+                                    w.emitEventPayload("menuRole", .{ .id = id, .role = role });
+                                }
                                 w.emitEventPayload("menu", .{ .id = id });
                             }
                         }
@@ -3982,6 +4374,25 @@ fn Backend(comptime config: Config) type {
                 },
                 WM_ZILT_TRAY => {
                     if (instance) |b| {
+                        // v0.1.18：托盘 hover（enter/move/leave），对齐 Tauri tray 事件
+                        if (lparam == win32.WM_MOUSEMOVE) {
+                            var pt = win32.POINT{ .x = 0, .y = 0 };
+                            _ = win32.GetCursorPos(&pt);
+                            if (!b.tray_hovering) {
+                                b.tray_hovering = true;
+                                var tme = win32.TRACKMOUSEEVENT{
+                                    .cbSize = @sizeOf(win32.TRACKMOUSEEVENT),
+                                    .dwFlags = win32.TME_LEAVE,
+                                    .hwndTrack = hwnd,
+                                    .dwHoverTime = 0,
+                                };
+                                _ = win32.TrackMouseEvent(&tme);
+                                if (b.mainWindow()) |mw| mw.emitEventPayload("trayHover", .{ .phase = "enter", .x = pt.x, .y = pt.y });
+                            } else if (b.mainWindow()) |mw| {
+                                mw.emitEventPayload("trayHover", .{ .phase = "move", .x = pt.x, .y = pt.y });
+                            }
+                            return 0;
+                        }
                         // v0.1.13：左右键/中键/双击行为可配置
                         const action: shared_system.ClickAction = if (lparam == win32.WM_LBUTTONUP)
                             b.tray_click_left

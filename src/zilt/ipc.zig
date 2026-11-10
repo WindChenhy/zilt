@@ -147,6 +147,58 @@ pub const WindowOptions = struct {
     icon: ?[]const u8 = null,
 };
 
+/// v0.1.18：窗口光标形状（对齐 Tauri `CursorIcon` 的 Windows 子集）。
+pub const CursorKind = enum {
+    default,
+    arrow,
+    ibeam,
+    crosshair,
+    hand,
+    wait,
+    help,
+    not_allowed,
+    size_ns,
+    size_ew,
+    size_nwse,
+    size_nesw,
+    move,
+    up_arrow,
+
+    pub fn fromName(name: []const u8) ?CursorKind {
+        const eql = std.ascii.eqlIgnoreCase;
+        if (eql(name, "default") or eql(name, "arrow")) return .arrow;
+        if (eql(name, "ibeam") or eql(name, "text")) return .ibeam;
+        if (eql(name, "crosshair")) return .crosshair;
+        if (eql(name, "hand") or eql(name, "pointer")) return .hand;
+        if (eql(name, "wait") or eql(name, "progress")) return .wait;
+        if (eql(name, "help")) return .help;
+        if (eql(name, "not-allowed") or eql(name, "notallowed") or eql(name, "no")) return .not_allowed;
+        if (eql(name, "size-ns") or eql(name, "ns-resize") or eql(name, "ns")) return .size_ns;
+        if (eql(name, "size-ew") or eql(name, "ew-resize") or eql(name, "ew")) return .size_ew;
+        if (eql(name, "size-nwse") or eql(name, "nwse-resize")) return .size_nwse;
+        if (eql(name, "size-nesw") or eql(name, "nesw-resize")) return .size_nesw;
+        if (eql(name, "move") or eql(name, "grabbing")) return .move;
+        if (eql(name, "up-arrow") or eql(name, "uparrow")) return .up_arrow;
+        return null;
+    }
+};
+
+/// v0.1.18：每窗口外观覆盖（Win11 标题栏配色，颜色为 0xRRGGBB）。
+pub const WindowTheme = struct {
+    dark: ?bool = null,
+    caption: ?u32 = null,
+    text: ?u32 = null,
+    border: ?u32 = null,
+};
+
+/// v0.1.18：运行时改尺寸约束（null = 不改；0 = 清除该约束）。
+pub const WindowLimits = struct {
+    min_width: ?u32 = null,
+    min_height: ?u32 = null,
+    max_width: ?u32 = null,
+    max_height: ?u32 = null,
+};
+
 pub const WindowCmd = union(enum) {
     set_title: []const u8,
     minimize,
@@ -162,6 +214,29 @@ pub const WindowCmd = union(enum) {
     start_dragging,
     always_on_top: bool,
     skip_taskbar: bool,
+    // ---- v0.1.18：对齐 Tauri/Wails 的窗口精细控制 ----
+    cursor: CursorKind,
+    cursor_visible: bool,
+    cursor_grab: bool,
+    cursor_position: struct { x: i32, y: i32 },
+    /// 鼠标事件穿透到下层窗口（WS_EX_LAYERED | WS_EX_TRANSPARENT）
+    ignore_cursor: bool,
+    /// 禁止截图/录屏捕获（SetWindowDisplayAffinity WDA_EXCLUDEFROMCAPTURE）
+    content_protected: bool,
+    /// DWM 边框阴影（对无边框窗口有效）
+    shadow: bool,
+    always_on_bottom: bool,
+    /// 不参与激活（WS_EX_NOACTIVATE）
+    focusable: bool,
+    enabled: bool,
+    theme: WindowTheme,
+    limits: WindowLimits,
+    /// 全屏到指定显示器（0 基索引，按 EnumDisplayMonitors 顺序）
+    fullscreen_monitor: u32,
+    /// 运行时替换窗口图标；null = 恢复应用默认图标
+    icon: ?[]const u8,
+    /// 查询窗口当前状态（JSON），用于调试与自动化断言
+    state,
 };
 
 // ---------------------------------------------------------------------------
@@ -195,6 +270,8 @@ pub const Context = struct {
     restart_fn: ?*const fn (backend: *anyopaque) void = null,
     /// 窗口控制（v0.1.6：跨线程安全 marshal 到 UI 线程）。null = 平台不支持。
     window_fn: ?*const fn (backend: *anyopaque, window_id: u32, cmd: WindowCmd) bool = null,
+    /// v0.1.18：窗口状态查询（返回 allocator 分配的 JSON，所有权归调用方）。
+    window_query_fn: ?*const fn (backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator) ?[]u8 = null,
     /// 新建窗口（返回新窗口 id；null = 创建失败/平台不支持）。
     spawn_window_fn: ?*const fn (backend: *anyopaque, opts: WindowOptions) ?u32 = null,
     /// 剪贴板写文本（成功 true）。
@@ -778,6 +855,28 @@ pub const runtime_js =
     \\      skipTaskbar: (enabled, id) => winApi('skipTaskbar', { enabled, window_id: id }),
     \\      focus: (id) => winApi('focus', { window_id: id }),
     \\      startDragging: (id) => winApi('startDragging', { window_id: id }),
+    \\      // v0.1.18：精细控制（对齐 Tauri set_cursor_* / set_content_protected 等）
+    \\      setCursor: (kind, id) => winApi('setCursor', { cursor: kind ?? 'default', window_id: id }),
+    \\      setCursorVisible: (visible, id) => winApi('setCursorVisible', { visible: visible !== false, window_id: id }),
+    \\      setCursorGrab: (grab, id) => winApi('setCursorGrab', { grab: grab !== false, window_id: id }),
+    \\      setCursorPosition: (x, y, id) => winApi('setCursorPosition', { x, y, window_id: id }),
+    \\      setIgnoreCursorEvents: (ignore, id) => winApi('setIgnoreCursorEvents', { ignore: ignore !== false, window_id: id }),
+    \\      setContentProtected: (on, id) => winApi('setContentProtected', { enabled: on !== false, window_id: id }),
+    \\      setShadow: (on, id) => winApi('setShadow', { enabled: on !== false, window_id: id }),
+    \\      setAlwaysOnBottom: (on, id) => winApi('setAlwaysOnBottom', { enabled: on !== false, window_id: id }),
+    \\      setFocusable: (on, id) => winApi('setFocusable', { enabled: on !== false, window_id: id }),
+    \\      setEnabled: (on, id) => winApi('setEnabled', { enabled: on !== false, window_id: id }),
+    \\      setTheme: (opts, id) => winApi('setTheme', {
+    \\        dark: opts?.dark, caption_color: opts?.captionColor,
+    \\        text_color: opts?.textColor, border_color: opts?.borderColor, window_id: id,
+    \\      }),
+    \\      setMinMax: (opts, id) => winApi('setMinMax', {
+    \\        min_width: opts?.minWidth, min_height: opts?.minHeight,
+    \\        max_width: opts?.maxWidth, max_height: opts?.maxHeight, window_id: id,
+    \\      }),
+    \\      fullscreenOnMonitor: (index, id) => winApi('fullscreenOnMonitor', { monitor: index ?? 0, window_id: id }),
+    \\      setIcon: (path, id) => winApi('setIcon', { icon: path ?? null, window_id: id }),
+    \\      state: (id) => winApi('state', { window_id: id }),
     \\    },
     \\    // v0.1.9: eval returns a Promise resolved by __zilt.evalResult
     \\    eval: (script) => new Promise((resolve, reject) => {
@@ -983,7 +1082,7 @@ pub const runtime_js =
     \\      query: (db, sql, params) => builtin('__zilt.sql', { action: 'query', db, sql: String(sql), params: (params ?? []).map(ziltSqlParam) }),
     \\      execute: (db, sql, params) => builtin('__zilt.sql', { action: 'execute', db, sql: String(sql), params: (params ?? []).map(ziltSqlParam) }),
     \\    },
-    \\    version: '0.1.17',
+    \\    version: '0.1.18',
     \\  };
     \\  window.zilt.on('webviewEval', (p) => {
     \\    const wait = webviewEvalWaiters.get(p && p.rid);
@@ -1199,4 +1298,16 @@ test "metas reflect command signatures" {
     try testing.expect(metas[0].result == f64);
     try testing.expect(metas[2].result == void); // failNow
     try testing.expect(metas[3].args == null); // noArgs
+}
+
+test "v0.1.18: cursor kind names" {
+    try testing.expectEqual(CursorKind.arrow, CursorKind.fromName("default").?);
+    try testing.expectEqual(CursorKind.arrow, CursorKind.fromName("ARROW").?);
+    try testing.expectEqual(CursorKind.ibeam, CursorKind.fromName("text").?);
+    try testing.expectEqual(CursorKind.hand, CursorKind.fromName("pointer").?);
+    try testing.expectEqual(CursorKind.not_allowed, CursorKind.fromName("not-allowed").?);
+    try testing.expectEqual(CursorKind.size_ns, CursorKind.fromName("ns-resize").?);
+    try testing.expectEqual(CursorKind.size_ew, CursorKind.fromName("ew-resize").?);
+    try testing.expectEqual(CursorKind.move, CursorKind.fromName("grabbing").?);
+    try testing.expect(CursorKind.fromName("nope") == null);
 }

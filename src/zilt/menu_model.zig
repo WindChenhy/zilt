@@ -23,6 +23,10 @@ pub const Node = struct {
     checked: bool = false,
     /// 子菜单默认项（粗体）
     default_item: bool = false,
+    /// v0.1.18：预定义角色（undo/redo/cut/copy/paste/delete/select_all）
+    role: ?[]const u8 = null,
+    /// v0.1.18：菜单项图标（.ico 路径）
+    icon: ?[]const u8 = null,
     children: std.ArrayListUnmanaged(*Node) = .empty,
 
     pub fn isSeparator(self: Node) bool {
@@ -66,6 +70,8 @@ pub const Model = struct {
                 .id = try self.arenaAlloc().dupe(u8, item.id orelse ""),
                 .label = try self.arenaAlloc().dupe(u8, item.label),
                 .accel = if (item.accel) |a| try self.arenaAlloc().dupe(u8, a) else null,
+                .role = if (item.role) |r| try self.arenaAlloc().dupe(u8, r) else null,
+                .icon = if (item.icon) |i| try self.arenaAlloc().dupe(u8, i) else null,
             };
             if (item.items) |children| {
                 try self.appendConfigItems(&node.children, children);
@@ -133,6 +139,8 @@ pub const Model = struct {
             .accel = if (spec.accel) |a| try self.arenaAlloc().dupe(u8, a) else null,
             .enabled = spec.enabled,
             .checked = spec.checked,
+            .role = if (spec.role) |r| try self.arenaAlloc().dupe(u8, r) else null,
+            .icon = if (spec.icon) |i| try self.arenaAlloc().dupe(u8, i) else null,
         };
         if (spec.children) |children| {
             try self.appendConfigItems(&node.children, children);
@@ -279,6 +287,8 @@ pub const Spec = struct {
     accel: ?[]const u8 = null,
     enabled: bool = true,
     checked: bool = false,
+    role: ?[]const u8 = null,
+    icon: ?[]const u8 = null,
     children: ?[]const Config.MenuItem = null,
 };
 

@@ -5,6 +5,7 @@
 const std = @import("std");
 const win32 = @import("win32.zig");
 const menu_model = @import("../../menu_model.zig");
+const menu_mod = @import("menu.zig");
 
 pub const MF_CHECKED: win32.UINT = 0x00000008;
 pub const MF_GRAYED: win32.UINT = 0x00000001;
@@ -18,13 +19,29 @@ pub const Built = struct {
     hmenu: win32.HMENU,
     /// 叶子命令 id，索引 = win_id - base - 1
     ids: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// v0.1.18：与 ids 平行的角色表
+    roles: std.ArrayListUnmanaged(?[]const u8) = .empty,
+    /// v0.1.18：菜单项位图（销毁菜单时一并释放）
+    bitmaps: std.ArrayListUnmanaged(win32.HBITMAP) = .empty,
     base: u16 = 0,
     default_id: ?u16 = null,
 
     pub fn deinit(self: *Built, alloc: std.mem.Allocator) void {
-        // ids 里的字符串归 model 的 arena，这里只释放数组本身
+        // ids/roles 里的字符串归 model 的 arena，这里只释放数组本身
         self.ids.deinit(alloc);
+        self.roles.deinit(alloc);
+        for (self.bitmaps.items) |bmp| {
+            if (bmp) |h| _ = win32.DeleteObject(@ptrCast(h));
+        }
+        self.bitmaps.deinit(alloc);
         if (self.hmenu) |h| _ = win32.DestroyMenu(h);
+    }
+
+    pub fn roleFor(self: *const Built, win_id: u16) ?[]const u8 {
+        if (win_id <= self.base) return null;
+        const idx = win_id - self.base - 1;
+        if (idx >= self.roles.items.len) return null;
+        return self.roles.items[idx];
     }
 
     pub fn idFor(self: *const Built, win_id: u16) ?[]const u8 {
@@ -92,6 +109,7 @@ fn fill(ctx: *Ctx, hmenu: win32.HMENU, list: []*menu_model.Node) !void {
         ctx.next.* += 1;
         const win_id = ctx.next.*;
         try ctx.built.ids.append(ctx.alloc, node.id);
+        try ctx.built.roles.append(ctx.alloc, node.role);
 
         var flags: win32.UINT = win32.MF_STRING;
         if (node.checked) flags |= MF_CHECKED;
@@ -102,6 +120,14 @@ fn fill(ctx: *Ctx, hmenu: win32.HMENU, list: []*menu_model.Node) !void {
         defer ctx.alloc.free(text);
         if (win32.AppendMenuW(hmenu, flags, win_id, text.ptr) == 0) return error.AppendMenuFailed;
         if (node.default_item) ctx.built.default_id = win_id;
+        if (node.icon) |icon_path| {
+            if (menu_mod.loadMenuBitmap(ctx.alloc, icon_path)) |bmp| {
+                _ = win32.SetMenuItemBitmaps(hmenu, win_id, win32.MF_BYCOMMAND, bmp, bmp);
+                ctx.built.bitmaps.append(ctx.alloc, bmp) catch {
+                    _ = win32.DeleteObject(@ptrCast(bmp));
+                };
+            }
+        }
     }
 }
 

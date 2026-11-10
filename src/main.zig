@@ -23,7 +23,7 @@ pub fn main() !void {
         .events = app.events,
         .assets = &app.assets,
         .security = app.security,
-        .title = "Zilt — v0.1.17 示例",
+        .title = "Zilt — v0.1.18 示例",
         .width = 960,
         .height = 700,
         .url = "https://zilt.app/index.html",
@@ -81,6 +81,18 @@ pub fn main() !void {
                 .{ .label = "打开文件...", .id = "open", .accel = "Ctrl+O" },
                 .{ .label = "-" },
                 .{ .label = "退出", .id = "exit", .accel = "Alt+F4" },
+            } },
+            // v0.1.18：预定义角色菜单（copy/paste 等由框架直接执行；不带加速键，
+            // 避免劫持 WebView 原生的 Ctrl+C/V 行为）
+            .{ .label = "编辑", .items = &.{
+                .{ .label = "撤销", .id = "edit.undo", .role = "undo" },
+                .{ .label = "重做", .id = "edit.redo", .role = "redo" },
+                .{ .label = "-" },
+                .{ .label = "剪切", .id = "edit.cut", .role = "cut" },
+                .{ .label = "复制", .id = "edit.copy", .role = "copy" },
+                .{ .label = "粘贴", .id = "edit.paste", .role = "paste" },
+                .{ .label = "删除", .id = "edit.delete", .role = "delete" },
+                .{ .label = "全选", .id = "edit.selectAll", .role = "select_all" },
             } },
             .{ .label = "帮助", .items = &.{
                 .{ .label = "关于 Zilt", .id = "about", .accel = "F1" },

@@ -26,6 +26,9 @@ extern "dwmapi" fn DwmSetWindowAttribute(
     cbAttribute: u32,
 ) callconv(.c) com.HRESULT;
 
+/// v0.1.18：无边框窗口的 DWM 阴影（负 margin 让 DWM 绘制系统边框阴影）。
+extern "dwmapi" fn DwmExtendFrameIntoClientArea(hwnd: win32.HWND, margins: *const win32.MARGINS) callconv(.c) com.HRESULT;
+
 const SW_SHOWNORMAL: c_int = 1;
 
 const REG_RUN: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral(autostart.registry_path);
@@ -128,12 +131,12 @@ fn setDwmAttr(hwnd: win32.HWND, attr: u32, value: u32) bool {
     return com.succeeded(hr);
 }
 
-pub const AppearResult = struct { dark: bool, backdrop: bool };
+pub const AppearResult = struct { dark: bool, backdrop: bool, colors: bool = false };
 
 /// 应用暗色标题栏与背景效果。Win10（无 backdrop 属性）会静默跳过
 /// DWMWA_SYSTEMBACKDROP_TYPE；暗色标题栏在 1809 前用旧槽位 19 回退。
 pub fn applyAppearance(hwnd: win32.HWND, appearance: theme.Appearance) AppearResult {
-    var result = AppearResult{ .dark = false, .backdrop = false };
+    var result = AppearResult{ .dark = false, .backdrop = false, .colors = false };
     if (appearance.dark_titlebar) |dark| {
         const v: u32 = @intFromBool(dark);
         result.dark = setDwmAttr(hwnd, theme.DWMWA_USE_IMMERSIVE_DARK_MODE, v) or
@@ -142,7 +145,27 @@ pub fn applyAppearance(hwnd: win32.HWND, appearance: theme.Appearance) AppearRes
     if (appearance.backdrop) |b| {
         result.backdrop = setDwmAttr(hwnd, theme.DWMWA_SYSTEMBACKDROP_TYPE, @intFromEnum(b));
     }
+    // v0.1.18：标题栏配色（Win11 22H2+；旧系统静默失败）
+    if (appearance.caption_color) |c| {
+        result.colors = setDwmAttr(hwnd, theme.DWMWA_CAPTION_COLOR, theme.colorRef(c)) or result.colors;
+    }
+    if (appearance.text_color) |c| {
+        result.colors = setDwmAttr(hwnd, theme.DWMWA_TEXT_COLOR, theme.colorRef(c)) or result.colors;
+    }
+    if (appearance.border_color) |c| {
+        result.colors = setDwmAttr(hwnd, theme.DWMWA_BORDER_COLOR, theme.colorRef(c)) or result.colors;
+    }
     return result;
+}
+
+/// 开关无边框窗口的 DWM 阴影。margin 全 -1 时 DWM 把客户区当作整个边框，
+/// 从而绘制系统阴影并保留圆角；全 0 则移除扩展。
+pub fn applyShadow(hwnd: win32.HWND, enabled: bool) bool {
+    var margins = win32.MARGINS{ .cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = 0, .cyBottomHeight = 0 };
+    if (enabled) {
+        margins = .{ .cxLeftWidth = -1, .cxRightWidth = -1, .cyTopHeight = -1, .cyBottomHeight = -1 };
+    }
+    return com.succeeded(DwmExtendFrameIntoClientArea(hwnd, &margins));
 }
 
 const testing = std.testing;

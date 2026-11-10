@@ -433,6 +433,38 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
 - [x] **验收**：冒烟 32 项含 store/fs/path/log/windowState + http + ws + webviews +
       **partition 隔离**（alpha/beta localStorage 互不可见、共享实例与主页面互通）
 
+### v0.1.18 — Windows 窗口层对齐 Tauri（P0，2026-11-10）
+
+> 目标：把「窗口层差 ~15 个 Win32 小 API」补齐到与 Tauri 2 同级。
+> 全部实现并实测；GUI 冒烟 32 → **33 项**。
+
+- [x] **光标**：`window.setCursor(kind)`（14 种：arrow/ibeam/hand/wait/crosshair/
+      not-allowed/size-ns|ew|nwse|nesw/move/up-arrow）、`setCursorVisible`、
+      `setCursorGrab`（SetCapture）、`setCursorPosition`；`WM_SETCURSOR` 按窗口生效
+- [x] **鼠标穿透**：`setIgnoreCursorEvents`（WS_EX_LAYERED|WS_EX_TRANSPARENT +
+      alpha=255 防全透明，实测坑）
+- [x] **截屏保护**：`setContentProtected`（SetWindowDisplayAffinity WDA_EXCLUDEFROMCAPTURE）
+- [x] **阴影**：`setShadow`（DwmExtendFrameIntoClientArea 负 margin）
+- [x] **层序/焦点**：`setAlwaysOnBottom`（WM_WINDOWPOSCHANGING 强制 HWND_BOTTOM）、
+      `setFocusable`（WS_EX_NOACTIVATE）、`setEnabled`（EnableWindow）
+- [x] **标题栏配色**：`setTheme({dark, captionColor, textColor, borderColor})`
+      （DWMWA_CAPTION_COLOR/TEXT_COLOR/BORDER_COLOR，Win11 生效）
+- [x] **运行时图标**：`setIcon(path)` / `setIcon(null)` 恢复默认（WM_SETICON + 旧图标释放）
+- [x] **菜单加速键真正生效**：由菜单 `accel` 生成 ACCEL 表（CreateAcceleratorTableW），
+      消息循环 TranslateAcceleratorW 分发 → WM_COMMAND（此前只显示 `\tCtrl+K` 文本）
+- [x] **菜单角色 + 图标**：`role` = undo/redo/cut/copy/paste/delete/select_all
+      （原生编辑控件走 WM_*，页面走 execCommand；paste 走「原生读剪贴板 + insertText」）；
+      `icon` = .ico/.bmp 经 GetIconInfo → SetMenuItemBitmaps，随窗口/菜单销毁释放
+- [x] **托盘 hover**：`trayHover {phase: enter|move|leave, x, y}`（TrackMouseEvent + WM_MOUSELEAVE）
+- [x] **尺寸约束/多屏**：`setMinMax({minWidth…})` 运行时生效（0 = 清除）；
+      `fullscreenOnMonitor(index)` 按 EnumDisplayMonitors 顺序；普通全屏改为当前显示器
+- [x] **窗口状态查询**：`window.state()` → {x,y,width,height,style,ex_style,enabled,
+      visible,focused,zoomed,iconic,fullscreen,always_on_top/bottom,ignore_cursor,
+      focusable,content_protected,min/max,child_webviews}（供调试与自动化断言）
+- [x] **单测**：+4（光标名解析 / RGB→COLORREF / 角色反查 / ACCEL 表过滤）；框架 **220**
+- [x] **验收**：冒烟 33 项 exit 0（新增 c-wincontrol 实测 12 个操作与 state 回读一致性）；
+      示例应用菜单加「编辑」角色子菜单
+
 ### v0.1.17 — 工具链、测试与生态（P2）
 
 > 状态（2026-11-09 收尾）：CLI / 图标 CLI / headless / 热重启 / npm 运行时包 /

@@ -133,8 +133,14 @@ pub const Config = struct {
         label: []const u8,
         id: ?[]const u8 = null,
         items: ?[]const MenuItem = null,
-        /// 加速键展示（v0.1.13）：`"Ctrl+N"`，菜单项右侧以 `\t` 对齐显示
+        /// 加速键展示（v0.1.13）：`"Ctrl+N"`，菜单项右侧以 `\t` 对齐显示；
+        /// v0.1.18 起同时参与 ACCEL 表，真正响应键盘。
         accel: ?[]const u8 = null,
+        /// v0.1.18：预定义角色（undo/redo/cut/copy/paste/delete/select_all），
+        /// 有 role 的项必须同时给 id（菜单 id 表按叶子顺序，缺 id 会错位）。
+        role: ?[]const u8 = null,
+        /// v0.1.18：菜单项左侧图标（.ico 路径，16×16 渲染）
+        icon: ?[]const u8 = null,
     };
 
     /// 全局快捷键（key: "A"-"Z"/"0"-"9"/"F1"-"F12"，编译期校验）。

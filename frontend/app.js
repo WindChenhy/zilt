@@ -555,6 +555,52 @@ async function runChecks() {
         : `ready=${rA},${rB},${rS} settle=${sA},${sB},${sS} A=${writeA} B0=${readB} B=${writeB} A2=${readA2} S=${writeS} main=${readMain} parts=${JSON.stringify(parts)}`);
     } catch (e) { setCheck('c-partition', false, String(e.message || e)); }
 
+    // 33. v0.1.18：窗口精细控制（光标/穿透/截屏保护/置底/可聚焦/尺寸约束/主题/图标/全屏）
+    try {
+      const S = () => window.zilt.window.state();
+      const s0 = await S();
+      const rCursor = await window.zilt.window.setCursor('hand');
+      const rIgnore = await window.zilt.window.setIgnoreCursorEvents(true);
+      const sIgnore = await S();
+      await window.zilt.window.setIgnoreCursorEvents(false);
+      const rProtect = await window.zilt.window.setContentProtected(true);
+      const sProtect = await S();
+      await window.zilt.window.setContentProtected(false);
+      const rFocus = await window.zilt.window.setFocusable(false);
+      const sFocus = await S();
+      await window.zilt.window.setFocusable(true);
+      const rBottom = await window.zilt.window.setAlwaysOnBottom(true);
+      const sBottom = await S();
+      await window.zilt.window.setAlwaysOnBottom(false);
+      const rLimits = await window.zilt.window.setMinMax({ minWidth: 480, minHeight: 320, maxWidth: 1600, maxHeight: 1200 });
+      const sLimits = await S();
+      await window.zilt.window.setMinMax({ minWidth: 0, minHeight: 0, maxWidth: 0, maxHeight: 0 });
+      const rShadow = await window.zilt.window.setShadow(true);
+      const rTheme = await window.zilt.window.setTheme({ dark: true, captionColor: 0x1F2937 });
+      const rIcon = await window.zilt.window.setIcon(null);
+      const rVis = await window.zilt.window.setCursorVisible(false);
+      await window.zilt.window.setCursorVisible(true);
+      const rEnabled = await window.zilt.window.setEnabled(false);
+      const sDisabled = await S();
+      await window.zilt.window.setEnabled(true);
+      const rFs = await window.zilt.window.fullscreenOnMonitor(0);
+      const sFs = await S();
+      await window.zilt.window.fullscreen(false);
+
+      const ok = !!s0 && s0.width > 0 && s0.enabled === true && s0.focusable === true &&
+        rCursor === true && rIgnore === true && sIgnore.ignore_cursor === true &&
+        rProtect === true && sProtect.content_protected === true &&
+        rFocus === true && sFocus.focusable === false &&
+        rBottom === true && sBottom.always_on_bottom === true &&
+        rLimits === true && sLimits.min_width === 480 && sLimits.max_height === 1200 &&
+        rShadow === true && rTheme === true && rIcon === true && rVis === true &&
+        rEnabled === true && sDisabled.enabled === false &&
+        rFs === true && sFs.fullscreen === true;
+      setCheck('c-wincontrol', ok, ok
+        ? 'win-control ok (cursor/ignore/protect/bottom/focusable/limits/theme/shadow/icon/fullscreen)'
+        : `state0=${JSON.stringify(s0)} ignore=${sIgnore.ignore_cursor} protect=${sProtect.content_protected} focusable=${sFocus.focusable} bottom=${sBottom.always_on_bottom} limits=${JSON.stringify(sLimits)} disabled=${sDisabled.enabled} fs=${sFs.fullscreen} r=${JSON.stringify([rCursor,rIgnore,rProtect,rFocus,rBottom,rLimits,rShadow,rTheme,rIcon,rVis,rEnabled,rFs])}`);
+    } catch (e) { setCheck('c-wincontrol', false, String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -591,6 +637,7 @@ async function runChecks() {
       webviews: $('c-webviews').className === 'pass',
       proc: $('c-proc').className === 'pass',
       partition: $('c-partition').className === 'pass',
+      wincontrol: $('c-wincontrol').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

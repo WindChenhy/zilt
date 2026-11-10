@@ -265,7 +265,7 @@ pub extern "user32" fn AdjustWindowRect(lpRect: *RECT, dwStyle: DWORD, bMenu: BO
 pub extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.c) BOOL;
 pub extern "user32" fn GetWindowRect(hWnd: HWND, lpRect: *RECT) callconv(.c) BOOL;
 pub extern "user32" fn GetForegroundWindow() callconv(.c) HWND;
-pub extern "user32" fn LoadCursorW(hInstance: HINSTANCE, lpCursorName: LPCWSTR) callconv(.c) HCURSOR;
+pub extern "user32" fn LoadCursorW(hInstance: HINSTANCE, lpCursorName: ?*const anyopaque) callconv(.c) HCURSOR;
 pub extern "user32" fn SetWindowTextW(hWnd: HWND, lpString: LPCWSTR) callconv(.c) BOOL;
 pub extern "user32" fn SetWindowPos(hWnd: HWND, hWndInsertAfter: HWND, x: i32, y: i32, cx: i32, cy: i32, uFlags: UINT) callconv(.c) BOOL;
 pub extern "user32" fn SetWindowLongW(hWnd: HWND, nIndex: i32, dwNewLong: LONG) callconv(.c) LONG;
@@ -674,3 +674,158 @@ pub extern "advapi32" fn RegSetValueExW(
     cbData: DWORD,
 ) callconv(.c) LONG;
 pub extern "advapi32" fn RegCloseKey(hKey: HKEY) callconv(.c) LONG;
+
+// ---------------------------------------------------------------------------
+// v0.1.18：窗口精细控制（光标/穿透/截屏保护/阴影/层序/菜单加速键/托盘 hover）
+// ---------------------------------------------------------------------------
+
+pub const HCURSOR_ALIAS = HCURSOR;
+pub const HBITMAP = ?*anyopaque;
+pub const HACCEL = ?*anyopaque;
+
+/// 系统光标 id（IDC_*）
+pub const IDC_IBEAM: usize = 32513;
+pub const IDC_WAIT: usize = 32514;
+pub const IDC_CROSS: usize = 32515;
+pub const IDC_UPARROW: usize = 32516;
+pub const IDC_SIZENWSE: usize = 32642;
+pub const IDC_SIZENESW: usize = 32643;
+pub const IDC_SIZEWE: usize = 32644;
+pub const IDC_SIZENS: usize = 32645;
+pub const IDC_SIZEALL: usize = 32646;
+pub const IDC_NO: usize = 32648;
+pub const IDC_HAND: usize = 32649;
+pub const IDC_APPSTARTING: usize = 32650;
+pub const IDC_HELP: usize = 32651;
+
+pub const WM_SETCURSOR: UINT = 0x0020;
+pub const WM_MOUSEMOVE: UINT = 0x0200;
+pub const WM_MOUSELEAVE: UINT = 0x02A3;
+pub const WM_WINDOWPOSCHANGING: UINT = 0x0046;
+pub const WM_GETICON: UINT = 0x007F;
+
+pub const WS_EX_TRANSPARENT: DWORD = 0x00000020;
+pub const WS_EX_LAYERED: DWORD = 0x00080000;
+pub const WS_EX_NOACTIVATE: DWORD = 0x08000000;
+
+pub const HWND_BOTTOM: HWND = @ptrFromInt(1);
+
+
+pub const WDA_NONE: DWORD = 0x00000000;
+pub const WDA_EXCLUDEFROMCAPTURE: DWORD = 0x00000011;
+
+pub const TME_LEAVE: DWORD = 0x00000002;
+pub const TME_HOVER: DWORD = 0x00000001;
+
+pub const TRACKMOUSEEVENT = extern struct {
+    cbSize: DWORD,
+    dwFlags: DWORD,
+    hwndTrack: HWND,
+    dwHoverTime: DWORD,
+};
+
+pub const WINDOWPOS = extern struct {
+    hwnd: HWND,
+    hwndInsertAfter: HWND,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    flags: UINT,
+};
+
+/// MENUITEMINFOA/W（用 W 版）。
+pub const MENUITEMINFOW = extern struct {
+    cbSize: UINT,
+    fMask: UINT,
+    fType: UINT,
+    fState: UINT,
+    wID: UINT,
+    hSubMenu: HMENU,
+    hbmpChecked: HBITMAP,
+    hbmpUnchecked: HBITMAP,
+    dwItemData: usize,
+    dwTypeData: ?LPWSTR,
+    cch: UINT,
+    hbmpItem: HBITMAP,
+};
+
+pub const MIIM_STATE: UINT = 0x00000001;
+pub const MIIM_ID: UINT = 0x00000002;
+pub const MIIM_BITMAP: UINT = 0x00000080;
+pub const MF_BYCOMMAND: UINT = 0x00000000;
+pub const MF_BYPOSITION: UINT = 0x00000400;
+
+/// 加速键表项（ACCEL）。
+pub const ACCEL = extern struct {
+    fVirt: u8,
+    key: WORD,
+    cmd: WORD,
+};
+
+pub const FVIRTKEY: u8 = 0x01;
+pub const FNOINVERT: u8 = 0x02;
+pub const FSHIFT: u8 = 0x04;
+pub const FCONTROL: u8 = 0x08;
+pub const FALT: u8 = 0x10;
+
+pub const MARGINS = extern struct {
+    cxLeftWidth: i32,
+    cxRightWidth: i32,
+    cyTopHeight: i32,
+    cyBottomHeight: i32,
+};
+
+pub extern "user32" fn SetCursor(hCursor: HCURSOR) callconv(.c) HCURSOR;
+pub extern "user32" fn ShowCursor(bShow: BOOL) callconv(.c) i32;
+pub extern "user32" fn SetCapture(hWnd: HWND) callconv(.c) HWND;
+pub extern "user32" fn SetCursorPos(X: i32, Y: i32) callconv(.c) BOOL;
+pub extern "user32" fn SetLayeredWindowAttributes(hwnd: HWND, crKey: DWORD, bAlpha: u8, dwFlags: DWORD) callconv(.c) BOOL;
+pub extern "user32" fn SetWindowDisplayAffinity(hWnd: HWND, dwAffinity: DWORD) callconv(.c) BOOL;
+pub extern "user32" fn EnableWindow(hWnd: HWND, bEnable: BOOL) callconv(.c) BOOL;
+pub extern "user32" fn IsWindowEnabled(hWnd: HWND) callconv(.c) BOOL;
+pub extern "user32" fn TrackMouseEvent(lpEventTrack: *TRACKMOUSEEVENT) callconv(.c) BOOL;
+pub extern "user32" fn TranslateAcceleratorW(hWnd: HWND, hAccTable: HACCEL, lpMsg: *MSG) callconv(.c) c_int;
+pub extern "user32" fn CreateAcceleratorTableW(paccel: [*]ACCEL, cAccel: c_int) callconv(.c) HACCEL;
+pub extern "user32" fn DestroyAcceleratorTable(hAccel: HACCEL) callconv(.c) BOOL;
+pub extern "user32" fn SetMenuItemBitmaps(hMenu: HMENU, uPosition: UINT, uFlags: UINT, hBitmapUnchecked: HBITMAP, hBitmapChecked: HBITMAP) callconv(.c) BOOL;
+pub extern "user32" fn LoadImageW(hinst: HINSTANCE, name: LPCWSTR, type: UINT, cx: c_int, cy: c_int, fuLoad: UINT) callconv(.c) ?*anyopaque;
+pub extern "user32" fn GetIconInfo(hIcon: HICON, piconinfo: *ICONINFO) callconv(.c) BOOL;
+pub extern "user32" fn GetActiveWindow() callconv(.c) HWND;
+pub extern "user32" fn GetFocus() callconv(.c) HWND;
+pub extern "user32" fn GetClassNameW(hWnd: HWND, lpClassName: [*]u16, nMaxCount: c_int) callconv(.c) c_int;
+pub extern "user32" fn MonitorFromWindow(hwnd: HWND, dwFlags: DWORD) callconv(.c) ?*anyopaque;
+pub extern "user32" fn GetMonitorInfoW(hMonitor: ?*anyopaque, lpmi: *MONITORINFO) callconv(.c) BOOL;
+
+pub const MONITORINFO = extern struct {
+    cbSize: DWORD,
+    rcMonitor: RECT,
+    rcWork: RECT,
+    dwFlags: DWORD,
+};
+
+pub const MONITOR_DEFAULTTONEAREST: DWORD = 0x00000002;
+
+pub const ICONINFO = extern struct {
+    fIcon: BOOL,
+    xHotspot: DWORD,
+    yHotspot: DWORD,
+    hbmMask: HBITMAP,
+    hbmColor: HBITMAP,
+};
+
+pub const IMAGE_ICON: UINT = 1;
+pub const IMAGE_BITMAP: UINT = 0;
+pub const LR_LOADFROMFILE: UINT = 0x00000010;
+pub const LR_DEFAULTSIZE: UINT = 0x00000040;
+pub const LR_SHARED: UINT = 0x00008000;
+
+pub const WS_EX_TOPMOST: DWORD = 0x00000008;
+
+// 编辑命令（菜单角色用）
+pub const WM_CUT: UINT = 0x0300;
+pub const WM_COPY: UINT = 0x0301;
+pub const WM_PASTE: UINT = 0x0302;
+pub const WM_CLEAR: UINT = 0x0303;
+pub const WM_UNDO: UINT = 0x0304;
+pub const EM_SETSEL: UINT = 0x00B1;
