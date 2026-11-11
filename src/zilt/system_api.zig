@@ -121,6 +121,25 @@ pub const FsOp = union(enum) {
     copy: FsMove,
     /// 各 scope 解析出的绝对路径（调试/授权可视化）
     roots,
+    // ---- v0.1.22 ----
+    /// 目录监视（ReadDirectoryChangesW），变更走 `fsEvent`
+    watch: FsWatchReq,
+    unwatch: i64,
+    /// 流式读取（大文件分块），分块走 `fsChunk`（base64）
+    read_stream: FsStreamReq,
+};
+
+pub const FsWatchReq = struct {
+    /// 目录（相对 scope）；空 = scope 根
+    path: []const u8 = "",
+    scope: ?[]const u8 = null,
+    recursive: bool = true,
+};
+
+pub const FsStreamReq = struct {
+    path: []const u8,
+    scope: ?[]const u8 = null,
+    chunk_size: u32 = 64 * 1024,
 };
 
 /// 窗口状态（v0.1.16 window-state）：读当前几何 / 立即持久化
@@ -276,6 +295,14 @@ pub const UpdaterOp = enum { info, check };
 pub const SqlOp = union(enum) {
     query: SqlQuery,
     execute: SqlQuery,
+    /// v0.1.22：事务化迁移（成功后设置 PRAGMA user_version）
+    migrate: SqlMigrate,
+};
+
+pub const SqlMigrate = struct {
+    db: []const u8,
+    version: i32,
+    statements: []const []const u8 = &.{},
 };
 pub const SqlQuery = struct {
     /// 数据库文件路径（不存在时按 SQLite 惯例创建）

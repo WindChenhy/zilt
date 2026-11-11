@@ -3,7 +3,7 @@
 
 pub const app_name = "Zilt";
 pub const publisher = "Zilt";
-pub const version = "0.1.21";
+pub const version = "0.1.22";
 pub const app_id = "app.zilt.desktop";
 pub const exe_name = "zilt-app.exe";
 

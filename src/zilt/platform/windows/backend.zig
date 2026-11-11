@@ -84,6 +84,8 @@ const WM_ZILT_WS: win32.UINT = win32.WM_APP + 11; // WebSocket 读线程 → UI 
 const WM_ZILT_PROC: win32.UINT = win32.WM_APP + 12; // 子进程 worker → UI 线程
 const WM_ZILT_EVAL: win32.UINT = win32.WM_APP + 13; // 子 webview eval（延后到回调外执行）
 const WM_ZILT_HTTP_CHUNK: win32.UINT = win32.WM_APP + 14; // v0.1.20 流式下载分块
+const WM_ZILT_FSWATCH: win32.UINT = win32.WM_APP + 15; // v0.1.22 目录监视事件
+const WM_ZILT_FSCHUNK: win32.UINT = win32.WM_APP + 16; // v0.1.22 文件流式读取分块
 const WM_CLIPBOARDUPDATE: win32.UINT = 0x031D;
 const TRAY_MENU_BASE: u16 = 100;
 
@@ -1090,6 +1092,10 @@ fn Backend(comptime config: Config) type {
         /// v0.1.21：运行时持久化授权（形如 "fs:documents/**"）
         acl_grants: std.ArrayListUnmanaged([]const u8) = .empty,
         acl_loaded: bool = false,
+        /// v0.1.22：目录监视槽与 id 分配
+        fs_watches: std.ArrayListUnmanaged(*FsWatch) = .empty,
+        next_fs_watch_id: i64 = 1,
+        next_fs_stream_id: i64 = 1,
         /// v0.1.16：子进程槽（仅 UI 线程读写；worker 只发事件）
         procs: std.ArrayListUnmanaged(*ProcSlot) = .empty,
         watcher: ?*Watcher = null,
@@ -2612,13 +2618,23 @@ fn Backend(comptime config: Config) type {
         /// sqlite3.dll 动态加载，缺失返回 SqliteNotFound → 前端收到明确错误。
         fn runSqlOp(self: *Self, op: shared_system.SqlOp, alloc: std.mem.Allocator) !shared_system.Result {
             _ = self;
+            if (op == .migrate) {
+                const m = op.migrate;
+                win_sqlite.migrate(alloc, m.db, m.statements, m.version) catch |e| {
+                    log.print("[sql] migrate failed: {s} (db={s})", .{ @errorName(e), m.db });
+                    return error.SqliteFailed;
+                };
+                log.print("[sql] migrated to v{d} ({d} statements)", .{ m.version, m.statements.len });
+                return .{ .ok = true };
+            }
             const q = switch (op) {
                 .query => |x| x,
                 .execute => |x| x,
+                .migrate => unreachable,
             };
             const want_rows = switch (op) {
                 .query => true,
-                .execute => false,
+                .execute, .migrate => false,
             };
             const out = win_sqlite.run(alloc, q.db, q.sql, q.params, want_rows) catch |e| {
                 log.print("[sql] {s} failed: {s} (db={s})", .{ @tagName(op), @errorName(e), q.db });
@@ -2880,6 +2896,91 @@ fn Backend(comptime config: Config) type {
         /// stat/改名/复制/根目录清单）。所有相对路径都经过 scope 校验与逃逸检查。
         fn runFsOp(self: *Self, op: shared_system.FsOp, alloc: std.mem.Allocator) !shared_system.Result {
             switch (op) {
+                .watch => |req| {
+                    const scope = try fsScopeOf(req.scope);
+                    if (!self.fsAllowed(scope, req.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const dir = if (req.path.len == 0 or std.mem.eql(u8, req.path, "."))
+                        try alloc.dupe(u8, root)
+                    else
+                        try fs_api_mod.joinChecked(alloc, root, req.path);
+                    defer alloc.free(dir);
+
+                    const dw = try std.unicode.utf8ToUtf16LeAllocZ(alloc, dir);
+                    defer alloc.free(dw);
+                    const attr = win32.GetFileAttributesW(dw.ptr);
+                    if (attr == win32.INVALID_FILE_ATTRIBUTES) return error.FileNotFound;
+                    if (attr & win32.FILE_ATTRIBUTE_DIRECTORY == 0) return error.NotADirectory;
+                    const handle = win32.CreateFileW(
+                        dw.ptr,
+                        win32.FILE_LIST_DIRECTORY,
+                        win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE | win32.FILE_SHARE_DELETE,
+                        null,
+                        win32.OPEN_EXISTING,
+                        win32.FILE_FLAG_BACKUP_SEMANTICS,
+                        null,
+                    );
+                    if (handle == win32.INVALID_HANDLE_VALUE) return error.WatchFailed;
+
+                    const pa = std.heap.page_allocator;
+                    const wv = pa.create(FsWatch) catch {
+                        _ = win32.CloseHandle(handle);
+                        return error.OutOfMemory;
+                    };
+                    const id = self.next_fs_watch_id;
+                    self.next_fs_watch_id += 1;
+                    wv.* = .{ .id = id, .hwnd = self.mainWindowHwnd(), .handle = handle, .recursive = req.recursive };
+                    const t = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, fsWatchMain, .{wv}) catch {
+                        _ = win32.CloseHandle(handle);
+                        pa.destroy(wv);
+                        return error.WatchFailed;
+                    };
+                    wv.thread = t;
+                    try self.fs_watches.append(self.allocator, wv);
+                    log.print("[fs] watch #{d} {s} recursive={}", .{ id, dir, req.recursive });
+                    return .{ .json = try std.fmt.allocPrint(alloc, "{{\"id\":{d}}}", .{id}) };
+                },
+                .unwatch => |id| {
+                    for (self.fs_watches.items, 0..) |wv, i| {
+                        if (wv.id != id) continue;
+                        _ = self.fs_watches.swapRemove(i);
+                        self.stopFsWatch(wv);
+                        return .{ .ok = true };
+                    }
+                    return .{ .ok = false };
+                },
+                .read_stream => |req| {
+                    const scope = try fsScopeOf(req.scope);
+                    if (!self.fsAllowed(scope, req.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, req.path);
+                    defer alloc.free(path);
+                    if (fileSizeOf(alloc, path) == null) return error.FileNotFound;
+
+                    const a2 = std.heap.page_allocator;
+                    const job = a2.create(FsStreamJob) catch return error.OutOfMemory;
+                    const id = self.next_fs_stream_id;
+                    self.next_fs_stream_id += 1;
+                    job.* = .{
+                        .id = id,
+                        .hwnd = self.mainWindowHwnd(),
+                        .path = a2.dupe(u8, path) catch {
+                            a2.destroy(job);
+                            return error.OutOfMemory;
+                        },
+                        .chunk_size = @min(@max(req.chunk_size, 4096), 1024 * 1024),
+                    };
+                    const t = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, fsStreamMain, .{job}) catch {
+                        a2.free(job.path);
+                        a2.destroy(job);
+                        return error.SpawnFailed;
+                    };
+                    t.detach();
+                    log.print("[fs] readStream #{d} {s} chunk={d}", .{ id, path, job.chunk_size });
+                    return .{ .json = try std.fmt.allocPrint(alloc, "{{\"id\":{d}}}", .{id}) };
+                },
                 .roots => {
                     var out: std.ArrayListUnmanaged(u8) = .empty;
                     errdefer out.deinit(alloc);
@@ -3035,6 +3136,24 @@ fn Backend(comptime config: Config) type {
 
         /// v0.1.19：更新器 JS API。info 读当前配置与「是否已有待重启的替换」；
         /// check 复用启动时的 updaterFlow（后台线程，结果走 updateInfo/updaterFailed 事件）。
+        fn mainWindowHwnd(self: *Self) win32.HWND {
+            if (self.mainWindow()) |w| return w.hwnd;
+            return null;
+        }
+
+        fn stopFsWatch(self: *Self, wv: *FsWatch) void {
+            _ = self;
+            wv.stopping.store(true, .release);
+            // 同步 ReadDirectoryChangesW 会一直阻塞：CancelIoEx 让内核返回
+            // ERROR_OPERATION_ABORTED，线程才能退出（只 CloseHandle 不解阻塞）。
+            _ = win32.CancelIoEx(wv.handle, null);
+            _ = win32.CloseHandle(wv.handle);
+            wv.thread.join();
+            const id = wv.id;
+            std.heap.page_allocator.destroy(wv);
+            log.print("[fs] watch #{d} stopped", .{id});
+        }
+
         /// v0.1.21：资源授权（编译期 scopes + 运行时持久化授权）。
         fn aclAllowed(self: *Self, kind: []const u8, resource: []const u8) bool {
             return security.scopeAllowedWith(config.security, self.acl_grants.items, kind, resource);
@@ -4560,6 +4679,8 @@ fn Backend(comptime config: Config) type {
                 a.destroy(c);
             }
             self.wss_conns.deinit(self.allocator);
+            for (self.fs_watches.items) |wv| self.stopFsWatch(wv);
+            self.fs_watches.deinit(self.allocator);
             for (self.acl_grants.items) |g| self.allocator.free(g);
             self.acl_grants.deinit(self.allocator);
             // v0.1.17：释放分区 Environment（名字 + 引用）
@@ -5013,6 +5134,34 @@ fn Backend(comptime config: Config) type {
                             return 0;
                         };
                         b.runAction(w, req);
+                    }
+                    return 0;
+                },
+                WM_ZILT_FSWATCH => {
+                    const ev: *FsWatchEvent = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    defer {
+                        const a = std.heap.page_allocator;
+                        a.free(ev.path);
+                        a.destroy(ev);
+                    }
+                    if (instance) |b| {
+                        if (b.mainWindow()) |w| {
+                            w.emitEventPayload("fsEvent", .{ .id = ev.id, .action = ev.action, .path = ev.path });
+                        }
+                    }
+                    return 0;
+                },
+                WM_ZILT_FSCHUNK => {
+                    const ch: *FsChunk = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    defer {
+                        const a = std.heap.page_allocator;
+                        a.free(ch.data);
+                        a.destroy(ch);
+                    }
+                    if (instance) |b| {
+                        if (b.mainWindow()) |w| {
+                            w.emitEventPayload("fsChunk", .{ .id = ch.id, .seq = ch.seq, .done = ch.done, .data = ch.data });
+                        }
                     }
                     return 0;
                 },
@@ -6453,6 +6602,131 @@ const WsConn = struct {
     /// UI 已主动发起关闭 → 读循环不再回 echo close（RFC close 握手只发一次）
     closing: bool = false,
 };
+
+/// v0.1.22：目录监视槽（ReadDirectoryChangesW 阻塞读，unwatch 时关句柄唤醒）。
+const FsWatch = struct {
+    id: i64,
+    hwnd: win32.HWND,
+    handle: win32.HANDLE,
+    recursive: bool = true,
+    stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: std.Thread = undefined,
+};
+
+const FsWatchEvent = struct {
+    hwnd: win32.HWND,
+    id: i64,
+    action: []const u8,
+    path: []u8,
+};
+
+fn fsWatchMain(wv: *FsWatch) void {
+    const a = std.heap.page_allocator;
+    var buf: [16 * 1024]u8 align(4) = undefined;
+    const filter = win32.FILE_NOTIFY_CHANGE_FILE_NAME | win32.FILE_NOTIFY_CHANGE_DIR_NAME |
+        win32.FILE_NOTIFY_CHANGE_LAST_WRITE | win32.FILE_NOTIFY_CHANGE_SIZE;
+    while (!wv.stopping.load(.acquire)) {
+        var bytes: win32.DWORD = 0;
+        if (win32.ReadDirectoryChangesW(wv.handle, &buf, buf.len, if (wv.recursive) 1 else 0, filter, &bytes, null, null) == 0) break;
+        if (bytes == 0) continue;
+        var off: usize = 0;
+        while (off + @sizeOf(win32.FILE_NOTIFY_INFORMATION) <= bytes) {
+            const info: *const win32.FILE_NOTIFY_INFORMATION = @ptrCast(@alignCast(&buf[off]));
+            const name_units: usize = info.FileNameLength / 2;
+            const name_ptr: [*]const u16 = @ptrCast(@alignCast(&buf[off + @sizeOf(win32.FILE_NOTIFY_INFORMATION)]));
+            const name = std.unicode.utf16LeToUtf8Alloc(a, name_ptr[0..name_units]) catch null;
+            if (name) |n| {
+                const action: []const u8 = switch (info.Action) {
+                    win32.FILE_ACTION_ADDED => "added",
+                    win32.FILE_ACTION_REMOVED => "removed",
+                    win32.FILE_ACTION_MODIFIED => "modified",
+                    win32.FILE_ACTION_RENAMED_OLD_NAME => "renamed_old",
+                    win32.FILE_ACTION_RENAMED_NEW_NAME => "renamed_new",
+                    else => "unknown",
+                };
+                const ev = a.create(FsWatchEvent) catch {
+                    a.free(n);
+                    break;
+                };
+                ev.* = .{ .hwnd = wv.hwnd, .id = wv.id, .action = action, .path = n };
+                if (win32.PostMessageW(wv.hwnd, WM_ZILT_FSWATCH, 0, @bitCast(@intFromPtr(ev))) == 0) {
+                    a.free(n);
+                    a.destroy(ev);
+                    break;
+                }
+            }
+            if (info.NextEntryOffset == 0) break;
+            off += info.NextEntryOffset;
+        }
+    }
+}
+
+const FsStreamJob = struct {
+    id: i64,
+    hwnd: win32.HWND,
+    path: []u8,
+    chunk_size: u32,
+};
+
+const FsChunk = struct {
+    hwnd: win32.HWND,
+    id: i64,
+    seq: u32,
+    done: bool,
+    data: []u8,
+};
+
+fn fsPostChunk(job: *FsStreamJob, seq: u32, done: bool, data: []u8) bool {
+    const a = std.heap.page_allocator;
+    const ch = a.create(FsChunk) catch {
+        a.free(data);
+        return false;
+    };
+    ch.* = .{ .hwnd = job.hwnd, .id = job.id, .seq = seq, .done = done, .data = data };
+    if (win32.PostMessageW(job.hwnd, WM_ZILT_FSCHUNK, 0, @bitCast(@intFromPtr(ch))) == 0) {
+        a.free(data);
+        a.destroy(ch);
+        return false;
+    }
+    return true;
+}
+
+/// v0.1.22：大文件分块读（base64 → fsChunk 事件），最后 done=true。
+fn fsStreamMain(job: *FsStreamJob) void {
+    const a = std.heap.page_allocator;
+    defer {
+        a.free(job.path);
+        a.destroy(job);
+    }
+    const pw = std.unicode.utf8ToUtf16LeAllocZ(a, job.path) catch {
+        _ = fsPostChunk(job, 0, true, a.alloc(u8, 0) catch &.{});
+        return;
+    };
+    defer a.free(pw);
+    const h = win32.CreateFileW(pw.ptr, win32.GENERIC_READ, win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE, null, win32.OPEN_EXISTING, win32.FILE_ATTRIBUTE_NORMAL, null);
+    if (h == win32.INVALID_HANDLE_VALUE) {
+        _ = fsPostChunk(job, 0, true, a.alloc(u8, 0) catch &.{});
+        return;
+    }
+    defer _ = win32.CloseHandle(h);
+
+    const buf = a.alloc(u8, job.chunk_size) catch {
+        _ = fsPostChunk(job, 0, true, a.alloc(u8, 0) catch &.{});
+        return;
+    };
+    defer a.free(buf);
+
+    var seq: u32 = 0;
+    while (true) {
+        var read: win32.DWORD = 0;
+        if (win32.ReadFile(h, buf.ptr, job.chunk_size, &read, null) == 0) break;
+        if (read == 0) break;
+        const b64 = net_mod.base64Alloc(a, buf[0..read]) catch break;
+        if (!fsPostChunk(job, seq, false, b64)) return;
+        seq += 1;
+    }
+    _ = fsPostChunk(job, seq, true, a.alloc(u8, 0) catch &.{});
+}
 
 /// v0.1.20：wss 连接（WinHTTP WebSocket；ws:// 仍走上面的 raw 路径）。
 /// 两条路径并存是为了不动机已实测的 ws:// 实现（分包/掩码/握手都是自研代码）。

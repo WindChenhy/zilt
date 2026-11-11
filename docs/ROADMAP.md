@@ -433,6 +433,27 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
 - [x] **验收**：冒烟 32 项含 store/fs/path/log/windowState + http + ws + webviews +
       **partition 隔离**（alpha/beta localStorage 互不可见、共享实例与主页面互通）
 
+### v0.1.22 — 数据与监视收尾（P1，2026-11-11）
+
+- [x] **fs.watch**：`fs.watch(path, {scope, recursive})` → id，变更经 `fsEvent`
+      （action = added/removed/modified/renamed_old/renamed_new + 相对路径）；
+      `fs.unwatch(id)` 停止。实现：`CreateFileW(FILE_LIST_DIRECTORY)` +
+      `ReadDirectoryChangesW` 阻塞循环（16KB 缓冲，解析 FILE_NOTIFY_INFORMATION 链）
+      · 实测坑：同步 ReadDirectoryChangesW 只 `CloseHandle` 不会解除阻塞（unwatch 卡死）
+        → 必须 `CancelIoEx` 再关句柄，线程才能退出
+- [x] **fs 流式读**：`fs.readStream(path, {scope, chunkSize})` → id，分块经 `fsChunk`
+      （base64，seq 递增，最后 done=true）；默认 64KB，夹在 4KB–1MB
+- [x] **SQL 迁移**：`sql.migrate(db, version, statements)` —— BEGIN → 逐条执行 →
+      `PRAGMA user_version = version` → COMMIT；任一步失败整体 ROLLBACK
+      （headless E2E：v1 迁移成功、版本/数据可查；故意坏 SQL 回滚后版本与建表都不生效）
+- [x] **冒烟**：41 项 exit 0（c-fs2：watch 捕获 added + readStream 11007 字节 / 3 分块还原一致）
+- [ ] **未做（明确记录，非“已完成”）**：
+      · DPAPI 加密库（需要 CryptProtectData 接线；当前 SQL 库是明文文件）
+      · 每窗口 UA / 代理 / InPrivate / 浏览器扩展（需 ICoreWebView2Settings2 与
+        ControllerOptions，未接线）
+      · 用户自定义协议注册（asset_routes 尚未开放给应用回调）
+      · `with_webview` 原生句柄暴露（安全面大，需独立设计）
+
 ### v0.1.21 — 安全模型补齐（P0，2026-11-11）
 
 > 目标：把 scope 从「只有 fs 用」扩到 shell/http，并支持运行时授权持久化。

@@ -111,7 +111,6 @@ pub const TPM_RETURNCMD: UINT = 0x0100;
 
 pub const GENERIC_READ: DWORD = 0x80000000;
 pub const GENERIC_WRITE: DWORD = 0x40000000;
-pub const OPEN_EXISTING: DWORD = 3;
 pub const CREATE_ALWAYS: DWORD = 2;
 pub const MOVEFILE_REPLACE_EXISTING: DWORD = 0x1;
 
@@ -832,3 +831,42 @@ pub const WM_UNDO: UINT = 0x0304;
 pub const EM_SETSEL: UINT = 0x00B1;
 
 pub extern "kernel32" fn GetTickCount64() callconv(.c) u64;
+
+// ---------------------------------------------------------------------------
+// v0.1.22：目录监视（fs.watch）
+// ---------------------------------------------------------------------------
+pub const FILE_LIST_DIRECTORY: DWORD = 0x00000001;
+pub const FILE_SHARE_WRITE: DWORD = 0x00000002;
+pub const FILE_SHARE_DELETE: DWORD = 0x00000004;
+pub const OPEN_EXISTING: DWORD = 3;
+pub const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;
+
+pub const FILE_NOTIFY_CHANGE_FILE_NAME: DWORD = 0x00000001;
+pub const FILE_NOTIFY_CHANGE_DIR_NAME: DWORD = 0x00000002;
+pub const FILE_NOTIFY_CHANGE_LAST_WRITE: DWORD = 0x00000010;
+pub const FILE_NOTIFY_CHANGE_SIZE: DWORD = 0x00000008;
+
+pub const FILE_ACTION_ADDED: DWORD = 1;
+pub const FILE_ACTION_REMOVED: DWORD = 2;
+pub const FILE_ACTION_MODIFIED: DWORD = 3;
+pub const FILE_ACTION_RENAMED_OLD_NAME: DWORD = 4;
+pub const FILE_ACTION_RENAMED_NEW_NAME: DWORD = 5;
+
+pub const FILE_NOTIFY_INFORMATION = extern struct {
+    NextEntryOffset: DWORD,
+    Action: DWORD,
+    FileNameLength: DWORD,
+    // 变长文件名紧随其后（UTF-16，无 NUL）
+};
+
+pub extern "kernel32" fn ReadDirectoryChangesW(
+    hDirectory: HANDLE,
+    lpBuffer: ?*anyopaque,
+    nBufferLength: DWORD,
+    bWatchSubtree: BOOL,
+    dwNotifyFilter: DWORD,
+    lpBytesReturned: ?*DWORD,
+    lpOverlapped: ?*anyopaque,
+    lpCompletionRoutine: ?*anyopaque,
+) callconv(.c) BOOL;
+pub extern "kernel32" fn CancelIoEx(hFile: HANDLE, lpOverlapped: ?*anyopaque) callconv(.c) BOOL;

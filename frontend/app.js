@@ -781,6 +781,45 @@ async function runChecks() {
         : `frozen=${frozen} seed=${hadSeed}/${seededRevoked} d0=${d0} g=${g} listed=${JSON.stringify(listed)} w=${w} r=${JSON.stringify(r)} rm=${rm} rv=${rv} d1=${d1} http=${httpDenied}`);
     } catch (e) { setCheck('c-acl2', false, String(e.message || e)); }
 
+    // 41. v0.1.22：fs.watch（ReadDirectoryChangesW）+ fs.readStream（分块）
+    try {
+      const dir = 'watch_' + Date.now();
+      await window.zilt.fs.mkdir(dir);
+      const evs = [];
+      const offEv = window.zilt.on('fsEvent', (p) => evs.push(p));
+      const w = await window.zilt.fs.watch(dir);
+      const target = dir + '/a.txt';
+      const payload = 'stream-' + 'x'.repeat(10000);
+      await window.zilt.fs.write(target, payload);
+
+      const waitFor = async (pred, ms) => {
+        const t0 = Date.now();
+        while (Date.now() - t0 < ms) {
+          if (pred()) return true;
+          await new Promise((r) => setTimeout(r, 60));
+        }
+        return false;
+      };
+      const sawAdd = await waitFor(() => evs.some((e) => e.action === 'added' && e.path === 'a.txt'), 4000);
+
+      const all = [];
+      const offChunk = window.zilt.on('fsChunk', (p) => all.push(p));
+      const sres = await window.zilt.fs.readStream(target, { chunkSize: 4096 });
+      const sid = sres && sres.id;
+      await waitFor(() => all.some((p) => p.id === sid && p.done), 5000);
+      const mine = all.filter((p) => p.id === sid && !p.done);
+      const text = mine.map((p) => atob(p.data)).join('');
+      const unw = await window.zilt.fs.unwatch(w.id);
+      offEv(); offChunk();
+      await window.zilt.fs.removeDir(dir);
+
+      const ok = !!w && typeof w.id === 'number' && sawAdd && unw === true &&
+        text.length === payload.length && text === payload && mine.length >= 2;
+      setCheck('c-fs2', ok, ok
+        ? `fs watch/stream ok (${mine.length} chunks, ${text.length} bytes)`
+        : `w=${JSON.stringify(w)} sawAdd=${sawAdd} events=${JSON.stringify(evs.slice(0, 4))} sid=${sid} chunks=${mine.length} len=${text.length}/${payload.length} unw=${unw}`);
+    } catch (e) { setCheck('c-fs2', false, String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -825,6 +864,7 @@ async function runChecks() {
       wss: $('c-wss').className === 'pass',
       zigev: $('c-zigev').className === 'pass',
       acl2: $('c-acl2').className === 'pass',
+      fs2: $('c-fs2').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

@@ -30,13 +30,22 @@ fn headlessSystem(backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator,
     _ = window_id;
     return switch (req) {
         .sql => |op| {
+            if (op == .migrate) {
+                const m = op.migrate;
+                win_sqlite.migrate(alloc, m.db, m.statements, m.version) catch |e| {
+                    log.print("[headless:sql] migrate failed: {s}", .{@errorName(e)});
+                    return e;
+                };
+                return .{ .ok = true };
+            }
             const q = switch (op) {
                 .query => |x| x,
                 .execute => |x| x,
+                .migrate => unreachable,
             };
             const want_rows = switch (op) {
                 .query => true,
-                .execute => false,
+                .execute, .migrate => false,
             };
             const out = win_sqlite.run(alloc, q.db, q.sql, q.params, want_rows) catch |e| {
                 log.print("[headless:sql] failed: {s} (db={s})", .{ @errorName(e), q.db });

@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.21（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs/path/log/opener/windowState 周边 API + 更新器通道/崩溃回滚/健康确认 + 代码签名（签名产物已实测 Authenticode + RFC3161）+ MSI（WiX 3.14 自动 vendor，安装/卸载实测）+ MSIX（makeappx，松散注册实测）+ services 生命周期 + http（异步）+ websocket 客户端 + 单窗口多 WebView + 前端对话框/子进程/图标生成 CLI + SQL（SQLite 动态加载）+ headless/server 模式 + 热重启 dev + npm 运行时包/脚手架 + SQL + 多 WebView 数据分区 + 窗口精细控制/菜单角色与加速键/托盘 hover + fs 全量/scope ACL/channel/MCP + WinHTTP（https/wss/代理/流式/multipart）+ scope 全覆盖/运行时授权/原型冻结 + 8 套模板 + WebDriver 自动化 + CI 流水线 + `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.1.22（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs/path/log/opener/windowState 周边 API + 更新器通道/崩溃回滚/健康确认 + 代码签名（签名产物已实测 Authenticode + RFC3161）+ MSI（WiX 3.14 自动 vendor，安装/卸载实测）+ MSIX（makeappx，松散注册实测）+ services 生命周期 + http（异步）+ websocket 客户端 + 单窗口多 WebView + 前端对话框/子进程/图标生成 CLI + SQL（SQLite 动态加载）+ headless/server 模式 + 热重启 dev + npm 运行时包/脚手架 + SQL + 多 WebView 数据分区 + 窗口精细控制/菜单角色与加速键/托盘 hover + fs 全量/scope ACL/channel/MCP + WinHTTP（https/wss/代理/流式/multipart）+ scope 全覆盖/运行时授权/原型冻结 + fs.watch/流式读/SQL 迁移 + 8 套模板 + WebDriver 自动化 + CI 流水线 + `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 
@@ -29,6 +29,14 @@ v0.1.17 新增（2026-11-08，均已实现、验证并提交）：
 - **多 WebView 数据分区**（2026-11-09）：`webviews.create({partition:'login'})` → 独立 WebView2 Environment + 独立 user data folder（`<profile>\WebView2-partitions\<name>`），Cookie/localStorage/IndexedDB 与主页面隔离；同名分区复用同一 Environment；新增 `webviews.eval(id, script)`（异步事件回传，包成 Promise）。**实测**：alpha/beta 分区 localStorage 互不可见、共享实例与主页面互通，两个 user data 目录真实落盘（12M/7.7M）
 - **日志轮转**：4MB 阈值，zilt.log → .1 → .2 → .3（实测 5MB 日志轮转）
 - **验收**：单元测试 **234/234**（框架 216 + 工具 18）；GUI 冒烟 **32 项** ALL PASSED（exit 0，含数据分区隔离）；WebDriver 4/4；headless 四端点 + SQL 真 E2E；日志轮转实测；`zilt version` 报 0.1.17
+
+v0.1.22 新增（2026-11-11，数据与监视收尾）：
+
+- **fs.watch**：目录监视（`ReadDirectoryChangesW`）→ `fsEvent`（added/removed/modified/renamed_* + 相对路径）；`fs.unwatch` 停止（`CancelIoEx` 解阻塞，实测坑）
+- **fs 流式读**：`fs.readStream(path, {chunkSize})` → `fsChunk`（base64 分块 + done），大文件不整块进内存
+- **SQL 迁移**：`sql.migrate(db, version, statements)` 事务化 + `PRAGMA user_version`，失败整体回滚（headless E2E 验证）
+- **验收**：冒烟 **41 项** exit 0（c-fs2 覆盖 watch + 11KB 流式还原）
+- **未做**：DPAPI 加密库、每窗口 UA/代理/InPrivate、自定义协议注册、`with_webview`
 
 v0.1.21 新增（2026-11-11，安全模型补齐）：
 

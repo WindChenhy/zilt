@@ -95,6 +95,10 @@ pub const Args = struct {
     role: ?[]const u8 = null,
     // ---- v0.1.21：ACL ----
     acl_kind: ?[]const u8 = null,
+    recursive: ?bool = null,
+    chunk_size: ?u32 = null,
+    version: ?i32 = null,
+    statements: ?[]const []const u8 = null,
     pattern: ?[]const u8 = null,
     // ---- v0.1.19：fs scope / 目标路径 ----
     scope: ?[]const u8 = null,
@@ -652,6 +656,17 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
 
     if (eql(u8, name, "fs")) {
         if (eql(u8, a.action, "roots")) return .{ .fs = .roots };
+        if (eql(u8, a.action, "watch")) return .{ .fs = .{ .watch = .{
+            .path = a.path orelse "",
+            .scope = a.scope,
+            .recursive = a.recursive orelse true,
+        } } };
+        if (eql(u8, a.action, "unwatch")) return .{ .fs = .{ .unwatch = a.id orelse return error.MissingId } };
+        if (eql(u8, a.action, "readStream") or eql(u8, a.action, "read_stream")) return .{ .fs = .{ .read_stream = .{
+            .path = a.path orelse return error.MissingPath,
+            .scope = a.scope,
+            .chunk_size = a.chunk_size orelse 64 * 1024,
+        } } };
         const target = system_api.FsTarget{ .path = a.path orelse return error.MissingPath, .scope = a.scope };
         if (eql(u8, a.action, "read")) return .{ .fs = .{ .read = target } };
         if (eql(u8, a.action, "write")) return .{ .fs = .{ .write = .{
@@ -683,6 +698,17 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
             .to_scope = a.to_scope,
         } } };
         if (eql(u8, a.action, "roots")) return .{ .fs = .roots };
+        if (eql(u8, a.action, "watch")) return .{ .fs = .{ .watch = .{
+            .path = a.path orelse "",
+            .scope = a.scope,
+            .recursive = a.recursive orelse true,
+        } } };
+        if (eql(u8, a.action, "unwatch")) return .{ .fs = .{ .unwatch = a.id orelse return error.MissingId } };
+        if (eql(u8, a.action, "readStream") or eql(u8, a.action, "read_stream")) return .{ .fs = .{ .read_stream = .{
+            .path = a.path orelse return error.MissingPath,
+            .scope = a.scope,
+            .chunk_size = a.chunk_size orelse 64 * 1024,
+        } } };
         return error.UnknownFsAction;
     }
 
@@ -790,6 +816,11 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
     }
 
     if (eql(u8, name, "sql")) {
+        if (eql(u8, a.action, "migrate")) return .{ .sql = .{ .migrate = .{
+            .db = a.path orelse a.db orelse return error.MissingPath,
+            .version = a.version orelse return error.MissingVersion,
+            .statements = a.statements orelse &.{},
+        } } };
         const q = system_api.SqlQuery{
             .db = a.db orelse return error.MissingDb,
             .sql = a.sql orelse return error.MissingSql,

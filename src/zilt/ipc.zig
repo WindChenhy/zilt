@@ -682,18 +682,29 @@ fn fnMeta(comptime f: anytype) Meta {
     };
 }
 
-/// 提取命令命名空间的全部元数据（跳过非函数 decl）。
+/// 命令命名空间里是否为可分发命令：普通 fn（带 ctx 参数）而非泛型函数。
+/// 泛型 fn（含 comptime 参数）视为应用侧辅助类型函数（如信封构造器），
+/// 不暴露为命令——避免 dispatch/绑定代码生成把它们当命令展开。
+fn isCommandFn(comptime f: anytype) bool {
+    const info = @typeInfo(@TypeOf(f));
+    if (info != .@"fn") return false;
+    // Zig 0.17：泛型函数（含 anytype/comptime 参数）由 is_generic 标记
+    if (info.@"fn".is_generic) return false;
+    return true;
+}
+
+/// 提取命令命名空间的全部元数据（跳过非函数 decl 与泛型函数）。
 pub fn commandMetas(comptime Commands: type) []const Meta {
     const decl_names = @typeInfo(Commands).@"struct".decl_names;
     var count: usize = 0;
     for (decl_names) |name| {
-        if (@typeInfo(@TypeOf(@field(Commands, name))) == .@"fn") count += 1;
+        if (comptime isCommandFn(@field(Commands, name))) count += 1;
     }
     var metas: [count]Meta = undefined;
     var i: usize = 0;
     for (decl_names) |name| {
         const f = @field(Commands, name);
-        if (@typeInfo(@TypeOf(f)) != .@"fn") continue;
+        if (comptime !isCommandFn(f)) continue;
         var m = fnMeta(f);
         m.name = name;
         // 剥掉 error union：result 存 payload 类型
@@ -763,8 +774,8 @@ fn makeHandler(comptime f: anytype) *const fn (Context, []const u8) anyerror![]u
 pub fn dispatch(comptime Commands: type, ctx: Context, method: []const u8, args_json: []const u8) anyerror![]u8 {
     inline for (@typeInfo(Commands).@"struct".decl_names) |name| {
         const f = @field(Commands, name);
-        if (@typeInfo(@TypeOf(f)) == .@"fn" and std.mem.eql(u8, name, method)) {
-            return makeHandler(f)(ctx, args_json);
+        if (comptime isCommandFn(f)) {
+            if (std.mem.eql(u8, name, method)) return makeHandler(f)(ctx, args_json);
         }
     }
     return error.UnknownCommand;
@@ -1050,6 +1061,15 @@ pub const runtime_js =
     \\      rename: (from, to, scope) => builtin('__zilt.fs', { action: 'rename', path: from, to, scope }),
     \\      copy: (from, to, scope) => builtin('__zilt.fs', { action: 'copy', path: from, to, scope }),
     \\      roots: () => builtin('__zilt.fs', { action: 'roots' }),
+    \\      // v0.1.22：目录监视（fsEvent）与大文件流式读（fsChunk，base64）
+    \\      watch: (path, opts) => builtin('__zilt.fs', {
+    \\        action: 'watch', path: path ?? '',
+    \\        scope: opts?.scope, recursive: opts?.recursive !== false,
+    \\      }),
+    \\      unwatch: (id) => builtin('__zilt.fs', { action: 'unwatch', id }),
+    \\      readStream: (path, opts) => builtin('__zilt.fs', {
+    \\        action: 'readStream', path, scope: opts?.scope, chunk_size: opts?.chunkSize,
+    \\      }),
     \\    },
     \\    // v0.1.16: path / log / opener / windowState
     \\    path: {
@@ -1202,8 +1222,12 @@ pub const runtime_js =
     \\    sql: {
     \\      query: (db, sql, params) => builtin('__zilt.sql', { action: 'query', db, sql: String(sql), params: (params ?? []).map(ziltSqlParam) }),
     \\      execute: (db, sql, params) => builtin('__zilt.sql', { action: 'execute', db, sql: String(sql), params: (params ?? []).map(ziltSqlParam) }),
+    \\      // v0.1.22：事务化迁移（成功后 PRAGMA user_version = version；失败整体回滚）
+    \\      migrate: (db, version, statements) => builtin('__zilt.sql', {
+    \\        action: 'migrate', path: db, version, statements: statements ?? [],
+    \\      }),
     \\    },
-    \\    version: '0.1.21',
+    \\    version: '0.1.22',
     \\  };
     \\  // v0.1.21：原型冻结（security.freezePrototype）——必须在对象建好之后
     \\  if (window.__ZILT_FREEZE__) {

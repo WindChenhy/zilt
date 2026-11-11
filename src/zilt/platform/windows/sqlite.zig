@@ -270,3 +270,52 @@ pub fn run(
     rows.deinit(alloc);
     return out.toOwnedSlice(alloc);
 }
+
+/// v0.1.22：事务化迁移——依次执行 statements，成功后把 `PRAGMA user_version`
+/// 设为 version；任一步失败回滚（含已执行的部分）。
+pub fn migrate(
+    alloc: std.mem.Allocator,
+    db_path: []const u8,
+    statements: []const []const u8,
+    version: i32,
+) !void {
+    const lib_ptr = try alloc.create(Lib);
+    defer alloc.destroy(lib_ptr);
+    lib_ptr.* = try load(alloc);
+
+    const db = try open(lib_ptr, db_path, alloc);
+    defer close(db);
+
+    try execSimple(alloc, db, "BEGIN");
+    for (statements) |st| {
+        execSimple(alloc, db, st) catch |e| {
+            execSimple(alloc, db, "ROLLBACK") catch {};
+            log.print("[sql] migrate step failed: {s}", .{@errorName(e)});
+            return e;
+        };
+    }
+    const pragma = try std.fmt.allocPrint(alloc, "PRAGMA user_version = {d}", .{version});
+    defer alloc.free(pragma);
+    execSimple(alloc, db, pragma) catch |e| {
+        execSimple(alloc, db, "ROLLBACK") catch {};
+        return e;
+    };
+    try execSimple(alloc, db, "COMMIT");
+}
+
+/// 单条无参数 SQL（prepare → step 到 DONE → finalize）。
+fn execSimple(alloc: std.mem.Allocator, db: Opened, sql_text: []const u8) !void {
+    const z = try alloc.allocSentinel(u8, sql_text.len, 0);
+    defer alloc.free(z);
+    @memcpy(z[0..sql_text.len], sql_text);
+
+    var stmt: StmtHandle = null;
+    if (db.lib.prepare(db.handle, z.ptr, @intCast(z.len), &stmt, null) != sql.SQLITE_OK) {
+        const msg = db.lib.errmsg(db.handle) orelse "";
+        log.print("[sql] exec prepare failed: {s}", .{std.mem.span(msg)});
+        return error.SqlitePrepareFailed;
+    }
+    defer _ = db.lib.finalize(stmt);
+    const rc = db.lib.step(stmt);
+    if (rc != sql.SQLITE_DONE and rc != sql.SQLITE_ROW) return error.SqliteStepFailed;
+}
