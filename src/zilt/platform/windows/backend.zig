@@ -467,6 +467,13 @@ fn boolStr(v: bool) []const u8 {
     return if (v) "true" else "false";
 }
 
+/// 进程命令的授权资源名：basename 去掉 .exe（"C:////x////git.exe" → "git"）。
+fn procBaseName(arg: []const u8) []const u8 {
+    const base = std.fs.path.basename(arg);
+    if (std.mem.endsWith(u8, base, ".exe") or std.mem.endsWith(u8, base, ".EXE")) return base[0 .. base.len - 4];
+    return base;
+}
+
 /// 判断窗口类名是否原生编辑控件（Edit / RichEdit20W 等）。
 fn isEditClass(cls_utf16: []const u16) bool {
     const name = std.unicode.utf16LeToUtf8Alloc(std.heap.page_allocator, cls_utf16) catch return false;
@@ -1080,6 +1087,9 @@ fn Backend(comptime config: Config) type {
         wss_conns: std.ArrayListUnmanaged(*WssConn) = .empty,
         /// v0.1.16：子 webview 专用窗口类名（懒注册）
         child_class_w: ?[:0]u16 = null,
+        /// v0.1.21：运行时持久化授权（形如 "fs:documents/**"）
+        acl_grants: std.ArrayListUnmanaged([]const u8) = .empty,
+        acl_loaded: bool = false,
         /// v0.1.16：子进程槽（仅 UI 线程读写；worker 只发事件）
         procs: std.ArrayListUnmanaged(*ProcSlot) = .empty,
         watcher: ?*Watcher = null,
@@ -1517,6 +1527,11 @@ fn Backend(comptime config: Config) type {
                 });
             } else |err| {
                 log.print("[webview] driver unavailable: {s} (legacy handlers remain)", .{@errorName(err)});
+            }
+
+            // v0.1.21：原型冻结标记（runtime 末尾据此冻结 window.zilt 与内建原型）
+            if (config.security.freeze_prototype) {
+                self.injectScript(w, webview, "window.__ZILT_FREEZE__ = true;");
             }
 
             // 注入 zilt 运行时（window.zilt：invoke/emit/on + __reload）
@@ -2071,6 +2086,7 @@ fn Backend(comptime config: Config) type {
                 .process => |op| return self.runProcOp(op, alloc),
                 .sql => |op| return self.runSqlOp(op, alloc),
                 .updater => |op| return self.runUpdaterOp(op, alloc),
+                .acl => |op| return self.runAclOp(op, alloc),
             }
         }
 
@@ -2081,6 +2097,8 @@ fn Backend(comptime config: Config) type {
             defer self.allocator.free(local);
             const root = std.fmt.allocPrint(self.allocator, "{s}\\{s}", .{ local, config.app_id }) catch return;
             self.storage_root = root;
+
+            self.loadAclGrants();
 
             const path = std.fmt.allocPrint(self.allocator, "{s}\\store.json", .{root}) catch return;
             defer self.allocator.free(path);
@@ -2101,6 +2119,8 @@ fn Backend(comptime config: Config) type {
             const root = self.storage_root orelse return;
             const json = st.toJson(self.allocator) catch return;
             defer self.allocator.free(json);
+            self.loadAclGrants();
+
             const path = std.fmt.allocPrint(self.allocator, "{s}\\store.json", .{root}) catch return;
             defer self.allocator.free(path);
             if (!win32.writeFileAlloc(self.allocator, path, json)) {
@@ -2118,6 +2138,10 @@ fn Backend(comptime config: Config) type {
             switch (op) {
                 .request => |req| {
                     const w = self.mainWindow() orelse return error.NoMainWindow;
+                    if (!self.aclAllowed("http", req.url)) {
+                        log.print("[acl] http denied: {s}", .{req.url});
+                        return error.PermissionDenied;
+                    }
                     const job = makeHttpJob(w.hwnd, req) orelse return error.OutOfMemory;
                     const t = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, httpWorker, .{job}) catch {
                         freeHttpJob(job);
@@ -2195,6 +2219,10 @@ fn Backend(comptime config: Config) type {
             switch (op) {
                 .connect => |req| {
                     const w = self.mainWindow() orelse return error.NoMainWindow;
+                    if (!self.aclAllowed("http", req.url)) {
+                        log.print("[acl] ws denied: {s}", .{req.url});
+                        return error.PermissionDenied;
+                    }
                     // v0.1.20：wss 走 WinHTTP（TLS/代理/证书策略），ws 仍走自研帧层
                     if (req.url.len >= 4 and std.ascii.eqlIgnoreCase(req.url[0..4], "wss:")) {
                         const job = a.create(WssJob) catch return error.OutOfMemory;
@@ -2607,6 +2635,11 @@ fn Backend(comptime config: Config) type {
                 .spawn => |req| {
                     const w = self.mainWindow() orelse return error.NoMainWindow;
                     if (req.argv.len == 0) return error.MissingCommand;
+                    const exe_name = procBaseName(req.argv[0]);
+                    if (!self.aclAllowed("shell", exe_name)) {
+                        log.print("[acl] shell denied: {s}", .{req.argv[0]});
+                        return error.PermissionDenied;
+                    }
                     const slot = a.create(ProcSlot) catch return error.OutOfMemory;
                     // argv/cwd 拷贝到 page_allocator（worker 生命周期内有效）
                     const argv_copy = a.alloc([]u8, req.argv.len) catch {
@@ -2831,12 +2864,10 @@ fn Backend(comptime config: Config) type {
         /// v0.1.19：fs scope 授权。appData/appConfig/appCache 默认可用；其它根目录
         /// 需要 capability 显式声明 `"fs:documents/**"` 之类的模式。
         fn fsAllowed(self: *Self, scope: fs_api_mod.Scope, rel: []const u8, alloc: std.mem.Allocator) bool {
-            _ = self;
             if (scope.isAppPrivate()) return true;
-            if (!security.scopesDeclared(config.security)) return false;
             const res = fs_api_mod.resourceString(alloc, scope, rel) catch return false;
             defer alloc.free(res);
-            return security.scopeAllowed(config.security, "fs", res);
+            return self.aclAllowed("fs", res);
         }
 
         fn fsScopeOf(name: ?[]const u8) !fs_api_mod.Scope {
@@ -3004,6 +3035,77 @@ fn Backend(comptime config: Config) type {
 
         /// v0.1.19：更新器 JS API。info 读当前配置与「是否已有待重启的替换」；
         /// check 复用启动时的 updaterFlow（后台线程，结果走 updateInfo/updaterFailed 事件）。
+        /// v0.1.21：资源授权（编译期 scopes + 运行时持久化授权）。
+        fn aclAllowed(self: *Self, kind: []const u8, resource: []const u8) bool {
+            return security.scopeAllowedWith(config.security, self.acl_grants.items, kind, resource);
+        }
+
+        fn loadAclGrants(self: *Self) void {
+            if (self.acl_loaded) return; // initStorage 可能被多个窗口各调一次
+            self.acl_loaded = true;
+            const root = self.storage_root orelse return;
+            const path = std.fmt.allocPrint(self.allocator, "{s}\\acl.json", .{root}) catch return;
+            defer self.allocator.free(path);
+            const bytes = win32.readFileAlloc(self.allocator, path) orelse return;
+            defer self.allocator.free(bytes);
+            var parsed = std.json.parseFromSlice([]const []const u8, self.allocator, bytes, .{}) catch return;
+            defer parsed.deinit();
+            for (parsed.value) |g| {
+                const copy = self.allocator.dupe(u8, g) catch continue;
+                self.acl_grants.append(self.allocator, copy) catch self.allocator.free(copy);
+            }
+            log.print("[acl] loaded {d} grants", .{self.acl_grants.items.len});
+        }
+
+        fn saveAclGrants(self: *Self) void {
+            const root = self.storage_root orelse return;
+            const path = std.fmt.allocPrint(self.allocator, "{s}\\acl.json", .{root}) catch return;
+            defer self.allocator.free(path);
+            const json = std.json.Stringify.valueAlloc(self.allocator, self.acl_grants.items, .{}) catch return;
+            defer self.allocator.free(json);
+            if (!win32.writeFileAlloc(self.allocator, path, json)) log.print("[acl] save failed", .{});
+        }
+
+        /// v0.1.21：acl.list / grant / revoke（grant 落盘，重启后仍生效）。
+        fn runAclOp(self: *Self, op: shared_system.AclOp, alloc: std.mem.Allocator) !shared_system.Result {
+            switch (op) {
+                .list => return .{ .json = try std.json.Stringify.valueAlloc(alloc, self.acl_grants.items, .{}) },
+                .grant => |g| {
+                    if (g.kind.len == 0 or g.pattern.len == 0) return error.InvalidPattern;
+                    const pat = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ g.kind, g.pattern });
+                    defer self.allocator.free(pat);
+                    for (self.acl_grants.items) |cur| {
+                        if (std.mem.eql(u8, cur, pat)) return .{ .ok = true };
+                    }
+                    const copy = try self.allocator.dupe(u8, pat);
+                    errdefer self.allocator.free(copy);
+                    try self.acl_grants.append(self.allocator, copy);
+                    self.saveAclGrants();
+                    log.print("[acl] granted {s}", .{pat});
+                    return .{ .ok = true };
+                },
+                .revoke => |g| {
+                    const pat = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ g.kind, g.pattern });
+                    defer self.allocator.free(pat);
+                    var removed: usize = 0;
+                    var i: usize = 0;
+                    while (i < self.acl_grants.items.len) {
+                        if (!std.mem.eql(u8, self.acl_grants.items[i], pat)) {
+                            i += 1;
+                            continue;
+                        }
+                        const old = self.acl_grants.swapRemove(i);
+                        self.allocator.free(old);
+                        removed += 1;
+                    }
+                    if (removed == 0) return .{ .ok = false };
+                    self.saveAclGrants();
+                    log.print("[acl] revoked {s} ({d})", .{ pat, removed });
+                    return .{ .ok = true };
+                },
+            }
+        }
+
         fn runUpdaterOp(self: *Self, op: shared_system.UpdaterOp, alloc: std.mem.Allocator) !shared_system.Result {
             switch (op) {
                 .info => {
@@ -4458,6 +4560,8 @@ fn Backend(comptime config: Config) type {
                 a.destroy(c);
             }
             self.wss_conns.deinit(self.allocator);
+            for (self.acl_grants.items) |g| self.allocator.free(g);
+            self.acl_grants.deinit(self.allocator);
             // v0.1.17：释放分区 Environment（名字 + 引用）
             for (self.partitions.items) |pe| {
                 _ = pe.env.lpVtbl.Release(pe.env);

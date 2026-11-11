@@ -433,6 +433,29 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
 - [x] **验收**：冒烟 32 项含 store/fs/path/log/windowState + http + ws + webviews +
       **partition 隔离**（alpha/beta localStorage 互不可见、共享实例与主页面互通）
 
+### v0.1.21 — 安全模型补齐（P0，2026-11-11）
+
+> 目标：把 scope 从「只有 fs 用」扩到 shell/http，并支持运行时授权持久化。
+
+- [x] **scope 全覆盖**：`fs`（原有）+ **`http`**（含 ws/wss URL）+ **`shell`**（argv[0]
+      basename，去 .exe）三处执行点统一走 `aclAllowed`；越权返回 PermissionDenied
+- [x] **运行时授权 `window.zilt.acl`**：`grant(kind, pattern)` / `revoke` / `list`；
+      授权落盘到 `<appData>cl.json`，**重启后仍生效**（启动加载，跨进程 E2E 验证）
+- [x] **合并判定**：`security.scopeAllowedWith(options, extra_grants, kind, resource)`——
+      编译期 capability scopes 与运行时授权取并集；opt-in 语义保持（两者都没有 → 放行）
+- [x] **原型冻结**：`security.freeze_prototype` → 运行前注入标记，runtime 建好
+      `window.zilt` 后冻结自身 + Object/Array/Function/String/Number 原型
+- [x] **示例配置**：demo capability 声明 fs/http/shell scopes（进入强制模式），
+      http/ws 仅放行 127.0.0.1，shell 仅 cmd
+- [x] **实测修复两个 bug**：`initStorage` 会随窗口创建多次调用 → `loadAclGrants` 加
+      `acl_loaded` 守卫（此前授权被重复加载）；`revoke` 只删第一个匹配 → 改为删除全部
+- [x] **单测**：231（+1：运行时授权与编译期 scope 的并集/opt-in 交互）
+- [x] **冒烟**：40 项 exit 0（c-acl2：documents 拒绝 → 授权 → 读写 → 撤销 → 再拒绝；
+      跨进程预置 downloads 授权被加载并撤销；https 未授权拒绝；原型冻结断言）
+- [ ] **未做（明确记录）**：Tauri 的 **isolation pattern**（独立 iframe 沙箱页 + 消息
+      校验脚本）未实现——现有的 `security.isolation` 只是「远程页面不得访问 IPC」。
+      iframe 代理会改变所有 invoke/event 的链路，风险与工作量都大，留作独立版本。
+
 ### v0.1.20 — 网络层换 WinHTTP（P0，2026-11-11）
 
 > 目标：一次补掉网络维度 4 个差异点（wss / 代理 / 流式 / 上传）。

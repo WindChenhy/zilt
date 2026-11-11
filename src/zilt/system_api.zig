@@ -253,6 +253,21 @@ pub const Request = union(enum) {
     sql: SqlOp,
     /// v0.1.19：更新器（info = 状态；check = 触发检查/下载/替换）
     updater: UpdaterOp,
+    /// v0.1.21：运行时授权（持久化到 acl.json）
+    acl: AclOp,
+};
+
+pub const AclGrant = struct {
+    /// fs / shell / http
+    kind: []const u8,
+    /// 资源模式（"documents/**"、"git"、"https://api.x/*"）
+    pattern: []const u8,
+};
+
+pub const AclOp = union(enum) {
+    list,
+    grant: AclGrant,
+    revoke: AclGrant,
 };
 
 pub const UpdaterOp = enum { info, check };

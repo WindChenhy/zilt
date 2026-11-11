@@ -17,7 +17,20 @@ pub const security: zilt.security.Options = .{
         .commands = &.{"*"},
         .events = &.{"*"},
         .receive_events = &.{"*"},
+        // v0.1.21：资源 scope（fs/http/shell）。声明后进入强制模式；
+        // 应用私有目录（appData/appConfig/appCache）始终可用。
+        .scopes = &.{
+            "fs:appData/**",
+            "fs:appCache/**",
+            "fs:appConfig/**",
+            "http:http://127.0.0.1:*",
+            "http:ws://127.0.0.1:*",
+            "http:wss://127.0.0.1:*",
+            "shell:cmd",
+        },
     }},
+    // v0.1.21：冻结 window.zilt + 内建原型（防原型链篡改）
+    .freeze_prototype = true,
     .deny_commands = &.{"blockedDemo"}, // 冒烟用：未授权命令须返回 PermissionDenied
     .navigation_origins = &.{"https://zilt.app"},
     .external_links = .system_browser,

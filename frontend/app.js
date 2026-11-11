@@ -747,6 +747,40 @@ async function runChecks() {
         : `hits before=${before} after=${after}`);
     } catch (e) { setCheck('c-zigev', false, String(e.message || e)); }
 
+    // 40. v0.1.21：ACL —— 越权拒绝 / 运行时授权 / 撤销
+    try {
+      // 启动时若 acl.json 里预置了 downloads 授权，说明持久化加载生效；
+      // 本轮顺手撤销它（幂等），并据此断言「跨进程持久化 + 撤销落盘」。
+      const seededList = await window.zilt.acl.list();
+      const hadSeed = Array.isArray(seededList) && seededList.includes('fs:downloads/**');
+      if (hadSeed) await window.zilt.acl.revoke('fs', 'downloads/**');
+      const seededRevoked = !(await window.zilt.acl.list()).includes('fs:downloads/**');
+      const seedOk = !hadSeed || seededRevoked;
+      await window.zilt.acl.revoke('fs', 'documents/**'); // 幂等：清掉上次残留
+      const denyMsg = async (fn) => {
+        try { await fn(); return ''; } catch (e) { return String((e && e.message) || e); }
+      };
+      const d0 = await denyMsg(() => window.zilt.fs.write('zilt_acl_probe.txt', 'x', 'documents'));
+      const g = await window.zilt.acl.grant('fs', 'documents/**');
+      const listed = await window.zilt.acl.list();
+      const w = await window.zilt.fs.write('zilt_acl_probe.txt', 'acl-ok', 'documents');
+      const r = await window.zilt.fs.read('zilt_acl_probe.txt', 'documents');
+      const rm = await window.zilt.fs.remove('zilt_acl_probe.txt', 'documents');
+      const rv = await window.zilt.acl.revoke('fs', 'documents/**');
+      const d1 = await denyMsg(() => window.zilt.fs.read('zilt_acl_probe.txt', 'documents'));
+      const httpDenied = await denyMsg(() => window.zilt.http.request({ url: 'https://example.com/' }));
+
+      // v0.1.21：freezePrototype 生效 → window.zilt 与 Object.prototype 被冻结
+      const frozen = Object.isFrozen(window.zilt) && Object.isFrozen(Object.prototype);
+      const ok = frozen && seedOk && d0.includes('PermissionDenied') && g === true &&
+        Array.isArray(listed) && listed.includes('fs:documents/**') &&
+        w === true && r === 'acl-ok' && rm === true && rv === true &&
+        d1.includes('PermissionDenied') && httpDenied.includes('PermissionDenied');
+      setCheck('c-acl2', ok, ok
+        ? 'acl ok (documents 拒绝 → 授权 → 读写 → 撤销 → 再拒绝；https 未授权拒绝)'
+        : `frozen=${frozen} seed=${hadSeed}/${seededRevoked} d0=${d0} g=${g} listed=${JSON.stringify(listed)} w=${w} r=${JSON.stringify(r)} rm=${rm} rv=${rv} d1=${d1} http=${httpDenied}`);
+    } catch (e) { setCheck('c-acl2', false, String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -790,6 +824,7 @@ async function runChecks() {
       http2: $('c-http2').className === 'pass',
       wss: $('c-wss').className === 'pass',
       zigev: $('c-zigev').className === 'pass',
+      acl2: $('c-acl2').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

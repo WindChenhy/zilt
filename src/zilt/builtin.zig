@@ -93,6 +93,9 @@ pub const Args = struct {
     max_height: ?u32 = null,
     monitor: ?u32 = null,
     role: ?[]const u8 = null,
+    // ---- v0.1.21：ACL ----
+    acl_kind: ?[]const u8 = null,
+    pattern: ?[]const u8 = null,
     // ---- v0.1.19：fs scope / 目标路径 ----
     scope: ?[]const u8 = null,
     to: ?[]const u8 = null,
@@ -525,7 +528,7 @@ pub fn isSystemMethod(method: []const u8) bool {
         eql(u8, name, "store") or eql(u8, name, "fs") or eql(u8, name, "windowState") or
         eql(u8, name, "services") or eql(u8, name, "http") or eql(u8, name, "ws") or
         eql(u8, name, "webviews") or eql(u8, name, "process") or eql(u8, name, "sql") or
-        eql(u8, name, "updater");
+        eql(u8, name, "updater") or eql(u8, name, "acl");
 }
 
 pub fn clickActionFromName(name: ?[]const u8) system_api.ClickAction {
@@ -681,6 +684,19 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
         } } };
         if (eql(u8, a.action, "roots")) return .{ .fs = .roots };
         return error.UnknownFsAction;
+    }
+
+    if (eql(u8, name, "acl")) {
+        if (eql(u8, a.action, "list")) return .{ .acl = .list };
+        if (eql(u8, a.action, "grant")) return .{ .acl = .{ .grant = .{
+            .kind = a.acl_kind orelse "fs",
+            .pattern = a.pattern orelse return error.MissingPath,
+        } } };
+        if (eql(u8, a.action, "revoke")) return .{ .acl = .{ .revoke = .{
+            .kind = a.acl_kind orelse "fs",
+            .pattern = a.pattern orelse return error.MissingPath,
+        } } };
+        return error.UnknownAclAction;
     }
 
     if (eql(u8, name, "updater")) {

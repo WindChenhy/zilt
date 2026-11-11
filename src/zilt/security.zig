@@ -26,6 +26,8 @@ pub const Options = struct {
     deny_events: []const []const u8 = &.{},
     dev_relaxed: bool = false,
     isolation: bool = false,
+    /// v0.1.21：运行时冻结 window.zilt 与内建原型（防原型链篡改）。
+    freeze_prototype: bool = false,
 };
 pub const Direction = enum { command, event, receive_event };
 
@@ -105,15 +107,32 @@ pub fn scopesDeclared(options: Options) bool {
 /// v0.1.19：资源是否被授权。kind = fs/shell/http/sql…
 /// 未声明任何 scope 时返回 true（opt-in）。
 pub fn scopeAllowed(options: Options, kind: []const u8, resource: []const u8) bool {
-    if (!scopesDeclared(options)) return true;
+    return scopeAllowedWith(options, &.{}, kind, resource);
+}
+
+/// v0.1.21：是否处于「已声明 scopes 或存在运行时授权」的强制模式。
+pub fn aclEnforced(options: Options, extra: []const []const u8) bool {
+    return scopesDeclared(options) or extra.len != 0;
+}
+
+/// v0.1.21：把编译期 capability scopes 与运行时持久化授权合并判断。
+pub fn scopeAllowedWith(options: Options, extra: []const []const u8, kind: []const u8, resource: []const u8) bool {
+    if (!aclEnforced(options, extra)) return true;
     for (options.capabilities) |cap| {
         for (cap.scopes) |pat| {
-            const sep = std.mem.indexOfScalar(u8, pat, ':') orelse continue;
-            if (!std.ascii.eqlIgnoreCase(pat[0..sep], kind)) continue;
-            if (matchScopeBody(pat[sep + 1 ..], resource)) return true;
+            if (matchScopePattern(pat, kind, resource)) return true;
         }
     }
+    for (extra) |pat| {
+        if (matchScopePattern(pat, kind, resource)) return true;
+    }
     return false;
+}
+
+fn matchScopePattern(pat: []const u8, kind: []const u8, resource: []const u8) bool {
+    const sep = std.mem.indexOfScalar(u8, pat, ':') orelse return false;
+    if (!std.ascii.eqlIgnoreCase(pat[0..sep], kind)) return false;
+    return matchScopeBody(pat[sep + 1 ..], resource);
 }
 
 fn matchScopeBody(body: []const u8, resource: []const u8) bool {
@@ -210,4 +229,24 @@ test "v0.1.19: scope opt-in and matching" {
     try std.testing.expect(scopeAllowed(opts, "http", "https://api.example.com/v1/x"));
     try std.testing.expect(!scopeAllowed(opts, "http", "https://evil.example.com/x"));
     try std.testing.expect(!scopeAllowed(opts, "sql", "app.db"));
+}
+
+test "v0.1.21: runtime grants extend capability scopes" {
+    const caps = [_]Capability{
+        .{ .name = "main", .scopes = &.{"fs:appData/**"} },
+    };
+    const opts = Options{ .capabilities = &caps };
+    try std.testing.expect(aclEnforced(opts, &.{}));
+    try std.testing.expect(scopeAllowedWith(opts, &.{}, "fs", "appData/a.txt"));
+    try std.testing.expect(!scopeAllowedWith(opts, &.{}, "fs", "documents/a.txt"));
+    // 运行时授权后放行
+    const grants = [_][]const u8{"fs:documents/**"};
+    try std.testing.expect(scopeAllowedWith(opts, &grants, "fs", "documents/a.txt"));
+    try std.testing.expect(!scopeAllowedWith(opts, &grants, "fs", "downloads/a.txt"));
+    // 没有编译期 scopes、只有运行时授权 → 也进入强制模式
+    const empty = Options{};
+    try std.testing.expect(!aclEnforced(empty, &.{}));
+    try std.testing.expect(scopeAllowedWith(empty, &.{}, "fs", "anything"));
+    try std.testing.expect(!scopeAllowedWith(empty, &grants, "fs", "downloads/a.txt"));
+    try std.testing.expect(scopeAllowedWith(empty, &grants, "fs", "documents/a.txt"));
 }

@@ -1004,6 +1004,13 @@ pub const runtime_js =
     \\      keys: () => builtin('__zilt.store', { action: 'keys' }),
     \\      all: () => builtin('__zilt.store', { action: 'all' }),
     \\    },
+    \\    // v0.1.21：运行时授权（持久化到 <appData>\acl.json，重启后仍生效）。
+    \\    // kind = fs / shell / http；pattern 形如 "documents/**"、"git"、"https://api.x/*"。
+    \\    acl: {
+    \\      list: () => builtin('__zilt.acl', { action: 'list' }),
+    \\      grant: (kind, pattern) => builtin('__zilt.acl', { action: 'grant', acl_kind: kind, pattern }),
+    \\      revoke: (kind, pattern) => builtin('__zilt.acl', { action: 'revoke', acl_kind: kind, pattern }),
+    \\    },
     \\    // v0.1.19：更新器（info = 当前配置/是否需要重启；check = 立即检查）
     \\    updater: {
     \\      info: () => builtin('__zilt.updater', { action: 'info' }),
@@ -1196,8 +1203,15 @@ pub const runtime_js =
     \\      query: (db, sql, params) => builtin('__zilt.sql', { action: 'query', db, sql: String(sql), params: (params ?? []).map(ziltSqlParam) }),
     \\      execute: (db, sql, params) => builtin('__zilt.sql', { action: 'execute', db, sql: String(sql), params: (params ?? []).map(ziltSqlParam) }),
     \\    },
-    \\    version: '0.1.20',
+    \\    version: '0.1.21',
     \\  };
+    \\  // v0.1.21：原型冻结（security.freezePrototype）——必须在对象建好之后
+    \\  if (window.__ZILT_FREEZE__) {
+    \\    try {
+    \\      Object.freeze(window.zilt);
+    \\      [Object.prototype, Array.prototype, Function.prototype, String.prototype, Number.prototype].forEach(function (p) { Object.freeze(p); });
+    \\    } catch (e) {}
+    \\  }
     \\  window.zilt.on('webviewEval', (p) => {
     \\    const wait = webviewEvalWaiters.get(p && p.rid);
     \\    if (!wait) return;
