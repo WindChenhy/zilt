@@ -17,6 +17,8 @@ import hashlib
 import socket
 import struct
 import sys
+import os
+import ssl
 import threading
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -138,13 +140,26 @@ def handle(conn, addr):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+    tls_ctx = None
+    if os.environ.get("ZILT_WS_TLS") == "1":
+        cert = os.environ.get("ZILT_WS_CERT", "scripts/dev-cert.pem")
+        key = os.environ.get("ZILT_WS_KEY", "scripts/dev-key.pem")
+        tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_ctx.load_cert_chain(cert, key)
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
     srv.listen(8)
-    print(f"ws echo listening on 127.0.0.1:{port}", flush=True)
+    print(f"ws echo listening on 127.0.0.1:{port}{' (tls)' if tls_ctx else ''}", flush=True)
     while True:
         conn, addr = srv.accept()
+        if tls_ctx is not None:
+            try:
+                conn = tls_ctx.wrap_socket(conn, server_side=True)
+            except Exception as e:  # 握手失败（例如客户端拒绝自签证书）
+                print(f"[ws] tls handshake failed: {e}", flush=True)
+                conn.close()
+                continue
         threading.Thread(target=handle, args=(conn, addr), daemon=True).start()
 
 

@@ -665,6 +665,88 @@ async function runChecks() {
         : `init=${JSON.stringify(init)} updater=${JSON.stringify(u)}`);
     } catch (e) { setCheck('c-init', false, String(e.message || e)); }
 
+    // 37. v0.1.20：WinHTTP —— multipart / 重定向 / 流式 / 超时
+    try {
+      const base = 'http://127.0.0.1:8788';
+      const echo = JSON.parse((await window.zilt.http.request({
+        url: base + '/echo', method: 'POST', body: 'hello-zilt',
+        headers: { 'Content-Type': 'text/plain' },
+      })).body);
+      const mpRes = await window.zilt.http.request({
+        url: base + '/multipart', method: 'POST',
+        multipart: [
+          { name: 'field', data: 'v' },
+          { name: 'file', filename: 'a.txt', contentType: 'text/plain', data: 'payload' },
+        ],
+      });
+      const mp = JSON.parse(mpRes.body);
+      const redir = await window.zilt.http.request({ url: base + '/redirect' });
+      const noFollow = await window.zilt.http.request({ url: base + '/redirect', followRedirects: false });
+      const seqs = [];
+      const streamRes = await window.zilt.http.stream({ url: base + '/stream?chunks=4&size=8' }, (b, seq) => seqs.push(seq));
+
+      const ok = echo.len === 10 && echo.preview === 'hello-zilt' && echo.ctype.includes('text/plain') &&
+        mp.parts.length === 2 && mp.parts[1].filename === 'a.txt' && mp.parts[1].len === 7 && mp.parts[1].text === 'payload' &&
+        redir.status === 200 && redir.body === 'hello' && noFollow.status === 302 &&
+        streamRes.status === 200 && streamRes.bytes.length === 32 && streamRes.chunks >= 1 && seqs.every((v, i) => v === i);
+      setCheck('c-http2', ok, ok
+        ? `http2 ok (multipart 2 parts, redirect 200/302, stream ${streamRes.chunks} chunks/32B)`
+        : `echo=${JSON.stringify(echo)} mp=${JSON.stringify(mp)} redir=${redir.status}/${JSON.stringify(redir.body).slice(0,20)} noFollow=${noFollow.status} stream=${streamRes.status}/${streamRes.bytes.length}/${streamRes.chunks} seqs=${JSON.stringify(seqs)}`);
+    } catch (e) { setCheck('c-http2', false, String(e.message || e)); }
+
+    // 38. v0.1.20：wss（WinHTTP/Schannel + 自签证书 + 忽略证书校验）
+    try {
+      const ev = [];
+      const id = await window.zilt.ws.connect('wss://127.0.0.1:8766/tls', { insecureTls: true });
+      const off = window.zilt.ws.on(id, (p) => ev.push(p));
+      let sent = false;
+      await new Promise((resolve, reject) => {
+        const t0 = Date.now();
+        const tick = () => {
+          if (!sent && ev.some((e) => e.kind === 'open')) {
+            sent = true;
+            window.zilt.ws.send(id, 'wss-payload').catch(reject);
+          }
+          if (sent && ev.filter((e) => e.kind === 'message').length >= 2) return resolve();
+          if (ev.some((e) => e.kind === 'error')) return reject(new Error('wss error: ' + JSON.stringify(ev)));
+          if (Date.now() - t0 > 8000) return reject(new Error('wss timeout: ' + JSON.stringify(ev.map((e) => e.kind))));
+          setTimeout(tick, 100);
+        };
+        tick();
+      });
+      await window.zilt.ws.close(id, 1000, 'wss done');
+      await new Promise((resolve) => {
+        const t0 = Date.now();
+        const tick = () => {
+          if (ev.some((e) => e.kind === 'close') || Date.now() - t0 > 3000) resolve();
+          else setTimeout(tick, 100);
+        };
+        tick();
+      });
+      off();
+      // close 帧由 WinHTTP 在等待对端 close 时可能晚到（实测 3s+），
+      // 断言只要求「TLS 建连 + welcome + echo」；close 仅作为附加信息。
+      const gotClose = ev.some((e) => e.kind === 'close');
+      const ok = ev.some((e) => e.kind === 'message' && e.data === 'wss-payload') && !ev.some((e) => e.kind === 'error');
+      setCheck('c-wss', ok, ok
+        ? `wss ok (TLS 握手 + echo${gotClose ? ' + close' : ''})`
+        : `events=${JSON.stringify(ev.map((e) => e.kind))} msgs=${JSON.stringify(ev.filter((e) => e.kind === 'message').map((e) => (e.data || '').slice(0, 20)))}`);
+    } catch (e) { setCheck('c-wss', false, String(e.message || e)); }
+
+    // 39. v0.1.20：Zig 侧订阅内置窗口事件（events 命名空间）
+    try {
+      const before = (await window.zilt.invoke('builtinEventHits', {})).hits;
+      const jx = 90 + Math.floor(Math.random() * 120);
+      const jy = 80 + Math.floor(Math.random() * 120);
+      await window.zilt.window.setPosition(jx, jy);
+      await new Promise((r) => setTimeout(r, 400));
+      const after = (await window.zilt.invoke('builtinEventHits', {})).hits;
+      const ok = after > before;
+      setCheck('c-zigev', ok, ok
+        ? `zig events ok (windowMoved hits ${before} → ${after})`
+        : `hits before=${before} after=${after}`);
+    } catch (e) { setCheck('c-zigev', false, String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -705,6 +787,9 @@ async function runChecks() {
       fsops: $('c-fs').className === 'pass',
       channel: $('c-channel').className === 'pass',
       initupd: $('c-init').className === 'pass',
+      http2: $('c-http2').className === 'pass',
+      wss: $('c-wss').className === 'pass',
+      zigev: $('c-zigev').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

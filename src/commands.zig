@@ -447,3 +447,9 @@ fn streamMain(st: *StreamState) void {
     }
     st.ctx.channelClose(st.id, null);
 }
+
+
+/// v0.1.20：返回 Zig 侧收到的内置窗口事件数（验证 events 命名空间订阅）。
+pub fn builtinEventHits(_: Context, _: struct {}) !struct { hits: u32 } {
+    return .{ .hits = @import("events.zig").builtin_hits.load(.monotonic) };
+}

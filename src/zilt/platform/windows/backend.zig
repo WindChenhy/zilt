@@ -25,6 +25,8 @@ const menu_mod = @import("menu.zig");
 const menu_runtime = @import("menu_runtime.zig");
 const win_taskbar = @import("taskbar.zig");
 const win_sysinfo = @import("sysinfo.zig");
+const winhttp = @import("winhttp.zig");
+const net_mod = @import("../../net.zig");
 const sys_integration = @import("system_integration.zig");
 const shared_system = @import("../../system_api.zig");
 const shared_menu_model = @import("../../menu_model.zig");
@@ -81,6 +83,7 @@ const WM_ZILT_HTTP: win32.UINT = win32.WM_APP + 10; // HTTP 后台线程 → UI 
 const WM_ZILT_WS: win32.UINT = win32.WM_APP + 11; // WebSocket 读线程 → UI 线程
 const WM_ZILT_PROC: win32.UINT = win32.WM_APP + 12; // 子进程 worker → UI 线程
 const WM_ZILT_EVAL: win32.UINT = win32.WM_APP + 13; // 子 webview eval（延后到回调外执行）
+const WM_ZILT_HTTP_CHUNK: win32.UINT = win32.WM_APP + 14; // v0.1.20 流式下载分块
 const WM_CLIPBOARDUPDATE: win32.UINT = 0x031D;
 const TRAY_MENU_BASE: u16 = 100;
 
@@ -981,15 +984,21 @@ fn Backend(comptime config: Config) type {
             }
 
             /// UI 线程便捷事件：序列化 payload 并直接投递（菜单/快捷键/更新流程用）。
+            /// v0.1.20：内置事件（trayMenu/menu/hotkey/deepLink/clipboardChanged/
+            /// windowCloseRequested/windowResized 等）同时分发到应用 events 命名空间——
+            /// Zig 侧声明同名 pub fn 即可订阅（与 JS 侧 window.zilt.on 对齐）。
+            /// Zig 分发不受前端 capability 约束（应用内部代码）；处理器在 UI 线程
+            /// 同步执行，须保持轻量。无匹配处理器时仅一次名称比较，无额外开销。
             fn emitEventPayload(self: *Window, name: []const u8, payload: anytype) void {
                 if (!self.alive) return;
                 const b = self.backend;
+                const payload_json = std.json.Stringify.valueAlloc(b.allocator, payload, .{}) catch return;
+                defer b.allocator.free(payload_json);
+                _ = ipc.dispatchEvent(config.events, b.makeContextWith(self, b.allocator), name, payload_json);
                 // v0.1.11：声明了 capability 清单时，Zig→JS 事件同样受
                 // receive_events 约束（框架内部 "__" 事件不受限）。
                 if (config.security.capabilities.len != 0 and !std.mem.startsWith(u8, name, "__") and
                     !security.allowed(config.security, config.url, b.dev_url, config.url, self.label, .receive_event, name)) return;
-                const payload_json = std.json.Stringify.valueAlloc(b.allocator, payload, .{}) catch return;
-                defer b.allocator.free(payload_json);
                 const msg = ipc.encodeEvent(b.allocator, name, payload_json) catch return;
                 self.emitJsonUi(msg); // 所有权转移
             }
@@ -1067,6 +1076,8 @@ fn Backend(comptime config: Config) type {
         services: ?shared_services.Registry = null,
         /// v0.1.16：活跃 WebSocket 连接（仅 UI 线程读写；读线程只发事件不碰容器）
         ws_conns: std.ArrayListUnmanaged(*WsConn) = .empty,
+        /// v0.1.20：wss 连接（WinHTTP WebSocket）
+        wss_conns: std.ArrayListUnmanaged(*WssConn) = .empty,
         /// v0.1.16：子 webview 专用窗口类名（懒注册）
         child_class_w: ?[:0]u16 = null,
         /// v0.1.16：子进程槽（仅 UI 线程读写；worker 只发事件）
@@ -2104,40 +2115,17 @@ fn Backend(comptime config: Config) type {
         /// —— 同步实现会让窗口在慢请求下冻结数秒，体验上等同于卡死。
         fn runHttpOp(self: *Self, op: shared_system.HttpOp, alloc: std.mem.Allocator) !shared_system.Result {
             _ = alloc;
-            const a = std.heap.page_allocator;
             switch (op) {
                 .request => |req| {
                     const w = self.mainWindow() orelse return error.NoMainWindow;
-
-                    const job = a.create(HttpJob) catch return error.OutOfMemory;
-                    job.* = .{
-                        .hwnd = w.hwnd,
-                        .id = req.id,
-                        .url = a.dupe(u8, req.url) catch {
-                            a.destroy(job);
-                            return error.OutOfMemory;
-                        },
-                        .method = a.dupe(u8, req.method) catch {
-                            freeHttpJob(job);
-                            return error.OutOfMemory;
-                        },
-                        .headers = a.dupe(u8, req.headers) catch {
-                            freeHttpJob(job);
-                            return error.OutOfMemory;
-                        },
-                        .body = a.dupe(u8, req.body) catch {
-                            freeHttpJob(job);
-                            return error.OutOfMemory;
-                        },
-                    };
-
+                    const job = makeHttpJob(w.hwnd, req) orelse return error.OutOfMemory;
                     const t = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, httpWorker, .{job}) catch {
                         freeHttpJob(job);
                         log.print("[http] spawn failed", .{});
                         return error.HttpSpawnFailed;
                     };
                     t.detach();
-                    log.print("[http] {s} {s} (id={d}) dispatched", .{ job.method, job.url, job.id });
+                    log.print("[http] {s} {s} (id={d}, stream={}) dispatched", .{ job.method, job.url, job.id, job.stream });
                     return .{ .ok = true };
                 },
             }
@@ -2175,6 +2163,30 @@ fn Backend(comptime config: Config) type {
             log.print("[ws] conn id={d} released", .{id});
         }
 
+        fn wssConnById(self: *Self, id: i64) ?*WssConn {
+            for (self.wss_conns.items) |c| {
+                if (c.id == id) return c;
+            }
+            return null;
+        }
+
+        /// UI 线程：移除 wss 槽 + 等读线程退出 + 释放 WinHTTP 句柄。
+        fn wssRemoveConn(self: *Self, conn: *WssConn) void {
+            var found = false;
+            for (self.wss_conns.items, 0..) |c, i| {
+                if (c == conn) {
+                    _ = self.wss_conns.swapRemove(i);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return;
+            conn.read_thread.join();
+            conn.ws.deinit();
+            std.heap.page_allocator.destroy(conn);
+            log.print("[ws] wss conn id={d} released", .{conn.id});
+        }
+
         /// connect/send/close。connect 异步（握手秒级，不能冻结 UI）；
         /// send/close 同步执行 —— 帧写是小缓冲阻塞写，通常亚毫秒。
         fn runWsOp(self: *Self, op: shared_system.WsOp, alloc: std.mem.Allocator) !shared_system.Result {
@@ -2183,6 +2195,29 @@ fn Backend(comptime config: Config) type {
             switch (op) {
                 .connect => |req| {
                     const w = self.mainWindow() orelse return error.NoMainWindow;
+                    // v0.1.20：wss 走 WinHTTP（TLS/代理/证书策略），ws 仍走自研帧层
+                    if (req.url.len >= 4 and std.ascii.eqlIgnoreCase(req.url[0..4], "wss:")) {
+                        const job = a.create(WssJob) catch return error.OutOfMemory;
+                        job.* = .{
+                            .id = req.id,
+                            .hwnd = w.hwnd,
+                            .url = a.dupe(u8, req.url) catch {
+                                a.destroy(job);
+                                return error.OutOfMemory;
+                            },
+                        };
+                        if (req.proxy) |pr| job.proxy = a.dupe(u8, pr) catch null;
+                        job.insecure_tls = req.insecure_tls;
+                        if (req.headers.len > 0) job.headers = a.dupe(u8, req.headers) catch &.{};
+                        const t = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, wssWorker, .{job}) catch {
+                            freeWssJob(job);
+                            log.print("[ws] wss spawn failed", .{});
+                            return error.WsSpawnFailed;
+                        };
+                        t.detach();
+                        log.print("[ws] wss connect id={d} {s} dispatched", .{ req.id, req.url });
+                        return .{ .ok = true };
+                    }
                     const job = a.create(WsJob) catch return error.OutOfMemory;
                     job.* = .{
                         .id = req.id,
@@ -2203,14 +2238,28 @@ fn Backend(comptime config: Config) type {
                     return .{ .ok = true };
                 },
                 .send => |req| {
-                    const conn = self.wsConnById(req.id) orelse return error.WsNotConnected;
-                    wsWriteFrame(conn, .text, req.data) catch |err| {
-                        log.print("[ws] send id={d} failed: {s}", .{ req.id, @errorName(err) });
-                        return error.WsWriteFailed;
-                    };
-                    return .{ .ok = true };
+                    if (self.wsConnById(req.id)) |conn| {
+                        wsWriteFrame(conn, .text, req.data) catch |err| {
+                            log.print("[ws] send id={d} failed: {s}", .{ req.id, @errorName(err) });
+                            return error.WsWriteFailed;
+                        };
+                        return .{ .ok = true };
+                    }
+                    if (self.wssConnById(req.id)) |conn| {
+                        conn.ws.sendText(req.data) catch |err| {
+                            log.print("[ws] wss send id={d} failed: {s}", .{ req.id, @errorName(err) });
+                            return error.WsWriteFailed;
+                        };
+                        return .{ .ok = true };
+                    }
+                    return error.WsNotConnected;
                 },
                 .close => |req| {
+                    if (self.wssConnById(req.id)) |tls_conn| {
+                        tls_conn.closing = true;
+                        tls_conn.ws.close(req.code, req.reason);
+                        return .{ .ok = true };
+                    }
                     const conn = self.wsConnById(req.id) orelse return error.WsNotConnected;
                     conn.closing = true;
                     const cp = shared_ws.closePayload(a, req.code, req.reason) catch return error.OutOfMemory;
@@ -4400,6 +4449,15 @@ fn Backend(comptime config: Config) type {
                 a.destroy(c);
             }
             self.ws_conns.deinit(self.allocator);
+            // v0.1.20：wss 连接（WinHTTP 句柄）
+            for (self.wss_conns.items) |c| {
+                c.ws.close(1001, "app exit");
+                c.read_thread.join();
+                c.ws.deinit();
+                const a = std.heap.page_allocator;
+                a.destroy(c);
+            }
+            self.wss_conns.deinit(self.allocator);
             // v0.1.17：释放分区 Environment（名字 + 引用）
             for (self.partitions.items) |pe| {
                 _ = pe.env.lpVtbl.Release(pe.env);
@@ -4854,6 +4912,16 @@ fn Backend(comptime config: Config) type {
                     }
                     return 0;
                 },
+                WM_ZILT_HTTP_CHUNK => {
+                    const ch: *HttpChunk = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    defer freeHttpChunk(ch);
+                    if (instance) |b| {
+                        if (b.mainWindow()) |w| {
+                            w.emitEventPayload("httpChunk", .{ .id = ch.id, .seq = ch.seq, .data = ch.data });
+                        }
+                    }
+                    return 0;
+                },
                 WM_ZILT_HTTP => {
                     const res: *HttpResult = @ptrFromInt(@as(usize, @bitCast(lparam)));
                     defer freeHttpResult(res);
@@ -4880,7 +4948,21 @@ fn Backend(comptime config: Config) type {
                         switch (ev.kind) {
                             .open => {
                                 if (w) |mw| {
-                                    if (ev.conn) |conn| {
+                                    if (ev.tls) |tc| {
+                                        const t = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, wssReadLoop, .{tc}) catch null;
+                                        if (t) |th| {
+                                            tc.read_thread = th;
+                                            b.wss_conns.append(b.allocator, tc) catch {};
+                                            log.print("[ws] wss open id={d}", .{ev.id});
+                                            mw.emitEventPayload("wsEvent", .{ .id = ev.id, .kind = "open" });
+                                        } else {
+                                            mw.emitEventPayload("wsEvent", .{ .id = ev.id, .kind = "error", .err = "WsSpawnFailed" });
+                                            {
+                                            tc.ws.deinit();
+                                            std.heap.page_allocator.destroy(tc);
+                                        }
+                                        }
+                                    } else if (ev.conn) |conn| {
                                         const t = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, wsReadLoop, .{conn}) catch null;
                                         if (t) |th| {
                                             conn.read_thread = th;
@@ -4895,19 +4977,26 @@ fn Backend(comptime config: Config) type {
                                     }
                                 } else if (ev.conn) |conn| {
                                     b.wsRemoveConn(conn);
+                                } else if (ev.tls) |tc| {
+                                    {
+                                            tc.ws.deinit();
+                                            std.heap.page_allocator.destroy(tc);
+                                        }
                                 }
                             },
                             .message => {
-                                if (w) |mw| mw.emitEventPayload("wsEvent", .{ .id = ev.id, .kind = "message", .data = ev.data });
+                                if (w) |mw| mw.emitEventPayload("wsEvent", .{ .id = ev.id, .kind = "message", .data = ev.data, .binary = ev.binary });
                             },
                             .close => {
                                 if (w) |mw| mw.emitEventPayload("wsEvent", .{ .id = ev.id, .kind = "close", .code = ev.code, .reason = ev.reason });
                                 if (ev.conn) |conn| b.wsRemoveConn(conn);
+                                if (ev.tls) |tc| b.wssRemoveConn(tc);
                                 log.print("[ws] closed id={d} code={d}", .{ ev.id, ev.code });
                             },
                             .err => {
                                 if (w) |mw| mw.emitEventPayload("wsEvent", .{ .id = ev.id, .kind = "error", .err = ev.err });
                                 if (ev.conn) |conn| b.wsRemoveConn(conn);
+                                if (ev.tls) |tc| b.wssRemoveConn(tc);
                                 log.print("[ws] error id={d}: {s}", .{ ev.id, ev.err orelse "-" });
                             },
                         }
@@ -5812,19 +5901,80 @@ const HttpResult = struct {
 const HttpJob = struct {
     hwnd: win32.HWND,
     id: i64,
-    url: []u8,
-    method: []u8,
-    headers: []u8,
-    body: []u8,
+    url: []const u8 = "",
+    method: []const u8 = "GET",
+    headers: []const u8 = "",
+    body: []const u8 = "",
+    timeout_ms: u32 = 30_000,
+    proxy: ?[]const u8 = null,
+    insecure_tls: bool = false,
+    follow_redirects: bool = true,
+    stream: bool = false,
+    parts: []const shared_system.MultiPart = &.{},
+    /// 所有字符串都从 arena 分配：freeHttpJob 一次回收
+    arena: std.heap.ArenaAllocator,
 };
 
 fn freeHttpJob(job: *HttpJob) void {
     const a = std.heap.page_allocator;
-    a.free(job.url);
-    a.free(job.method);
-    a.free(job.headers);
-    a.free(job.body);
+    var j = job.*;
+    j.arena.deinit();
     a.destroy(job);
+}
+
+/// 把请求深拷贝进 job（arena），任何分配失败都清理干净。
+fn makeHttpJob(hwnd: win32.HWND, req: shared_system.HttpRequest) ?*HttpJob {
+    const a = std.heap.page_allocator;
+    const job = a.create(HttpJob) catch return null;
+    job.* = .{ .hwnd = hwnd, .id = req.id, .arena = std.heap.ArenaAllocator.init(a) };
+    const ja = job.arena.allocator();
+
+    job.url = ja.dupe(u8, req.url) catch return fail: {
+        freeHttpJob(job);
+        break :fail null;
+    };
+    job.method = ja.dupe(u8, req.method) catch return fail: {
+        freeHttpJob(job);
+        break :fail null;
+    };
+    job.headers = ja.dupe(u8, req.headers) catch return fail: {
+        freeHttpJob(job);
+        break :fail null;
+    };
+    job.body = ja.dupe(u8, req.body) catch return fail: {
+        freeHttpJob(job);
+        break :fail null;
+    };
+    job.timeout_ms = req.timeout_ms;
+    job.insecure_tls = req.insecure_tls;
+    job.follow_redirects = req.follow_redirects;
+    job.stream = req.stream;
+    if (req.proxy) |p| job.proxy = ja.dupe(u8, p) catch null;
+
+    if (req.multipart) |parts| {
+        if (parts.len > 0) {
+            const owned = ja.alloc(shared_system.MultiPart, parts.len) catch {
+                freeHttpJob(job);
+                return null;
+            };
+            for (parts, 0..) |p, i| {
+                owned[i] = .{
+                    .name = ja.dupe(u8, p.name) catch {
+                        freeHttpJob(job);
+                        return null;
+                    },
+                    .data = ja.dupe(u8, p.data) catch {
+                        freeHttpJob(job);
+                        return null;
+                    },
+                    .filename = if (p.filename) |f| ja.dupe(u8, f) catch null else null,
+                    .content_type = if (p.content_type) |c| ja.dupe(u8, c) catch null else null,
+                };
+            }
+            job.parts = owned;
+        }
+    }
+    return job;
 }
 
 fn freeHttpResult(res: *HttpResult) void {
@@ -5860,6 +6010,50 @@ fn parseHeaderList(a: std.mem.Allocator, raw: []const u8) ![]std.http.Header {
     return list.toOwnedSlice(a);
 }
 
+/// v0.1.20：流式分块（worker → UI 线程，data 为 base64）。
+const HttpChunk = struct {
+    hwnd: win32.HWND,
+    id: i64,
+    seq: u32,
+    data: []u8,
+};
+
+fn freeHttpChunk(ch: *HttpChunk) void {
+    const a = std.heap.page_allocator;
+    a.free(ch.data);
+    a.destroy(ch);
+}
+
+const ChunkCtx = struct {
+    hwnd: win32.HWND,
+    id: i64,
+    seq: u32 = 0,
+};
+
+fn httpChunkCb(ctx: *anyopaque, data: []const u8) bool {
+    const c: *ChunkCtx = @ptrCast(@alignCast(ctx));
+    const a = std.heap.page_allocator;
+    const b64 = net_mod.base64Alloc(a, data) catch return false;
+    const ch = a.create(HttpChunk) catch {
+        a.free(b64);
+        return false;
+    };
+    ch.* = .{ .hwnd = c.hwnd, .id = c.id, .seq = c.seq, .data = b64 };
+    c.seq += 1;
+    if (win32.PostMessageW(c.hwnd, WM_ZILT_HTTP_CHUNK, 0, @bitCast(@intFromPtr(ch))) == 0) {
+        freeHttpChunk(ch);
+        return false;
+    }
+    return true;
+}
+
+fn postHttpResult(job: *HttpJob, res: *HttpResult) void {
+    if (win32.PostMessageW(job.hwnd, WM_ZILT_HTTP, 0, @bitCast(@intFromPtr(res))) == 0) {
+        freeHttpResult(res);
+    }
+}
+
+/// v0.1.20：WinHTTP 请求（支持 https、代理、超时、重定向策略、忽略证书、流式分块）。
 fn httpWorker(job: *HttpJob) void {
     const a = std.heap.page_allocator;
 
@@ -5870,43 +6064,79 @@ fn httpWorker(job: *HttpJob) void {
     res.* = .{
         .id = job.id,
         .status = 0,
-        .body = a.dupe(u8, "") catch &[_]u8{},
+        .body = a.alloc(u8, 0) catch &[_]u8{},
         .err = null,
     };
 
-    {
-        var threaded: std.Io.Threaded = .init(a, .{});
-        defer threaded.deinit();
-        var client: std.http.Client = .{ .allocator = a, .io = threaded.io() };
-        defer client.deinit();
+    const url = net_mod.parseUrl(job.url) catch {
+        res.err = a.dupe(u8, "InvalidUrl") catch null;
+        postHttpResult(job, res);
+        freeHttpJob(job);
+        return;
+    };
 
-        const hdrs = parseHeaderList(a, job.headers) catch a.alloc(std.http.Header, 0) catch &[_]std.http.Header{};
-        defer a.free(hdrs);
-
-        var aw: std.Io.Writer.Allocating = .init(a);
-        defer aw.deinit();
-
-        const outcome = client.fetch(.{
-            .location = .{ .url = job.url },
-            .method = parseHttpMethod(job.method),
-            .payload = if (job.body.len > 0) job.body else null,
-            .extra_headers = hdrs,
-            .response_writer = &aw.writer,
-        });
-
-        if (outcome) |r| {
-            res.status = @intFromEnum(r.status);
-            if (aw.toOwnedSlice()) |bytes| {
-                res.body = bytes;
-            } else |_| {}
-        } else |e| {
-            res.err = a.dupe(u8, @errorName(e)) catch null;
+    // multipart：覆盖 body 并补 Content-Type
+    var mp: ?net_mod.Multipart = null;
+    defer if (mp) |*m| m.deinit(a);
+    var body: []const u8 = job.body;
+    var headers: []const u8 = job.headers;
+    var headers_owned: ?[]u8 = null;
+    defer if (headers_owned) |h| a.free(h);
+    var parts_tmp: []net_mod.Part = &.{};
+    defer if (parts_tmp.len > 0) a.free(parts_tmp);
+    if (job.parts.len > 0) {
+        parts_tmp = a.alloc(net_mod.Part, job.parts.len) catch &.{};
+        for (job.parts, 0..) |p, i| {
+            parts_tmp[i] = .{ .name = p.name, .data = p.data, .filename = p.filename, .content_type = p.content_type };
         }
     }
-
-    if (win32.PostMessageW(job.hwnd, WM_ZILT_HTTP, 0, @bitCast(@intFromPtr(res))) == 0) {
-        freeHttpResult(res);
+    if (job.parts.len > 0) {
+        var bbuf: [32]u8 = undefined;
+        const boundary = net_mod.randomBoundary(&bbuf);
+        mp = net_mod.buildMultipart(a, boundary, parts_tmp) catch {
+            res.err = a.dupe(u8, "MultipartFailed") catch null;
+            postHttpResult(job, res);
+            freeHttpJob(job);
+            return;
+        };
+        body = mp.?.body;
+        headers_owned = std.fmt.allocPrint(a, "{s}{s}Content-Type: {s}", .{
+            job.headers, if (job.headers.len > 0) "\n" else "", mp.?.content_type,
+        }) catch null;
+        if (headers_owned) |h| headers = h;
     }
+
+    var cctx = ChunkCtx{ .hwnd = job.hwnd, .id = job.id };
+    const sink: ?winhttp.Sink = if (job.stream) .{ .ctx = &cctx, .on_chunk = httpChunkCb } else null;
+
+    const r = winhttp.request(a, url, .{
+        .method = job.method,
+        .headers = headers,
+        .body = body,
+        .timeout_ms = job.timeout_ms,
+        .proxy = job.proxy,
+        .insecure_tls = job.insecure_tls,
+        .follow_redirects = job.follow_redirects,
+    }, sink) catch |e| {
+        res.err = a.dupe(u8, @errorName(e)) catch null;
+        log.print("[http] {s} failed: {s}", .{ url.host, @errorName(e) });
+        postHttpResult(job, res);
+        freeHttpJob(job);
+        return;
+    };
+
+    res.status = r.status;
+    if (job.stream) {
+        a.free(r.body);
+    } else {
+        a.free(res.body);
+        res.body = r.body;
+    }
+    log.print("[http] {s}{s} -> {d} ({d} bytes{s})", .{
+        if (url.secure) "https://" else "http://", url.host, r.status, res.body.len,
+        if (job.stream) ", streamed" else "",
+    });
+    postHttpResult(job, res);
     freeHttpJob(job);
 }
 
@@ -6120,6 +6350,123 @@ const WsConn = struct {
     closing: bool = false,
 };
 
+/// v0.1.20：wss 连接（WinHTTP WebSocket；ws:// 仍走上面的 raw 路径）。
+/// 两条路径并存是为了不动机已实测的 ws:// 实现（分包/掩码/握手都是自研代码）。
+const WssConn = struct {
+    id: i64,
+    hwnd: win32.HWND,
+    ws: *winhttp.WebSocket,
+    /// UI 已主动 close → 读循环不再重复 close
+    closing: bool = false,
+    read_thread: std.Thread = undefined,
+};
+
+const WssJob = struct {
+    id: i64,
+    hwnd: win32.HWND,
+    url: []u8,
+    proxy: ?[]u8 = null,
+    insecure_tls: bool = false,
+    headers: []u8 = &.{},
+};
+
+fn freeWssJob(job: *WssJob) void {
+    const a = std.heap.page_allocator;
+    a.free(job.url);
+    if (job.proxy) |p| a.free(p);
+    if (job.headers.len > 0) a.free(job.headers);
+    a.destroy(job);
+}
+
+/// 后台线程：WinHTTP 建连 + WebSocket 升级，成功后把连接交给 UI 线程。
+fn wssWorker(job: *WssJob) void {
+    const a = std.heap.page_allocator;
+    const url = net_mod.parseUrl(job.url) catch {
+        wsPostError(job.id, job.hwnd, "InvalidUrl");
+        freeWssJob(job);
+        return;
+    };
+    const ws = winhttp.openWebSocket(a, url, .{
+        .proxy = job.proxy,
+        .insecure_tls = job.insecure_tls,
+        .headers = job.headers,
+    }) catch |e| {
+        wsPostError(job.id, job.hwnd, @errorName(e));
+        freeWssJob(job);
+        return;
+    };
+    const conn = a.create(WssConn) catch {
+        ws.deinit();
+        wsPostError(job.id, job.hwnd, "OutOfMemory");
+        freeWssJob(job);
+        return;
+    };
+    conn.* = .{ .id = job.id, .hwnd = job.hwnd, .ws = ws };
+
+    const ev = a.create(WsEvent) catch {
+        ws.deinit();
+        a.destroy(conn);
+        freeWssJob(job);
+        return;
+    };
+    ev.* = .{ .id = job.id, .kind = .open, .hwnd = job.hwnd, .tls = conn };
+    if (win32.PostMessageW(job.hwnd, WM_ZILT_WS, 0, @bitCast(@intFromPtr(ev))) == 0) {
+        freeWsEvent(ev);
+        ws.deinit();
+        a.destroy(conn);
+        freeWssJob(job);
+        return;
+    }
+    log.print("[ws] wss handshake ok id={d} ({s}:{d}{s})", .{ job.id, url.host, url.port, url.path });
+    freeWssJob(job);
+}
+
+/// wss 读循环：WinHTTP 已处理 ping/pong，这里只做「分片累积 → 整帧事件」。
+fn wssReadLoop(conn: *WssConn) void {
+    const a = std.heap.page_allocator;
+    var buf: [16 * 1024]u8 = undefined;
+    var acc: std.ArrayListUnmanaged(u8) = .empty;
+    defer acc.deinit(a);
+
+    while (true) {
+        const r = conn.ws.receive(&buf) catch |e| {
+            wsPostError(conn.id, conn.hwnd, @errorName(e));
+            return;
+        };
+        if (r.kind == .close) {
+            const ev = a.create(WsEvent) catch return;
+            ev.* = .{ .id = conn.id, .kind = .close, .hwnd = conn.hwnd, .tls = conn, .code = r.code };
+            if (win32.PostMessageW(conn.hwnd, WM_ZILT_WS, 0, @bitCast(@intFromPtr(ev))) == 0) freeWsEvent(ev);
+            return;
+        }
+        const fragmented = r.kind == .utf8_fragment or r.kind == .binary_fragment;
+        acc.appendSlice(a, buf[0..r.n]) catch {
+            wsPostError(conn.id, conn.hwnd, "OutOfMemory");
+            return;
+        };
+        if (fragmented) continue;
+
+        const binary = r.kind == .binary_message;
+        const data = if (binary)
+            net_mod.base64Alloc(a, acc.items) catch {
+                wsPostError(conn.id, conn.hwnd, "OutOfMemory");
+                return;
+            }
+        else
+            a.dupe(u8, acc.items) catch {
+                wsPostError(conn.id, conn.hwnd, "OutOfMemory");
+                return;
+            };
+        const ev = a.create(WsEvent) catch {
+            a.free(data);
+            return;
+        };
+        ev.* = .{ .id = conn.id, .kind = .message, .hwnd = conn.hwnd, .data = data, .binary = binary };
+        if (win32.PostMessageW(conn.hwnd, WM_ZILT_WS, 0, @bitCast(@intFromPtr(ev))) == 0) freeWsEvent(ev);
+        acc.clearRetainingCapacity();
+    }
+}
+
 /// 后台线程 → UI 线程的事件。page_allocator 持有，UI 线程取走后 free。
 const WsEvent = struct {
     pub const Kind = enum { open, message, close, err };
@@ -6128,7 +6475,11 @@ const WsEvent = struct {
     hwnd: win32.HWND,
     /// open：新连接（所有权移交 UI）；err：握手失败时的半成品连接（UI 清理）
     conn: ?*WsConn = null,
+    /// v0.1.20：wss 连接（与 conn 互斥）
+    tls: ?*WssConn = null,
     data: ?[]u8 = null,
+    /// v0.1.20：binary 帧（data 为 base64）
+    binary: bool = false,
     code: u16 = 0,
     reason: ?[]u8 = null,
     err: ?[]u8 = null,

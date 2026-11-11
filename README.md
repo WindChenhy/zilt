@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.19（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs/path/log/opener/windowState 周边 API + 更新器通道/崩溃回滚/健康确认 + 代码签名（签名产物已实测 Authenticode + RFC3161）+ MSI（WiX 3.14 自动 vendor，安装/卸载实测）+ MSIX（makeappx，松散注册实测）+ services 生命周期 + http（异步）+ websocket 客户端 + 单窗口多 WebView + 前端对话框/子进程/图标生成 CLI + SQL（SQLite 动态加载）+ headless/server 模式 + 热重启 dev + npm 运行时包/脚手架 + SQL + 多 WebView 数据分区 + 窗口精细控制/菜单角色与加速键/托盘 hover + fs 全量/scope ACL/channel/MCP + 8 套模板 + WebDriver 自动化 + CI 流水线 + `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.1.20（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs/path/log/opener/windowState 周边 API + 更新器通道/崩溃回滚/健康确认 + 代码签名（签名产物已实测 Authenticode + RFC3161）+ MSI（WiX 3.14 自动 vendor，安装/卸载实测）+ MSIX（makeappx，松散注册实测）+ services 生命周期 + http（异步）+ websocket 客户端 + 单窗口多 WebView + 前端对话框/子进程/图标生成 CLI + SQL（SQLite 动态加载）+ headless/server 模式 + 热重启 dev + npm 运行时包/脚手架 + SQL + 多 WebView 数据分区 + 窗口精细控制/菜单角色与加速键/托盘 hover + fs 全量/scope ACL/channel/MCP + WinHTTP（https/wss/代理/流式/multipart） + 8 套模板 + WebDriver 自动化 + CI 流水线 + `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 
@@ -29,6 +29,15 @@ v0.1.17 新增（2026-11-08，均已实现、验证并提交）：
 - **多 WebView 数据分区**（2026-11-09）：`webviews.create({partition:'login'})` → 独立 WebView2 Environment + 独立 user data folder（`<profile>\WebView2-partitions\<name>`），Cookie/localStorage/IndexedDB 与主页面隔离；同名分区复用同一 Environment；新增 `webviews.eval(id, script)`（异步事件回传，包成 Promise）。**实测**：alpha/beta 分区 localStorage 互不可见、共享实例与主页面互通，两个 user data 目录真实落盘（12M/7.7M）
 - **日志轮转**：4MB 阈值，zilt.log → .1 → .2 → .3（实测 5MB 日志轮转）
 - **验收**：单元测试 **234/234**（框架 216 + 工具 18）；GUI 冒烟 **32 项** ALL PASSED（exit 0，含数据分区隔离）；WebDriver 4/4；headless 四端点 + SQL 真 E2E；日志轮转实测；`zilt version` 报 0.1.17
+
+v0.1.20 新增（2026-11-11，网络层换 WinHTTP）：
+
+- **HTTP(S) 全能力**：`http.request` 支持 https、显式/系统代理（loopback 自动绕过）、重定向策略、忽略证书、**multipart 上传**；新增 `http.stream(opts, onChunk)` 流式下载（`httpChunk` 事件，base64 分块 → Uint8Array）
+- **wss / TLS**：`ws.connect('wss://…', {insecureTls, proxy})` 走 WinHTTP/Schannel；`ws://` 保留自研帧层；消息新增 `binary` 标记
+- **Zig 侧订阅内置事件**：`pub fn windowMoved(ctx, payload) void` 即可在 Zig 收到框架事件（与 `window.zilt.on` 对齐）
+- **测试基建**：`scripts/http_echo.py`（echo/流式/302/multipart/慢响应）、`scripts/ws_echo.py --tls`（自签证书）
+- **已知限制**：WinHTTP 对「只建连不发响应头」的等待超时未生效（三条路径实测），connect 超时正常
+- **验收**：单测 **230**；冒烟 **39 项** exit 0（http2 / wss / zigev 新增）
 
 v0.1.19 新增（2026-11-10，结构性能力补齐）：
 

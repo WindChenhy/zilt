@@ -1089,16 +1089,63 @@ pub const runtime_js =
     \\            headers: typeof o.headers === 'string' ? o.headers : Object.entries(o.headers ?? {}).map(([k, v]) => k + ': ' + v).join('\\n'),
     \\            body: o.body ?? '',
     \\            timeout_ms: o.timeout_ms ?? 30000,
+    \\            proxy: o.proxy,
+    \\            insecure_tls: o.insecureTls === true,
+    \\            follow_redirects: o.followRedirects !== false,
+    \\            parts: (o.multipart ?? []).length > 0 ? (o.multipart ?? []).map((p) => ({ name: p.name, data: p.data ?? '', filename: p.filename, content_type: p.contentType ?? p.content_type })) : null,
     \\          }).catch((e) => { off(); reject(e); });
+    \\        });
+    \\      },
+    \\      // v0.1.20：流式下载（onChunk(bytes, seq) 边到边回调，结束时给完整 Uint8Array）
+    \\      stream: (opts, onChunk) => {
+    \\        const o = opts ?? {};
+    \\        const id = ++httpSeq;
+    \\        const chunks = [];
+    \\        return new Promise((resolve, reject) => {
+    \\          const offChunk = window.zilt.on('httpChunk', (p) => {
+    \\            if (!p || p.id !== id) return;
+    \\            const bin = atob(p.data);
+    \\            const bytes = new Uint8Array(bin.length);
+    \\            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    \\            chunks.push(bytes);
+    \\            if (typeof onChunk === 'function') onChunk(bytes, p.seq);
+    \\          });
+    \\          const off = window.zilt.on('httpResponse', (p) => {
+    \\            if (!p || p.id !== id) return;
+    \\            off(); offChunk();
+    \\            if (p.err) { reject(new Error(p.err)); return; }
+    \\            const total = chunks.reduce((n, c) => n + c.length, 0);
+    \\            const all = new Uint8Array(total);
+    \\            let at = 0;
+    \\            for (const c of chunks) { all.set(c, at); at += c.length; }
+    \\            resolve({ status: p.status, bytes: all, chunks: chunks.length });
+    \\          });
+    \\          builtin('__zilt.http', {
+    \\            action: 'request', id, stream: true,
+    \\            url: o.url,
+    \\            method: o.method ?? 'GET',
+    \\            headers: typeof o.headers === 'string' ? o.headers : Object.entries(o.headers ?? {}).map(([k, v]) => k + ': ' + v).join('\\n'),
+    \\            timeout_ms: o.timeout_ms ?? 60000,
+    \\            proxy: o.proxy,
+    \\            insecure_tls: o.insecureTls === true,
+    \\            follow_redirects: o.followRedirects !== false,
+    \\          }).catch((e) => { off(); offChunk(); reject(e); });
     \\        });
     \\      },
     \\    },
     \\    // v0.1.16: WebSocket。connect 异步 —— 握手在后台线程执行，立即返回连接 id；
     \\    // open/message/close/error 全走 wsEvent 事件（kind 字段区分）。
     \\    ws: {
-    \\      connect: (url) => {
+    \\      // v0.1.20：wss:// 走 WinHTTP（TLS/代理）；ws:// 仍走自研帧层
+    \\      connect: (url, opts) => {
     \\        const id = ++wsSeq;
-    \\        return builtin('__zilt.ws', { action: 'connect', id, url }).then(() => id);
+    \\        const o = opts ?? {};
+    \\        return builtin('__zilt.ws', {
+    \\          action: 'connect', id, url,
+    \\          proxy: o.proxy,
+    \\          insecure_tls: o.insecureTls === true,
+    \\          headers: typeof o.headers === 'string' ? o.headers : Object.entries(o.headers ?? {}).map(([k, v]) => k + ': ' + v).join('\\n'),
+    \\        }).then(() => id);
     \\      },
     \\      send: (id, data) => builtin('__zilt.ws', { action: 'send', id, data: String(data) }),
     \\      close: (id, code, reason) => builtin('__zilt.ws', { action: 'close', id, code: code ?? 1000, reason: reason ?? '' }),
@@ -1149,7 +1196,7 @@ pub const runtime_js =
     \\      query: (db, sql, params) => builtin('__zilt.sql', { action: 'query', db, sql: String(sql), params: (params ?? []).map(ziltSqlParam) }),
     \\      execute: (db, sql, params) => builtin('__zilt.sql', { action: 'execute', db, sql: String(sql), params: (params ?? []).map(ziltSqlParam) }),
     \\    },
-    \\    version: '0.1.19',
+    \\    version: '0.1.20',
     \\  };
     \\  window.zilt.on('webviewEval', (p) => {
     \\    const wait = webviewEvalWaiters.get(p && p.rid);

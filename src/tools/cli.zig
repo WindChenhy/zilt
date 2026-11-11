@@ -80,7 +80,7 @@ fn printHelp() void {
         \\  zilt version   打印版本
         \\  zilt icon <in.png> [-o out.ico] [--sizes 16,32,48,256]
         \\                 PNG → 多尺寸 .ico（Windows 发布图标）
-        \\  zilt npm-pack [-o npm] [--name @zilt/runtime] [--version 0.1.19]
+        \\  zilt npm-pack [-o npm] [--name @zilt/runtime] [--version 0.1.20]
         \\                 生成 @zilt/runtime npm 包（package.json/index.js/index.d.ts）
         \\
         \\构建/运行仍走 zig build:
@@ -324,7 +324,7 @@ fn runIcon(alloc: std.mem.Allocator, args: []const []u8) !u8 {
 
 fn runNpmPack(alloc: std.mem.Allocator, args: []const []u8) !u8 {
     var out_dir: []const u8 = "npm";
-    var version: []const u8 = "0.1.19";
+    var version: []const u8 = "0.1.20";
     var name: []const u8 = "@zilt/runtime";
 
     var i: usize = 0;

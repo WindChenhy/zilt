@@ -97,6 +97,12 @@ pub const Args = struct {
     scope: ?[]const u8 = null,
     to: ?[]const u8 = null,
     to_scope: ?[]const u8 = null,
+    // ---- v0.1.20：网络 ----
+    proxy: ?[]const u8 = null,
+    insecure_tls: ?bool = null,
+    follow_redirects: ?bool = null,
+    stream: ?bool = null,
+    parts: ?[]const system_api.MultiPart = null,
     key: ?[]const u8 = null,
     value: ?[]const u8 = null,
     data: ?[]const u8 = null,
@@ -692,6 +698,11 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
                 .headers = a.headers orelse "",
                 .body = a.body orelse a.text orelse a.data orelse "",
                 .timeout_ms = a.timeout_ms orelse 30_000,
+                .proxy = a.proxy,
+                .insecure_tls = a.insecure_tls orelse false,
+                .follow_redirects = a.follow_redirects orelse true,
+                .stream = a.stream orelse false,
+                .multipart = a.parts,
             } } };
         }
         return error.UnknownHttpAction;
@@ -715,6 +726,9 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
         if (eql(u8, a.action, "connect")) return .{ .ws = .{ .connect = .{
             .id = a.id orelse 0,
             .url = a.url orelse return error.MissingUrl,
+            .proxy = a.proxy,
+            .insecure_tls = a.insecure_tls orelse false,
+            .headers = a.headers orelse "",
         } } };
         if (eql(u8, a.action, "send")) return .{ .ws = .{ .send = .{
             .id = a.id orelse return error.MissingId,

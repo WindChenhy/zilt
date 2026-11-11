@@ -17,3 +17,8 @@ smoke_log.txt
 mcp_e2e*.log
 headless_final.log
 driver_e2e.log
+scripts/dev-cert.pem
+scripts/dev-key.pem
+http_echo.log
+wss_echo.log
+ws_echo2.log

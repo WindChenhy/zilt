@@ -125,6 +125,7 @@ TS 工程：`zig build gen` 生成 `frontend/bindings/zilt.ts`（全类型命令
 | 资产服务 | custom scheme 拦截（`AddWebResourceRequestedFilter`）+ 内存 IStream 响应；压缩资产首次请求惰性解压 + 进程内缓存，恒以 identity 下发（custom scheme 不走网络栈内容解码，实测见 reference §G.6/G.7）；If-None-Match→304 逻辑就绪（当前通道不回传验证器，休眠） |
 | 反代 dev 模式 | `ZILT_DEV_PROXY=<dev_url>`（config `frontend.dev_proxy`）：应用保持自身 origin，资产请求经 custom scheme 处理器同步转发上游（Content-Type 透传）；keep-alive 死连接重建连接池重试一次；HMR 由模板预置的显式 `server.hmr` 直连 vite ws，热更新模块经代理 `?t=` 重取 |
 | 前端工程化 | `project.zig` Config.Frontend（dir/dist/build_command/dev_command/dev_url/dev_proxy，单一配置源）；`zig build frontend` spawn build_command（cwd=frontend）；`zig build dev` spawn dev_command → TCP 直连 127.0.0.1 探测 → 注入 ZILT_DEV_URL（或 ZILT_DEV_PROXY）→ Job Object 整树清理 |
+| 网络（v0.1.20） | WinHTTP 动态加载：`WinHttpOpen/Connect/OpenRequest/SendRequest/ReceiveResponse/ReadData`；https/代理/重定向/证书策略；wss 用 `WinHttpWebSocketCompleteUpgrade`（ws:// 仍走自研帧层）；流式下载分块经 `WM_ZILT_HTTP_CHUNK` → `httpChunk` 事件 |
 | fs 全量 / scope | 12 个操作 × 11 个根目录（userSubdir 环境变量解析 + exe 目录）；写入/复制自动 mkdir -p，removeDir 用 FindFirstFileW 递归；每次访问先查 capability `scopes`（appData 私有目录豁免） |
 | 流式通道 | `__zilt.channel` 事件 + JS 侧 `Map` 分发；Zig `ctx.channelSend/close` 按 seq 推送（无背压） |
 | MCP 服务端 | headless `POST /mcp`：JSON-RPC 2.0，tools 由 `commandMetas` comptime 生成（name/description/inputSchema），tools/call 复用 `ipc.dispatch` |

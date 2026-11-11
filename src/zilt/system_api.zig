@@ -146,6 +146,23 @@ pub const HttpRequest = struct {
     headers: []const u8 = "",
     body: []const u8 = "",
     timeout_ms: u32 = 30_000,
+    // ---- v0.1.20（WinHTTP）----
+    /// 显式代理（"http://127.0.0.1:7890"）；null = 系统代理
+    proxy: ?[]const u8 = null,
+    /// 忽略证书错误（自签测试环境用；生产不要开）
+    insecure_tls: bool = false,
+    follow_redirects: bool = true,
+    /// 流式：边读边发 `httpChunk` 事件（base64），httpResponse 的 body 为空
+    stream: bool = false,
+    /// multipart/form-data 分片（非空时覆盖 body 并自动设置 Content-Type）
+    multipart: ?[]const MultiPart = null,
+};
+
+pub const MultiPart = struct {
+    name: []const u8,
+    data: []const u8 = "",
+    filename: ?[]const u8 = null,
+    content_type: ?[]const u8 = null,
 };
 
 pub const HttpOp = union(enum) {
@@ -155,8 +172,14 @@ pub const HttpOp = union(enum) {
 /// WebSocket（v0.1.16）。connect 异步执行：立即返回，握手结果与后续消息
 /// 都走 `wsEvent` 事件（kind: open/message/close/error）。
 pub const WsOp = union(enum) {
-    /// url 仅支持 ws://（wss 需 TLS，明确报错）
-    connect: struct { id: i64, url: []const u8 },
+    /// v0.1.20：ws:// 与 wss:// 都支持（wss 走 WinHTTP/Schannel）
+    connect: struct {
+        id: i64,
+        url: []const u8,
+        proxy: ?[]const u8 = null,
+        insecure_tls: bool = false,
+        headers: []const u8 = "",
+    },
     send: struct { id: i64, data: []const u8 },
     close: struct { id: i64, code: u16 = 1000, reason: []const u8 = "" },
 };

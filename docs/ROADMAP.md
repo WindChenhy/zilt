@@ -433,6 +433,36 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
 - [x] **验收**：冒烟 32 项含 store/fs/path/log/windowState + http + ws + webviews +
       **partition 隔离**（alpha/beta localStorage 互不可见、共享实例与主页面互通）
 
+### v0.1.20 — 网络层换 WinHTTP（P0，2026-11-11）
+
+> 目标：一次补掉网络维度 4 个差异点（wss / 代理 / 流式 / 上传）。
+> 实现方式：动态加载 winhttp.dll（同 sqlite/WebView2 模式），不改 build.zig 链接。
+
+- [x] **WinHTTP 客户端**（`platform/windows/winhttp.zig`）：会话→连接→请求→读数据全链路；
+      15 个导出函数动态解析；错误码映射为稳定名（Timeout/CannotConnect/SecureFailure…）
+- [x] **https + 代理**：显式 `proxy` 走 NAMED_PROXY；默认跟随系统代理；
+      **loopback 自动 NO_PROXY**（系统代理会把 127.0.0.1 代理掉，实测无法连接）
+- [x] **重定向策略**：`followRedirects:false` → `WINHTTP_OPTION_DISABLE_FEATURE`
+      （`WINHTTP_OPTION_REDIRECT_POLICY` 设了不生效，实测后改用前者）
+- [x] **忽略证书**：`insecureTls`（IGNORE_UNKNOWN_CA/CN/DATE），仅用于自签测试环境
+- [x] **multipart 上传**：`http.request({multipart:[{name,data,filename,contentType}]})`
+      → 自动 boundary + Content-Type + 编码（`net.buildMultipart`，含引号转义）
+- [x] **流式下载**：`http.stream(opts, onChunk)` → 后台 `WinHttpReadData` 分块 →
+      `httpChunk` 事件（base64）→ JS 端 Uint8Array 累积 + 逐块回调
+- [x] **wss（TLS）**：`ws.connect(url, {insecureTls, proxy})` —— wss 走
+      `WinHttpWebSocketCompleteUpgrade`（Schannel/代理全免费），ws:// 保留自研帧层；
+      `wsEvent.message` 新增 `binary` 标记（binary 时 data 为 base64）
+- [x] **Zig 侧订阅内置事件**：`emitEventPayload` 同时 `ipc.dispatchEvent(config.events)`，
+      应用可用 `pub fn windowMoved(ctx, payload) void` 直接收到框架事件
+- [x] **测试基建**：`scripts/http_echo.py`（echo/chunked 流/302/multipart/慢响应）、
+      `scripts/ws_echo.py` 支持 `ZILT_WS_TLS=1` + 自签证书（openssl 生成）
+- [x] **单测**：230（+5：URL 解析 3 组、multipart、base64）
+- [x] **冒烟**：39 项 exit 0（c-http2 multipart/302/流式 32B；c-wss TLS echo；c-zigev）
+- [ ] **已知限制（实测记录）**：WinHTTP 的「等响应头」超时未生效——
+      `WinHttpSetTimeouts` + `WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT` + 看门狗关句柄
+      三条路径都试过，服务端只建连不发头时仍等到响应（3s+）；connect 超时正常。
+      wss 的 close 帧可能晚 3s+ 到达（对端 close 握手时序），已放宽断言并在文档标注。
+
 ### v0.1.19 — 结构性能力补齐（P1，2026-11-10）
 
 > 目标：补「权限 scope / 流式 IPC / fs 标准库 / 更新器 API / 初始化脚本」，

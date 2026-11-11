@@ -830,3 +830,5 @@ pub const WM_PASTE: UINT = 0x0302;
 pub const WM_CLEAR: UINT = 0x0303;
 pub const WM_UNDO: UINT = 0x0304;
 pub const EM_SETSEL: UINT = 0x00B1;
+
+pub extern "kernel32" fn GetTickCount64() callconv(.c) u64;
