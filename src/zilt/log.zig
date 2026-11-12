@@ -1,10 +1,25 @@
-//! 极简日志：stderr + 文件双写。
-//! PoC 阶段假定单 UI 线程调用（WebView2 回调全部落在 UI 线程），故不加锁。
+//! 极简日志：stderr + 文件双写（v0.2.0 起跨平台）。
+//!
+//! Linux 侧冒烟靠 `zilt.log` 断言，因此文件日志必须真的落盘。
+//! 写入用 `std.Io.File.Writer`（positional 模式，位置显式设为文件末尾）+ 互斥锁，
+//! 因为后台线程（http/ws/fs watch）也会打日志。轮转按大小：4MB → .1 → .2 → .3。
 
 const std = @import("std");
-const win32 = @import("platform/windows/win32.zig");
+const Io = std.Io;
 
-var log_file: ?win32.HANDLE = null;
+/// 惰性创建一次（Threaded 只在需要 async/concurrent 时才分配）。
+var g_threaded: std.Io.Threaded = undefined;
+var g_threaded_ready = false;
+fn io() Io {
+    if (!g_threaded_ready) {
+        g_threaded = .init(std.heap.page_allocator, .{});
+        g_threaded_ready = true;
+    }
+    return g_threaded.io();
+}
+
+var log_file: ?Io.File = null;
+var log_mutex: Io.Mutex = .init;
 
 /// 轮转阈值与保留份数（v0.1.17）。超过 4MB → zilt.log.1，最多保留 3 份。
 pub const ROTATE_BYTES: u64 = 4 * 1024 * 1024;
@@ -18,14 +33,12 @@ pub fn rotatedName(alloc: std.mem.Allocator, path: []const u8, idx: u32) ![]u8 {
 /// 按大小轮转：超阈值时把 .1→.2→.3 依次后移，当前文件 → .1。
 /// 任何一步失败都静默（日志不可用不应影响应用启动）。
 pub fn rotateIfNeeded(path: []const u8, max_bytes: u64) void {
-    const alloc = std.heap.page_allocator;
-    const path_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return;
-    defer alloc.free(path_w);
+    const i = io();
+    const st = Io.Dir.cwd().statFile(i, path, .{}) catch return; // 不存在
+    if (st.size < max_bytes) return;
 
-    var data: win32.WIN32_FILE_ATTRIBUTE_DATA = undefined;
-    if (win32.GetFileAttributesExW(path_w.ptr, 0, &data) == 0) return; // 不存在
-    const size = (@as(u64, data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-    if (size < max_bytes) return;
+    const alloc = std.heap.page_allocator;
+    const cwd = Io.Dir.cwd();
 
     // 老的先让位：.2→.3, .1→.2（最老一份被覆盖）
     var idx: u32 = ROTATE_KEEP - 1;
@@ -34,35 +47,17 @@ pub fn rotateIfNeeded(path: []const u8, max_bytes: u64) void {
         defer alloc.free(from);
         const to = rotatedName(alloc, path, idx + 1) catch return;
         defer alloc.free(to);
-        const from_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, from) catch return;
-        defer alloc.free(from_w);
-        const to_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, to) catch return;
-        defer alloc.free(to_w);
-        _ = win32.MoveFileExW(from_w.ptr, to_w.ptr, win32.MOVEFILE_REPLACE_EXISTING);
+        cwd.rename(from, cwd, to, i) catch {};
         if (idx == 1) break;
     }
     const first = rotatedName(alloc, path, 1) catch return;
     defer alloc.free(first);
-    const first_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, first) catch return;
-    defer alloc.free(first_w);
-    _ = win32.MoveFileExW(path_w.ptr, first_w.ptr, win32.MOVEFILE_REPLACE_EXISTING);
+    cwd.rename(path, cwd, first, i) catch {};
 }
 
 pub fn initFileLog(path: []const u8) void {
-    const alloc = std.heap.page_allocator;
     rotateIfNeeded(path, ROTATE_BYTES);
-    const path_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return;
-    defer alloc.free(path_w);
-    const f = win32.CreateFileW(
-        path_w.ptr,
-        win32.FILE_APPEND_DATA,
-        win32.FILE_SHARE_READ,
-        null,
-        win32.OPEN_ALWAYS,
-        win32.FILE_ATTRIBUTE_NORMAL,
-        null,
-    );
-    if (f == win32.INVALID_HANDLE_VALUE) return;
+    const f = Io.Dir.cwd().createFile(io(), path, .{ .truncate = false, .read = true }) catch return;
     log_file = f;
 }
 
@@ -81,8 +76,15 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
     const msg = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch "(log line truncated)\n";
 
     std.debug.print("{s}", .{msg});
-    if (log_file) |f| {
-        var written: win32.DWORD = 0;
-        _ = win32.WriteFile(f, msg.ptr, @intCast(msg.len), &written, null);
-    }
+    const f = log_file orelse return;
+
+    const i = io();
+    log_mutex.lockUncancelable(i);
+    defer log_mutex.unlock(i);
+    var wbuf: [4096]u8 = undefined;
+    var w = Io.File.Writer.init(f, i, &wbuf);
+    // positional 模式：显式定位到末尾 → 语义等同 O_APPEND
+    w.pos = f.length(i) catch return;
+    w.interface.writeAll(msg) catch {};
+    w.interface.flush() catch {};
 }

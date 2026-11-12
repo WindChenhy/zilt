@@ -69,6 +69,9 @@ pub fn main() !void {
 /// `ZILT_CAP_FROM=<capabilities.json> ZILT_CAP_OUT=<out.zig> zig build capabilities`
 /// 不设置 FROM 时保持原行为（导出 JSON）。
 fn generateFromJson(alloc: std.mem.Allocator) !bool {
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const win32 = zilt.platform_windows.win32;
     const from = win32.getEnvUtf8(alloc, "ZILT_CAP_FROM") orelse return false;
     defer alloc.free(from);
@@ -76,7 +79,7 @@ fn generateFromJson(alloc: std.mem.Allocator) !bool {
     defer alloc.free(out);
 
     const codegen = @import("frontend_codegen.zig");
-    const json = codegen.readFileAlloc(alloc, from) orelse {
+    const json = codegen.readFileAlloc(alloc, io, from) orelse {
         std.debug.print("capabilities: 读取 {s} 失败\n", .{from});
         return error.ReadFailed;
     };
@@ -84,8 +87,8 @@ fn generateFromJson(alloc: std.mem.Allocator) !bool {
     const src = try @import("capability_codegen.zig").renderZig(alloc, json);
     defer alloc.free(src);
 
-    codegen.ensureDirDeep(alloc, std.fs.path.dirname(out) orelse ".") catch {};
-    if (!codegen.writeFilePayload(alloc, out, src)) return error.WriteFailed;
+    codegen.ensureDirDeep(alloc, io, std.fs.path.dirname(out) orelse ".") catch {};
+    if (!codegen.writeFilePayload(alloc, io, out, src)) return error.WriteFailed;
     std.debug.print("generated {s} from {s} ({d} bytes)\n", .{ out, from, src.len });
     return true;
 }

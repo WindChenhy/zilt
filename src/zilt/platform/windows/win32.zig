@@ -266,6 +266,8 @@ pub extern "user32" fn CreateWindowExW(
 pub extern "user32" fn ShowWindow(hWnd: HWND, nCmdShow: i32) callconv(.c) BOOL;
 pub extern "user32" fn UpdateWindow(hWnd: HWND) callconv(.c) BOOL;
 pub extern "user32" fn DestroyWindow(hWnd: HWND) callconv(.c) BOOL;
+pub extern "user32" fn PostThreadMessageW(idThread: DWORD, msg: UINT, wParam: usize, lParam: isize) callconv(.c) BOOL;
+pub extern "kernel32" fn GetCurrentThreadId() callconv(.c) DWORD;
 pub extern "user32" fn GetMessageW(lpMsg: *MSG, hWnd: HWND, wMsgFilterMin: UINT, wMsgFilterMax: UINT) callconv(.c) i32;
 pub extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(.c) BOOL;
 pub extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.c) LRESULT;

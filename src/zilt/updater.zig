@@ -441,6 +441,10 @@ fn sigB64(alloc: std.mem.Allocator, sig_bytes: [64]u8) ![]u8 {
 }
 
 test "stageUpdate: 原子替换舞步 + cleanupOld" {
+    // v0.2.0：stageBytes 仍走 Win32（MoveFileExW；Windows 上运行中的 exe 不能被覆盖，
+    // 需要 "写 .new → 旧改名 .old → new 接管原名" 的舞步）。Linux 上 rename 可直接
+    // 覆盖运行中的二进制，等 v0.2.4 出 Linux staging 时再放开本测试。
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
     const win32 = @import("platform/windows/win32.zig");
     const alloc2 = testing.allocator;
 

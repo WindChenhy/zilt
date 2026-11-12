@@ -11,60 +11,27 @@
 //!    Accept-Encoding 直接下发 + Content-Encoding: gzip
 
 const std = @import("std");
+const Io = std.Io;
 
-// ---- 自包含 win32 助手（build runner 宿主环境） ----
+// ---- 文件系统：std.Io（Windows / Linux 同一份实现） ----
+//
+// v0.2.0：原实现直接调 kernel32（FindFirstFileW / CreateFileW / …），Linux 上
+// `zig build` 连 configure 阶段都过不去（build.zig 在求值期就要遍历 dist）。
+// 改用 `std.Io.Dir`：跨平台、无 extern、Windows 语义不变（WTF-8 路径由 std 处理）。
+//
+// 约定：所有公开函数第一个参数是 `io`（build.zig 用 `b.graph.io`，CLI 自建
+// `std.Io.Threaded`）；路径分隔符对外统一 `'/'`（Zig 的 @embedFile / b.path 均接受）。
 
-const DWORD = u32;
-const BOOL = i32;
-const HANDLE = *anyopaque;
-const LPCWSTR = [*:0]const u16;
-const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
-
-pub extern "kernel32" fn FindFirstFileW(lpFileName: LPCWSTR, lpFindFileData: *WIN32_FIND_DATAW) callconv(.c) HANDLE;
-pub extern "kernel32" fn FindNextFileW(hFindFile: HANDLE, lpFindFileData: *WIN32_FIND_DATAW) callconv(.c) BOOL;
-pub extern "kernel32" fn FindClose(hFindFile: HANDLE) callconv(.c) BOOL;
-pub extern "kernel32" fn CreateDirectoryW(lpPathName: LPCWSTR, lpSecurityAttributes: ?*anyopaque) callconv(.c) BOOL;
-pub extern "kernel32" fn RemoveDirectoryW(lpPathName: LPCWSTR) callconv(.c) BOOL;
-pub extern "kernel32" fn DeleteFileW(lpFileName: LPCWSTR) callconv(.c) BOOL;
-pub extern "kernel32" fn CreateFileW(lpFileName: LPCWSTR, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?*anyopaque) callconv(.c) HANDLE;
-pub extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: DWORD, lpNumberOfBytesRead: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.c) BOOL;
-pub extern "kernel32" fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *i64) callconv(.c) BOOL;
-pub extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: [*]const u8, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.c) BOOL;
-
-/// 递归建目录（'/' 或 '' 分段）。
-pub fn ensureDirDeep(alloc: std.mem.Allocator, path: []const u8) !void {
-    var i: usize = 0;
-    while (i < path.len) : (i += 1) {
-        if (path[i] == '/' or path[i] == '\\') {
-            if (i > 0 and path[i - 1] != ':') {
-                const part = path[0..i];
-                const pw = std.unicode.utf8ToUtf16LeAllocZ(alloc, part) catch continue;
-                defer alloc.free(pw);
-                _ = CreateDirectoryW(pw.ptr, null);
-            }
-        }
-    }
-    const pw = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
-    defer alloc.free(pw);
-    _ = CreateDirectoryW(pw.ptr, null);
+/// 递归建目录（幂等；已存在不算错误）。
+pub fn ensureDirDeep(alloc: std.mem.Allocator, io: Io, path: []const u8) !void {
+    _ = alloc;
+    _ = try Io.Dir.cwd().createDirPathStatus(io, path, .default_dir);
 }
 
 /// 写文件（覆盖；成功 true）。构建期 payload 落盘用。
-pub fn writeFilePayload(alloc: std.mem.Allocator, path: []const u8, data: []const u8) bool {
-    const pw = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return false;
-    defer alloc.free(pw);
-    const GENERIC_WRITE: DWORD = 0x40000000;
-    const CREATE_ALWAYS: DWORD = 2;
-    const f = CreateFileW(pw.ptr, GENERIC_WRITE, 0, null, CREATE_ALWAYS, 0x80, null);
-    if (f == INVALID_HANDLE_VALUE) return false;
-    defer _ = CloseHandle(f);
-    var total: usize = 0;
-    while (total < data.len) {
-        var got: DWORD = 0;
-        const chunk: DWORD = @intCast(@min(data.len - total, 1 << 30));
-        if (WriteFile(f, data.ptr + total, chunk, &got, null) == 0 or got == 0) return false;
-        total += got;
-    }
+pub fn writeFilePayload(alloc: std.mem.Allocator, io: Io, path: []const u8, data: []const u8) bool {
+    _ = alloc;
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data }) catch return false;
     return true;
 }
 
@@ -72,29 +39,6 @@ pub fn writeFilePayload(alloc: std.mem.Allocator, path: []const u8, data: []cons
 pub fn fsJoinRel(alloc: std.mem.Allocator, base: []const u8, rel: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}/{s}", .{ base, rel });
 }
-
-pub extern "kernel32" fn GetEnvironmentVariableW(lpName: LPCWSTR, lpBuffer: ?[*]u16, nSize: DWORD) callconv(.c) DWORD;
-
-pub const FILETIME = extern struct {
-    dwLowDateTime: DWORD,
-    dwHighDateTime: DWORD,
-};
-
-pub const WIN32_FIND_DATAW = extern struct {
-    dwFileAttributes: DWORD,
-    ftCreationTime: FILETIME,
-    ftLastAccessTime: FILETIME,
-    ftLastWriteTime: FILETIME,
-    nFileSizeHigh: DWORD,
-    nFileSizeLow: DWORD,
-    dwReserved0: DWORD,
-    dwReserved1: DWORD,
-    cFileName: [260]u16,
-    cAlternateFileName: [14]u16,
-};
-
-const FILE_ATTRIBUTE_DIRECTORY: DWORD = 0x10;
-const FILE_ATTRIBUTE_REPARSE_POINT: DWORD = 0x400;
 
 /// 构建期状态：内容寻址资产目录（build.zig 填充）
 pub var payload_dir_buf: ?[]const u8 = null;
@@ -106,8 +50,10 @@ pub const default_excludes = [_][]const u8{
 };
 
 /// 递归收集文件相对路径（'/' 分隔，无前导 ./，按字典序排序）。
+/// dist 不存在 → 空表（应用仍可构建，运行时 404）。
 pub fn collectFiles(
     alloc: std.mem.Allocator,
+    io: Io,
     root: []const u8,
     excludes: []const []const u8,
 ) ![][]const u8 {
@@ -116,7 +62,22 @@ pub fn collectFiles(
         for (list.items) |it| alloc.free(it);
         list.deinit(alloc);
     }
-    try walk(alloc, root, "", excludes, &list, 0);
+
+    var dir = Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return list.toOwnedSlice(alloc),
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var walker = try dir.walk(alloc);
+    defer walker.deinit();
+
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (excludedPath(entry.path, excludes)) continue;
+        try list.append(alloc, try normalizePath(alloc, entry.path));
+    }
+
     std.mem.sort([]const u8, list.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
@@ -125,63 +86,26 @@ pub fn collectFiles(
     return list.toOwnedSlice(alloc);
 }
 
-fn walk(
-    alloc: std.mem.Allocator,
-    root: []const u8,
-    rel_prefix: []const u8,
-    excludes: []const []const u8,
-    list: *std.ArrayList([]const u8),
-    depth: u8,
-) !void {
-    if (depth > 16) return;
-    const pattern = try joinPath(alloc, root, "*");
-    defer alloc.free(pattern);
-    const pattern_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, pattern);
-    defer alloc.free(pattern_w);
-
-    var wfd: WIN32_FIND_DATAW = undefined;
-    const h = FindFirstFileW(pattern_w.ptr, &wfd);
-    if (h == INVALID_HANDLE_VALUE) return; // 目录不存在 → 空
-
-    defer _ = FindClose(h);
-
-    while (true) {
-        const name_len = std.mem.indexOfScalar(u16, &wfd.cFileName, 0) orelse wfd.cFileName.len;
-        if (name_len > 0 and wfd.cFileName[0] != '.') {
-            if (std.unicode.utf16LeToUtf8Alloc(alloc, wfd.cFileName[0..name_len])) |name| {
-                defer alloc.free(name);
-                const excluded = for (excludes) |e| {
-                    if (std.ascii.eqlIgnoreCase(name, e)) break true;
-                } else false;
-                const is_dir = (wfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                const is_reparse = (wfd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-
-                if (!excluded and !is_reparse) {
-                    if (is_dir) {
-                        const sub_rel = if (rel_prefix.len == 0)
-                            try alloc.dupe(u8, name)
-                        else
-                            try std.fmt.allocPrint(alloc, "{s}/{s}", .{ rel_prefix, name });
-                        defer alloc.free(sub_rel);
-                        const sub_abs = try joinPath(alloc, root, name);
-                        defer alloc.free(sub_abs);
-                        try walk(alloc, sub_abs, sub_rel, excludes, list, depth + 1);
-                    } else {
-                        const rel = if (rel_prefix.len == 0)
-                            try alloc.dupe(u8, name)
-                        else
-                            try std.fmt.allocPrint(alloc, "{s}/{s}", .{ rel_prefix, name });
-                        try list.append(alloc, rel);
-                    }
-                }
-            } else |_| {}
+/// 任一路径段命中排除名，或以 '.' 开头（隐藏项）→ 跳过。
+fn excludedPath(path: []const u8, excludes: []const []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, path, "/\\");
+    while (it.next()) |seg| {
+        if (seg.len == 0) continue;
+        if (seg[0] == '.') return true;
+        for (excludes) |e| {
+            if (std.ascii.eqlIgnoreCase(seg, e)) return true;
         }
-        if (FindNextFileW(h, &wfd) == 0) break;
     }
+    return false;
 }
 
-fn joinPath(alloc: std.mem.Allocator, base: []const u8, name: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}\\{s}", .{ base, name });
+/// 路径分隔符统一为 '/'（@embedFile 与 b.path 都接受）。
+fn normalizePath(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    const out = try alloc.dupe(u8, path);
+    for (out) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    return out;
 }
 
 /// 生成 zilt-assets/assets.zig 源码（payload 相对路径与 collectFiles 顺序一致；
@@ -236,13 +160,11 @@ pub fn zigEscape(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
     return buf.toOwnedSlice(alloc);
 }
 
-/// dist 相对路径与 rel 拼接（'\' 分隔，供 addCopyFile 的子路径）。
+/// 绝对路径与相对路径拼接（统一 '/' 分隔：Windows 的 Zig 构建系统同样接受）。
 pub fn fsJoin(alloc: std.mem.Allocator, base: []const u8, rel: []const u8) ![]u8 {
-    const out = try alloc.dupe(u8, rel);
-    for (out) |*c| {
-        if (c.* == '/') c.* = '\\';
-    }
-    return std.fmt.allocPrint(alloc, "{s}\\{s}", .{ base, out });
+    if (base.len == 0) return alloc.dupe(u8, rel);
+    const trimmed = std.mem.trimEnd(u8, base, "/\\");
+    return std.fmt.allocPrint(alloc, "{s}/{s}", .{ trimmed, rel });
 }
 
 // ---------------------------------------------------------------------------
@@ -281,46 +203,19 @@ pub fn gzipDecompress(alloc: std.mem.Allocator, gz: []const u8) ![]u8 {
     return out;
 }
 
-/// 读取整个文件（构建期压缩输入；失败返回 null）。自包含 win32 实现。
-pub fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ?[]u8 {
-    const w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return null;
-    defer alloc.free(w);
-    const GENERIC_READ: DWORD = 0x80000000;
-    const OPEN_EXISTING: DWORD = 3;
-    const FILE_SHARE_READ_WRITE: DWORD = 1 | 2;
-    const f = CreateFileW(w.ptr, GENERIC_READ, FILE_SHARE_READ_WRITE, null, OPEN_EXISTING, 0, null);
-    if (f == INVALID_HANDLE_VALUE) return null;
-    defer _ = CloseHandle(f);
-    var size: i64 = 0;
-    if (GetFileSizeEx(f, &size) == 0) return null;
-    if (size <= 0 or size > 512 * 1024 * 1024) return null;
-    const buf = alloc.alloc(u8, @intCast(size)) catch return null;
-    var off: usize = 0;
-    while (off < buf.len) {
-        var got: DWORD = 0;
-        if (ReadFile(f, buf.ptr + off, @intCast(buf.len - off), &got, null) == 0 or got == 0) {
-            alloc.free(buf);
-            return null;
-        }
-        off += got;
-    }
-    return buf;
+/// 读取整个文件（构建期压缩输入；失败返回 null）。
+pub fn readFileAlloc(alloc: std.mem.Allocator, io: Io, path: []const u8) ?[]u8 {
+    return Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(512 * 1024 * 1024)) catch null;
 }
 
-var temp_w_buf = [5:0]u16{ 'T', 'E', 'M', 'P', 0 };
+/// 测试用临时目录（相对 cwd，落在 .zig-cache 下；跨平台且不污染系统 TEMP）。
+var test_seq: std.atomic.Value(u32) = .init(0);
 
-fn tempRoot(alloc: std.mem.Allocator) ![]u8 {
-    const temp_w: LPCWSTR = @ptrCast(&temp_w_buf);
-    const need = GetEnvironmentVariableW(temp_w, null, 0);
-    if (need == 0) return alloc.dupe(u8, "C:" ++ bs ++ "Windows" ++ bs ++ "Temp");
-    const buf = try alloc.alloc(u16, need + 1);
-    defer alloc.free(buf);
-    const got = GetEnvironmentVariableW(temp_w, buf.ptr, @intCast(need + 1));
-    if (got == 0 or got > need) return alloc.dupe(u8, "C:" ++ bs ++ "Windows" ++ bs ++ "Temp");
-    return std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..got]);
+fn testRoot(alloc: std.mem.Allocator, tag: []const u8) ![]u8 {
+    // 0.17 的 std.time / std.crypto.random 均已迁移；用进程内自增序号即可
+    const n = test_seq.fetchAdd(1, .monotonic);
+    return std.fmt.allocPrint(alloc, ".zig-cache/zilt-tests/{s}-{d}", .{ tag, n });
 }
-
-const bs = "\\"; // 单个反斜杠（Zig 转义）
 
 // ---------------------------------------------------------------------------
 // 测试（zig build test-tools）
@@ -344,19 +239,18 @@ test "collectFiles: 排序 + 排除 + 递归（真实临时目录）" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
-    const pid = std.os.windows.GetCurrentProcessId();
-    const root = try std.fmt.allocPrint(alloc, "{s}\\zilt-cg-{d}", .{ try tempRoot(alloc), pid });
+    const root = try testRoot(alloc, "cg");
     defer alloc.free(root);
 
     try mkDir(root);
-    try mkDir(try std.fmt.allocPrint(alloc, "{s}\\assets", .{root}));
-    try mkDir(try std.fmt.allocPrint(alloc, "{s}\\node_modules", .{root}));
-    try writeFileTree(try std.fmt.allocPrint(alloc, "{s}\\index.html", .{root}), "<html></html>");
-    try writeFileTree(try std.fmt.allocPrint(alloc, "{s}\\assets\\app.js", .{root}), "console.log(1)");
-    try writeFileTree(try std.fmt.allocPrint(alloc, "{s}\\node_modules\\x.js", .{root}), "junk");
+    try mkDir(try std.fmt.allocPrint(alloc, "{s}/assets", .{root}));
+    try mkDir(try std.fmt.allocPrint(alloc, "{s}/node_modules", .{root}));
+    try writeFileTree(try std.fmt.allocPrint(alloc, "{s}/index.html", .{root}), "<html></html>");
+    try writeFileTree(try std.fmt.allocPrint(alloc, "{s}/assets/app.js", .{root}), "console.log(1)");
+    try writeFileTree(try std.fmt.allocPrint(alloc, "{s}/node_modules/x.js", .{root}), "junk");
     defer cleanupTree(alloc, root);
 
-    const files = try collectFiles(alloc, root, &default_excludes);
+    const files = try collectFiles(alloc, testIo(), root, &default_excludes);
     defer {
         for (files) |f| alloc.free(f);
         alloc.free(files);
@@ -422,61 +316,44 @@ test "readFileAlloc: 往返（真实临时文件）" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
-    const pid = std.os.windows.GetCurrentProcessId();
-    const root = try std.fmt.allocPrint(alloc, "{s}\\zilt-rf-{d}", .{ try tempRoot(alloc), pid });
+    const root = try testRoot(alloc, "rf");
     defer alloc.free(root);
     try mkDir(root);
-    const path = try std.fmt.allocPrint(alloc, "{s}\\data.bin", .{root});
+    const path = try std.fmt.allocPrint(alloc, "{s}/data.bin", .{root});
     defer alloc.free(path);
     const payload = "bin\x00ary\xff bytes";
     try writeFileTree(path, payload);
     defer cleanupTree(alloc, root);
 
-    const got = readFileAlloc(alloc, path) orelse return error.TestUnexpectedResult;
+    const io = testIo();
+    const got = readFileAlloc(alloc, io, path) orelse return error.TestUnexpectedResult;
     try testing.expectEqualSlices(u8, payload, got);
-    try testing.expect(readFileAlloc(alloc, try std.fmt.allocPrint(alloc, "{s}\\missing.bin", .{root})) == null);
+    const missing = try std.fmt.allocPrint(alloc, "{s}/missing.bin", .{root});
+    defer alloc.free(missing);
+    try testing.expect(readFileAlloc(alloc, io, missing) == null);
+}
+
+/// 测试用 Io：只做同步目录操作，用 page_allocator 避免与 testing.allocator 的
+/// 泄漏检查纠缠（Threaded 只在需要 async/concurrent 时才分配）。
+var test_threaded: std.Io.Threaded = undefined;
+var test_threaded_ready = false;
+fn testIo() std.Io {
+    if (!test_threaded_ready) {
+        test_threaded = .init(std.heap.page_allocator, .{});
+        test_threaded_ready = true;
+    }
+    return test_threaded.io();
 }
 
 fn mkDir(path: []const u8) !void {
-    const w = try std.unicode.utf8ToUtf16LeAllocZ(testing.allocator, path);
-    defer testing.allocator.free(w);
-    _ = CreateDirectoryW(w.ptr, null);
+    _ = try std.Io.Dir.cwd().createDirPathStatus(testIo(), path, .default_dir);
 }
 
 fn cleanupTree(alloc: std.mem.Allocator, root: []const u8) void {
-    const names = [_][]const u8{
-        "index.html", "assets\\app.js", "node_modules\\x.js",
-    };
-    for (names) |n| {
-        const p = std.fmt.allocPrint(alloc, "{s}\\{s}", .{ root, n }) catch continue;
-        defer alloc.free(p);
-        const pw = std.unicode.utf8ToUtf16LeAllocZ(alloc, p) catch continue;
-        defer alloc.free(pw);
-        _ = DeleteFileW(pw.ptr);
-    }
-    const subs = [_][]const u8{ "assets", "node_modules" };
-    for (subs) |n| {
-        const p = std.fmt.allocPrint(alloc, "{s}\\{s}", .{ root, n }) catch continue;
-        defer alloc.free(p);
-        const pw = std.unicode.utf8ToUtf16LeAllocZ(alloc, p) catch continue;
-        defer alloc.free(pw);
-        _ = RemoveDirectoryW(pw.ptr);
-    }
-    const rw = std.unicode.utf8ToUtf16LeAllocZ(alloc, root) catch return;
-    defer alloc.free(rw);
-    _ = RemoveDirectoryW(rw.ptr);
+    _ = alloc;
+    std.Io.Dir.cwd().deleteTree(testIo(), root) catch {};
 }
 
 fn writeFileTree(path: []const u8, data: []const u8) !void {
-    const w = try std.unicode.utf8ToUtf16LeAllocZ(testing.allocator, path);
-    defer testing.allocator.free(w);
-    const GENERIC_WRITE: DWORD = 0x40000000;
-    const CREATE_ALWAYS: DWORD = 2;
-    const f = CreateFileW(w.ptr, GENERIC_WRITE, 0, null, CREATE_ALWAYS, 0x80, null);
-    if (f == INVALID_HANDLE_VALUE) return error.TestUnexpectedResult;
-    defer _ = CloseHandle(f);
-    var written: DWORD = 0;
-    _ = WriteFile(f, data.ptr, @intCast(data.len), &written, null);
+    try std.Io.Dir.cwd().writeFile(testIo(), .{ .sub_path = path, .data = data });
 }
-
-extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.c) BOOL;

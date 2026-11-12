@@ -82,7 +82,7 @@ pub fn build(b: *std.Build) void {
     const dist = frontend.dist;
     // build runner 的 cwd 不保证是项目根——统一绝对路径（joinString）
     const dist_abs = b.root.joinString(b.allocator, dist) catch dist;
-    const files = codegen.collectFiles(b.allocator, dist_abs, &codegen.default_excludes) catch blk: {
+    const files = codegen.collectFiles(b.allocator, b.graph.io, dist_abs, &codegen.default_excludes) catch blk: {
         std.log.warn("[zilt] 前端 dist 遍历失败：资产表为空——先运行 `zig build frontend`", .{});
         break :blk &[_][]const u8{};
     };
@@ -112,7 +112,7 @@ pub fn build(b: *std.Build) void {
             h.update(rel);
             const abs = codegen.fsJoin(b.allocator, dist_abs, rel) catch unreachable;
             defer b.allocator.free(abs);
-            if (codegen.readFileAlloc(b.allocator, abs)) |bytes| {
+            if (codegen.readFileAlloc(b.allocator, b.graph.io, abs)) |bytes| {
                 h.update(bytes);
                 b.allocator.free(bytes);
             }
@@ -124,7 +124,7 @@ pub fn build(b: *std.Build) void {
     }
     const payload_dir = codegen.payload_dir_buf.?;
     const payload_dir_abs = b.root.joinString(b.allocator, payload_dir) catch payload_dir;
-    codegen.ensureDirDeep(b.allocator, payload_dir_abs) catch @panic("assets dir create failed");
+    codegen.ensureDirDeep(b.allocator, b.graph.io, payload_dir_abs) catch @panic("assets dir create failed");
 
     // ---- 资产预压缩（Phase C）：>8KB 且 gzip 收益 ≥10% 的文件只嵌 .gz ----
     const gz_flags = b.allocator.alloc(bool, files.len) catch @panic("OOM");
@@ -132,7 +132,7 @@ pub fn build(b: *std.Build) void {
         gz_flags[i] = false;
         const abs = codegen.fsJoin(b.allocator, dist_abs, rel) catch unreachable;
         defer b.allocator.free(abs);
-        const bytes = codegen.readFileAlloc(b.allocator, abs) orelse continue;
+        const bytes = codegen.readFileAlloc(b.allocator, b.graph.io, abs) orelse continue;
         defer b.allocator.free(bytes);
         if (bytes.len <= codegen.gzip_min_size) continue;
         const gz = codegen.gzipCompress(b.allocator, bytes) catch continue;
@@ -141,21 +141,21 @@ pub fn build(b: *std.Build) void {
         gz_flags[i] = true;
         const gz_dst = std.fmt.allocPrint(b.allocator, "{s}/payload/{s}.gz", .{ payload_dir_abs, rel }) catch unreachable;
         defer b.allocator.free(gz_dst);
-        codegen.ensureDirDeep(b.allocator, std.fs.path.dirname(gz_dst) orelse ".") catch @panic("mkdir failed");
-        if (!codegen.writeFilePayload(b.allocator, gz_dst, gz)) @panic("payload gz write failed");
+        codegen.ensureDirDeep(b.allocator, b.graph.io, std.fs.path.dirname(gz_dst) orelse ".") catch @panic("mkdir failed");
+        if (!codegen.writeFilePayload(b.allocator, b.graph.io, gz_dst, gz)) @panic("payload gz write failed");
     }
     const generated = codegen.generateAssetsZig(b.allocator, files, gz_flags) catch @panic("assets codegen OOM");
     const assets_zig_path = std.fmt.allocPrint(b.allocator, "{s}/assets.zig", .{payload_dir_abs}) catch unreachable;
-    if (!codegen.writeFilePayload(b.allocator, assets_zig_path, generated)) @panic("assets.zig write failed");
+    if (!codegen.writeFilePayload(b.allocator, b.graph.io, assets_zig_path, generated)) @panic("assets.zig write failed");
     for (files) |rel| {
         const fs_rel = codegen.fsJoin(b.allocator, dist_abs, rel) catch unreachable;
         defer b.allocator.free(fs_rel);
-        const bytes = codegen.readFileAlloc(b.allocator, fs_rel) orelse @panic("payload read failed");
+        const bytes = codegen.readFileAlloc(b.allocator, b.graph.io, fs_rel) orelse @panic("payload read failed");
         defer b.allocator.free(bytes);
         const payload_dst = std.fmt.allocPrint(b.allocator, "{s}/payload/{s}", .{ payload_dir_abs, rel }) catch unreachable;
         defer b.allocator.free(payload_dst);
-        codegen.ensureDirDeep(b.allocator, std.fs.path.dirname(payload_dst) orelse ".") catch @panic("mkdir failed");
-        if (!codegen.writeFilePayload(b.allocator, payload_dst, bytes)) @panic("payload write failed");
+        codegen.ensureDirDeep(b.allocator, b.graph.io, std.fs.path.dirname(payload_dst) orelse ".") catch @panic("mkdir failed");
+        if (!codegen.writeFilePayload(b.allocator, b.graph.io, payload_dst, bytes)) @panic("payload write failed");
     }
     const assets_mod = b.createModule(.{
         .root_source_file = b.path(codegen.fsJoinRel(b.allocator, payload_dir, "assets.zig") catch unreachable),
