@@ -433,6 +433,26 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
 - [x] **验收**：冒烟 32 项含 store/fs/path/log/windowState + http + ws + webviews +
       **partition 隔离**（alpha/beta localStorage 互不可见、共享实例与主页面互通）
 
+### v0.1.24 — 每窗口 UA + 应用自定义协议（2026-11-12）
+
+> 差距表里最后两项「小改动、高价值」的 Windows 能力。
+
+- [x] **每窗口 UA**：`window.create({ userAgent })` → 该窗口独立 UA
+  （`ICoreWebView2Settings2::put_UserAgent`，在 `attach` 前写入 `wv_opts.settings`）。
+  另有运行时 `webview.setUserAgent(ua)`（空串恢复默认）。
+  **语义坑**：`put_UserAgent` 只对**下一次导航**生效——当前文档的子资源请求仍用旧 UA，
+  所以冒烟必须开新窗口验证（`ua-probe.html` + `BroadcastChannel` 回传服务端看到的 UA）。
+- [x] **应用自定义协议**：`Config.protocols` 注册 `{ name, handle }`，请求
+  `https://<origin>/__proto/<name>/<rest>?<query>` 交给处理函数，返回
+  `{status, content_type, body, headers, owned}`；框架负责写回
+  `CreateWebResourceResponse`（并叠加全局 CSP/`security.headers`）。
+  限制（已在 protocol.zig 顶部写明）：WebView2 的 `WebResourceRequested` 拿不到请求体，
+  POST body 不可读；**真 scheme**（`media://`）需 `ICoreWebView2EnvironmentOptions4`
+  的 17 槽 vtable + `ICoreWebView2CustomSchemeRegistration`，列为后续项。
+- [x] **验收**：单测 +3（协议路由/注册表/处理器分配）；冒烟 **49 项** exit 0
+  （c-proto：文本 + 自定义头 + JSON/201 + 二进制 4 字节；c-ua：新窗口 UA 出现在请求头）
+- [ ] **未做**：真自定义 scheme（Options4）、浏览器扩展加载、InPrivate（见 v0.2 规划）
+
 ### v0.1.23 — 全量审查 + 六项收尾（2026-11-12）
 
 > 先做全仓审查（死代码 / 冗余 / 缺陷），再补上 Tauri/Wails 差距表里「能做且值得做」的六项。

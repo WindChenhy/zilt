@@ -56,6 +56,8 @@ pub const Args = struct {
     child: ?bool = null,
     zoom: ?f64 = null,
     download_id: ?u64 = null,
+    /// v0.1.24：窗口/WebView 的 User-Agent
+    user_agent: ?[]const u8 = null,
     tag: ?[]const u8 = null,
     group: ?[]const u8 = null,
     progress: ?f64 = null,
@@ -320,6 +322,7 @@ fn windowCmd(ctx: ipc.Context, a: Args) ![]u8 {
             .modal = a.modal orelse false,
             .child = a.child orelse false,
             .proxy = a.proxy,
+            .user_agent = a.user_agent,
         };
         if (a.window_id) |_| opts.parent = a.window_id;
         const id = spawn(ctx.backend, opts);
@@ -412,6 +415,8 @@ pub fn requestFromArgs(a: Args) !webview.Request {
         .params = a.params_json orelse "{}",
         .rid = a.rid orelse return error.MissingRid,
     } };
+    // v0.1.24：运行时 UA（空串 = 恢复引擎默认）
+    if (eql(u8, a.action, "setUserAgent")) return .{ .set_user_agent = a.user_agent orelse "" };
     return error.UnknownWebViewAction;
 }
 

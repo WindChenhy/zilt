@@ -379,6 +379,18 @@ pub const Driver = struct {
                 try check(w16.lpVtbl.ShowPrintUI(w16, if (kind == .browser) 0 else 1));
             },
             .cancel_download => |id| try self.cancel(id),
+            // v0.1.24：运行时改 UA（Settings2.put_UserAgent；空串恢复默认）
+            .set_user_agent => |ua| {
+                var settings: ?*wv2.ICoreWebView2Settings = null;
+                try check(w.lpVtbl.get_Settings(w, &settings));
+                const s = settings orelse return error.WebViewCallFailed;
+                defer release(s);
+                const s2 = try query(Settings2, s, &iid_settings2);
+                defer release(s2);
+                const wide = try wideZ(self.allocator, ua);
+                defer self.allocator.free(wide);
+                try check(s2.lpVtbl.put_UserAgent(s2, wide.ptr));
+            },
             // v0.1.23：CDP 是异步的——发起后立刻以 "{}" 完成本次请求，真正的结果
             // 由 CdpHandler 以 webviewCdp 事件送回（rid 匹配）。
             .cdp => |c| {

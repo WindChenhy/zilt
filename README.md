@@ -30,6 +30,13 @@ v0.1.17 新增（2026-11-08，均已实现、验证并提交）：
 - **日志轮转**：4MB 阈值，zilt.log → .1 → .2 → .3（实测 5MB 日志轮转）
 - **验收**：单元测试 **234/234**（框架 216 + 工具 18）；GUI 冒烟 **32 项** ALL PASSED（exit 0，含数据分区隔离）；WebDriver 4/4；headless 四端点 + SQL 真 E2E；日志轮转实测；`zilt version` 报 0.1.17
 
+v0.1.24 新增（2026-11-12，平台细节收尾）：
+
+- **每窗口 UA**：`window.create({ userAgent })` → 独立 UA（另有运行时 `webview.setUserAgent`）。注意 WebView2 语义：只对下一次导航生效
+- **应用自定义协议**：`Config.protocols = &.{ .{ .name="media", .handle=fn } }` → `https://<origin>/__proto/media/<path>` 由 Zig 处理，可自定义状态码/内容类型/响应头/二进制体
+- **验收**：单测 +3；冒烟 **49 项** exit 0（c-proto / c-ua）
+- **未做**：真 `scheme://` 注册（需 WebView2 Options4）、浏览器扩展、InPrivate
+
 v0.1.23 新增（2026-11-12，审查 + 六项收尾）：
 
 - **CDP 逃生口 / 截图 / 每请求头**：`webview.cdp(method, params)`、`captureScreenshot()`（PNG data URL）、`setExtraHeaders({...})`（`Network.setExtraHTTPHeaders`，作用于页面全部请求）

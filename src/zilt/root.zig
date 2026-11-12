@@ -47,6 +47,7 @@ pub const sql = @import("sql.zig");
 pub const npm_pack = @import("npm_pack.zig");
 pub const mcp = @import("mcp.zig");
 pub const net = @import("net.zig");
+pub const protocol = @import("protocol.zig");
 
 /// 平台模块（Windows 后端内部使用；用户一般无需直接接触）
 pub const platform_windows = @import("platform/windows/mod.zig");
@@ -61,6 +62,7 @@ pub fn run(comptime config: Config) !void {
 
 test {
     _ = @import("version.zig");
+    _ = @import("protocol.zig");
     _ = @import("security.zig");
     _ = @import("asset_routes.zig");
     _ = @import("builtin.zig");

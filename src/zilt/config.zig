@@ -72,6 +72,8 @@ pub const Config = struct {
     /// v0.1.19：注入到每个页面 document-start 的用户脚本（对齐 Tauri initialization_script）。
     /// 在框架 runtime 之后注入，可直接使用 window.zilt。
     init_scripts: []const []const u8 = &.{},
+    /// v0.1.24：应用自定义协议处理器（`/__proto/<name>/…`，见 protocol.zig）。
+    protocols: []const @import("protocol.zig").Protocol = &.{},
     /// 主窗口状态持久化键（null = 不持久化；与 persist_window_state 配合按窗口 label 保存）
     state_key: ?[]const u8 = null,
     /// 所有窗口按 label 持久化位置/尺寸/最大化/全屏（v0.1.8）

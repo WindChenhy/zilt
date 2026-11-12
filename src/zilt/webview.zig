@@ -114,6 +114,8 @@ pub const Request = union(enum) {
     /// **异步**：本请求立即返回 `{}`，结果经 `webviewCdp` 事件带回（rid 匹配）。
     /// params 是原始 JSON 文本（默认 `{}`）。
     cdp: struct { method: []const u8, params: []const u8 = "{}", rid: i64 },
+    /// v0.1.24：运行时改本窗口 UA（下次导航生效；空串 = 恢复引擎默认）
+    set_user_agent: []const u8,
     cancel_download: u64,
 };
 

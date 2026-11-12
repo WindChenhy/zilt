@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>ua probe</title></head>
+<body>
+<script>
+// v0.1.24：每窗口 UA 冒烟探针。
+// 本页面在一个独立窗口里加载（创建时指定 userAgent），请求协议回显并把
+// 服务端看到的 User-Agent 通过 BroadcastChannel 送回主窗口。
+(async () => {
+  try {
+    const text = await (await fetch('/__proto/echo?probe=ua&t=' + Date.now())).text();
+    const ch = new BroadcastChannel('zilt-smoke-ua');
+    ch.postMessage(text);
+    ch.close();
+  } catch (e) {
+    const ch = new BroadcastChannel('zilt-smoke-ua');
+    ch.postMessage('ERR|' + (e && e.message ? e.message : e));
+    ch.close();
+  }
+})();
+</script>
+</body>
+</html>

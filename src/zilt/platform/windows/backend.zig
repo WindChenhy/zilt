@@ -50,6 +50,7 @@ const icon_mod = @import("icon.zig");
 const deep_link = @import("deep_link.zig");
 const security = @import("../../security.zig");
 const asset_routes = @import("../../asset_routes.zig");
+const protocol = @import("../../protocol.zig");
 const app_data = @import("app_data.zig");
 const builtin = @import("../../builtin.zig");
 const shared_webview = @import("../../webview.zig");
@@ -998,6 +999,8 @@ fn Backend(comptime config: Config) type {
             own_env: ?*wv2.ICoreWebView2Environment = null,
             /// v0.1.23：覆盖式标题栏（客户区 = 整个窗口，自绘标题栏）
             overlay: bool = false,
+            /// v0.1.24：本窗口 User-Agent（覆盖 config.webview.settings.user_agent）
+            user_agent: ?[]u8 = null,
             menu_bitmaps: std.ArrayListUnmanaged(win32.HBITMAP) = .empty,
 
             fn updateBounds(self: *Window) void {
@@ -1308,6 +1311,8 @@ fn Backend(comptime config: Config) type {
             // v0.1.23：每窗口代理（独立 Environment 时使用）
             const proxy = if (opts.proxy) |p| try self.allocator.dupe(u8, p) else null;
             errdefer if (proxy) |p| self.allocator.free(p);
+            const user_agent = if (opts.user_agent) |ua| try self.allocator.dupe(u8, ua) else null;
+            errdefer if (user_agent) |ua| self.allocator.free(ua);
 
             const w = try self.allocator.create(Window);
             errdefer self.allocator.destroy(w);
@@ -1332,6 +1337,7 @@ fn Backend(comptime config: Config) type {
                 .close_requested_events = opts.close_requested_event,
                 .proxy = proxy,
                 .overlay = opts.titlebar_overlay,
+                .user_agent = user_agent,
             };
 
             const hinstance = win32.GetModuleHandleW(null);
@@ -1587,6 +1593,8 @@ fn Backend(comptime config: Config) type {
             // v0.1.9/v0.1.10：WebView2 事件面 / Settings / 运行时 API / 下载 / 权限 / 崩溃恢复。
             var wv_opts = config.webview;
             wv_opts.origin = originOf(config.url);
+            // v0.1.24：每窗口 UA 覆盖（config 里的是应用级默认值）
+            if (w.user_agent) |ua| wv_opts.settings.user_agent = ua;
             if (webview_driver.attach(self.allocator, webview, controller, wv_opts, w, .{
                 .emit = driverEmit,
                 .navigation = driverNavigation,
@@ -4405,6 +4413,8 @@ fn Backend(comptime config: Config) type {
                 const raw_path = uri_u8[path_start..];
                 const path = asset_routes.decodePath(self.allocator, if (raw_path.len == 0 or raw_path[0] != '/') "/" else raw_path) catch return;
                 defer self.allocator.free(path);
+                // v0.1.24：应用自定义协议优先于静态资产
+                if (self.serveProtocol(uri_u8, path, args)) return;
                 var resource_context: u32 = 0;
                 _ = args.lpVtbl.get_ResourceContext(args, &resource_context);
                 var candidates = asset_routes.Candidates.init(self.allocator, path, resource_context == 1) catch return;
@@ -4532,8 +4542,85 @@ fn Backend(comptime config: Config) type {
             }
         }
 
-        fn appendHeader(self: *Self, headers: *wv2.ICoreWebView2HttpResponseHeaders, name: []const u8, value: []const u8) !void {
-            const name_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, name);
+        /// v0.1.24：应用自定义协议（`/__proto/<name>/…`）。命中并已写回响应返回 true。
+        /// 未注册的名字返回 false（走静态资产 404）。
+        fn serveProtocol(self: *Self, uri: []const u8, path: []const u8, args: *wv2.ICoreWebView2WebResourceRequestedEventArgs) bool {
+            const route = protocol.parseRoute(path, uri) orelse return false;
+            const p = protocol.find(config.protocols, route.name) orelse {
+                log.print("[proto] '{s}' 未注册 <- {s}", .{ route.name, uri });
+                return false;
+            };
+
+            var method: []const u8 = "GET";
+            var method_buf: ?[]u8 = null;
+            defer if (method_buf) |m| self.allocator.free(m);
+            const rr = args.getRequest();
+            if (com.succeeded(rr.hr) and rr.request != null) {
+                const req = rr.request.?;
+                defer _ = req.lpVtbl.Release(req);
+                var mw: ?wv2.LPWSTR = null;
+                if (com.succeeded(req.lpVtbl.get_Method(req, &mw)) and mw != null) {
+                    defer wv2.freeCoString(mw);
+                    if (std.unicode.utf16LeToUtf8Alloc(self.allocator, std.mem.span(mw.?))) |m| {
+                        method_buf = m;
+                        method = m;
+                    } else |_| {}
+                }
+            }
+
+            const ua = requestHeaderUtf8(args, self.allocator, "User-Agent");
+            defer if (ua) |v| self.allocator.free(v);
+            const res = p.handle(.{
+                .name = route.name,
+                .path = route.path,
+                .query = route.query,
+                .method = method,
+                .user_agent = ua,
+                .url = uri,
+            }, self.allocator) catch |err| {
+                log.print("[proto] {s} handler failed: {s}", .{ route.name, @errorName(err) });
+                self.writeProtocolResponse(args, .{ .status = 500, .body = "protocol handler failed", .owned = false }, uri);
+                return true;
+            };
+            defer if (res.owned) self.allocator.free(res.body);
+            log.print("[proto] {d} {s}/{s} {d} bytes", .{ res.status, route.name, route.path, res.body.len });
+            self.writeProtocolResponse(args, res, uri);
+            return true;
+        }
+
+        fn writeProtocolResponse(self: *Self, args: *wv2.ICoreWebView2WebResourceRequestedEventArgs, res: protocol.Response, uri: []const u8) void {
+            const env = self.env orelse return;
+            const reason = protocol.reasonFor(res.status);
+            const reason_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, reason) catch return;
+            defer self.allocator.free(reason_w);
+
+            var hb: std.Io.Writer.Allocating = .init(self.allocator);
+            defer hb.deinit();
+            hb.writer.print("Content-Type: {s}", .{res.content_type}) catch return;
+            for (res.headers) |h| hb.writer.print("\r\n{s}: {s}", .{ h.name, h.value }) catch return;
+            const headers_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, hb.written()) catch return;
+            defer self.allocator.free(headers_w);
+
+            const stream = streamFromBytes(res.body) orelse return;
+            const stream_unknown: *com.IUnknown = @ptrCast(@alignCast(stream));
+            defer _ = stream_unknown.lpVtbl.Release(stream_unknown);
+            const r = env.createWebResourceResponse(stream, res.status, reason_w.ptr, headers_w.ptr);
+            if (com.failed(r.hr) or r.response == null) {
+                log.print("[proto] createWebResourceResponse failed hr=0x{x} <- {s}", .{ @as(u32, @bitCast(r.hr)), uri });
+                return;
+            }
+            const response = r.response.?;
+            defer _ = response.lpVtbl.Release(response);
+            var rh: ?*wv2.ICoreWebView2HttpResponseHeaders = null;
+            if (com.failed(response.lpVtbl.get_Headers(response, &rh))) return;
+            const h = rh orelse return;
+            defer _ = h.lpVtbl.Release(h);
+            if (config.security.csp) |csp| self.appendHeader(h, "Content-Security-Policy", csp) catch {};
+            for (config.security.headers) |header| self.appendHeader(h, header.name, header.value) catch {};
+            _ = args.putResponse(response);
+        }
+
+        fn appendHeader(self: *Self, headers: *wv2.ICoreWebView2HttpResponseHeaders, name: []const u8, value: []const u8) !void {            const name_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, name);
             defer self.allocator.free(name_w);
             const value_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, value);
             defer self.allocator.free(value_w);

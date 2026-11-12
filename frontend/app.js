@@ -879,6 +879,47 @@ async function runChecks() {
         : 'overlay off (skipped)');
     } catch (e) { setCheck('c-overlay', false, String(e.message || e)); }
 
+    // 48. v0.1.24：应用自定义协议（文本 / 自定义头 / JSON+201 / 二进制）
+    try {
+      const stamp = Date.now();
+      const r = await fetch(`/__proto/echo/a/b?x=1&y=${stamp}`);
+      const text = await r.text();
+      const hdr = r.headers.get('X-Proto');
+      const jr = await fetch(`/__proto/json?t=${stamp}`);
+      const jt = await jr.json();
+      const br = await fetch(`/__proto/bin?t=${stamp}`);
+      const bytes = new Uint8Array(await br.arrayBuffer());
+      const ok = text.startsWith(`echo|a/b|x=1&y=${stamp}|GET|`) && hdr === 'zilt' &&
+        jr.status === 201 && jt.proto === true && jt.framework === 'zilt' &&
+        bytes.length === 4 && bytes[2] === 0xfe && bytes[3] === 0xff;
+      setCheck('c-proto', ok, ok
+        ? `protocol ok (echo/json-201/bin ${bytes.length}B)`
+        : `text=${String(text).slice(0, 60)} xproto=${hdr} json=${jr.status}/${JSON.stringify(jt)} bin=${bytes.join(',')}`);
+    } catch (e) { setCheck('c-proto', false, String(e.message || e)); }
+
+    // 49. v0.1.24：每窗口 UA（独立窗口创建时指定 → 该窗口请求头可见）
+    // 注意：WebView2 的 put_UserAgent 只对下一次导航生效，所以必须用新窗口验证，
+    // 在当前文档里改 UA 后立刻 fetch 仍是旧 UA（子资源沿用文档 UA）。
+    try {
+      const marker = 'ZiltUA/1.0 (win)';
+      const seen = await new Promise(async (resolve, reject) => {
+        const ch = new BroadcastChannel('zilt-smoke-ua');
+        const timer = setTimeout(() => { ch.close(); reject(new Error('ua probe timeout')); }, 12000);
+        ch.onmessage = (e) => { clearTimeout(timer); ch.close(); resolve(String(e.data)); };
+        try {
+          const w = await window.zilt.window.create({
+            title: 'ua probe', url: 'https://zilt.app/ua-probe.html',
+            label: 'ua-probe-' + Date.now(), width: 320, height: 200, userAgent: marker,
+          });
+          setTimeout(() => { if (w && typeof w.id === 'number') window.zilt.window.close(w.id).catch(() => {}); }, 6000);
+        } catch (err) { clearTimeout(timer); ch.close(); reject(err); }
+      });
+      const ok = seen.endsWith('|' + marker);
+      setCheck('c-ua', ok, ok
+        ? `per-window UA ok (${marker})`
+        : `probe=${String(seen).slice(-80)}`);
+    } catch (e) { setCheck('c-ua', false, String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -930,6 +971,8 @@ async function runChecks() {
       find: $('c-find').className === 'pass',
       proxy: $('c-proxy').className === 'pass',
       overlay: $('c-overlay').className === 'pass',
+      proto: $('c-proto').className === 'pass',
+      ua: $('c-ua').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

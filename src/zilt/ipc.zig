@@ -153,6 +153,8 @@ pub const WindowOptions = struct {
     /// `data-zilt-drag-region` 拖动，窗口按钮用 window.minimize/maximize/close）。
     /// 四边仍可缩放（8px 命中区）。
     titlebar_overlay: bool = false,
+    /// v0.1.24：本窗口 User-Agent（null = 用 config.webview.settings.user_agent）
+    user_agent: ?[]const u8 = null,
 };
 
 /// v0.1.18：窗口光标形状（对齐 Tauri `CursorIcon` 的 Windows 子集）。
@@ -897,7 +899,12 @@ const runtime_js_head =
     \\    startDragging: () => builtin('__zilt.startDragging', {}),
     \\    // v0.1.11: window.zilt.window
     \\    window: {
-    \\      create: (opts) => winApi('create', opts),
+    \\      create: (opts) => {
+    \\        const o = Object.assign({}, opts ?? {});
+    \\        // v0.1.24: userAgent → user_agent（Zig 侧 snake_case）
+    \\        if (o.userAgent !== undefined) o.user_agent = o.userAgent;
+    \\        return winApi('create', o);
+    \\      },
     \\      close: (id) => winApi('close', { window_id: id }),
     \\      show: (id) => winApi('show', { window_id: id }),
     \\      hide: (id) => winApi('hide', { window_id: id }),
@@ -992,6 +999,8 @@ const runtime_js_head =
     \\          return window.find(s, !!o.matchCase, !!o.backwards, o.wrap !== false, false, false, false);
     \\        } catch (e) { return false; }
     \\      },
+    \\      // v0.1.24: 运行时改本窗口 UA（下次导航生效；不传 = 恢复引擎默认）
+    \\      setUserAgent: (ua) => builtin('__zilt.webview', { action: 'setUserAgent', user_agent: ua == null ? '' : String(ua) }),
     \\    },
     \\    // v0.1.12: clipboard / drag / notifications
     \\    clipboard: {

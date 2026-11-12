@@ -52,6 +52,8 @@ pub fn main() !void {
         .init_scripts = &.{
             "window.__ziltInit = { version: window.zilt.version, at: Date.now() };",
         },
+        // v0.1.24：应用自定义协议（/__proto/<name>/…）
+        .protocols = &app.protocols,
         // v0.1.12：剪贴板变化事件 + OLE 自定义拖放格式
         .clipboard_change_event = true,
         .drag_formats = &.{"ZiltDemoFormat"},
