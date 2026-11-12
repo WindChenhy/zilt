@@ -211,6 +211,25 @@ test "tsType mappings" {
     try testing.expectEqualStrings("\"on\" | \"off\"", comptime tsType(enum { on, off }));
 }
 
+test "v0.1.21: jsonName 映射 TS 属性名" {
+    // 应用侧若声明 `pub fn jsonName(field) []const u8`，TS 属性名走该映射
+    // （对齐 Tauri 的 serde rename：Zig 字段 snake_case，JSON/TS 用 camelCase）。
+    const Renamed = struct {
+        user_name: []const u8,
+        retry_count: u32 = 3,
+        pub fn jsonName(comptime field: []const u8) []const u8 {
+            comptime {
+                if (std.mem.eql(u8, field, "user_name")) return "userName";
+                if (std.mem.eql(u8, field, "retry_count")) return "retryCount";
+                return field;
+            }
+        }
+    };
+    try testing.expectEqualStrings("{ userName: string; retryCount?: number }", comptime tsType(Renamed));
+    // 没有 jsonName 的类型保持原字段名
+    try testing.expectEqualStrings("{ user_name: string }", comptime tsType(struct { user_name: []const u8 }));
+}
+
 test "generateTs contains typed commands and events" {
     const ts = comptime generateTs(SampleCommands, SampleEvents);
 
