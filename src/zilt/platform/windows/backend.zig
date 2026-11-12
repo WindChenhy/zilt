@@ -166,6 +166,7 @@ pub fn run(comptime config: Config) !void {
 
     var backend = try alloc.create(B);
     backend.* = .{ .allocator = alloc };
+    backend.ui_thread_id.store(win32.GetCurrentThreadId(), .release);
     B.setInstance(backend);
     defer {
         alloc.destroy(backend);
@@ -1135,6 +1136,10 @@ fn Backend(comptime config: Config) type {
         /// WinRT Toast 通知主通道（气球为降级；不要求 tray 启用）
         toast: ?toast_mod.Toast = null,
         quit_code: std.atomic.Value(u8) = .init(0),
+        /// UI 线程 id（run() 创建后记录）：quitFromBackend 可能被任意线程调用
+        ///（应用后台收尾线程等）——PostQuitMessage 只投递到调用线程的队列，
+        /// 跨线程必须用 PostThreadMessageW(WM_QUIT) 才能送达 UI 消息循环。
+        ui_thread_id: std.atomic.Value(u32) = .init(0),
         /// 启动/第二实例转发的深链接载荷（导航完成后发 deepLink 事件）
         pending_launch: ?deep_link.Launch = null,
         launch_emitted: bool = false,
@@ -1853,7 +1858,13 @@ fn Backend(comptime config: Config) type {
         fn quitFromBackend(backend_ptr: *anyopaque, code: u8) void {
             const self: *Self = @ptrCast(@alignCast(backend_ptr));
             self.quit_code.store(code, .monotonic);
-            win32.PostQuitMessage(@intCast(code));
+            if (win32.GetCurrentThreadId() == self.ui_thread_id.load(.acquire)) {
+                win32.PostQuitMessage(@intCast(code));
+            } else {
+                // 跨线程：WM_QUIT 定向投递到 UI 消息循环（PostQuitMessage 只投
+                // 调用线程自身的队列——应用后台收尾线程调 quit 时会静默丢失）
+                _ = win32.PostThreadMessageW(self.ui_thread_id.load(.acquire), win32.WM_QUIT, @intCast(code), 0);
+            }
         }
 
         /// Context.restart_fn 入口（*anyopaque → 实例）。
