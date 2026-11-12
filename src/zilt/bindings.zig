@@ -141,16 +141,21 @@ pub fn tsType(comptime T: type) []const u8 {
         },
         .@"struct" => |st| blk: {
             comptime var out: []const u8 = "{ ";
+            // v0.1.21：类型声明了 `pub fn jsonName(field) []const u8` 时，
+            // TS 属性名采用该映射（应用侧 JSON 契约与 Zig 字段名解耦，
+            // 对齐 Tauri 的 serde rename）
+            const has_json_name = @hasDecl(T, "jsonName");
             inline for (st.field_names, st.field_types, st.field_attrs, 0..) |fname, ftype, fattr, i| {
                 if (i > 0) out = out ++ "; ";
                 // 有默认值或可选类型的字段 → TS 可选属性
                 const is_optional = @typeInfo(ftype) == .optional;
                 const has_default = fattr.defaultValue(ftype) != null;
+                const ts_name = if (has_json_name) T.jsonName(fname) else fname;
                 if (is_optional or has_default) {
                     const base = if (is_optional) @typeInfo(ftype).optional.child else ftype;
-                    out = out ++ fname ++ "?: " ++ tsType(base);
+                    out = out ++ ts_name ++ "?: " ++ tsType(base);
                 } else {
-                    out = out ++ fname ++ ": " ++ tsType(ftype);
+                    out = out ++ ts_name ++ ": " ++ tsType(ftype);
                 }
             }
             out = out ++ (if (st.field_names.len == 0) "" else " ") ++ "}";
@@ -168,7 +173,6 @@ pub fn tsType(comptime T: type) []const u8 {
         else => "unknown",
     };
 }
-
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
