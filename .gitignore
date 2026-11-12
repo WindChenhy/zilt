@@ -2,7 +2,6 @@
 zig-cache/
 zig-out/
 dist/
-docs/
 node_modules/
 frontend/dist/
 frontend/bindings/
