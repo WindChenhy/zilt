@@ -82,8 +82,21 @@
 > v0.2.5 提供 GTK4 + WebKitGTK 6.0 构建变体（对齐 Wails v3 的现代栈；Tauri 2 目前仍是 GTK3）。
 > 绑定用 `@cImport` + pkg-config（GTK/WebKit 是稳定 C ABI），不引入第三方 GObject 绑定。
 
-- [ ] **v0.2.0 骨架**：抽出平台接口（`ipc.Context` 构造收敛），Linux 后端（GtkApplication +
-      WebKitWebView + scheme 资产 + IPC 桥），`zilt doctor` 加 pkg-config 检查
+- [~] **v0.2.0 骨架**
+      - [x] 平台接口层（2026-11-12）：`platform/interface.zig`（后端契约 `platform_name` +
+            `run(comptime Config) !void` + 能力矩阵 `windows_capabilities` /
+            `linux_target_capabilities` + 编译期 `assertBackend`）,`platform/mod.zig` 按
+            `builtin.os.tag` 选择后端（Windows/Linux/unsupported），`root.run` 只做转发。
+            契约测试：最小 `ipc.Context`（只有必需字段）的降级错误名固定
+            （`WebViewNotAvailable` / `ClipboardNotAvailable` / `NotificationNotAvailable` /
+            `DialogNotAvailable` / `SystemNotAvailable` / `DragNotAvailable`），
+            Linux 后端照此实现即可与 Windows 行为一致；能力矩阵自身无重复且平台独占项不在 Linux 目标集。
+            **Windows 回归**：冒烟 49 项 exit 0（接口改动零行为变化）。
+      - [ ] Linux 后端实现（GTK3 + WebKit2GTK 4.1）：需 Linux 构建环境；本机 WSL 被安全策略拦截，
+            待 CI（ubuntu-22.04 + xvfb）就位后落地——先 `g_application_run` + `WebKitWebView`
+            + scheme 资产 + IPC 桥，再补窗口/系统集成
+      - [ ] `zilt doctor` Linux 依赖检查（cli.zig 目前深绑 Win32 文件 IO，需随之移植）
+      - [ ] `build.zig` 的 Linux 分支（pkg-config 链接 gtk-3 / webkit2gtk-4.1，Windows 资源步骤加 OS 守卫）
 - [ ] **v0.2.1 窗口/WebView 面**：多窗口/模态/全屏、eval、devtools、下载、分区、截图、子 WebView
 - [ ] **v0.2.2 系统集成**：单实例（GApplication）+ 深链、通知（GNotification）、剪贴板、对话框、菜单、托盘
 - [ ] **v0.2.3 安全与数据**：capability/scope 全链路、CSP、`Config.protocols` → 真 scheme、

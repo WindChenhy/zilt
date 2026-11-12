@@ -57,6 +57,11 @@ Zilt 是基于**系统 WebView** 的跨平台 GUI 框架（对标 Tauri 2 / Wail
 
 **平台边界（v0.2 起）**：`platform/` 是唯一允许出现 OS API 的目录。
 
+- 入口：`root.run` → `platform/mod.zig::run`（按 `builtin.os.tag` 选 `platform/<os>/backend.zig`），
+  契约由 `platform/interface.zig::assertBackend` 在**编译期**校验（缺 `platform_name` /
+  `run(comptime Config) !void` 直接编译失败）；
+- 能力矩阵与降级语义：`interface.zig` 的 `windows_capabilities` / `linux_target_capabilities`
+  是文档的代码化版本；未实现的钩子留 `null`，调用方得到固定错误名（有单测锁定）；
 - 平台无关层（`ipc` / `security` / `fs_api` / `protocol` / `net` / `sql` / `store` / `updater` /
   `patch` / `pack_formats` / `bindings`）两平台共用；
 - 平台层通过 `ipc.Context` 的函数指针（`clipboard_*`、`webview_request_fn`、`spawn_window_fn`…）

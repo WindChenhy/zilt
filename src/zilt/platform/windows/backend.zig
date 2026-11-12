@@ -104,6 +104,11 @@ const SMOKE_ENV = "ZILT_SMOKE_TEST_MS";
 /// 内置默认图标（Zig 官方 logo，多尺寸 ICO）。config.icon 为 null 时使用。
 const default_icon_bytes = @embedFile("../../assets/zilt.ico");
 
+/// v0.2.0：平台后端标识（见 platform/interface.zig 契约）。
+/// 取名 platform_name 而非 name：backend.zig 里有大量名为 name 的局部量，
+/// 容器级 `name` 会被 Zig 判为 shadow 冲突。
+pub const platform_name = "windows";
+
 pub fn run(comptime config: Config) !void {
     try security.validateHeaders(config.security);
     const B = Backend(config);

@@ -11,7 +11,7 @@
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
 | Windows | ✅ 0.1.x 全栈 | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
-| Linux | 🚧 v0.2（[需求文档](docs/v0.2-LINUX.md)） | GTK3 + WebKit2GTK 4.1；v0.2.5 增 GTK4 + WebKitGTK 6.0 变体 |
+| Linux | 🚧 v0.2（接口层就绪，GTK 实现待 CI） | GTK3 + WebKit2GTK 4.1；v0.2.5 增 GTK4 + WebKitGTK 6.0 变体 |
 | macOS | ⏳ v0.3+ | WKWebView（zig-objc 路线） |
 
 Windows 能力面：窗口/多窗口/覆盖式标题栏、WebView2 事件面与 Settings、IPC + 事件 + 流式 channel、

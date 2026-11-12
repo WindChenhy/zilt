@@ -51,18 +51,20 @@ pub const protocol = @import("protocol.zig");
 
 /// 平台模块（Windows 后端内部使用；用户一般无需直接接触）
 pub const platform_windows = @import("platform/windows/mod.zig");
+/// v0.2.0：平台后端选择层（platform/<os>/backend.zig）+ 契约校验
+pub const platform = @import("platform/mod.zig");
 
 /// 运行应用（入口）。config 为编译期值（commands 等类型字段要求）。
+/// 平台选择与契约校验在 `platform/mod.zig`，本函数只做转发。
 pub fn run(comptime config: Config) !void {
-    switch (builtin.os.tag) {
-        .windows => return platform_windows.backend.run(config),
-        else => @compileError("Zilt: 该平台后端尚未实现（Phase 1 计划：Linux/macOS）"),
-    }
+    return platform.run(config);
 }
 
 test {
     _ = @import("version.zig");
     _ = @import("protocol.zig");
+    _ = @import("platform/interface.zig");
+    _ = @import("platform/mod.zig");
     _ = @import("security.zig");
     _ = @import("asset_routes.zig");
     _ = @import("builtin.zig");
