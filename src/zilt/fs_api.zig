@@ -95,6 +95,9 @@ pub fn isSafeRelative(rel: []const u8) bool {
     if (rel[0] == '\\' or rel[0] == '/') return false;
     // 盘符（C:、C:\）
     if (rel.len >= 2 and rel[1] == ':') return false;
+    // v0.1.23：任意位置的 ':' 都是 NTFS 备用数据流（`a.txt:hidden`）或设备名，
+    // 文件名本身不允许冒号——直接拒绝，避免 scope 根之外留持久化隐蔽数据。
+    if (std.mem.indexOfScalar(u8, rel, ':') != null) return false;
 
     var it = std.mem.tokenizeAny(u8, rel, "\\/");
     var any = false;
@@ -186,6 +189,9 @@ test "path safety rejects escapes" {
     try testing.expect(!isSafeRelative("\\\\server\\share"));
     try testing.expect(!isSafeRelative("a\x00b"));
     try testing.expect(!isSafeRelative("./a"));
+    // v0.1.23：NTFS 备用数据流 / 设备名冒号
+    try testing.expect(!isSafeRelative("notes.txt:secret"));
+    try testing.expect(!isSafeRelative("dir/a:b"));
 }
 
 test "join normalizes separators and rejects escape" {

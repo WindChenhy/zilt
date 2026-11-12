@@ -820,6 +820,65 @@ async function runChecks() {
         : `w=${JSON.stringify(w)} sawAdd=${sawAdd} events=${JSON.stringify(evs.slice(0, 4))} sid=${sid} chunks=${mine.length} len=${text.length}/${payload.length} unw=${unw}`);
     } catch (e) { setCheck('c-fs2', false, String(e.message || e)); }
 
+    // 42. v0.1.23：CDP 逃生口（Browser.getVersion）
+    try {
+      const v = await window.zilt.webview.cdp('Browser.getVersion', {});
+      const ok = !!v && typeof v.product === 'string' && /Chrome\/|Edg\//.test(v.product);
+      setCheck('c-cdp', ok, ok ? `cdp ok (${v.product})` : `resp=${JSON.stringify(v).slice(0, 120)}`);
+    } catch (e) { setCheck('c-cdp', false, String(e.message || e)); }
+
+    // 43. v0.1.23：截屏（PNG data URL）
+    try {
+      const url = await window.zilt.webview.captureScreenshot();
+      const ok = typeof url === 'string' && url.startsWith('data:image/png;base64,') && url.length > 2000;
+      setCheck('c-shot', ok, ok ? `screenshot ok (${url.length} chars)` : `url=${String(url).slice(0, 60)} len=${String(url).length}`);
+    } catch (e) { setCheck('c-shot', false, String(e.message || e)); }
+
+    // 44. v0.1.23：每请求头（CDP Network.setExtraHTTPHeaders）
+    try {
+      let r1;
+      try { r1 = await window.zilt.webview.cdp('Network.enable', {}); }
+      catch (e1) { window.zilt.log('warn', 'cdp Network.enable failed: ' + String(e1.message || e1)); throw e1; }
+      let r2;
+      try { r2 = await window.zilt.webview.cdp('Network.setExtraHTTPHeaders', { headers: { 'X-Zilt-Smoke': 'v23' } }); }
+      catch (e2) { window.zilt.log('warn', 'cdp setExtraHTTPHeaders failed: ' + String(e2.message || e2)); throw e2; }
+      const ok = r1 !== undefined && r2 !== undefined;
+      setCheck('c-hdrs', ok, ok ? 'extra headers applied' : `enable=${JSON.stringify(r1)} set=${JSON.stringify(r2)}`);
+    } catch (e) {
+      setCheck('c-hdrs', false, String(e.message || e));
+    }
+
+    // 45. v0.1.23：页内查找（用页面上真实存在的词做探针）
+    try {
+      const body = (document.body.innerText || '').trim();
+      const probe = (body.split(/\s+/)[0] || '').slice(0, 12);
+      const found = probe.length > 0 ? window.zilt.webview.find(probe) : false;
+      setCheck('c-find', found === true, `find(${JSON.stringify(probe)}) -> ${found}`);
+    } catch (e) { setCheck('c-find', false, String(e.message || e)); }
+
+    // 46. v0.1.23：每窗口代理（独立 Environment + profile；Zig 日志可见 env ready）
+    try {
+      const w = await window.zilt.window.create({
+        title: 'proxy probe', url: 'https://zilt.app/index.html', label: 'proxy-probe-' + Date.now(),
+        width: 300, height: 200, proxy: '127.0.0.1:9',
+      });
+      const ok = !!w && typeof w.id === 'number';
+      setCheck('c-proxy', ok, ok ? `proxy window #${w.id} created` : `resp=${JSON.stringify(w)}`);
+      if (ok) setTimeout(() => { window.zilt.window.close(w.id).catch(() => {}); }, 1200);
+    } catch (e) { setCheck('c-proxy', false, String(e.message || e)); }
+
+    // 47. v0.1.23：覆盖式标题栏（ZILT_SMOKE_OVERLAY=1 时客户区=整个窗口）
+    try {
+      const st = await window.zilt.window.state();
+      const overlay = !!st && st.overlay === true;
+      const dw = Math.abs(window.outerWidth - window.innerWidth);
+      const dh = Math.abs(window.outerHeight - window.innerHeight);
+      const ok = !overlay || (dw <= 2 && dh <= 2);
+      setCheck('c-overlay', ok, overlay
+        ? `overlay on (outer ${window.outerWidth}x${window.outerHeight} / inner ${window.innerWidth}x${window.innerHeight})`
+        : 'overlay off (skipped)');
+    } catch (e) { setCheck('c-overlay', false, String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -865,6 +924,12 @@ async function runChecks() {
       zigev: $('c-zigev').className === 'pass',
       acl2: $('c-acl2').className === 'pass',
       fs2: $('c-fs2').className === 'pass',
+      cdp: $('c-cdp').className === 'pass',
+      shot: $('c-shot').className === 'pass',
+      hdrs: $('c-hdrs').className === 'pass',
+      find: $('c-find').className === 'pass',
+      proxy: $('c-proxy').className === 'pass',
+      overlay: $('c-overlay').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

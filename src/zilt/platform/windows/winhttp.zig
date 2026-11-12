@@ -298,10 +298,12 @@ pub fn request(alloc: std.mem.Allocator, url: net.Url, opts: RequestOptions, sin
     };
     defer if (hdrs_w) |w| alloc.free(std.mem.span(w));
 
-    const body_ptr: ?*const anyopaque = if (opts.body.len == 0) null else opts.body.ptr;
-    if (a.SendRequest(req, hdrs_w, if (hdrs.len == 0) 0 else @intCast(hdrs.len), body_ptr, @intCast(opts.body.len), @intCast(opts.body.len), 0) == 0) {
-        return errFor(win32.GetLastError());
-    }
+    // dwHeadersLength 的单位是 **WCHAR 数**，不是 UTF-8 字节数。含非 ASCII 头值
+    // （如 `X-Note: 测试`）时两者不相等，传字节数会让 WinHTTP 读过缓冲区末尾。
+    const hdrs_len: u32 = if (hdrs_w) |w| @intCast(std.mem.span(w).len) else 0;
+
+    // 看门狗必须在 SendRequest **之前**启动：SendRequest 会一直阻塞到收到响应头，
+    // 「TCP 已连上但服务器永不响应」的场景卡在这里，原先放在其后等于没有超时。
     var wd = Watchdog{ .handle = req, .ms = if (opts.timeout_ms == 0) 600_000 else opts.timeout_ms };
     const wd_thread: ?std.Thread = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, watchdogMain, .{&wd}) catch null;
     defer if (wd_thread) |th| {
@@ -309,6 +311,12 @@ pub fn request(alloc: std.mem.Allocator, url: net.Url, opts: RequestOptions, sin
         th.join();
         if (wd.fired.load(.acquire)) handle_owned = false;
     };
+
+    const body_ptr: ?*const anyopaque = if (opts.body.len == 0) null else opts.body.ptr;
+    if (a.SendRequest(req, hdrs_w, hdrs_len, body_ptr, @intCast(opts.body.len), @intCast(opts.body.len), 0) == 0) {
+        if (wd.fired.load(.acquire)) return error.Timeout;
+        return errFor(win32.GetLastError());
+    }
 
     if (a.ReceiveResponse(req, null) == 0) {
         if (wd.fired.load(.acquire)) return error.Timeout;
@@ -471,10 +479,10 @@ pub fn openWebSocket(alloc: std.mem.Allocator, url: net.Url, opts: WebSocketOpti
         break :blk w.ptr;
     };
     defer if (hdrs_w) |w| alloc.free(std.mem.span(w));
+    // 同 request()：dwHeadersLength 以 WCHAR 计，不是 UTF-8 字节数。
+    const hdrs_len: u32 = if (hdrs_w) |w| @intCast(std.mem.span(w).len) else 0;
 
-    if (a.SendRequest(req, hdrs_w, if (hdrs.len == 0) 0 else @intCast(hdrs.len), null, 0, 0, 0) == 0) {
-        return errFor(win32.GetLastError());
-    }
+    // 看门狗先于 SendRequest 启动（服务器不返回响应头时也能超时）
     var wd = Watchdog{ .handle = req, .ms = if (opts.timeout_ms == 0) 600_000 else opts.timeout_ms };
     const wd_thread: ?std.Thread = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, watchdogMain, .{&wd}) catch null;
     defer if (wd_thread) |th| {
@@ -482,6 +490,11 @@ pub fn openWebSocket(alloc: std.mem.Allocator, url: net.Url, opts: WebSocketOpti
         th.join();
         if (wd.fired.load(.acquire)) handle_owned = false;
     };
+
+    if (a.SendRequest(req, hdrs_w, hdrs_len, null, 0, 0, 0) == 0) {
+        if (wd.fired.load(.acquire)) return error.Timeout;
+        return errFor(win32.GetLastError());
+    }
 
     if (a.ReceiveResponse(req, null) == 0) {
         if (wd.fired.load(.acquire)) return error.Timeout;
@@ -492,15 +505,11 @@ pub fn openWebSocket(alloc: std.mem.Allocator, url: net.Url, opts: WebSocketOpti
         std.debug.print("[wh] CompleteUpgrade failed err={d}\n", .{win32.GetLastError()});
         return error.WinHttpUpgradeFailed;
     };
+    errdefer _ = a.CloseHandle(ws);
 
     const self = try alloc.create(WebSocket);
     self.* = .{ .ws = ws, .session = session, .connect = connect, .alloc = alloc };
     return self;
-}
-
-/// 供日志/诊断：当前错误码的语义名。
-pub fn describe(code: u32) []const u8 {
-    return errorNameFor(code);
 }
 
 const testing = std.testing;

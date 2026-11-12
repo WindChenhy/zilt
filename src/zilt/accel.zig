@@ -269,12 +269,6 @@ pub fn formatBuf(buf: []u8, accel: Accel) ?[]const u8 {
     return buf[0..n];
 }
 
-/// 菜单项展示用后缀（`\tCtrl+K`）；无修饰符也返回，调用方自行决定是否使用。
-pub fn menuSuffix(buf: []u8, accel: Accel) ?[]const u8 {
-    const text = formatBuf(buf, accel) orelse return null;
-    return text;
-}
-
 /// 冲突检测：返回首个与 `candidate` 重复的注册 id（同 VK + 同修饰符）。
 pub fn findConflict(
     ids: []const []const u8,

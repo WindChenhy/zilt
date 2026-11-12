@@ -37,6 +37,9 @@ pub const Config = struct {
     resizable: bool = true,
     /// 是否带原生标题栏/边框
     decorations: bool = true,
+    /// v0.1.23：覆盖式标题栏——客户区覆盖整个窗口（无原生标题栏/边框），前端自绘。
+    /// 需要配合 `data-zilt-drag-region` 实现拖动，四边仍可缩放。
+    titlebar_overlay: bool = false,
     /// WebView 背景透明（桌面透出）
     transparent: bool = false,
     /// 窗口置顶

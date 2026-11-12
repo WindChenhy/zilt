@@ -41,6 +41,8 @@ pub const IID_WebResourceRequestedEventHandler: com.GUID = .parse("{AB00B74C-15F
 pub const IID_NavigationCompletedEventHandler: com.GUID = .parse("{D33A35BF-1C49-4F98-93AB-006E0533FE1C}");
 pub const IID_ICoreWebView2NavigationCompletedEventArgs: com.GUID = .parse("{30D68B7D-20D9-4752-A9CA-EC8448FBB5C1}");
 pub const IID_AddScriptToExecuteOnDocumentCreatedCompletedHandler: com.GUID = .parse("{B99369F3-9B11-47B5-BC6F-8E7895FCEA17}");
+/// ICoreWebView2CallDevToolsProtocolMethodCompletedHandler（WebView2.h）
+pub const IID_CallDevToolsProtocolMethodCompletedHandler: com.GUID = .parse("{5C4889F0-5EF6-4C5A-952C-D8F1B92D0574}");
 
 // ============================== 枚举 ==============================
 

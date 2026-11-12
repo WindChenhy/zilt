@@ -37,17 +37,8 @@ pub extern "shell32" fn CommandLineToArgvW(lpCmdLine: [*:0]const u16, pNumArgs: 
 
 const BOOL = i32;
 
-fn getEnv(alloc: std.mem.Allocator, name: [:0]const u8) ?[]u8 {
-    const nw = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch return null;
-    defer alloc.free(nw);
-    const need = GetEnvironmentVariableW(nw.ptr, null, 0);
-    if (need == 0) return null;
-    const buf = alloc.alloc(u16, need + 1) catch return null;
-    defer alloc.free(buf);
-    const got = GetEnvironmentVariableW(nw.ptr, buf.ptr, @intCast(need + 1));
-    if (got == 0 or got > need) return null;
-    return std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..got]) catch null;
-}
+/// v0.1.23：三份拷贝合一（实现见 win_env.zig）。
+const getEnv = @import("win_env.zig").get;
 
 fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ?[]u8 {
     const pw = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return null;

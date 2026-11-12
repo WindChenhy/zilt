@@ -12,9 +12,6 @@ pub const MF_GRAYED: win32.UINT = 0x00000001;
 pub const MF_DEFAULT: win32.UINT = 0x00001000;
 pub const MF_BYCOMMAND: win32.UINT = 0x00000000;
 
-extern "user32" fn SetMenuDefaultItem(hMenu: win32.HMENU, uItem: win32.UINT, fByPos: win32.UINT) callconv(.c) win32.BOOL;
-extern "user32" fn DrawMenuBar(hWnd: win32.HWND) callconv(.c) win32.BOOL;
-
 pub const Built = struct {
     hmenu: win32.HMENU,
     /// 叶子命令 id，索引 = win_id - base - 1
@@ -24,7 +21,6 @@ pub const Built = struct {
     /// v0.1.18：菜单项位图（销毁菜单时一并释放）
     bitmaps: std.ArrayListUnmanaged(win32.HBITMAP) = .empty,
     base: u16 = 0,
-    default_id: ?u16 = null,
 
     pub fn deinit(self: *Built, alloc: std.mem.Allocator) void {
         // ids/roles 里的字符串归 model 的 arena，这里只释放数组本身
@@ -51,38 +47,20 @@ pub const Built = struct {
         const id = self.ids.items[idx];
         return if (id.len == 0) null else id;
     }
-
-    pub fn labelFor(self: *const Built, win_id: u16) ?[]const u8 {
-        if (win_id <= self.base) return null;
-        const idx = win_id - self.base - 1;
-        if (idx >= self.ids.items.len) return null;
-        return self.ids.items[idx];
-    }
 };
 
 const Ctx = struct {
     alloc: std.mem.Allocator,
     built: *Built,
     next: *u16,
-    root: bool,
 };
-
-/// 构建菜单栏（CreateMenu）。`base` 为叶子 win id 起始值（菜单栏用 0）。
-pub fn buildMenuBar(alloc: std.mem.Allocator, model: *menu_model.Model, base: u16) !Built {
-    var built = Built{ .hmenu = win32.CreateMenu() orelse return error.CreateMenuFailed, .base = base };
-    errdefer built.deinit(alloc);
-    var next: u16 = base;
-    var ctx = Ctx{ .alloc = alloc, .built = &built, .next = &next, .root = true };
-    try fill(&ctx, built.hmenu, model.roots.items);
-    return built;
-}
 
 /// 构建弹出菜单（托盘右键 / WebView 上下文菜单）。
 pub fn buildPopup(alloc: std.mem.Allocator, model: *menu_model.Model, base: u16) !Built {
     var built = Built{ .hmenu = win32.CreatePopupMenu() orelse return error.CreateMenuFailed, .base = base };
     errdefer built.deinit(alloc);
     var next: u16 = base;
-    var ctx = Ctx{ .alloc = alloc, .built = &built, .next = &next, .root = false };
+    var ctx = Ctx{ .alloc = alloc, .built = &built, .next = &next };
     try fill(&ctx, built.hmenu, model.roots.items);
     return built;
 }
@@ -119,7 +97,6 @@ fn fill(ctx: *Ctx, hmenu: win32.HMENU, list: []*menu_model.Node) !void {
         const text = try menuText(ctx.alloc, node, true);
         defer ctx.alloc.free(text);
         if (win32.AppendMenuW(hmenu, flags, win_id, text.ptr) == 0) return error.AppendMenuFailed;
-        if (node.default_item) ctx.built.default_id = win_id;
         if (node.icon) |icon_path| {
             if (menu_mod.loadMenuBitmap(ctx.alloc, icon_path)) |bmp| {
                 _ = win32.SetMenuItemBitmaps(hmenu, win_id, win32.MF_BYCOMMAND, bmp, bmp);
@@ -139,16 +116,6 @@ fn menuText(alloc: std.mem.Allocator, node: *menu_model.Node, with_accel: bool) 
         try alloc.dupe(u8, node.label);
     defer alloc.free(text);
     return std.unicode.utf8ToUtf16LeAllocZ(alloc, text);
-}
-
-/// 应用默认项（SetMenuDefaultItem 需要菜单句柄，AppendMenuW 的 MF_DEFAULT 在
-/// 部分 Windows 版本上不生效，双保险）。
-pub fn applyDefault(built: Built) void {
-    if (built.default_id) |id| _ = SetMenuDefaultItem(built.hmenu, id, 0);
-}
-
-pub fn refreshMenuBar(hwnd: win32.HWND) void {
-    _ = DrawMenuBar(hwnd);
 }
 
 const testing = std.testing;

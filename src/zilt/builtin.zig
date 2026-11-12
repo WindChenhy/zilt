@@ -139,6 +139,8 @@ pub const Args = struct {
     partition: ?[]const u8 = null,
     /// 子 webview eval 的请求 id（__zilt.webviews.eval，用于事件匹配）
     rid: ?i64 = null,
+    /// v0.1.23：CDP 参数 JSON 文本（__zilt.webview action=cdp）
+    params_json: ?[]const u8 = null,
 };
 
 pub fn isBuiltin(method: []const u8) bool {
@@ -317,6 +319,7 @@ fn windowCmd(ctx: ipc.Context, a: Args) ![]u8 {
             .parent = a.parent,
             .modal = a.modal orelse false,
             .child = a.child orelse false,
+            .proxy = a.proxy,
         };
         if (a.window_id) |_| opts.parent = a.window_id;
         const id = spawn(ctx.backend, opts);
@@ -403,6 +406,12 @@ pub fn requestFromArgs(a: Args) !webview.Request {
     if (eql(u8, a.action, "clearStorage")) return .{ .clear_storage = .{} };
     if (eql(u8, a.action, "cookies.get")) return .{ .cookies = .{ .get = .{ .url = a.url } } };
     if (eql(u8, a.action, "cookies.clear")) return .{ .cookies = .{ .clear = .{ .origin = a.url } } };
+    // v0.1.23：任意 CDP 调用（异步，结果走 webviewCdp 事件）
+    if (eql(u8, a.action, "cdp")) return .{ .cdp = .{
+        .method = a.method orelse return error.MissingCdpMethod,
+        .params = a.params_json orelse "{}",
+        .rid = a.rid orelse return error.MissingRid,
+    } };
     return error.UnknownWebViewAction;
 }
 

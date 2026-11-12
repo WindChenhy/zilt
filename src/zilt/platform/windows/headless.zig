@@ -241,7 +241,7 @@ fn handleIpc(
     var dummy: u8 = 0;
     const ctx = ipc.Context{
         .allocator = alloc,
-        .msg_allocator = arena_state.allocator(),
+        .msg_allocator = alloc, // 长生命周期：ctx 可能被应用捕获后跨线程 emit（消息由 emit 侧释放）
         .backend = @ptrCast(&dummy),
         .window_id = 0,
         .emit_fn = headlessEmit,
@@ -290,7 +290,7 @@ fn handleMcp(
     var dummy: u8 = 0;
     const ctx = ipc.Context{
         .allocator = alloc,
-        .msg_allocator = arena_state.allocator(),
+        .msg_allocator = alloc, // 长生命周期：ctx 可能被应用捕获后跨线程 emit（消息由 emit 侧释放）
         .backend = @ptrCast(&dummy),
         .window_id = 0,
         .emit_fn = headlessEmit,

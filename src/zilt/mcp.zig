@@ -10,7 +10,7 @@ const std = @import("std");
 const ipc = @import("ipc.zig");
 
 pub const PROTOCOL_VERSION = "2024-11-05";
-pub const version = "0.1.22";
+pub const version = @import("version.zig").version;
 
 /// comptime 生成 tools/list 的 JSON（避免运行期反射）。
 pub fn toolsJson(comptime Commands: type) []const u8 {

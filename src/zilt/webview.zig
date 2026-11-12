@@ -110,6 +110,10 @@ pub const Request = union(enum) {
     /// Result is the evaluated JSON value, undefined => null. Non-JSON values
     /// produce NonJsonResult; thrown/rejected JS produces JavaScriptException.
     eval: struct { script: []const u8, timeout_ms: u32 = 30_000 },
+    /// v0.1.23：任意 CDP 调用（Page.captureScreenshot / Network.setExtraHTTPHeaders …）。
+    /// **异步**：本请求立即返回 `{}`，结果经 `webviewCdp` 事件带回（rid 匹配）。
+    /// params 是原始 JSON 文本（默认 `{}`）。
+    cdp: struct { method: []const u8, params: []const u8 = "{}", rid: i64 },
     cancel_download: u64,
 };
 

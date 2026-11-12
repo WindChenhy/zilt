@@ -220,6 +220,14 @@ pub fn run(comptime config: Config) !void {
         } else |_| {}
     }
 
+    // v0.1.23：覆盖式标题栏测试钩子（冒烟用：ZILT_SMOKE_OVERLAY=1 让主窗口走 overlay，
+    // 断言 innerHeight == outerHeight）。生产行为只由 config.titlebar_overlay 决定。
+    const overlay_hook = blk: {
+        const v = win32.getEnvUtf8(alloc, "ZILT_SMOKE_OVERLAY") orelse break :blk false;
+        defer alloc.free(v);
+        break :blk v.len > 0 and v[0] == '1';
+    };
+
     const main = try backend.createWindow(.{
         .title = config.title,
         .width = config.width,
@@ -230,6 +238,7 @@ pub fn run(comptime config: Config) !void {
         .visible = config.visible,
         .resizable = config.resizable,
         .decorations = config.decorations,
+        .titlebar_overlay = config.titlebar_overlay or overlay_hook,
         .transparent = config.transparent,
         .always_on_top = config.always_on_top,
         .skip_taskbar = config.skip_taskbar,
@@ -430,14 +439,14 @@ fn clampIconPx(metric: i32, fallback: u32) u32 {
 
 /// 窗口样式（纯函数，单测覆盖）。
 fn windowStyleFor(opts: ipc.WindowOptions) win32.DWORD {
-    var style: win32.DWORD = if (opts.decorations)
+    var style: win32.DWORD = if (opts.decorations and !opts.titlebar_overlay)
         win32.WS_OVERLAPPEDWINDOW
     else
         win32.WS_POPUP | win32.WS_SYSMENU | win32.WS_MINIMIZEBOX | win32.WS_MAXIMIZEBOX;
 
     if (!opts.resizable) {
         style &= ~(win32.WS_THICKFRAME | win32.WS_MAXIMIZEBOX);
-    } else if (!opts.decorations) {
+    } else if (!opts.decorations or opts.titlebar_overlay) {
         style |= win32.WS_THICKFRAME;
     }
     if (opts.child) style = (style & ~(win32.WS_POPUP | win32.WS_CAPTION | win32.WS_SYSMENU | win32.WS_MINIMIZEBOX | win32.WS_MAXIMIZEBOX)) | 0x40000000;
@@ -983,6 +992,12 @@ fn Backend(comptime config: Config) type {
             focusable: bool = true,
             always_on_bottom: bool = false,
             accel: win32.HACCEL = null,
+            /// v0.1.23：本窗口专用代理（非 null 时使用独立 Environment + profile）
+            proxy: ?[]u8 = null,
+            /// v0.1.23：独立 Environment（proxy 窗口专用，窗口销毁时 Release）
+            own_env: ?*wv2.ICoreWebView2Environment = null,
+            /// v0.1.23：覆盖式标题栏（客户区 = 整个窗口，自绘标题栏）
+            overlay: bool = false,
             menu_bitmaps: std.ArrayListUnmanaged(win32.HBITMAP) = .empty,
 
             fn updateBounds(self: *Window) void {
@@ -1290,6 +1305,9 @@ fn Backend(comptime config: Config) type {
             errdefer self.allocator.free(title);
             const url = try self.allocator.dupe(u8, opts.url orelse config.url);
             errdefer self.allocator.free(url);
+            // v0.1.23：每窗口代理（独立 Environment 时使用）
+            const proxy = if (opts.proxy) |p| try self.allocator.dupe(u8, p) else null;
+            errdefer if (proxy) |p| self.allocator.free(p);
 
             const w = try self.allocator.create(Window);
             errdefer self.allocator.destroy(w);
@@ -1312,6 +1330,8 @@ fn Backend(comptime config: Config) type {
                 .background_color = opts.background_color,
                 .transparent = opts.transparent,
                 .close_requested_events = opts.close_requested_event,
+                .proxy = proxy,
+                .overlay = opts.titlebar_overlay,
             };
 
             const hinstance = win32.GetModuleHandleW(null);
@@ -1320,7 +1340,7 @@ fn Backend(comptime config: Config) type {
 
             const style = windowStyleFor(opts);
             const ex_style = windowExStyleFor(opts);
-            const has_menu = opts.decorations and !opts.child and menu_items.len != 0;
+            const has_menu = opts.decorations and !opts.titlebar_overlay and !opts.child and menu_items.len != 0;
             if (has_menu) {
                 w.menu = try menu_mod.buildWin32WithIcons(self.allocator, menu_items, &w.menu_bitmaps);
             }
@@ -1422,7 +1442,14 @@ fn Backend(comptime config: Config) type {
         }
 
         fn beginController(self: *Self, w: *Window) void {
+            // v0.1.23：代理窗口有自己的 Environment（首次创建，崩溃恢复时复用）
+            if (w.own_env) |env| return self.beginControllerWithEnv(w, env);
+            if (w.proxy) |proxy| return self.beginProxyEnv(w, proxy);
             const env = self.env orelse return;
+            self.beginControllerWithEnv(w, env);
+        }
+
+        fn beginControllerWithEnv(self: *Self, w: *Window, env: *wv2.ICoreWebView2Environment) void {
             const handler = ControllerCompletedHandler.create(self, w) catch {
                 log.print("[fatal] controller handler alloc failed", .{});
                 return;
@@ -1432,6 +1459,47 @@ fn Backend(comptime config: Config) type {
             if (com.failed(hr)) {
                 log.print("[fatal] CreateCoreWebView2Controller failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
                 win32.PostQuitMessage(3);
+            }
+        }
+
+        /// v0.1.23：为指定窗口建独立 Environment（WebView2 的代理是环境级选项）。
+        /// profile 目录：`<profile>\WebView2-windows\<窗口 id>`——该窗口与主窗口
+        /// 不共享 cookie/缓存（代理隔离的必然代价，已在文档注明）。
+        fn beginProxyEnv(self: *Self, w: *Window, proxy: []const u8) void {
+            const rt = if (self.runtime) |*r| r else {
+                log.print("[proxy] window #{d} failed: runtime missing", .{w.id});
+                return;
+            };
+            const profile = app_data.profileDirectory(self.allocator, config.app_id, config.migrate_legacy_profile) catch {
+                log.print("[proxy] window #{d} failed: profile dir", .{w.id});
+                return;
+            };
+            defer self.allocator.free(profile);
+            const root = std.fmt.allocPrint(self.allocator, "{s}\\WebView2-windows", .{profile}) catch return;
+            defer self.allocator.free(root);
+            const dir = std.fmt.allocPrint(self.allocator, "{s}\\{d}", .{ root, w.id }) catch return;
+            defer self.allocator.free(dir);
+            {
+                const root_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, root) catch return;
+                defer self.allocator.free(root_w);
+                _ = win32.CreateDirectoryW(root_w.ptr, null);
+                const dir_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, dir) catch return;
+                defer self.allocator.free(dir_w);
+                _ = win32.CreateDirectoryW(dir_w.ptr, null);
+            }
+            const dir_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, dir) catch return;
+            defer self.allocator.free(dir_w);
+
+            const eo = environment.Options{ .proxy_server = proxy };
+            const env_opts = env_options.EnvironmentOptions.create(self.allocator, eo) catch null;
+            defer if (env_opts) |o| o.dropRef();
+            const handler = WindowEnvCompletedHandler.create(self, w) catch return;
+            const hr = loader.createEnvironment(rt, dir_w.ptr, if (env_opts) |o| @ptrCast(o) else null, handler);
+            handler.dropRef();
+            if (com.failed(hr)) {
+                log.print("[proxy] window #{d} createEnvironment hr=0x{x}", .{ w.id, @as(u32, @bitCast(hr)) });
+            } else {
+                log.print("[proxy] window #{d} env requested (proxy={s})", .{ w.id, proxy });
             }
         }
 
@@ -4110,7 +4178,7 @@ fn Backend(comptime config: Config) type {
             const style: u32 = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_STYLE));
             const ex: u32 = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_EXSTYLE));
             return std.fmt.allocPrint(alloc,
-                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":{d},"ex_style":{d},"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":{s},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d}}}
+                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":{d},"ex_style":{d},"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":{s},"overlay":{s},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d}}}
             , .{
                 w.id,
                 rc.left,
@@ -4130,6 +4198,7 @@ fn Backend(comptime config: Config) type {
                 boolStr(w.ignore_cursor),
                 boolStr(w.focusable),
                 boolStr(w.content_protected),
+                boolStr(w.overlay),
                 w.min_width orelse 0,
                 w.min_height orelse 0,
                 w.max_width orelse 0,
@@ -4725,6 +4794,8 @@ fn Backend(comptime config: Config) type {
             for (self.windows.items) |w| if (w.alive) { _ = win32.DestroyWindow(w.hwnd); };
             for (self.windows.items) |w| {
                 releaseWindowCom(w);
+                if (w.own_env) |e| _ = e.lpVtbl.Release(e);
+                if (w.proxy) |p| self.allocator.free(p);
                 self.allocator.free(w.title);
                 self.allocator.free(w.url);
                 self.allocator.free(w.label);
@@ -4753,6 +4824,46 @@ fn Backend(comptime config: Config) type {
 
         fn wndProc(hwnd: win32.HWND, msg: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.c) win32.LRESULT {
             switch (msg) {
+                // v0.1.23：覆盖式标题栏——客户区吃掉整个非客户区（wParam=TRUE 时
+                // 返回值 0 表示「客户区 = 窗口矩形」），配合下方 WM_NCHITTEST 保留缩放。
+                win32.WM_NCCALCSIZE => {
+                    if (wparam != 0) {
+                        if (instance) |b| {
+                            if (b.windowOfHwnd(hwnd)) |w| {
+                                if (w.overlay and !w.fullscreen) return 0;
+                            }
+                        }
+                    }
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                },
+                // v0.1.23：无原生边框后自绘 8px 缩放命中区（最大化时不缩放）。
+                win32.WM_NCHITTEST => {
+                    if (instance) |b| {
+                        if (b.windowOfHwnd(hwnd)) |w| {
+                            if (w.overlay and !w.fullscreen and win32.IsZoomed(hwnd) == 0) {
+                                const x: i32 = @as(i16, @truncate(lparam));
+                                const y: i32 = @as(i16, @truncate(lparam >> 16));
+                                var rc: win32.RECT = undefined;
+                                if (win32.GetWindowRect(hwnd, &rc) != 0) {
+                                    const b8: i32 = 8;
+                                    const left = x - rc.left < b8;
+                                    const right = rc.right - x <= b8;
+                                    const top = y - rc.top < b8;
+                                    const bottom = rc.bottom - y <= b8;
+                                    if (top and left) return win32.HTTOPLEFT;
+                                    if (top and right) return win32.HTTOPRIGHT;
+                                    if (bottom and left) return win32.HTBOTTOMLEFT;
+                                    if (bottom and right) return win32.HTBOTTOMRIGHT;
+                                    if (left) return win32.HTLEFT;
+                                    if (right) return win32.HTRIGHT;
+                                    if (top) return win32.HTTOP;
+                                    if (bottom) return win32.HTBOTTOM;
+                                }
+                            }
+                        }
+                    }
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                },
                 win32.WM_MOVE => {
                     if (instance) |b| {
                         if (b.windowOfHwnd(hwnd)) |w| {
@@ -5483,6 +5594,54 @@ fn Backend(comptime config: Config) type {
                 }
             };
         }
+
+        /// v0.1.23：代理窗口的 Environment 创建完成 → 记到窗口上并建 controller。
+        const WindowEnvCompletedHandler = extern struct {
+            lpVtbl: *const VTable,
+            refs: u32,
+            backend: *Self,
+            window: *Window,
+
+            pub const COM_IIDS = [_]com.GUID{wv2.IID_EnvironmentCompletedHandler};
+
+            pub const VTable = extern struct {
+                QueryInterface: *const fn (*anyopaque, *const com.GUID, *?*anyopaque) callconv(.c) HRESULT,
+                AddRef: *const fn (*anyopaque) callconv(.c) u32,
+                Release: *const fn (*anyopaque) callconv(.c) u32,
+                Invoke: *const fn (*anyopaque, HRESULT, ?*wv2.ICoreWebView2Environment) callconv(.c) HRESULT,
+            };
+            pub const vtable = VTable{
+                .QueryInterface = com.ComVTableMixin(WindowEnvCompletedHandler).queryInterface,
+                .AddRef = com.ComVTableMixin(WindowEnvCompletedHandler).addRef,
+                .Release = com.ComVTableMixin(WindowEnvCompletedHandler).release,
+                .Invoke = invoke,
+            };
+
+            fn create(backend: *Self, window: *Window) !*WindowEnvCompletedHandler {
+                const h = try backend.allocator.create(WindowEnvCompletedHandler);
+                h.* = .{ .lpVtbl = &vtable, .refs = 1, .backend = backend, .window = window };
+                return h;
+            }
+            pub fn comDestroy(self: *WindowEnvCompletedHandler) void {
+                self.backend.allocator.destroy(self);
+            }
+            pub fn dropRef(self: *WindowEnvCompletedHandler) void {
+                _ = com.ComVTableMixin(WindowEnvCompletedHandler).release(@ptrCast(self));
+            }
+
+            fn invoke(self_: *anyopaque, error_code: HRESULT, env: ?*wv2.ICoreWebView2Environment) callconv(.c) HRESULT {
+                const self: *WindowEnvCompletedHandler = @ptrCast(@alignCast(self_));
+                if (com.failed(error_code) or env == null) {
+                    log.print("[proxy] window #{d} environment failed hr=0x{x}", .{ self.window.id, @as(u32, @bitCast(error_code)) });
+                    return com.S_OK;
+                }
+                self.window.own_env = env;
+                _ = env.?.lpVtbl.AddRef(env.?);
+                log.print("[proxy] window #{d} environment ready", .{self.window.id});
+                self.backend.beginControllerWithEnv(self.window, env.?);
+                return com.S_OK;
+            }
+        };
 
         /// ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler（主窗口）
         const EnvCompletedHandler = extern struct {

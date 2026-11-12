@@ -32,10 +32,6 @@ pub const Node = struct {
     pub fn isSeparator(self: Node) bool {
         return self.id.len == 0 and std.mem.eql(u8, self.label, "-");
     }
-
-    pub fn isSubmenu(self: Node) bool {
-        return self.children.items.len != 0;
-    }
 };
 
 pub const Model = struct {

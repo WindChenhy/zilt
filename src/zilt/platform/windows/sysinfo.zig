@@ -216,16 +216,6 @@ pub fn collectMonitors(alloc: std.mem.Allocator) ![]sysinfo.Monitor {
     return list.toOwnedSlice(alloc);
 }
 
-/// 窗口创建/DPI 变化后校正该窗口所在显示器的 DPI（GetDpiForWindow 最准确）。
-pub fn applyWindowDpi(monitors: []sysinfo.Monitor, hwnd: win32.HWND) void {
-    const dpi = GetDpiForWindow(hwnd);
-    if (dpi == 0) return;
-    for (monitors) |*m| {
-        m.dpi = dpi;
-        m.scale = sysinfo.scaleFromDpi(dpi);
-    }
-}
-
 const testing = std.testing;
 
 test "accent color conversion keeps alpha and swaps to ARGB" {

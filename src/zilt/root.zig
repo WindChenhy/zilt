@@ -8,6 +8,7 @@
 
 const builtin = @import("builtin");
 
+pub const version = @import("version.zig").version;
 pub const log = @import("log.zig");
 pub const ipc = @import("ipc.zig");
 pub const bindings = @import("bindings.zig");
@@ -59,6 +60,7 @@ pub fn run(comptime config: Config) !void {
 }
 
 test {
+    _ = @import("version.zig");
     _ = @import("security.zig");
     _ = @import("asset_routes.zig");
     _ = @import("builtin.zig");

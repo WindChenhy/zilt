@@ -43,6 +43,7 @@ pub fn render(alloc: std.mem.Allocator, options: zilt.security.Options) ![]u8 {
 
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
+    if (try generateFromJson(alloc)) return;
     const path = OUTPUT_PATH;
 
     const json = try render(alloc, app.security);
@@ -62,6 +63,31 @@ pub fn main() !void {
     var written: win32.DWORD = 0;
     if (win32.WriteFile(f, json.ptr, @intCast(json.len), &written, null) == 0) return error.WriteFailed;
     std.debug.print("generated {s} ({d} bytes, {d} capabilities)\n", .{ path, json.len, app.security.capabilities.len });
+}
+
+/// v0.1.23：JSON → Zig 策略源码。
+/// `ZILT_CAP_FROM=<capabilities.json> ZILT_CAP_OUT=<out.zig> zig build capabilities`
+/// 不设置 FROM 时保持原行为（导出 JSON）。
+fn generateFromJson(alloc: std.mem.Allocator) !bool {
+    const win32 = zilt.platform_windows.win32;
+    const from = win32.getEnvUtf8(alloc, "ZILT_CAP_FROM") orelse return false;
+    defer alloc.free(from);
+    const out = win32.getEnvUtf8(alloc, "ZILT_CAP_OUT") orelse try alloc.dupe(u8, "src/capabilities.zig");
+    defer alloc.free(out);
+
+    const codegen = @import("frontend_codegen.zig");
+    const json = codegen.readFileAlloc(alloc, from) orelse {
+        std.debug.print("capabilities: 读取 {s} 失败\n", .{from});
+        return error.ReadFailed;
+    };
+    defer alloc.free(json);
+    const src = try @import("capability_codegen.zig").renderZig(alloc, json);
+    defer alloc.free(src);
+
+    codegen.ensureDirDeep(alloc, std.fs.path.dirname(out) orelse ".") catch {};
+    if (!codegen.writeFilePayload(alloc, out, src)) return error.WriteFailed;
+    std.debug.print("generated {s} from {s} ({d} bytes)\n", .{ out, from, src.len });
+    return true;
 }
 
 test "manifest renders the enforced ACL and navigation policy" {

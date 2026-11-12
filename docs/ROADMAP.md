@@ -433,6 +433,62 @@ QI 矩阵显示 **v1/v2/v4 均返回 S_OK、仅 v3 返回 E_NOINTERFACE**，因�
 - [x] **验收**：冒烟 32 项含 store/fs/path/log/windowState + http + ws + webviews +
       **partition 隔离**（alpha/beta localStorage 互不可见、共享实例与主页面互通）
 
+### v0.1.23 — 全量审查 + 六项收尾（2026-11-12）
+
+> 先做全仓审查（死代码 / 冗余 / 缺陷），再补上 Tauri/Wails 差距表里「能做且值得做」的六项。
+
+**审查修复**
+
+- **WinHTTP 请求头长度单位**（真实越界读）：`dwHeadersLength` 以 **WCHAR 数**计，
+  原代码传 UTF-8 字节数——非 ASCII 头值（如 `X-Note: 测试`）会让 WinHTTP 读过缓冲区末尾。
+  request/openWebSocket 两处都改为按转换后的 `[:0]u16` 长度传。
+- **超时看门狗位置**：原先放在 `SendRequest` **之后**，而 SendRequest 会阻塞到收到响应头，
+  于是「TCP 已连上但服务器永不响应」卡死（v0.1.20 记录的已知限制）。改为在 SendRequest
+  之前启动看门狗，超时由 `WinHttpCloseHandle` 取消挂起 I/O → 返回 `error.Timeout`。
+- **wss 句柄泄漏**：`WebSocketCompleteUpgrade` 成功后若 `alloc.create` 失败，新句柄未释放；
+  补 `errdefer CloseHandle`。
+- **fs 路径加固**：拒绝路径中任意位置的 `:`（NTFS 备用数据流 `a.txt:hidden` / 设备名）。
+- **版本号单一来源**：运行时/MCP/CLI 统一读 `src/zilt/version.zig`，`build.zig` 顶部用
+  `comptime` 断言它与 `project.zig`（PE 资源/打包）一致——漏改一处直接编译失败。
+- **死代码清理**：`menu_runtime` 的 buildMenuBar/applyDefault/refreshMenuBar/labelFor
+  （v0.1.18 换 `menu.zig::buildWin32WithIcons` 后的遗留）+ `Ctx.root`/`default_id`、
+  `accel.menuSuffix`、`menu_model.isSubmenu`、`sysinfo.applyWindowDpi`、`winhttp.describe`。
+- **重复实现合并**：`pack/diff_patch/sign_update` 三份 `getEnv` → `src/tools/win_env.zig`。
+
+**六项能力**
+
+- [x] **CDP 逃生口**：`window.zilt.webview.cdp(method, params)` → Promise。
+  `ICoreWebView2::CallDevToolsProtocolMethod` + 自建
+  `ICoreWebView2CallDevToolsProtocolMethodCompletedHandler`
+  （IID `{5C4889F0-…}`），结果经 `webviewCdp {rid, ok, result}` 事件回传；
+  CDP 是异步的，请求本身立即返回 `{}`，避免嵌套消息循环等待。
+- [x] **截图**：`webview.captureScreenshot({format, quality})` → `data:image/png;base64,…`
+  （`Page.captureScreenshot`，实测 45 万字符 PNG data URL）。
+- [x] **每请求头**：`webview.setExtraHeaders({...})` = `Network.enable` +
+  `Network.setExtraHTTPHeaders`（作用于页面所有 HTTP 请求，区别于 `security.headers`
+  的资产响应头）。踩坑：JS 侧字段名必须是 `params_json`（std.json 不做 camel→snake）。
+- [x] **页内查找**：`webview.find(text, {matchCase, backwards, wrap})` → bool。
+  Chromium 无公开的匹配计数 API，用 `window.find` 做定位（与 Ctrl+F 语义一致，不产生高亮）。
+- [x] **每窗口代理**：`window.create({proxy})`。WebView2 代理是 Environment 级 →
+  该窗口用独立 Environment + 独立 profile（`<profile>\WebView2-windows\<id>`，
+  cookie/缓存不与主窗口共享）；崩溃恢复复用同一 Environment。
+  实测日志：`[proxy] window #3 environment ready`。
+- [x] **覆盖式标题栏**：`Config.titlebar_overlay` / `window.create({titlebarOverlay})`。
+  `WS_POPUP|WS_THICKFRAME`（无 `WS_CAPTION`）+ `WM_NCCALCSIZE` 返回 0（客户区=整窗）
+  + 自绘 `WM_NCHITTEST` 8px 缩放边；拖动复用运行时已有的
+  `data-zilt-drag-region` → `startDragging`。实测 `innerW/H == outerW/H`。
+- [x] **capability JSON DSL**：`ZILT_CAP_FROM=<capabilities.json> ZILT_CAP_OUT=<out.zig>
+  zig build capabilities` 把 JSON 反向生成 `security.Options` Zig 字面量
+  （`src/tools/capability_codegen.zig`，转义/缺省/非法枚举都有单测）；
+  生成物用 `zig build-obj -fno-emit-bin` 做过类型校验。
+
+**验收**
+
+- 单测全通过（+6：ipc 版本行拼接、version semver、win_env、capability_codegen ×3）
+- GUI 冒烟 **47 项** ALL PASSED，exit 0（新增 c-cdp / c-shot / c-hdrs / c-find / c-proxy / c-overlay）
+- `ZILT_SMOKE_OVERLAY=1` 二次冒烟：c-overlay 真实断言通过（客户区=整窗），exit 0
+- 版本 0.1.23（`window.zilt.version` / MCP serverInfo / `zilt version` 同源）
+
 ### v0.1.22 — 数据与监视收尾（P1，2026-11-11）
 
 - [x] **fs.watch**：`fs.watch(path, {scope, recursive})` → id，变更经 `fsEvent`

@@ -379,6 +379,18 @@ pub const Driver = struct {
                 try check(w16.lpVtbl.ShowPrintUI(w16, if (kind == .browser) 0 else 1));
             },
             .cancel_download => |id| try self.cancel(id),
+            // v0.1.23：CDP 是异步的——发起后立刻以 "{}" 完成本次请求，真正的结果
+            // 由 CdpHandler 以 webviewCdp 事件送回（rid 匹配）。
+            .cdp => |c| {
+                const h = try CdpHandler.create(self.allocator, self, c.rid);
+                defer h.dropRef();
+                const method = try wideZ(self.allocator, c.method);
+                defer self.allocator.free(method);
+                const params = try wideZ(self.allocator, c.params);
+                defer self.allocator.free(params);
+                try check(w.lpVtbl.CallDevToolsProtocolMethod(w, method.ptr, params.ptr, @ptrCast(&h.iface)));
+                return try self.allocator.dupe(u8, "{}");
+            },
             .eval, .cookies, .clear_storage => {
                 pending.plan = try encode(self.allocator, request, self.options.origin);
                 if (pending.plan.count == 0) return try self.allocator.dupe(u8, "null");
@@ -658,8 +670,78 @@ const Handler = struct {
     }
 };
 
-const PermissionPrompt = struct {
+/// v0.1.23：ICoreWebView2CallDevToolsProtocolMethodCompletedHandler。
+/// 结果以 `webviewCdp` 事件回主机（前端按 rid 匹配 Promise）。
+const CdpHandler = struct {
+    iface: Interface(VTable) = .{ .lpVtbl = &vtable },
     allocator: Allocator,
+    refs: u32 = 1,
+    driver: ?*Driver,
+    rid: i64,
+
+    const VTable = extern struct {
+        base: U,
+        Invoke: *const fn (*anyopaque, HRESULT, ?W) callconv(.c) HRESULT,
+    };
+    const vtable = VTable{
+        .base = .{ .QueryInterface = qi, .AddRef = addRef, .Release = subRef },
+        .Invoke = invoke,
+    };
+
+    fn create(a: Allocator, d: *Driver, rid: i64) !*CdpHandler {
+        const h = try a.create(CdpHandler);
+        h.* = .{ .allocator = a, .driver = d, .rid = rid };
+        return h;
+    }
+    fn from(raw: *anyopaque) *CdpHandler {
+        const iface: *Interface(VTable) = @ptrCast(@alignCast(raw));
+        return @fieldParentPtr("iface", iface);
+    }
+    fn qi(raw: *anyopaque, iid: *const com.GUID, out: *?*anyopaque) callconv(.c) HRESULT {
+        out.* = null;
+        if (!iid.eql(com.IID_IUnknown) and !iid.eql(wv2.IID_CallDevToolsProtocolMethodCompletedHandler)) return com.E_NOINTERFACE;
+        out.* = raw;
+        _ = addRef(raw);
+        return com.S_OK;
+    }
+    fn addRef(raw: *anyopaque) callconv(.c) u32 {
+        return @atomicRmw(u32, &from(raw).refs, .Add, 1, .monotonic) + 1;
+    }
+    fn subRef(raw: *anyopaque) callconv(.c) u32 {
+        const h = from(raw);
+        const n = @atomicRmw(u32, &h.refs, .Sub, 1, .acq_rel) - 1;
+        if (n == 0) h.allocator.destroy(h);
+        return n;
+    }
+    fn dropRef(h: *CdpHandler) void {
+        _ = subRef(&h.iface);
+    }
+
+    fn invoke(raw: *anyopaque, hr: HRESULT, wide: ?W) callconv(.c) HRESULT {
+        const h = from(raw);
+        _ = addRef(raw);
+        defer h.dropRef();
+        const d = h.driver orelse return com.S_OK;
+        if (!d.alive) return com.S_OK;
+        d.pin();
+        defer d.unpin();
+        d.callback_depth += 1;
+        defer d.callback_depth -= 1;
+        const a = d.allocator;
+        const payload = if (com.failed(hr) or wide == null)
+            std.fmt.allocPrint(a, "{{\"rid\":{d},\"ok\":false,\"error\":\"CdpFailed\"}}", .{h.rid}) catch return com.S_OK
+        else blk: {
+            const json = std.unicode.utf16LeToUtf8Alloc(a, std.mem.span(wide.?)) catch return com.S_OK;
+            defer a.free(json);
+            break :blk std.fmt.allocPrint(a, "{{\"rid\":{d},\"ok\":true,\"result\":{s}}}", .{ h.rid, json }) catch return com.S_OK;
+        };
+        defer a.free(payload);
+        d.callbacks.emit(d.context, "webviewCdp", payload);
+        return com.S_OK;
+    }
+};
+
+const PermissionPrompt = struct {    allocator: Allocator,
     args: *PermissionArgs,
     deferral: *Deferral,
     message: [:0]u16,

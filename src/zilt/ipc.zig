@@ -145,6 +145,14 @@ pub const WindowOptions = struct {
     close_requested_event: bool = false,
     /// 每窗口图标（资产路径；null = 应用默认图标）
     icon: ?[]const u8 = null,
+    /// v0.1.23：本窗口专用代理（`127.0.0.1:7890` / `http://host:port`）。
+    /// WebView2 的代理是 **Environment 级**选项，因此指定后该窗口会使用独立环境 +
+    /// 独立 profile 目录（cookie/缓存不与其他窗口共享）。
+    proxy: ?[]const u8 = null,
+    /// v0.1.23：覆盖式标题栏（无原生标题栏，WebView 铺满窗口；前端用
+    /// `data-zilt-drag-region` 拖动，窗口按钮用 window.minimize/maximize/close）。
+    /// 四边仍可缩放（8px 命中区）。
+    titlebar_overlay: bool = false,
 };
 
 /// v0.1.18：窗口光标形状（对齐 Tauri `CursorIcon` 的 Windows 子集）。
@@ -824,7 +832,10 @@ pub fn dispatchEvent(comptime Events: type, ctx: Context, name: []const u8, payl
 // 注入到页面的运行时（window.zilt）——命令无关，纯静态
 // ---------------------------------------------------------------------------
 
-pub const runtime_js =
+const runtime_version = @import("version.zig").version;
+
+/// 头/尾拆开只为把版本号拼进来——版本号只在 `version.zig` 维护，避免升版本漏改。
+const runtime_js_head =
     \\(() => {
     \\  const resolvers = new Map();
     \\  const listeners = new Map();
@@ -833,7 +844,9 @@ pub const runtime_js =
     \\  let wsSeq = 0;
     \\  let webviewEvalSeq = 0;
     \\  let channelSeq = 0;
+    \\  let cdpSeq = 0;
     \\  const webviewEvalWaiters = new Map();
+    \\  const cdpWaiters = new Map();
     \\  // SQL 参数编码：原生值 → Zig 侧 {kind:'text'|'int'|'real'|'nul', ...}
     \\  const ziltSqlParam = (v) => {
     \\    if (v === null || v === undefined) return { kind: 'nul' };
@@ -946,6 +959,39 @@ pub const runtime_js =
     \\      clearStorage: () => builtin('__zilt.webview', { action: 'clearStorage' }),
     \\      getCookies: (url) => builtin('__zilt.webview', { action: 'cookies.get', url }),
     \\      clearCookies: (origin) => builtin('__zilt.webview', { action: 'cookies.clear', url: origin }),
+    \\      // v0.1.23: 任意 CDP 调用（Promise）。逃生口：截图/请求头之外的协议能力
+    \\      // 都不必再等框架加 API。
+    \\      cdp: (method, params) => new Promise((resolve, reject) => {
+    \\        const rid = ++cdpSeq;
+    \\        cdpWaiters.set(rid, { resolve, reject });
+    \\        builtin('__zilt.webview', { action: 'cdp', method, rid, params_json: JSON.stringify(params ?? {}) })
+    \\          .catch((e) => { cdpWaiters.delete(rid); reject(e); });
+    \\      }),
+    \\      // 截屏：返回 data URL（可直接给 <img src>），format 支持 png/jpeg/webp
+    \\      captureScreenshot: async (opts) => {
+    \\        const o = opts ?? {};
+    \\        const params = { format: o.format ?? 'png' };
+    \\        if (o.quality != null) params.quality = o.quality;
+    \\        if (o.fromSurface != null) params.fromSurface = !!o.fromSurface;
+    \\        const r = await window.zilt.webview.cdp('Page.captureScreenshot', params);
+    \\        return r && r.data ? 'data:image/' + (o.format ?? 'png') + ';base64,' + r.data : '';
+    \\      },
+    \\      // 给页面的所有 HTTP 请求附加请求头（CDP Network.setExtraHTTPHeaders）
+    \\      setExtraHeaders: async (headers) => {
+    \\        await window.zilt.webview.cdp('Network.enable', {});
+    \\        await window.zilt.webview.cdp('Network.setExtraHTTPHeaders', { headers: headers ?? {} });
+    \\        return true;
+    \\      },
+    \\      // 页内查找。Chromium 没有公开的「匹配计数」API，这里用 window.find 做定位
+    \\      // （与 Ctrl+F 的导航语义一致，但不产生高亮，需要高亮请自行高亮选区）。
+    \\      find: (text, opts) => {
+    \\        const o = opts ?? {};
+    \\        const s = String(text ?? '');
+    \\        if (!s) return false;
+    \\        try {
+    \\          return window.find(s, !!o.matchCase, !!o.backwards, o.wrap !== false, false, false, false);
+    \\        } catch (e) { return false; }
+    \\      },
     \\    },
     \\    // v0.1.12: clipboard / drag / notifications
     \\    clipboard: {
@@ -1227,7 +1273,8 @@ pub const runtime_js =
     \\        action: 'migrate', path: db, version, statements: statements ?? [],
     \\      }),
     \\    },
-    \\    version: '0.1.22',
+;
+const runtime_js_tail =
     \\  };
     \\  // v0.1.21：原型冻结（security.freezePrototype）——必须在对象建好之后
     \\  if (window.__ZILT_FREEZE__) {
@@ -1241,6 +1288,12 @@ pub const runtime_js =
     \\    if (!wait) return;
     \\    webviewEvalWaiters.delete(p.rid);
     \\    if (p.ok) wait.resolve(p.value); else wait.reject(new Error(p.error || 'eval failed'));
+    \\  });
+    \\  window.zilt.on('webviewCdp', (p) => {
+    \\    const wait = cdpWaiters.get(p && p.rid);
+    \\    if (!wait) return;
+    \\    cdpWaiters.delete(p.rid);
+    \\    if (p.ok) wait.resolve(p.result); else wait.reject(new Error(p.error || 'cdp failed'));
     \\  });
     \\  window.zilt.on('__zilt.evalResult', (p) => {
     \\    const w = evalWaiters.get(p.id);
@@ -1260,11 +1313,25 @@ pub const runtime_js =
     \\
 ;
 
+pub const runtime_js = runtime_js_head ++ "\n" ++
+    "    version: '" ++ runtime_version ++ "',\n" ++
+    runtime_js_tail;
+
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "v0.1.23: runtime_js 的版本号来自 version.zig（拼接无语法破坏）" {
+    const expected = "    version: '" ++ runtime_version ++ "',\n";
+    const at = std.mem.indexOf(u8, runtime_js, expected) orelse {
+        std.debug.print("runtime_js 未找到版本行，前 200 字节：{s}\n", .{runtime_js[0..@min(200, runtime_js.len)]});
+        return error.VersionLineMissing;
+    };
+    // 版本行必须自成一行（前后都是换行），否则拼进 JS 会破坏语法
+    try testing.expect(at == 0 or runtime_js[at - 1] == '\n');
+}
 
 const TestCommands = struct {
     pub fn add(_: Context, args: struct { a: f64, b: f64 }) !f64 {

@@ -2,6 +2,16 @@ const std = @import("std");
 const project = @import("src/project.zig");
 const codegen = @import("src/tools/frontend_codegen.zig");
 
+// 版本号一致性：project.zig（打包/PE 资源）与 zilt/version.zig（运行时 window.zilt.version
+// / MCP / zilt --version）是同一版本的两处落点——模块边界决定无法共享同一份声明，
+// 因此在这里做编译期断言：任一处漏改直接编译失败。
+comptime {
+    const rt = @import("src/zilt/version.zig").version;
+    if (!std.mem.eql(u8, project.version, rt)) {
+        @compileError("版本号不一致：src/project.zig = " ++ project.version ++ "，src/zilt/version.zig = " ++ rt);
+    }
+}
+
 /// 应用 exe 图标与 VERSIONINFO（Windows PE 资源，v0.1.15）：
 /// 资源脚本在 build 期由 project.zig 插值生成（版本号不会漂移），
 /// manifest 固定在 src/zilt/assets/app.manifest；project.icon 非空时 icon 指向自定义 .ico。

@@ -30,6 +30,16 @@ v0.1.17 新增（2026-11-08，均已实现、验证并提交）：
 - **日志轮转**：4MB 阈值，zilt.log → .1 → .2 → .3（实测 5MB 日志轮转）
 - **验收**：单元测试 **234/234**（框架 216 + 工具 18）；GUI 冒烟 **32 项** ALL PASSED（exit 0，含数据分区隔离）；WebDriver 4/4；headless 四端点 + SQL 真 E2E；日志轮转实测；`zilt version` 报 0.1.17
 
+v0.1.23 新增（2026-11-12，审查 + 六项收尾）：
+
+- **CDP 逃生口 / 截图 / 每请求头**：`webview.cdp(method, params)`、`captureScreenshot()`（PNG data URL）、`setExtraHeaders({...})`（`Network.setExtraHTTPHeaders`，作用于页面全部请求）
+- **页内查找**：`webview.find(text, {matchCase, backwards, wrap})`（`window.find` 语义）
+- **每窗口代理**：`window.create({proxy})` → 独立 Environment + 独立 profile（WebView2 代理是环境级选项）
+- **覆盖式标题栏**：`Config.titlebar_overlay`，客户区覆盖整窗 + 自绘 8px 缩放边，拖动复用 `data-zilt-drag-region`
+- **capability JSON DSL**：`ZILT_CAP_FROM=capabilities.json ZILT_CAP_OUT=src/capabilities.zig zig build capabilities`
+- **审查修复**：WinHTTP 头长度单位（越界读）、超时看门狗前置（修掉 v0.1.20 的已知限制）、wss 句柄泄漏、fs 路径拒绝 NTFS ADS、版本号单一来源 + 编译期一致性断言、死代码/重复实现清理
+- **验收**：单测 **236**；冒烟 **47 项** exit 0；`ZILT_SMOKE_OVERLAY=1` 二次冒烟通过
+
 v0.1.22 新增（2026-11-11，数据与监视收尾）：
 
 - **fs.watch**：目录监视（`ReadDirectoryChangesW`）→ `fsEvent`（added/removed/modified/renamed_* + 相对路径）；`fs.unwatch` 停止（`CancelIoEx` 解阻塞，实测坑）
