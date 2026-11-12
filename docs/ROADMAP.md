@@ -92,11 +92,17 @@
             `DialogNotAvailable` / `SystemNotAvailable` / `DragNotAvailable`），
             Linux 后端照此实现即可与 Windows 行为一致；能力矩阵自身无重复且平台独占项不在 Linux 目标集。
             **Windows 回归**：冒烟 49 项 exit 0（接口改动零行为变化）。
-      - [ ] Linux 后端实现（GTK3 + WebKit2GTK 4.1）：需 Linux 构建环境；本机 WSL 被安全策略拦截，
-            待 CI（ubuntu-22.04 + xvfb）就位后落地——先 `g_application_run` + `WebKitWebView`
+      - [x] 构建工具链跨平台化（2026-11-12）：`frontend_codegen` 的 Win32 遍历/读写 →
+            `std.Io.Dir`（walk/readFileAlloc/writeFile/createDirPathStatus/deleteTree，路径统一 `/`）；
+            `log.zig` 的 Win32 追加写/轮转 → `Io.File.Writer`（positional + 显式定位末尾）+ `Io.Mutex`；
+            `tools/tests.zig` 按 OS 裁剪（`init`/`win_env`/`win_res` 暂限 Windows）。
+            **Linux（Ubuntu 22.04 / WSL2）`zig build test` 5/5 通过**；Windows 冒烟 49 项 exit 0。
+      - [ ] `build.zig` 按 OS 裁剪：Windows 专用 exe（cli/driver/keygen/sign/diff/pack/msix，链接
+            shell32/bcrypt）在 Linux 上跳过——当前 Linux `zig build` 卡在这里
+      - [ ] `init.zig` 移植到 std.Io（模板脚手架），之后放开 Linux 的工具测试
+      - [ ] Linux 后端实现（GTK3 + WebKit2GTK 4.1）：`g_application_run` + `WebKitWebView`
             + scheme 资产 + IPC 桥，再补窗口/系统集成
-      - [ ] `zilt doctor` Linux 依赖检查（cli.zig 目前深绑 Win32 文件 IO，需随之移植）
-      - [ ] `build.zig` 的 Linux 分支（pkg-config 链接 gtk-3 / webkit2gtk-4.1，Windows 资源步骤加 OS 守卫）
+      - [ ] `zilt doctor` Linux 依赖检查（随 cli 移植）
 - [ ] **v0.2.1 窗口/WebView 面**：多窗口/模态/全屏、eval、devtools、下载、分区、截图、子 WebView
 - [ ] **v0.2.2 系统集成**：单实例（GApplication）+ 深链、通知（GNotification）、剪贴板、对话框、菜单、托盘
 - [ ] **v0.2.3 安全与数据**：capability/scope 全链路、CSP、`Config.protocols` → 真 scheme、
