@@ -62,12 +62,44 @@ fn addAppIconResource(b: *std.Build, module: *std.Build.Module, icon_path: ?[]co
     module.addWin32ResourceFile(.{ .file = rc, .include_paths = include.items });
 }
 
+/// 非 Windows 上的 Windows 专用 step：请保留名字（避免 `no step named ...`），
+/// 但执行即失败并说明原因与后续计划——比悄悄不存在更有用。
+fn windowsOnlyStep(b: *std.Build, name: []const u8, desc: []const u8, target_os: std.Target.Os.Tag) *std.Build.Step {
+    const step = b.step(name, desc);
+    const msg = b.fmt(
+        "`{s}` 依赖 Win32（{s}），当前 target 是 {s}。\n" ++
+            "Linux 支持在 v0.2 分阶段推进：工具层先从 Win32 文件/编码 API 解耦，" ++
+            "再补 GTK 后端（见 docs/v0.2-LINUX.md 与 ROADMAP 的 v0.2.0 拆分）。",
+        .{ name, desc, @tagName(target_os) },
+    );
+    step.dependOn(&b.addFail(msg).step);
+    return step;
+}
+
+/// Win32 导入库（未声明的 extern 会在链接期报 undefined symbol，
+/// 因此按需显式列全；MinGW 自带这些导入库，无需 MSVC）。
+fn linkWindowsLibs(module: *std.Build.Module) void {
+    for ([_][]const u8{ "user32", "gdi32", "ole32", "advapi32", "comdlg32", "shell32" }) |lib| {
+        module.linkSystemLibrary(lib, .{});
+    }
+}
+
 pub fn build(b: *std.Build) void {
     // 默认 windows-gnu：Zig 自带 MinGW 导入库，无 MSVC 的机器也能开箱构建。
     const target = b.standardTargetOptions(.{
         .default_target = .{ .abi = .gnu },
     });
     const optimize = b.standardOptimizeOption(.{});
+
+    // ---- 平台判定（v0.2.0）----
+    // Windows 是当前唯一完整后端。非 Windows 上只保留「平台无关」的构建目标：
+    //   1. 框架/工具单测（`zig build test`，已可在 Linux 全绿）；
+    //   2. 应用 exe —— 它会在 platform/linux/backend.zig 的 @compileError 处停下，
+    //      报出「后端未实现」。这是诚实失败，而不是链接一堆 Win32 导入库后的噪声。
+    // Windows 专用工具（driver/dev/cli/bundle/keygen/sign/diff/pack/init）不参与
+    // 默认 install，对应 step 保留名字但执行即给出原因（见 windowsOnlyStep）。
+    const target_os = target.result.os.tag;
+    const is_windows = target_os == .windows;
 
     // zilt 库模块
     const zilt_mod = b.addModule("zilt", .{
@@ -193,17 +225,13 @@ pub fn build(b: *std.Build) void {
         .name = "zilt-app",
         .root_module = exe_mod,
     });
-    // GUI 子系统：双击/安装后运行不弹出控制台窗口（日志仍写 zilt.log）
-    exe.subsystem = .windows;
-
-    // Windows 系统库（Win32 extern 声明所需的导入库）
-    exe_mod.linkSystemLibrary("user32", .{});
-    exe_mod.linkSystemLibrary("gdi32", .{});
-    exe_mod.linkSystemLibrary("ole32", .{});
-    exe_mod.linkSystemLibrary("advapi32", .{});
-    exe_mod.linkSystemLibrary("comdlg32", .{});
-    exe_mod.linkSystemLibrary("shell32", .{});
-    addAppIconResource(b, exe_mod, project.icon);
+    if (is_windows) {
+        // GUI 子系统：双击/安装后运行不弹出控制台窗口（日志仍写 zilt.log）
+        exe.subsystem = .windows;
+        // Windows 系统库（Win32 extern 声明所需的导入库）
+        linkWindowsLibs(exe_mod);
+        addAppIconResource(b, exe_mod, project.icon);
+    }
 
     b.installArtifact(exe);
 
@@ -215,7 +243,12 @@ pub fn build(b: *std.Build) void {
     // ---- 前端构建（build_command；vanilla 无构建步骤 → no-op） ----
     const frontend_step = b.step("frontend", "Build the frontend (project.frontend.build_command)");
     if (frontend.build_command) |cmd| {
-        const fr = b.addSystemCommand(&.{ "cmd", "/C", cmd });
+        // build_command 是 shell 片段（`npm run build` 之类），需要对应平台的 shell：
+        // Windows 用 cmd /C，其余用 sh -c（v0.2.0）。
+        const fr = if (is_windows)
+            b.addSystemCommand(&.{ "cmd", "/C", cmd })
+        else
+            b.addSystemCommand(&.{ "sh", "-c", cmd });
         fr.setCwd(b.path(frontend.dir));
         frontend_step.dependOn(&fr.step);
     } else {
@@ -255,7 +288,9 @@ pub fn build(b: *std.Build) void {
     const cap_step = b.step("capabilities", "Generate the runtime capability manifest");
     cap_step.dependOn(&cap_run.step);
     gen_step.dependOn(&cap_run.step);
-    b.getInstallStep().dependOn(&cap_run.step);
+    // 清单是给前端用的构建期产物（不参与编译），Linux 上先不挂到默认 install：
+    // 它会编译同一份 zilt_mod，从而遮蔽真正的「后端未实现」报错。
+    if (is_windows) b.getInstallStep().dependOn(&cap_run.step);
 
     // ---- v0.1.17：WebDriver 自动化驱动（msedgedriver W3C 协议） ----
     const driver_mod = b.createModule(.{
@@ -263,20 +298,25 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    driver_mod.linkSystemLibrary("shell32", .{});
     const driver_exe = b.addExecutable(.{
         .name = "zilt-driver",
         .root_module = driver_mod,
     });
-    const driver_install = b.addInstallArtifact(driver_exe, .{});
-    b.getInstallStep().dependOn(&driver_install.step);
+    if (is_windows) {
+        driver_mod.linkSystemLibrary("shell32", .{});
+        const driver_install = b.addInstallArtifact(driver_exe, .{});
+        b.getInstallStep().dependOn(&driver_install.step);
 
-    // e2e：对构建产物跑 WebDriver（无 msedgedriver 时 SKIP）
-    const e2e_run = b.addRunArtifact(driver_exe);
-    e2e_run.addArg(b.fmt("zig-out\\bin\\{s}.exe", .{exe.name}));
-    e2e_run.step.dependOn(b.getInstallStep());
-    const e2e_step = b.step("e2e", "Run WebDriver E2E against the built app (SKIP without msedgedriver)");
-    e2e_step.dependOn(&e2e_run.step);
+        // e2e：对构建产物跑 WebDriver（无 msedgedriver 时 SKIP）
+        const e2e_run = b.addRunArtifact(driver_exe);
+        e2e_run.addArg(b.fmt("zig-out\\bin\\{s}.exe", .{exe.name}));
+        e2e_run.step.dependOn(b.getInstallStep());
+        const e2e_step = b.step("e2e", "Run WebDriver E2E against the built app (SKIP without msedgedriver)");
+        e2e_step.dependOn(&e2e_run.step);
+    } else {
+        // v0.2 计划：同一 driver 加 WebKitWebDriver 后端（docs/v0.2-LINUX.md §7）
+        _ = windowsOnlyStep(b, "e2e", "WebDriver E2E", target_os);
+    }
 
     // ---- dev：spawn dev 命令 → TCP 等待 → 应用直连 devUrl（HMR） ----
     const dev_mod = b.createModule(.{
@@ -284,28 +324,32 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    dev_mod.linkSystemLibrary("ws2_32", .{});
-    dev_mod.linkSystemLibrary("shell32", .{});
     const dev_exe = b.addExecutable(.{
         .name = "zilt-dev",
         .root_module = dev_mod,
     });
-    // v0.1.17：dev 工具也装到 zig-out/bin（此前只在 zig-cache 里，用户拿不到）
-    b.getInstallStep().dependOn(&b.addInstallArtifact(dev_exe, .{}).step);
-    const dev_run = b.addRunArtifact(dev_exe);
-    // v0.1.17：跑 zig-out/bin 的真实产物（而非 .zig-cache 内的 hash 目录副本）——
-    // 热重启监视/重启都指向同一稳定路径；重建后 install 覆盖该文件即可触发。
-    dev_run.addArg(b.fmt("zig-out\\bin\\{s}.exe", .{exe.name}));
-    dev_run.addArg(frontend.dev_command orelse "-");
-    dev_run.addArg(frontend.dev_url orelse "-");
-    dev_run.addArg(std.fmt.allocPrint(b.allocator, "{d}", .{frontend.wait_timeout_secs}) catch "90");
-    dev_run.addArg(frontend.dir);
-    dev_run.addArg(if (frontend.dev_proxy) "1" else "-"); // 反代模式标志（Phase C）
+    if (is_windows) {
+        dev_mod.linkSystemLibrary("ws2_32", .{});
+        dev_mod.linkSystemLibrary("shell32", .{});
+        // v0.1.17：dev 工具也装到 zig-out/bin（此前只在 zig-cache 里，用户拿不到）
+        b.getInstallStep().dependOn(&b.addInstallArtifact(dev_exe, .{}).step);
+        const dev_run = b.addRunArtifact(dev_exe);
+        // v0.1.17：跑 zig-out/bin 的真实产物（而非 .zig-cache 内的 hash 目录副本）——
+        // 热重启监视/重启都指向同一稳定路径；重建后 install 覆盖该文件即可触发。
+        dev_run.addArg(b.fmt("zig-out\\bin\\{s}.exe", .{exe.name}));
+        dev_run.addArg(frontend.dev_command orelse "-");
+        dev_run.addArg(frontend.dev_url orelse "-");
+        dev_run.addArg(std.fmt.allocPrint(b.allocator, "{d}", .{frontend.wait_timeout_secs}) catch "90");
+        dev_run.addArg(frontend.dir);
+        dev_run.addArg(if (frontend.dev_proxy) "1" else "-"); // 反代模式标志（Phase C）
 
-    dev_run.step.dependOn(&gen_run.step);
-    dev_run.step.dependOn(b.getInstallStep());
-    const dev_step = b.step("dev", "Run frontend dev server + app (HMR)");
-    dev_step.dependOn(&dev_run.step);
+        dev_run.step.dependOn(&gen_run.step);
+        dev_run.step.dependOn(b.getInstallStep());
+        const dev_step = b.step("dev", "Run frontend dev server + app (HMR)");
+        dev_step.dependOn(&dev_run.step);
+    } else {
+        _ = windowsOnlyStep(b, "dev", "frontend dev server + app (HMR)", target_os);
+    }
 
     // ---- 单元测试（框架 + 工具） ----
     const unit_tests = b.addTest(.{ .root_module = zilt_mod });
@@ -343,14 +387,11 @@ pub fn build(b: *std.Build) void {
         .name = "zilt-app",
         .root_module = rel_app_mod,
     });
-    rel_app.subsystem = .windows; // 分发产物无控制台窗口
-    rel_app_mod.linkSystemLibrary("user32", .{});
-    rel_app_mod.linkSystemLibrary("gdi32", .{});
-    rel_app_mod.linkSystemLibrary("ole32", .{});
-    rel_app_mod.linkSystemLibrary("advapi32", .{});
-    rel_app_mod.linkSystemLibrary("comdlg32", .{});
-    rel_app_mod.linkSystemLibrary("shell32", .{});
-    addAppIconResource(b, rel_app_mod, project.icon);
+    if (is_windows) {
+        rel_app.subsystem = .windows; // 分发产物无控制台窗口
+        linkWindowsLibs(rel_app_mod);
+        addAppIconResource(b, rel_app_mod, project.icon);
+    }
 
     // ---- v0.1.17：zilt CLI（doctor / info / version）----
     const cli_mod = b.createModule(.{
@@ -362,22 +403,29 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = app_meta_mod },
         },
     });
-    cli_mod.linkSystemLibrary("user32", .{});
-    cli_mod.linkSystemLibrary("advapi32", .{});
-    cli_mod.linkSystemLibrary("shell32", .{});
     const cli_exe = b.addExecutable(.{ .name = "zilt", .root_module = cli_mod });
-    b.installArtifact(cli_exe);
+    if (is_windows) {
+        cli_mod.linkSystemLibrary("user32", .{});
+        cli_mod.linkSystemLibrary("advapi32", .{});
+        cli_mod.linkSystemLibrary("shell32", .{});
+        b.installArtifact(cli_exe);
 
-    // 便捷 step（0.17 的 Build 无 args 字段，故按子命令各建一个 step）
-    const doctor_run = b.addRunArtifact(cli_exe);
-    doctor_run.addArg("doctor");
-    const doctor_step = b.step("doctor", "Run `zilt doctor` (build environment check)");
-    doctor_step.dependOn(&doctor_run.step);
+        // 便捷 step（0.17 的 Build 无 args 字段，故按子命令各建一个 step）
+        const doctor_run = b.addRunArtifact(cli_exe);
+        doctor_run.addArg("doctor");
+        const doctor_step = b.step("doctor", "Run `zilt doctor` (build environment check)");
+        doctor_step.dependOn(&doctor_run.step);
 
-    const info_run = b.addRunArtifact(cli_exe);
-    info_run.addArg("info");
-    const info_step = b.step("info", "Run `zilt info` (project config summary)");
-    info_step.dependOn(&info_run.step);
+        const info_run = b.addRunArtifact(cli_exe);
+        info_run.addArg("info");
+        const info_step = b.step("info", "Run `zilt info` (project config summary)");
+        info_step.dependOn(&info_run.step);
+    } else {
+        // cli.zig 目前深绑 Win32 文件/控制台 API；Linux 化是 v0.2.0 的一项
+        // （先抽 tools/fsio.zig 的 posix 实现，再加 pkg-config 依赖检查）
+        _ = windowsOnlyStep(b, "doctor", "build environment check", target_os);
+        _ = windowsOnlyStep(b, "info", "project config summary", target_os);
+    }
 
     const bundle_mod = b.createModule(.{
         .root_source_file = b.path("src/tools/bundle.zig"),
@@ -388,17 +436,23 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = app_meta_mod },
         },
     });
-    bundle_mod.linkSystemLibrary("shell32", .{}); // CommandLineToArgvW
     const bundle_exe = b.addExecutable(.{
         .name = "zilt-bundle",
         .root_module = bundle_mod,
     });
-    const bundle_run = b.addRunArtifact(bundle_exe);
-    bundle_run.addArtifactArg(rel_app); // argv[1] = Release exe 路径
-    const bundle_step = b.step("bundle", "Package distributables into dist/");
-    bundle_step.dependOn(&bundle_run.step);
+    if (is_windows) {
+        bundle_mod.linkSystemLibrary("shell32", .{}); // CommandLineToArgvW
+        const bundle_run = b.addRunArtifact(bundle_exe);
+        bundle_run.addArtifactArg(rel_app); // argv[1] = Release exe 路径
+        const bundle_step = b.step("bundle", "Package distributables into dist/");
+        bundle_step.dependOn(&bundle_run.step);
+    } else {
+        _ = windowsOnlyStep(b, "bundle", "package distributables into dist/", target_os);
+    }
 
     // ---- 更新签名工具：keygen / sign ----
+    // gen_keys 用 bcrypt（BCryptGenRandom）；sign_update 通过 win_env 读环境变量
+    // （GetEnvironmentVariableW）——两者都是 Win32。
     const keygen = b.addExecutable(.{
         .name = "zilt-keygen",
         .root_module = b.createModule(.{
@@ -407,9 +461,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    keygen.root_module.linkSystemLibrary("bcrypt", .{});
-    b.installArtifact(keygen);
-
     const sign = b.addExecutable(.{
         .name = "zilt-sign",
         .root_module = b.createModule(.{
@@ -418,7 +469,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    b.installArtifact(sign);
 
     // ---- 差分包生成（zilt-patch v1）----
     const diff_mod = b.createModule(.{
@@ -430,7 +480,6 @@ pub fn build(b: *std.Build) void {
         },
     });
     const diff_exe = b.addExecutable(.{ .name = "zilt-diff", .root_module = diff_mod });
-    b.installArtifact(diff_exe);
 
     // ---- 跨平台打包编排（msi/macos/appimage/deb/rpm/sign）----
     const pack_mod = b.createModule(.{
@@ -443,11 +492,6 @@ pub fn build(b: *std.Build) void {
         },
     });
     const pack_exe = b.addExecutable(.{ .name = "zilt-pack", .root_module = pack_mod });
-    b.installArtifact(pack_exe);
-    const pack_run = b.addRunArtifact(pack_exe);
-    pack_run.addArtifactArg(rel_app); // argv[1] = Release exe
-    const pack_step = b.step("pack", "Cross-platform packaging (ZILT_PACK_TARGET=msi|macos|appimage|deb|rpm|sign)");
-    pack_step.dependOn(&pack_run.step);
 
     // ---- init：项目模板创建 ----
     const init_mod = b.createModule(.{
@@ -455,13 +499,33 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    init_mod.linkSystemLibrary("shell32", .{});
-    init_mod.linkSystemLibrary("bcrypt", .{});
     const init_exe = b.addExecutable(.{
         .name = "zilt-init",
         .root_module = init_mod,
     });
-    const init_run = b.addRunArtifact(init_exe);
-    const init_step = b.step("init", "Create a new project from a template (ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=myapp zig build init)");
-    init_step.dependOn(&init_run.step);
+
+    if (is_windows) {
+        keygen.root_module.linkSystemLibrary("bcrypt", .{});
+        b.installArtifact(keygen);
+        b.installArtifact(sign);
+
+        b.installArtifact(diff_exe);
+
+        b.installArtifact(pack_exe);
+        const pack_run = b.addRunArtifact(pack_exe);
+        pack_run.addArtifactArg(rel_app); // argv[1] = Release exe
+        const pack_step = b.step("pack", "Cross-platform packaging (ZILT_PACK_TARGET=msi|macos|appimage|deb|rpm|sign)");
+        pack_step.dependOn(&pack_run.step);
+
+        init_mod.linkSystemLibrary("shell32", .{});
+        init_mod.linkSystemLibrary("bcrypt", .{});
+        const init_run = b.addRunArtifact(init_exe);
+        const init_step = b.step("init", "Create a new project from a template (ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=myapp zig build init)");
+        init_step.dependOn(&init_run.step);
+    } else {
+        // 这几个工具只做 Windows 产物（PEVERSIONINFO/NSIS/MSIX/Authenticode）；
+        // Linux 打包（deb/rpm/AppImage/Flatpak）是 v0.2.4，届时 pack.zig 会分平台实现。
+        _ = windowsOnlyStep(b, "pack", "cross-platform packaging", target_os);
+        _ = windowsOnlyStep(b, "init", "create a project from a template", target_os);
+    }
 }

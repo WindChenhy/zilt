@@ -97,8 +97,15 @@
             `log.zig` 的 Win32 追加写/轮转 → `Io.File.Writer`（positional + 显式定位末尾）+ `Io.Mutex`；
             `tools/tests.zig` 按 OS 裁剪（`init`/`win_env`/`win_res` 暂限 Windows）。
             **Linux（Ubuntu 22.04 / WSL2）`zig build test` 5/5 通过**；Windows 冒烟 49 项 exit 0。
-      - [ ] `build.zig` 按 OS 裁剪：Windows 专用 exe（cli/driver/keygen/sign/diff/pack/msix，链接
-            shell32/bcrypt）在 Linux 上跳过——当前 Linux `zig build` 卡在这里
+      - [x] `build.zig` 按 OS 裁剪（2026-11-13）：`target.result.os.tag` 判定 + `linkWindowsLibs`
+            收敛六库链接 + `windowsOnlyStep`（非 Windows 上 step 保留名字、执行即给出原因）。
+            Windows 专用 exe（cli/driver/dev/bundle/keygen/sign/diff/pack/init）不再链接
+            shell32/bcrypt，也不参与默认 install；`capabilities` 清单同样不挂默认 install
+            （否则会编译同一份 `zilt_mod`、遮蔽真正的后端报错）。`frontend.build_command`
+            在非 Windows 上改用 `sh -c`。
+            **结果**：Linux `zig build` 只走 `install → zilt-app` 一条链，报错即
+            `platform/linux/backend.zig` 的「Linux 后端尚未实现」；`zig build test` 仍全绿；
+            `zig build doctor` 打印依赖 Win32 的原因与 v0.2 计划。Windows 侧产物与之前完全一致。
       - [ ] `init.zig` 移植到 std.Io（模板脚手架），之后放开 Linux 的工具测试
       - [ ] Linux 后端实现（GTK3 + WebKit2GTK 4.1）：`g_application_run` + `WebKitWebView`
             + scheme 资产 + IPC 桥，再补窗口/系统集成
