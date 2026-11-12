@@ -55,6 +55,15 @@ Zilt 是基于**系统 WebView** 的跨平台 GUI 框架（对标 Tauri 2 / Wail
 └────────────────────────────────────────────┘
 ```
 
+**平台边界（v0.2 起）**：`platform/` 是唯一允许出现 OS API 的目录。
+
+- 平台无关层（`ipc` / `security` / `fs_api` / `protocol` / `net` / `sql` / `store` / `updater` /
+  `patch` / `pack_formats` / `bindings`）两平台共用；
+- 平台层通过 `ipc.Context` 的函数指针（`clipboard_*`、`webview_request_fn`、`spawn_window_fn`…）
+  向核心暴露能力，Windows 后端直接实现，Linux 后端（v0.2）同样实现；
+- 线程封送：Windows = `PostMessageW(WM_ZILT_*)`，Linux = `g_idle_add`（详见
+  [`docs/v0.2-LINUX.md`](v0.2-LINUX.md) §3.3）。
+
 ## 用户视角的 API
 
 ```zig

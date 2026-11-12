@@ -77,9 +77,22 @@
 
 ## Phase 1（调整后）— Linux / macOS 绑定
 
-- [ ] Linux：zig-gobject（webkit2gtk-4.1 与 webkitgtk-6.0）+ GTK 窗口
-- [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）
-- [ ] 统一平台接口（后端 trait 化：createWindow/serveAssets/postMessage/emit marshal）
+> **v0.2 起做 Linux**。详细需求、选型与里程碑见 [`docs/v0.2-LINUX.md`](v0.2-LINUX.md)。
+> 技术栈决定：默认 **GTK3 + WebKit2GTK 4.1**（覆盖 Ubuntu 22.04 / Debian 12 / RHEL 9），
+> v0.2.5 提供 GTK4 + WebKitGTK 6.0 构建变体（对齐 Wails v3 的现代栈；Tauri 2 目前仍是 GTK3）。
+> 绑定用 `@cImport` + pkg-config（GTK/WebKit 是稳定 C ABI），不引入第三方 GObject 绑定。
+
+- [ ] **v0.2.0 骨架**：抽出平台接口（`ipc.Context` 构造收敛），Linux 后端（GtkApplication +
+      WebKitWebView + scheme 资产 + IPC 桥），`zilt doctor` 加 pkg-config 检查
+- [ ] **v0.2.1 窗口/WebView 面**：多窗口/模态/全屏、eval、devtools、下载、分区、截图、子 WebView
+- [ ] **v0.2.2 系统集成**：单实例（GApplication）+ 深链、通知（GNotification）、剪贴板、对话框、菜单、托盘
+- [ ] **v0.2.3 安全与数据**：capability/scope 全链路、CSP、`Config.protocols` → 真 scheme、
+      fs watch（inotify）/流式、SQL（libsqlite3）、http/ws（libsoup）
+- [ ] **v0.2.4 打包与 CI**：deb/rpm/AppImage/Flatpak + Xvfb 冒烟 + WebKitWebDriver
+- [ ] **v0.2.5 GTK4 变体与稳定化**：`-Dgtk=gtk4`、Wayland/HiDPI、性能基线
+- [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）——v0.3+
+- [x] 平台差异收敛原则：平台无关层（ipc/security/fs_api/protocol/net/sql/store/patch/pack_formats）
+      两平台共用，差异只出现在 `platform/<os>/`
 
 ## Phase 3 — 打包器与周边 🚧 Windows 部分完成（2026-11-07，v0.1.0）
 

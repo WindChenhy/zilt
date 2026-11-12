@@ -6,7 +6,20 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.22（Windows 全栈 + 前端工程化 + 多窗口/持久化/隔离 + WebView2 事件面/Settings/环境 + capability ACL + 托盘/菜单/快捷键/任务栏 + 系统信息/主题/Shell/自启 + PE VERSIONINFO/manifest + 安装器增强（per-machine/License/协议与文件关联）+ store/fs/path/log/opener/windowState 周边 API + 更新器通道/崩溃回滚/健康确认 + 代码签名（签名产物已实测 Authenticode + RFC3161）+ MSI（WiX 3.14 自动 vendor，安装/卸载实测）+ MSIX（makeappx，松散注册实测）+ services 生命周期 + http（异步）+ websocket 客户端 + 单窗口多 WebView + 前端对话框/子进程/图标生成 CLI + SQL（SQLite 动态加载）+ headless/server 模式 + 热重启 dev + npm 运行时包/脚手架 + SQL + 多 WebView 数据分区 + 窗口精细控制/菜单角色与加速键/托盘 hover + fs 全量/scope ACL/channel/MCP + WinHTTP（https/wss/代理/流式/multipart）+ scope 全覆盖/运行时授权/原型冻结 + fs.watch/流式读/SQL 迁移 + 8 套模板 + WebDriver 自动化 + CI 流水线 + `zilt` CLI）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.1.24（Windows 全栈）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
+| 平台 | 状态 | 技术栈 |
+|---|---|---|
+| Windows | ✅ 0.1.x 全栈 | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
+| Linux | 🚧 v0.2（[需求文档](docs/v0.2-LINUX.md)） | GTK3 + WebKit2GTK 4.1；v0.2.5 增 GTK4 + WebKitGTK 6.0 变体 |
+| macOS | ⏳ v0.3+ | WKWebView（zig-objc 路线） |
+
+Windows 能力面：窗口/多窗口/覆盖式标题栏、WebView2 事件面与 Settings、IPC + 事件 + 流式 channel、
+内嵌资产（gzip/ETag/Range）、capability ACL + scope + 运行时授权、fs（scope/watch/流式）、SQL、
+store、http（WinHTTP：https/wss/代理/multipart/流式）、托盘/菜单/快捷键/任务栏/通知/剪贴板/拖放/对话框、
+自启/深链/单实例、更新器（ed25519 + 差分 + 回滚）、打包（NSIS/MSI/MSIX/zip）、headless + MCP、
+WebDriver、8 套模板、`zilt` CLI；v0.1.23 起含 CDP 逃生口/截图/每请求头/页内查找/每窗代理、
+v0.1.24 起含每窗口 UA 与应用自定义协议。
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 
@@ -227,6 +240,7 @@ TS 工程用生成的绑定：`const g = await greet({ name: 'Zilt' });`（全�
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 分层架构、IPC/内存契约、运行模式 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 路线图与验收记录 |
+| [docs/v0.2-LINUX.md](docs/v0.2-LINUX.md) | **v0.2 Linux 开发需求文档**（选型/架构/功能矩阵/v0.2.0–v0.2.5 里程碑） |
 | [docs/research/](docs/research/) | 可行性调研报告（全部一手来源） |
 | [docs/reference/](docs/reference/) | WebView2 ABI 笔记（IID/vtable/loader 协议/实测陷阱） |
 | [docs/adr/](docs/adr/) | 架构决策记录 |
