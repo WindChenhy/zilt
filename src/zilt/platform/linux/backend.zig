@@ -121,6 +121,7 @@ const clipboard = @import("../../clipboard.zig");
 const notification = @import("../../notification.zig");
 const window_state = @import("window_state.zig");
 const sys = @import("../../sys.zig");
+const gtk_compat = @import("gtk_compat.zig");
 const deep_link = @import("deep_link.zig");
 const desktop_entry = @import("desktop_entry.zig");
 const sysinfo_linux = @import("sysinfo_linux.zig");
@@ -464,7 +465,7 @@ pub fn run(comptime config: Config) !void {
     }
 
     // 无 DISPLAY 时 gtk_init 会直接 abort —— CI 必须用 xvfb-run（见 docs/v0.2-LINUX.md §7）
-    c.gtk_init(null, null);
+    gtk_compat.gtkInit();
 
     // scheme 必须在创建 WebView 之前注册（web process 首次启动后不再接受）
     const wc = c.webkit_web_context_get_default();
@@ -3174,7 +3175,16 @@ fn Backend(comptime config: Config) type {
                     try self.startSnapshot(w, cdp.rid);
                     return try alloc.dupe(u8, "{}");
                 },
-                .print => return error.NotSupported,
+                // v0.2.5：print 实装——WebKitPrintOperation 原生打印对话框
+                //（对齐 Windows 的原生打印 UI；模态，真实桌面交互，冒烟不覆盖）。
+                // system（系统打印首选项）在 Linux 无标准 API → NotSupported。
+                .print => |kind| {
+                    if (kind == .system) return error.NotSupported;
+                    const op = c.webkit_print_operation_new(view);
+                    if (op == null) return error.NotSupported;
+                    defer c.g_object_unref(@ptrCast(op));
+                    _ = c.webkit_print_operation_run_dialog(op, null);
+                },
             }
             return try alloc.dupe(u8, "null");
         }

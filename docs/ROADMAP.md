@@ -205,7 +205,15 @@
       glibc 2.34+ 并入 libc——`linker_allow_shlib_undefined = true`）；
       pack_formats 单测此前从未被编译执行（root.zig 补引用 + 修正与实现脱节的
       断言）。Flatpak manifest 为静态产物（flatpak-builder 实测留待有环境的 CI）。
-- [ ] **v0.2.5 GTK4 变体与稳定化**：`-Dgtk=gtk4`、Wayland/HiDPI、性能基线
+- [~] **v0.2.5 GTK4 变体与稳定化**（2026-11-14）：**print 实装**（P2 兑现——
+      WebKitPrintOperation 原生打印对话框，browser=对话框/system=NotSupported，
+      模态交互冒烟不覆盖）；**`-Dgtk=gtk4` 构建选项**（pkg-config 切换 gtk4 +
+      webkitgtk-6.0；22.04 无 6.0 dev 包 → pkg-config 可读报错；完整 GTK4 后端
+      需 24.04+ 环境）+ **gtk_compat.zig**（编译期按 `gtk_init` 参数个数判定
+      变体 + gtkInit/menuBarAvailable 适配 + 差异清单文档）；**性能基线**
+      （scripts/linux/dev-perf.sh，ReleaseSafe：构建缓存 3.4s、冒烟全程
+      ~8.4s、峰值 RSS ~215MB，2026-11-14 记录）。Wayland 实测/输入法/无障碍
+      仍在清单上（需桌面会话环境）。
 - [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）——v0.3+
 - [x] 平台差异收敛原则：平台无关层（ipc/security/fs_api/protocol/net/sql/store/patch/pack_formats）
       两平台共用，差异只出现在 `platform/<os>/`

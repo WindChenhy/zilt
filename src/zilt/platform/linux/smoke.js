@@ -236,10 +236,11 @@ function runSecondWindowProbe() {
     const rUaReset = await Z().invoke('__zilt.webview', { action: 'setUserAgent', user_agent: '' });
     check('webview.calls', rStop !== false && rUa !== false && rUaReset !== false, `stop=${rStop} ua=${rUa}/${rUaReset}`);
 
-    // 未实现项：print → NotSupported（错误名经 reject 稳定下发）
-    let printErr = '';
-    try { await V.print('browser'); } catch (e) { printErr = String(e.message || e); }
-    check('webview.unimpl', printErr === 'NotSupported', printErr);
+    // v0.2.5：print 已实装（WebKitPrintOperation 原生对话框，模态）——无头冒烟
+    // 不能交互，改为断言 system 变体（Linux 无系统打印首选项 API）稳定 NotSupported
+    let sysPrintErr = '';
+    try { await Z().invoke('__zilt.webview', { action: 'print', kind: 'system' }); } catch (e) { sysPrintErr = String(e.message || e); }
+    check('webview.unimpl', sysPrintErr === 'NotSupported', sysPrintErr);
 
     // 截图：runtime 的 captureScreenshot 走 cdp Page.captureScreenshot，
     // Linux 用 webkit_web_view_get_snapshot + cairo PNG 实现（返回 data URL）

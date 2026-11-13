@@ -62,6 +62,11 @@ fn addAppIconResource(b: *std.Build, module: *std.Build.Module, icon_path: ?[]co
     module.addWin32ResourceFile(.{ .file = rc, .include_paths = include.items });
 }
 
+/// GTK 变体的 pkg-config 包名（v0.2.5：build() 里按 -Dgtk 赋值；
+/// translate-c 的 include 与 linkLinuxWebviewLibs 共用）。
+var gtk_pkg_name: []const u8 = "gtk+-3.0";
+var webkit_pkg_name: []const u8 = "webkit2gtk-4.1";
+
 /// pkg-config 的 `-I` 目录（构建 translate-c 需要头文件路径）。
 ///
 /// 只在 linux 目标上调用；宿主没有 pkg-config 或缺少开发包时给出可执行的报错，
@@ -110,11 +115,11 @@ fn pkgConfigIncludeDirs(b: *std.Build, packages: []const []const u8) []const []c
 /// libdir 加进搜索路径。
 fn linkLinuxWebviewLibs(b: *std.Build, module: *std.Build.Module) void {
     module.link_libc = true;
-    for (pkgConfigLibDirs(b, &.{ "gtk+-3.0", "webkit2gtk-4.1", "libsoup-3.0" })) |dir| {
+    for (pkgConfigLibDirs(b, &.{ gtk_pkg_name, webkit_pkg_name, "libsoup-3.0" })) |dir| {
         module.addLibraryPath(.{ .cwd_relative = dir });
     }
-    module.linkSystemLibrary("gtk-3", .{});
-    module.linkSystemLibrary("webkit2gtk-4.1", .{});
+    module.linkSystemLibrary(gtk_pkg_name, .{});
+    module.linkSystemLibrary(webkit_pkg_name, .{});
     module.linkSystemLibrary("libsoup-3.0", .{}); // scheme 响应头（CSP/security.headers）
 }
 
@@ -209,6 +214,18 @@ pub fn build(b: *std.Build) void {
     const is_windows = target_os == .windows;
     const is_linux = target_os == .linux;
 
+    // ---- Linux：GTK 变体（v0.2.5）----
+    // -Dgtk=gtk4 切换到 GTK4 + WebKitGTK 6.0（Ubuntu 24.04+/Debian 13+）。
+    // 本机/22.04 CI 无 webkitgtk-6.0 开发包时，pkg-config 给出可读报错——
+    // 完整 GTK4 后端（GtkMenuBar 移除/事件模型差异）见 docs/v0.2-LINUX.md §v0.2.5。
+    const gtk_variant = b.option([]const u8, "gtk", "GTK toolkit variant: gtk3 (default) | gtk4") orelse "gtk3";
+    if (!std.mem.eql(u8, gtk_variant, "gtk3") and !std.mem.eql(u8, gtk_variant, "gtk4")) {
+        std.debug.print("invalid -Dgtk value (expected gtk3|gtk4)\n", .{});
+        @panic("invalid -Dgtk value (expected gtk3|gtk4)");
+    }
+    gtk_pkg_name = if (std.mem.eql(u8, gtk_variant, "gtk4")) "gtk4" else "gtk+-3.0";
+    webkit_pkg_name = if (std.mem.eql(u8, gtk_variant, "gtk4")) "webkitgtk-6.0" else "webkit2gtk-4.1";
+
     // ---- Linux：GTK3 + WebKit2GTK 4.1 绑定（v0.2.0）----
     // Zig 0.17 移除了 @cImport，改为构建期 translate-c：把 capi.h 翻成 Zig 模块。
     // 只在 linux 目标上创建，Windows 构建完全不产生这项成本（约 8 万行、首次 ~1 分钟，
@@ -219,7 +236,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        for (pkgConfigIncludeDirs(b, &.{ "gtk+-3.0", "webkit2gtk-4.1" })) |dir| {
+        for (pkgConfigIncludeDirs(b, &.{ gtk_pkg_name, webkit_pkg_name })) |dir| {
             tc.addSystemIncludePath(.{ .cwd_relative = dir });
         }
         break :blk tc.createModule();
