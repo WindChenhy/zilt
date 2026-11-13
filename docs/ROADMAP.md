@@ -143,7 +143,21 @@
             冒烟 33 → **40 项 exit 0**
       - [ ] print（P2）：Linux 仍 NotSupported——WebKit 打印 UI 走 GTK PrintOperation，
             规划随 v0.2.5 稳定化补齐（能力清单里本来就列为 P2）
-- [ ] **v0.2.2 系统集成**：单实例（GApplication）+ 深链、通知（GNotification）、剪贴板、对话框、菜单、托盘
+- [~] **v0.2.2 系统集成**（2026-11-13 进行中；Linux 侧第一批已落地）：
+      - [x] **剪贴板**：文本 / HTML / 文件列表 / 图片读写（GTK 剪贴板；HTML 与
+            URI 列表走延迟提供）；`clipboard_change_event` → `clipboardChanged`
+      - [x] **原生对话框**：消息框 / 打开 / 保存 / 选文件夹 / 多选 / 颜色 / 字体
+            （GtkFileChooserNative，有 portal 时走 portal；字体用 Pango 解析）
+      - [x] **通知**：GApplication + GNotification（tag 替换）；无 D-Bus 总线时
+            降级 `disabled_for_application`，不阻断启动
+      - [x] **菜单栏**：config.menu → 每窗口 GtkMenuBar；叶子 activate → `menu` 事件
+            {id}；无 id 叶子置灰（加速键/角色分发未接）
+      - [x] **托盘**：libayatana-appindicator3 **dlopen 可选依赖**（缺失仅日志）；
+            Config.tray.menu → GtkMenu；激活 → `trayMenu` {id}
+      - [ ] **单实例 + 深链**：GApplication 唯一 ID + G_APPLICATION_HANDLES_COMMAND_LINE、
+            `.desktop` + `xdg-mime` 注册、第二实例 argv 转交
+      - [ ] 运行时菜单模型（`window.zilt.menu.*` 的 list/add/remove/set/popup）、
+            拖放、自启动/系统信息（P2）
 - [ ] **v0.2.3 安全与数据**：capability/scope 全链路、CSP、`Config.protocols` → 真 scheme、
       fs watch（inotify）/流式、SQL（libsqlite3）、http/ws（libsoup）
 - [ ] **v0.2.4 打包与 CI**：deb/rpm/AppImage/Flatpak + Xvfb 冒烟 + WebKitWebDriver

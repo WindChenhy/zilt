@@ -1,4 +1,4 @@
-//! Linux 平台后端（v0.2.1）：GTK3 + WebKit2GTK 4.1。
+﻿//! Linux 平台后端（v0.2.1）：GTK3 + WebKit2GTK 4.1。
 //!
 //! 本版目标是把 Windows 那套「资产 + IPC」模型在 Linux 上立起来，且**可验证**：
 //!   - 窗口：`gtk_window_new` + `webkit_web_view_new_with_user_content_manager`
@@ -38,6 +38,19 @@
 //!       哈希文件名）→ state_key / persist_window_state 在创建时恢复、销毁时保存；
 //!       `window.zilt.windowState.get/save` 走 system_fn 的 `.window_state` op。
 //!     print 仍返回 NotSupported（P2，见能力清单）。
+//!   - v0.2.2（进行中）：系统集成第一批——
+//!     * **剪贴板**：文本 / HTML / 文件列表 / 图片读写（GTK 剪贴板；HTML 与
+//!       URI 列表走延迟提供，owner-change 可选发 clipboardChanged 事件）。
+//!     * **原生对话框**：消息框 / 打开 / 保存 / 选文件夹 / 多选 / 颜色 / 字体
+//!       （GtkFileChooserNative 在有 portal 时走 portal；字体用 Pango 描述解析）。
+//!     * **通知**：GApplication + GNotification（tag 替换语义）；无 D-Bus 会话总线时
+//!       按设计降级为 status=disabled_for_application，不阻断启动。
+//!     * **菜单栏**：config.menu → 每窗口 GtkMenuBar，叶子 activate 发 `menu` 事件
+//!       {id}；无 id 叶子置灰（加速键文本/角色分发尚未接）。
+//!     * **托盘**：libayatana-appindicator3 **dlopen 可选依赖**（缺失只日志），
+//!       Config.tray.menu → GtkMenu，激活发 `trayMenu` 事件 {id}。
+//!     * 尚未做：单实例 + 深链（GApplication 唯一 ID/命令行转交）、运行时菜单模型
+//!       （menu.* op）、拖放、自启动/系统信息（P2）。
 //!   - v0.2.1 切片 3：**多窗口 + 子 WebView + 数据分区**已接通——
 //!     * 窗口注册表：每窗口独立 GtkWindow/WebView/UCM/脚本/状态跟踪，id 从 1 起
 //!       （主窗口固定 1）；`window_fn` / `window_query_fn` / `webview_request_fn` /
@@ -69,10 +82,10 @@
 //!       结果经 `webviewEval` 事件回传（对齐 Windows 的异步事件回传）；窗口销毁
 //!       时子 WebView 随控件树一并释放。
 //!   - 尚未实现（钩子留 null → 前端拿到与 Windows 相同的固定降级错误名）：
-//!     剪贴板 / 通知 / 对话框 / 托盘 / 菜单 / 快捷键 / http/ws/fs/SQL。
-//!     这些属于 v0.2.2–v0.2.3，`platform/interface.zig` 的能力矩阵逐项打勾。
-//!   - 冒烟（ZILT_LINUX_SMOKE=1）：40 项检查。WSLg 环境必须 `GDK_BACKEND=x11`
+//!     快捷键 / http/ws/fs/SQL（v0.2.3）。`platform/interface.zig` 的能力矩阵逐项打勾。
+//!   - 冒烟（ZILT_LINUX_SMOKE=1）：42 项检查。WSLg 环境必须 `GDK_BACKEND=x11`
 //!     跑 xvfb-run——Wayland 路径实测在多窗口场景触发协议错误（Error 71）断连。
+//!     通知/托盘完整路径建议 `dbus-run-session -- xvfb-run …`（无总线时按设计降级）。
 //!
 //! 依赖（构建期）：pkg-config + libgtk-3-dev + libwebkit2gtk-4.1-dev。
 //! Zig 0.17 移除了 `@cImport`，C 绑定由 `build.zig` 的 `addTranslateC` 从 `capi.h` 生成。
@@ -88,6 +101,8 @@ const security = @import("../../security.zig");
 const builtin_cmds = @import("../../builtin.zig");
 const log = @import("../../log.zig");
 const system_api = @import("../../system_api.zig");
+const clipboard = @import("../../clipboard.zig");
+const notification = @import("../../notification.zig");
 const window_state = @import("window_state.zig");
 const Config = @import("../../config.zig").Config;
 
@@ -170,6 +185,75 @@ fn hostOf(url: []const u8) ?[]const u8 {
     }
     if (host.len == 0) return null;
     return host;
+}
+
+/// 托盘图标名：取资产路径的 basename 去扩展名。
+/// AppIndicator 只接受**主题图标名**（不是文件路径），自定义图标需要随应用
+/// 安装到 hicolor 主题目录（v0.2.4 打包阶段处理）；这里至少保证名字稳定。
+fn trayIconName(path: ?[]const u8) []const u8 {
+    const p = path orelse return "zilt-app";
+    const base = if (std.mem.lastIndexOfScalar(u8, p, '/')) |i| p[i + 1 ..] else p;
+    if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| {
+        if (dot > 0) return base[0..dot];
+    }
+    return if (base.len > 0) base else "zilt-app";
+}
+
+fn hexVal(ch: u8) ?u8 {
+    return switch (ch) {
+        '0'...'9' => ch - '0',
+        'a'...'f' => ch - 'a' + 10,
+        'A'...'F' => ch - 'A' + 10,
+        else => null,
+    };
+}
+
+/// `file://` URI → 本地路径（百分号解码；只接受空 host / localhost）。
+/// 调用方 free。非 file URI 返回 UnsupportedUri。
+fn fileUriToPath(alloc: std.mem.Allocator, uri: []const u8) ![]u8 {
+    if (!std.mem.startsWith(u8, uri, "file://")) return error.UnsupportedUri;
+    var rest = uri["file://".len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.UnsupportedUri;
+    const host = rest[0..slash];
+    if (host.len != 0 and !std.mem.eql(u8, host, "localhost")) return error.UnsupportedUri;
+    rest = rest[slash..];
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < rest.len) {
+        if (rest[i] == '%' and i + 2 < rest.len) {
+            if (hexVal(rest[i + 1])) |hi| {
+                if (hexVal(rest[i + 2])) |lo| {
+                    try out.append(alloc, (hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        try out.append(alloc, rest[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// 本地路径 → `file://` URI（保留 `/` 与 unreserved 字符，其余百分号编码）。
+fn pathToFileUri(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "file://");
+    for (path) |ch| {
+        const unreserved = std.ascii.isAlphanumeric(ch) or ch == '/' or ch == '-' or
+            ch == '_' or ch == '.' or ch == '~';
+        if (unreserved) {
+            try out.append(alloc, ch);
+        } else {
+            var buf: [3]u8 = undefined;
+            _ = std.fmt.bufPrint(&buf, "%{X:0>2}", .{ch}) catch unreachable;
+            try out.appendSlice(alloc, &buf);
+        }
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 /// 分区名规范化为可安全做目录名：保留字母/数字/-/_，其余转 '_'，最长 64；
@@ -260,6 +344,19 @@ pub fn run(comptime config: Config) !void {
         boolStr(self.smoke),
     });
 
+    // v0.2.2：通知宿主（GApplication）与托盘（可选依赖，缺失仅日志）
+    self.initNotifications();
+    self.initTray();
+
+    // v0.2.2：剪贴板变化监听（owner-change → clipboardChanged 事件）
+    if (config.clipboard_change_event) {
+        const cb = c.gtk_clipboard_get(c.GDK_SELECTION_CLIPBOARD);
+        if (cb != null) {
+            _ = c.g_signal_connect_data(cb, "owner-change", @ptrCast(&Self.onClipboardOwnerChange), self, null, 0);
+            log.print("[clip] change listener attached", .{});
+        }
+    }
+
     c.gtk_main();
     // 主循环退出时窗口通常还没 destroy（ctx.quit 路径）→ 逐窗口落盘状态
     for (self.windows.items) |st| self.saveWindowState(st);
@@ -301,6 +398,12 @@ fn Backend(comptime config: Config) type {
             /// 的最小尺寸，gtk_window_resize 被钳制（实测 setSize(800,600)
             /// 被卡在 960x700），而主 WebView 作为 bin 类 child 无此问题。
             overlay: [*c]c.GtkWidget,
+            /// 内容根（GtkBox 纵向：可选菜单栏 + overlay）；窗口销毁时随控件树释放
+            box: [*c]c.GtkWidget = null,
+            /// 每窗口菜单栏（config.menu；null = 无菜单）
+            menubar: [*c]c.GtkWidget = null,
+            /// 菜单项激活时的 user_data（窗口销毁时统一释放）
+            menu_actions: std.ArrayListUnmanaged(*MenuAction) = .empty,
             view: [*c]c.WebKitWebView,
             ucm: [*c]c.WebKitUserContentManager,
             /// 入口 URL（ACL 判定用，形如 zilt://app/index.html）
@@ -386,6 +489,32 @@ fn Backend(comptime config: Config) type {
             rid: i64,
         };
 
+        /// 剪贴板 HTML/文件列表的异步载荷（GTK 在目标程序粘贴时才调用 get 回调，
+        /// 生命周期跟着剪贴板 owner 走，由 clear 回调释放）。
+        const ClipPayload = struct {
+            backend: *Self,
+            data: []u8,
+            targets: []c.GtkTargetEntry,
+        };
+
+        /// 菜单项激活的 user_data（窗口注册表持有，窗口销毁时统一释放）。
+        const MenuAction = struct {
+            backend: *Self,
+            win_id: u32,
+            kind: MenuKind,
+            id: []u8,
+        };
+        const MenuKind = enum { menu, tray_menu };
+
+        /// 托盘（v0.2.2）：libayatana-appindicator3 为**可选依赖**，用 dlopen 动态加载；
+        /// 缺失时只记日志不阻断启动（对齐 docs/v0.2-LINUX.md §2.3 的决定）。
+        const Tray = struct {
+            lib: std.DynLib,
+            indicator: ?*anyopaque,
+            set_status: *const fn (?*anyopaque, c_int) callconv(.c) void,
+            set_menu: *const fn (?*anyopaque, ?*c.GtkMenu) callconv(.c) void,
+        };
+
         /// emit 的封送任务（worker 线程 → UI 线程，g_idle_add）。
         const EmitTask = struct {
             backend: *Self,
@@ -429,6 +558,13 @@ fn Backend(comptime config: Config) type {
         /// 进行中的下载（v0.2.1）
         downloads: std.ArrayListUnmanaged(*Download) = .empty,
         next_download_id: u64 = 1,
+        /// 当前剪贴板 HTML/文件列表载荷（v0.2.2；clear 回调里释放）
+        clip_payload: ?*ClipPayload = null,
+        /// GNotification 宿主（v0.2.2；注册失败时通知降级为日志）
+        gapp: ?*c.GApplication = null,
+        gapp_registered: bool = false,
+        /// 托盘（libayatana 动态加载；null = 不可用/未配置）
+        tray: ?Tray = null,
 
         fn deinit(self: *Self) void {
             // 主循环退出后可能仍有窗口未 destroy（ctx.quit 路径）→ 逐个释放记录
@@ -447,6 +583,12 @@ fn Backend(comptime config: Config) type {
             self.asset_cache.deinit(self.allocator);
             for (self.downloads.items) |d| self.allocator.destroy(d);
             self.downloads.deinit(self.allocator);
+            if (self.clip_payload) |p| {
+                self.allocator.free(p.data);
+                self.allocator.free(p.targets);
+                self.allocator.destroy(p);
+                self.clip_payload = null;
+            }
         }
 
         // ------------------------------------------------------------------
@@ -485,6 +627,11 @@ fn Backend(comptime config: Config) type {
                 if (maybe) |script| c.webkit_user_script_unref(script);
             }
             st.scripts.deinit(self.allocator);
+            for (st.menu_actions.items) |action| {
+                self.allocator.free(action.id);
+                self.allocator.destroy(action);
+            }
+            st.menu_actions.deinit(self.allocator);
             for (st.child_webviews.items) |cv| self.freeChildView(cv);
             st.child_webviews.deinit(self.allocator);
             self.allocator.destroy(st.sink);
@@ -691,6 +838,16 @@ fn Backend(comptime config: Config) type {
                 .eval_async_fn = evalAsyncEntry,
                 .spawn_window_fn = spawnWindowEntry,
                 .system_fn = systemEntry,
+                // v0.2.2：剪贴板 + 原生对话框
+                .clipboard_write_fn = clipboardWriteTextEntry,
+                .clipboard_read_fn = clipboardReadTextEntry,
+                .clipboard_read_data_fn = clipboardReadDataEntry,
+                .clipboard_write_data_fn = clipboardWriteDataEntry,
+                .dialog_fn = dialogEntry,
+                .notify_fn = notifyEntry,
+                .notification_show_fn = notificationShowEntry,
+                .notification_update_fn = notificationUpdateEntry,
+                .notification_status_fn = notificationStatusEntry,
                 // 其余钩子留 null：调用方按 platform/interface.zig 的固定错误名降级
             };
         }
@@ -826,11 +983,24 @@ fn Backend(comptime config: Config) type {
                 .max_height = opts.max_height orelse 0,
             };
 
+            // 内容根：GtkBox（纵向）＝ 可选菜单栏 + GtkOverlay
+            const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+            if (box == null) return error.WindowCreateFailed;
+            st.box = @ptrCast(box);
+            if (config.menu) |items| {
+                const menubar = self.buildMenuBar(items, st);
+                if (menubar != null) {
+                    st.menubar = menubar;
+                    c.gtk_box_pack_start(@ptrCast(box), menubar, 0, 0, 0);
+                }
+            }
+
             // GtkOverlay 布局容器（见 WinState.overlay 注释）
             const overlay = c.gtk_overlay_new();
             if (overlay == null) return error.WebViewCreateFailed;
             st.overlay = @ptrCast(overlay);
-            c.gtk_container_add(@ptrCast(win), overlay);
+            c.gtk_box_pack_start(@ptrCast(box), overlay, 1, 1, 0);
+            c.gtk_container_add(@ptrCast(win), box);
 
             const ucm = c.webkit_user_content_manager_new();
             if (ucm == null) return error.UserContentManagerFailed;
@@ -1174,6 +1344,655 @@ fn Backend(comptime config: Config) type {
         }
 
         // ------------------------------------------------------------------
+        // 剪贴板（v0.2.2）：文本 / HTML / 文件列表 / 图片
+        // ------------------------------------------------------------------
+
+        /// GtkClipboard 在 translate-c 里是不透明类型 → 用单指针（C 指针不可索引）。
+        fn gtkClipboard() ?*c.GtkClipboard {
+            return c.gtk_clipboard_get(c.GDK_SELECTION_CLIPBOARD);
+        }
+
+        fn clipboardWriteTextEntry(_: *anyopaque, text: []const u8) bool {
+            const cb = gtkClipboard() orelse return false;
+            const z = std.heap.c_allocator.allocSentinel(u8, text.len, 0) catch return false;
+            defer std.heap.c_allocator.free(z);
+            @memcpy(z, text);
+            c.gtk_clipboard_set_text(cb, z.ptr, @intCast(text.len));
+            c.gtk_clipboard_store(cb);
+            return true;
+        }
+
+        fn readClipboardText(alloc: std.mem.Allocator) ?[]u8 {
+            const cb = gtkClipboard() orelse return null;
+            const text = c.gtk_clipboard_wait_for_text(cb);
+            if (text == null) return null;
+            defer c.g_free(@ptrCast(text));
+            return alloc.dupe(u8, std.mem.span(text)) catch null;
+        }
+
+        fn clipboardReadTextEntry(_: *anyopaque, alloc: std.mem.Allocator) ?[]u8 {
+            return readClipboardText(alloc);
+        }
+
+        fn clipboardReadDataEntry(_: *anyopaque, _: u32, alloc: std.mem.Allocator, format: clipboard.Format) anyerror!?clipboard.Data {
+            const cb = gtkClipboard() orelse return error.ClipboardNotAvailable;
+            switch (format) {
+                .text => {
+                    const text = readClipboardText(alloc) orelse return null;
+                    return clipboard.Data{ .text = text };
+                },
+                .html => {
+                    const atom = c.gdk_atom_intern("text/html", 0);
+                    const sel = c.gtk_clipboard_wait_for_contents(cb, atom) orelse return null;
+                    defer c.gtk_selection_data_free(sel);
+                    const len = c.gtk_selection_data_get_length(sel);
+                    const raw = c.gtk_selection_data_get_data(sel);
+                    if (len <= 0 or raw == null) return null;
+                    return clipboard.Data{ .html = try alloc.dupe(u8, raw[0..@intCast(len)]) };
+                },
+                .image => {
+                    const pixbuf = c.gtk_clipboard_wait_for_image(cb) orelse return null;
+                    defer c.g_object_unref(@ptrCast(pixbuf));
+                    const width: u32 = @intCast(c.gdk_pixbuf_get_width(pixbuf));
+                    const height: u32 = @intCast(c.gdk_pixbuf_get_height(pixbuf));
+                    if (width == 0 or height == 0) return null;
+                    const channels = c.gdk_pixbuf_get_n_channels(pixbuf);
+                    const rowstride: usize = @intCast(c.gdk_pixbuf_get_rowstride(pixbuf));
+                    const pixels = c.gdk_pixbuf_get_pixels(pixbuf);
+                    if (pixels == null) return null;
+                    const rgba = try alloc.alloc(u8, @as(usize, width) * height * 4);
+                    errdefer alloc.free(rgba);
+                    for (0..height) |row| {
+                        const src = pixels + row * rowstride;
+                        for (0..width) |col| {
+                            const s = src + col * @as(usize, @intCast(channels));
+                            const d = rgba[(row * width + col) * 4 ..][0..4];
+                            d[0] = s[0];
+                            d[1] = s[1];
+                            d[2] = s[2];
+                            d[3] = if (channels >= 4) s[3] else 255;
+                        }
+                    }
+                    return clipboard.Data{ .image = .{ .width = width, .height = height, .rgba = rgba } };
+                },
+                .files => {
+                    const uris = c.gtk_clipboard_wait_for_uris(cb) orelse return null;
+                    defer c.g_strfreev(uris);
+                    var count: usize = 0;
+                    while (uris[count] != null) : (count += 1) {}
+                    if (count == 0) return null;
+                    const paths = try alloc.alloc([]const u8, count);
+                    errdefer alloc.free(paths);
+                    var filled: usize = 0;
+                    errdefer for (paths[0..filled]) |p| alloc.free(p);
+                    for (0..count) |i| {
+                        paths[i] = try fileUriToPath(alloc, std.mem.span(uris[i]));
+                        filled += 1;
+                    }
+                    return clipboard.Data{ .files = paths };
+                },
+            }
+        }
+
+        fn clipboardWriteDataEntry(backend: *anyopaque, _: u32, data: clipboard.Data) !void {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            const cb = gtkClipboard() orelse return error.ClipboardNotAvailable;
+            switch (data) {
+                .text => |text| {
+                    if (!clipboardWriteTextEntry(backend, text)) return error.ClipboardWriteFailed;
+                },
+                .html => |html| try self.writeClipboardPayload("text/html", html),
+                .files => |files| {
+                    var buf: std.ArrayListUnmanaged(u8) = .empty;
+                    defer buf.deinit(self.allocator);
+                    for (files, 0..) |path, i| {
+                        if (i != 0) try buf.append(self.allocator, '\r');
+                        if (i != 0) try buf.append(self.allocator, '\n');
+                        const uri = try pathToFileUri(self.allocator, path);
+                        defer self.allocator.free(uri);
+                        try buf.appendSlice(self.allocator, uri);
+                    }
+                    try buf.appendSlice(self.allocator, "\r\n");
+                    try self.writeClipboardPayload("text/uri-list", buf.items);
+                },
+                .image => |image| {
+                    if (image.width == 0 or image.height == 0) return error.ClipboardWriteFailed;
+                    const expect = @as(usize, image.width) * image.height * 4;
+                    if (image.rgba.len != expect) return error.ClipboardWriteFailed;
+                    const pixbuf = c.gdk_pixbuf_new(c.GDK_COLORSPACE_RGB, 1, 8, @intCast(image.width), @intCast(image.height));
+                    if (pixbuf == null) return error.ClipboardWriteFailed;
+                    defer c.g_object_unref(@ptrCast(pixbuf));
+                    const rowstride: usize = @intCast(c.gdk_pixbuf_get_rowstride(pixbuf));
+                    const pixels = c.gdk_pixbuf_get_pixels(pixbuf);
+                    if (pixels == null) return error.ClipboardWriteFailed;
+                    for (0..image.height) |row| {
+                        const src = image.rgba[row * image.width * 4 ..];
+                        const dst = pixels + row * rowstride;
+                        @memcpy(dst[0 .. image.width * 4], src[0 .. image.width * 4]);
+                    }
+                    c.gtk_clipboard_set_image(cb, pixbuf);
+                    c.gtk_clipboard_store(cb);
+                },
+            }
+        }
+
+        /// HTML / 文件列表走“延迟提供”：GTK 在目标粘贴时才回调 clipGet。
+        fn writeClipboardPayload(self: *Self, mime: [:0]const u8, bytes: []const u8) !void {
+            const cb = gtkClipboard() orelse return error.ClipboardNotAvailable;
+            c.gtk_clipboard_clear(cb); // 释放旧 payload（clipClear）
+            const targets = try self.allocator.alloc(c.GtkTargetEntry, 2);
+            errdefer self.allocator.free(targets);
+            targets[0] = .{ .target = @ptrCast(@constCast(mime.ptr)), .flags = 0, .info = 0 };
+            targets[1] = .{ .target = @ptrCast(@constCast("UTF8_STRING")), .flags = 0, .info = 1 };
+
+            const data = try self.allocator.dupe(u8, bytes);
+            errdefer self.allocator.free(data);
+            const p = try self.allocator.create(ClipPayload);
+            errdefer self.allocator.destroy(p);
+            p.* = .{ .backend = self, .data = data, .targets = targets };
+            if (c.gtk_clipboard_set_with_data(cb, targets.ptr, @intCast(targets.len), clipGet, clipClear, p) == 0) {
+                return error.ClipboardWriteFailed;
+            }
+            self.clip_payload = p;
+            c.gtk_clipboard_store(cb);
+        }
+
+        fn clipGet(_: ?*c.GtkClipboard, selection: ?*c.GtkSelectionData, _: c.guint, user_data: c.gpointer) callconv(.c) void {
+            const p: *ClipPayload = @ptrCast(@alignCast(user_data orelse return));
+            const sel = selection orelse return;
+            const target = c.gtk_selection_data_get_target(sel);
+            c.gtk_selection_data_set(sel, target, 8, p.data.ptr, @intCast(p.data.len));
+        }
+
+        fn clipClear(_: ?*c.GtkClipboard, user_data: c.gpointer) callconv(.c) void {
+            const p: *ClipPayload = @ptrCast(@alignCast(user_data orelse return));
+            const backend = p.backend;
+            if (backend.clip_payload == p) backend.clip_payload = null;
+            backend.allocator.free(p.data);
+            backend.allocator.free(p.targets);
+            backend.allocator.destroy(p);
+        }
+
+        fn onClipboardOwnerChange(_: ?*c.GtkClipboard, _: ?*anyopaque, user_data: c.gpointer) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return));
+            const w = self.windowById(0) orelse return;
+            const msg = ipc.encodeEvent(self.allocator, "clipboardChanged", "{}") catch return;
+            defer self.allocator.free(msg);
+            self.deliverAlloc(w.view, msg);
+        }
+
+        // ------------------------------------------------------------------
+        // 菜单栏 / 托盘（v0.2.2）
+        // ------------------------------------------------------------------
+
+        /// 每窗口菜单栏：config.menu（静态树）→ GtkMenuBar。
+        fn buildMenuBar(self: *Self, items: []const Config.MenuItem, st: *WinState) [*c]c.GtkWidget {
+            const bar = c.gtk_menu_bar_new();
+            if (bar == null) return null;
+            self.appendMenuItems(@ptrCast(bar), items, st.id, .menu);
+            c.gtk_widget_show_all(bar);
+            log.print("[menu] menu bar built ({d} top-level items)", .{items.len});
+            return bar;
+        }
+
+        /// 托盘右键菜单（config.tray.menu）→ GtkMenu。
+        fn buildTrayMenu(self: *Self, items: []const Config.MenuItem, win_id: u32) ?*c.GtkMenu {
+            const menu_widget = c.gtk_menu_new() orelse return null;
+            const menu: *c.GtkMenu = @ptrCast(menu_widget);
+            self.appendMenuItems(@ptrCast(menu), items, win_id, .tray_menu);
+            c.gtk_widget_show_all(@ptrCast(menu));
+            log.print("[tray] menu built ({d} top-level items)", .{items.len});
+            return menu;
+        }
+
+        /// 递归建菜单：分隔符 "-"；有 items → 子菜单；叶子按 id 绑定 activate。
+        /// 无 id 的叶子置灰（与 Windows 的 id 表语义一致）。
+        fn appendMenuItems(
+            self: *Self,
+            shell: [*c]c.GtkMenuShell,
+            items: []const Config.MenuItem,
+            win_id: u32,
+            kind: MenuKind,
+        ) void {
+            for (items) |item| {
+                if (std.mem.eql(u8, item.label, "-")) {
+                    const sep = c.gtk_separator_menu_item_new();
+                    if (sep != null) {
+                        c.gtk_menu_shell_append(shell, sep);
+                        c.gtk_widget_show(sep);
+                    }
+                    continue;
+                }
+                const label_z = dupeZ(self.allocator, item.label) catch continue;
+                defer self.allocator.free(label_z);
+                const menu_item = c.gtk_menu_item_new_with_label(label_z.ptr);
+                if (menu_item == null) continue;
+
+                if (item.items) |sub_items| {
+                    const sub = c.gtk_menu_new();
+                    if (sub != null) {
+                        self.appendMenuItems(@ptrCast(sub), sub_items, win_id, kind);
+                        c.gtk_menu_item_set_submenu(@ptrCast(menu_item), sub);
+                    }
+                } else if (item.id) |id| {
+                    const action = self.allocator.create(MenuAction) catch {
+                        c.gtk_widget_destroy(menu_item);
+                        continue;
+                    };
+                    const id_copy = self.allocator.dupe(u8, id) catch {
+                        self.allocator.destroy(action);
+                        c.gtk_widget_destroy(menu_item);
+                        continue;
+                    };
+                    action.* = .{ .backend = self, .win_id = win_id, .kind = kind, .id = id_copy };
+                    const owner = self.windowById(win_id);
+                    if (owner) |w| {
+                        w.menu_actions.append(self.allocator, action) catch {
+                            self.allocator.free(id_copy);
+                            self.allocator.destroy(action);
+                            c.gtk_widget_destroy(menu_item);
+                            continue;
+                        };
+                    } else {
+                        self.allocator.free(id_copy);
+                        self.allocator.destroy(action);
+                        c.gtk_widget_destroy(menu_item);
+                        continue;
+                    }
+                    _ = c.g_signal_connect_data(@ptrCast(menu_item), "activate", @ptrCast(&onMenuActivate), action, null, 0);
+                } else {
+                    c.gtk_widget_set_sensitive(menu_item, 0);
+                }
+                c.gtk_menu_shell_append(shell, menu_item);
+                c.gtk_widget_show(menu_item);
+            }
+        }
+
+        fn onMenuActivate(_: [*c]c.GtkMenuItem, user_data: c.gpointer) callconv(.c) void {
+            const action: *MenuAction = @ptrCast(@alignCast(user_data orelse return));
+            const self = action.backend;
+            const name: []const u8 = switch (action.kind) {
+                .menu => "menu",
+                .tray_menu => "trayMenu",
+            };
+            log.print("[menu] {s} -> {s}", .{ name, action.id });
+            const id_json = jsonStr(self.allocator, action.id) orelse return;
+            defer self.allocator.free(id_json);
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"id\":{s}}}", .{id_json}) catch return;
+            defer self.allocator.free(payload);
+            const target = if (action.kind == .tray_menu) self.windowById(0) else self.windowById(action.win_id);
+            const w = target orelse return;
+            self.emitRawToWindow(w.id, name, payload);
+        }
+
+        /// 托盘初始化：dlopen libayatana-appindicator3.so.1（缺失 → 日志 + 无托盘）。
+        fn initTray(self: *Self) void {
+            const tray_cfg = config.tray orelse return;
+            var lib = std.DynLib.open("libayatana-appindicator3.so.1") catch |err| {
+                log.print("[tray] libayatana-appindicator3 unavailable ({s}) — running without tray", .{@errorName(err)});
+                return;
+            };
+            const new_fn = lib.lookup(
+                *const fn ([*c]const u8, [*c]const u8, c_int) callconv(.c) ?*anyopaque,
+                "app_indicator_new",
+            ) orelse {
+                lib.close();
+                log.print("[tray] app_indicator_new not found — tray disabled", .{});
+                return;
+            };
+            const set_status_fn = lib.lookup(
+                *const fn (?*anyopaque, c_int) callconv(.c) void,
+                "app_indicator_set_status",
+            ) orelse {
+                lib.close();
+                log.print("[tray] app_indicator_set_status not found — tray disabled", .{});
+                return;
+            };
+            const set_menu_fn = lib.lookup(
+                *const fn (?*anyopaque, ?*c.GtkMenu) callconv(.c) void,
+                "app_indicator_set_menu",
+            ) orelse {
+                lib.close();
+                log.print("[tray] app_indicator_set_menu not found — tray disabled", .{});
+                return;
+            };
+            const set_icon_fn = lib.lookup(
+                *const fn (?*anyopaque, [*c]const u8, [*c]const u8) callconv(.c) void,
+                "app_indicator_set_icon_full",
+            );
+            const set_title_fn = lib.lookup(
+                *const fn (?*anyopaque, [*c]const u8) callconv(.c) void,
+                "app_indicator_set_title",
+            );
+
+            const icon_name = trayIconName(tray_cfg.icon orelse config.icon);
+            const id_z = dupeZ(self.allocator, config.app_id) catch return;
+            defer self.allocator.free(id_z);
+            const icon_z = dupeZ(self.allocator, icon_name) catch return;
+            defer self.allocator.free(icon_z);
+            // APP_INDICATOR_CATEGORY_APPLICATION_STATUS = 0
+            const indicator = new_fn(id_z.ptr, icon_z.ptr, 0) orelse {
+                lib.close();
+                log.print("[tray] app_indicator_new failed — tray disabled", .{});
+                return;
+            };
+            if (set_icon_fn) |f| f(indicator, icon_z.ptr, icon_z.ptr);
+            if (set_title_fn) |f| {
+                const title_z = dupeZ(self.allocator, tray_cfg.tooltip) catch null;
+                if (title_z) |tz| {
+                    defer self.allocator.free(tz);
+                    f(indicator, tz.ptr);
+                }
+            }
+            if (tray_cfg.menu) |items| {
+                if (self.buildTrayMenu(items, if (self.windowById(0)) |w| w.id else 1)) |menu| {
+                    set_menu_fn(indicator, menu);
+                }
+            }
+            // APP_INDICATOR_STATUS_ACTIVE = 1
+            set_status_fn(indicator, 1);
+            self.tray = .{
+                .lib = lib,
+                .indicator = indicator,
+                .set_status = set_status_fn,
+                .set_menu = set_menu_fn,
+            };
+            log.print("[tray] indicator created (icon={s}, menu={})", .{ icon_name, tray_cfg.menu != null });
+        }
+
+        // ------------------------------------------------------------------
+        // 通知（v0.2.2）：GNotification（需要 D-Bus session bus；缺失时降级为日志）
+        // ------------------------------------------------------------------
+
+        fn initNotifications(self: *Self) void {
+            const app_id_z = dupeZ(self.allocator, config.app_id) catch return;
+            defer self.allocator.free(app_id_z);
+            const app = c.g_application_new(app_id_z.ptr, 0) orelse {
+                log.print("[notify] g_application_new failed", .{});
+                return;
+            };
+            self.gapp = app;
+            var err: [*c]c.GError = null;
+            self.gapp_registered = c.g_application_register(app, null, &err) != 0;
+            if (err != null) {
+                log.print("[notify] GApplication register failed: {s}", .{std.mem.span(err.*.message)});
+                c.g_error_free(err);
+            }
+            log.print("[notify] GApplication ready (id={s}, registered={})", .{ config.app_id, self.gapp_registered });
+        }
+
+        fn sendNotification(self: *Self, tag: ?[]const u8, title: []const u8, body: []const u8) !void {
+            const app = self.gapp orelse return error.NotificationNotAvailable;
+            if (!self.gapp_registered) return error.NotificationNotAvailable;
+            const title_z = try dupeZ(self.allocator, title);
+            defer self.allocator.free(title_z);
+            const body_z = try dupeZ(self.allocator, body);
+            defer self.allocator.free(body_z);
+            const n = c.g_notification_new(title_z.ptr) orelse return error.NotificationFailed;
+            defer c.g_object_unref(@ptrCast(n));
+            c.g_notification_set_body(n, body_z.ptr);
+            var tag_z: ?[:0]u8 = null;
+            if (tag) |t| tag_z = dupeZ(self.allocator, t) catch null;
+            defer if (tag_z) |z| self.allocator.free(z);
+            c.g_application_send_notification(app, if (tag_z) |z| z.ptr else null, n);
+            log.print("[notify] sent title=\"{s}\" tag={s}", .{ title, tag orelse "-" });
+        }
+
+        fn notificationShowEntry(backend: *anyopaque, _: u32, options: notification.Options) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            try self.sendNotification(options.tag, options.title, options.body);
+        }
+
+        fn notificationUpdateEntry(
+            backend: *anyopaque,
+            _: u32,
+            tag: []const u8,
+            group: ?[]const u8,
+            progress: notification.Progress,
+        ) anyerror!void {
+            _ = group;
+            const self: *Self = @ptrCast(@alignCast(backend));
+            const body = if (progress.value_string.len > 0) progress.value_string else progress.status;
+            const title = if (progress.title.len > 0) progress.title else config.title;
+            try self.sendNotification(tag, title, body);
+        }
+
+        fn notificationStatusEntry(backend: *anyopaque, _: u32) anyerror!notification.Status {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            return if (self.gapp_registered) .enabled else .disabled_for_application;
+        }
+
+        /// v0.1.6 兼容入口（ctx.notify）：无 tag 的普通通知。
+        fn notifyEntry(backend: *anyopaque, title: []const u8, body: []const u8) void {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            self.sendNotification(null, title, body) catch |err| {
+                log.print("[notify] legacy notify failed: {s}", .{@errorName(err)});
+            };
+        }
+
+        // ------------------------------------------------------------------
+        // 原生对话框（v0.2.2）：消息框 / 文件 / 文件夹 / 多选 / 颜色 / 字体
+        // ------------------------------------------------------------------
+
+        fn dialogEntry(backend: *anyopaque, alloc: std.mem.Allocator, req: ipc.DialogRequest) anyerror!ipc.DialogResponse {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            const parent: [*c]c.GtkWindow = if (self.windowById(0)) |w| w.win else null;
+            switch (req) {
+                .message_box => |opts| return .{ .button = self.messageBoxDialog(parent, opts) },
+                .open_file => |opts| return .{ .path = try self.fileDialog(alloc, parent, opts, .open) },
+                .save_file => |opts| return .{ .path = try self.fileDialog(alloc, parent, opts, .save) },
+                .pick_folder => |opts| return .{ .path = try self.folderDialog(alloc, parent, opts.title) },
+                .pick_files => |opts| return .{ .paths = try self.filesDialog(alloc, parent, opts) },
+                .pick_color => |opts| return .{ .color = self.colorDialog(parent, opts) },
+                .pick_font => |opts| return .{ .font = try self.fontDialog(alloc, parent, opts) },
+            }
+        }
+
+        fn messageBoxDialog(self: *Self, parent: [*c]c.GtkWindow, opts: ipc.MessageBoxOptions) ipc.Button {
+            _ = self;
+            const kind: c.GtkMessageType = switch (opts.kind) {
+                .info => c.GTK_MESSAGE_INFO,
+                .warning => c.GTK_MESSAGE_WARNING,
+                .err => c.GTK_MESSAGE_ERROR,
+            };
+            const buttons: c.GtkButtonsType = switch (opts.buttons) {
+                .ok => c.GTK_BUTTONS_OK,
+                .ok_cancel => c.GTK_BUTTONS_OK_CANCEL,
+                .yes_no => c.GTK_BUTTONS_YES_NO,
+            };
+            const text_z = dupeZ(std.heap.c_allocator, opts.text) catch return .cancel;
+            defer std.heap.c_allocator.free(text_z);
+            const caption_z = dupeZ(std.heap.c_allocator, opts.caption) catch return .cancel;
+            defer std.heap.c_allocator.free(caption_z);
+            const dlg = c.gtk_message_dialog_new(
+                parent,
+                c.GTK_DIALOG_MODAL,
+                kind,
+                buttons,
+                "%s",
+                text_z.ptr,
+            );
+            if (dlg == null) return .cancel;
+            defer c.gtk_widget_destroy(dlg);
+            c.gtk_window_set_title(@ptrCast(dlg), caption_z.ptr);
+            return switch (c.gtk_dialog_run(@ptrCast(dlg))) {
+                c.GTK_RESPONSE_OK => .ok,
+                c.GTK_RESPONSE_YES => .yes,
+                c.GTK_RESPONSE_NO => .no,
+                else => .cancel,
+            };
+        }
+
+        const FileMode = enum { open, save };
+
+        /// GtkFileChooserNative：有桌面 portal 时走 portal，否则退化为普通 GtkFileChooserDialog。
+        /// 返回路径由 `alloc` 分配；取消返回 null。
+        fn fileDialog(
+            self: *Self,
+            alloc: std.mem.Allocator,
+            parent: [*c]c.GtkWindow,
+            opts: ipc.FileDialogOptions,
+            mode: FileMode,
+        ) !?[]u8 {
+            _ = self;
+            const native = (try nativeChooser(alloc, parent, opts, if (mode == .save) .save else .open)) orelse
+                return error.DialogNotAvailable;
+            defer c.g_object_unref(@ptrCast(native));
+            const chooser: *c.GtkFileChooser = @ptrCast(native);
+            if (mode == .save) c.gtk_file_chooser_set_do_overwrite_confirmation(chooser, 1);
+            if (c.gtk_native_dialog_run(@alignCast(@ptrCast(native))) != c.GTK_RESPONSE_ACCEPT) return null;
+            const chosen = c.gtk_file_chooser_get_filename(chooser);
+            if (chosen == null) return null;
+            defer c.g_free(@ptrCast(chosen));
+            return try alloc.dupe(u8, std.mem.span(chosen));
+        }
+
+        fn folderDialog(self: *Self, alloc: std.mem.Allocator, parent: [*c]c.GtkWindow, title: []const u8) !?[]u8 {
+            _ = self;
+            const title_z = try dupeZ(alloc, if (title.len > 0) title else "选择文件夹");
+            defer alloc.free(title_z);
+            const native = c.gtk_file_chooser_native_new(title_z.ptr, parent, c.GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER, "选择", "取消") orelse
+                return error.DialogNotAvailable;
+            defer c.g_object_unref(@ptrCast(native));
+            const chooser: *c.GtkFileChooser = @ptrCast(native);
+            if (c.gtk_native_dialog_run(@alignCast(@ptrCast(native))) != c.GTK_RESPONSE_ACCEPT) return null;
+            const chosen = c.gtk_file_chooser_get_filename(chooser);
+            if (chosen == null) return null;
+            defer c.g_free(@ptrCast(chosen));
+            return try alloc.dupe(u8, std.mem.span(chosen));
+        }
+
+        fn filesDialog(self: *Self, alloc: std.mem.Allocator, parent: [*c]c.GtkWindow, opts: ipc.FileDialogOptions) !?[][]u8 {
+            _ = self;
+            const native = (try nativeChooser(alloc, parent, opts, .open)) orelse return error.DialogNotAvailable;
+            defer c.g_object_unref(@ptrCast(native));
+            const chooser: *c.GtkFileChooser = @ptrCast(native);
+            c.gtk_file_chooser_set_select_multiple(chooser, 1);
+            if (c.gtk_native_dialog_run(@alignCast(@ptrCast(native))) != c.GTK_RESPONSE_ACCEPT) return null;
+
+            const list = c.gtk_file_chooser_get_filenames(chooser);
+            if (list == null) return null;
+            defer {
+                var node: ?*c.GSList = list;
+                while (node) |n| : (node = n.*.next) {
+                    if (n.*.data) |data| c.g_free(data);
+                }
+                c.g_slist_free(list);
+            }
+            var count: usize = 0;
+            {
+                var node: ?*c.GSList = list;
+                while (node) |n| : (node = n.*.next) count += 1;
+            }
+            if (count == 0) return null;
+            const paths = try alloc.alloc([]u8, count);
+            errdefer alloc.free(paths);
+            var i: usize = 0;
+            var node: ?*c.GSList = list;
+            errdefer for (paths[0..i]) |p| alloc.free(p);
+            while (node) |n| : (node = n.*.next) {
+                const raw: [*c]const u8 = @ptrCast(n.*.data orelse continue);
+                paths[i] = try alloc.dupe(u8, std.mem.span(raw));
+                i += 1;
+            }
+            return paths[0..i];
+        }
+
+        /// 共享的 native chooser 构造（含 filter / 默认文件名）。
+        fn nativeChooser(
+            alloc: std.mem.Allocator,
+            parent: [*c]c.GtkWindow,
+            opts: ipc.FileDialogOptions,
+            mode: FileMode,
+        ) !?*c.GtkFileChooserNative {
+            const title_z = try dupeZ(alloc, if (opts.title.len > 0) opts.title else (if (mode == .save) "保存文件" else "打开文件"));
+            defer alloc.free(title_z);
+            const action: c.GtkFileChooserAction = if (mode == .save) c.GTK_FILE_CHOOSER_ACTION_SAVE else c.GTK_FILE_CHOOSER_ACTION_OPEN;
+            const native = c.gtk_file_chooser_native_new(title_z.ptr, parent, action, if (mode == .save) "保存" else "打开", "取消");
+            if (native == null) return error.DialogNotAvailable;
+            const chooser: *c.GtkFileChooser = @ptrCast(native);
+
+            if (opts.default_name.len > 0) {
+                const name_z = try dupeZ(alloc, opts.default_name);
+                defer alloc.free(name_z);
+                c.gtk_file_chooser_set_current_name(chooser, name_z.ptr);
+            }
+            for (opts.filters) |f| {
+                const filter = c.gtk_file_filter_new();
+                if (filter == null) continue;
+                defer c.g_object_unref(@ptrCast(filter));
+                if (f.name.len > 0) {
+                    const fname_z = try dupeZ(alloc, f.name);
+                    defer alloc.free(fname_z);
+                    c.gtk_file_filter_set_name(filter, fname_z.ptr);
+                }
+                var patterns = std.mem.splitScalar(u8, f.pattern, ';');
+                while (patterns.next()) |pattern| {
+                    const trimmed = std.mem.trim(u8, pattern, " \t");
+                    if (trimmed.len == 0) continue;
+                    const pat_z = try dupeZ(alloc, trimmed);
+                    defer alloc.free(pat_z);
+                    c.gtk_file_filter_add_pattern(filter, pat_z.ptr);
+                }
+                c.gtk_file_chooser_add_filter(chooser, filter);
+            }
+            return native;
+        }
+
+        fn colorDialog(self: *Self, parent: [*c]c.GtkWindow, opts: ipc.ColorDialogOptions) ?u32 {
+            _ = self;
+            const title_z = dupeZ(std.heap.c_allocator, opts.title) catch return null;
+            defer std.heap.c_allocator.free(title_z);
+            const dlg = c.gtk_color_chooser_dialog_new(title_z.ptr, parent);
+            if (dlg == null) return null;
+            defer c.gtk_widget_destroy(dlg);
+            c.gtk_color_chooser_set_use_alpha(@ptrCast(dlg), 0);
+            var rgba = c.GdkRGBA{
+                .red = @as(f32, @floatFromInt(opts.default_rgb >> 16 & 0xFF)) / 255.0,
+                .green = @as(f32, @floatFromInt(opts.default_rgb >> 8 & 0xFF)) / 255.0,
+                .blue = @as(f32, @floatFromInt(opts.default_rgb & 0xFF)) / 255.0,
+                .alpha = 1.0,
+            };
+            c.gtk_color_chooser_set_rgba(@ptrCast(dlg), &rgba);
+            if (c.gtk_dialog_run(@ptrCast(dlg)) != c.GTK_RESPONSE_OK) return null;
+            c.gtk_color_chooser_get_rgba(@ptrCast(dlg), &rgba);
+            const r: u32 = @intFromFloat(@round(std.math.clamp(rgba.red, 0, 1) * 255));
+            const g: u32 = @intFromFloat(@round(std.math.clamp(rgba.green, 0, 1) * 255));
+            const b: u32 = @intFromFloat(@round(std.math.clamp(rgba.blue, 0, 1) * 255));
+            return (r << 16) | (g << 8) | b;
+        }
+
+        fn fontDialog(self: *Self, alloc: std.mem.Allocator, parent: [*c]c.GtkWindow, opts: ipc.FontDialogOptions) !?ipc.FontChoice {
+            _ = self;
+            const title_z = try dupeZ(alloc, opts.title);
+            defer alloc.free(title_z);
+            const dlg = c.gtk_font_chooser_dialog_new(title_z.ptr, parent);
+            if (dlg == null) return error.DialogNotAvailable;
+            defer c.gtk_widget_destroy(dlg);
+            if (c.gtk_dialog_run(@ptrCast(dlg)) != c.GTK_RESPONSE_OK) return null;
+
+            const font = c.gtk_font_chooser_get_font(@ptrCast(dlg));
+            if (font == null) return null;
+            defer c.g_free(@ptrCast(font));
+            const desc = c.pango_font_description_from_string(font);
+            if (desc == null) return null;
+            defer c.pango_font_description_free(desc);
+            const family_ptr = c.pango_font_description_get_family(desc);
+            const family: []const u8 = if (family_ptr != null) std.mem.span(family_ptr) else "";
+            const size_pango = c.pango_font_description_get_size(desc);
+            const points: i32 = @intCast(@divTrunc(size_pango, c.PANGO_SCALE));
+            return ipc.FontChoice{
+                .name = try alloc.dupe(u8, family),
+                .size_points = points,
+                .bold = c.pango_font_description_get_weight(desc) >= c.PANGO_WEIGHT_BOLD,
+                .italic = c.pango_font_description_get_style(desc) != c.PANGO_STYLE_NORMAL,
+                .underline = false,
+                .strikeout = false,
+                .color_rgb = opts.color_rgb,
+            };
+        }
+
+        // ------------------------------------------------------------------
         // 下载（v0.2.1）：WebKitWebContext::download-started → 目标路径 →
         // received-data / finished / failed → webview.download_* 事件
         // ------------------------------------------------------------------
@@ -1231,7 +2050,7 @@ fn Backend(comptime config: Config) type {
             );
             if (dlg == null) return error.DialogFailed;
             defer c.gtk_widget_destroy(dlg);
-            const chooser: [*c]c.GtkFileChooser = @ptrCast(dlg);
+            const chooser: *c.GtkFileChooser = @ptrCast(dlg);
             const name_z = try dupeZ(self.allocator, suggested);
             defer self.allocator.free(name_z);
             c.gtk_file_chooser_set_current_name(chooser, name_z.ptr);
@@ -2567,6 +3386,20 @@ test "hostOf: URL host、端口与 IPv6 字面量" {
     try testing.expectEqualStrings("app", hostOf("zilt://app/index.html").?);
     try testing.expect(hostOf("about:blank") == null);
     try testing.expect(hostOf("https:///x") == null);
+}
+
+test "file URI 往返与百分号解码" {
+    const a = testing.allocator;
+    const p = try fileUriToPath(a, "file:///tmp/a%20b.txt");
+    defer a.free(p);
+    try testing.expectEqualStrings("/tmp/a b.txt", p);
+    try testing.expectError(error.UnsupportedUri, fileUriToPath(a, "https://example.com/x"));
+    try testing.expectError(error.UnsupportedUri, fileUriToPath(a, "file://host/x"));
+    try testing.expectError(error.UnsupportedUri, fileUriToPath(a, "file://nope"));
+
+    const uri = try pathToFileUri(a, "/tmp/a b.txt");
+    defer a.free(uri);
+    try testing.expectEqualStrings("file:///tmp/a%20b.txt", uri);
 }
 
 test "reasonFor: 状态码有可读短语" {

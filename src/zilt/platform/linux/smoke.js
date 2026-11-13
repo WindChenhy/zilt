@@ -11,7 +11,8 @@
 // keep-above 的实际置顶、geometry hint 的强制执行）不可断言——只断言客户端
 // 可查字段（size/position/tracked 标志）与命令返回值。
 //
-// 刻意不测：剪贴板 / 通知 / 对话框（v0.2.2 才实现）。
+// 刻意不测：原生对话框（模态、需要人工交互）。
+// 剪贴板/通知/菜单栏/托盘在 v0.2.2 已覆盖（通知无 D-Bus 时按降级语义断言）。
 //
 // reload 刻意不做探测：报告 invoke 刚 post 就导航，消息会在导航中丢失
 // （实测导致「reload → 脚本重跑 → 再 reload」无限循环）；且 reload 与 stop
@@ -448,6 +449,34 @@ function runSecondWindowProbe() {
     try { await Z().webview.cancelDownload(999999); } catch (e) { cancelErr = String(e.message || e); }
     check('download.cancel', cancelErr === 'UnknownDownload', cancelErr);
   } catch (e) { check('download', false, String(e.message || e)); }
+
+  // ---- v0.2.2：剪贴板（文本 / HTML / 文件列表）----
+  try {
+    const C = Z().clipboard;
+    await C.writeText('zilt-linux-clipboard');
+    const text = await C.read('text');
+    await C.writeHtml('<b>zilt</b>');
+    const html = await C.read('html');
+    await C.writeFiles(['/tmp/a.txt', '/tmp/b c.txt']);
+    const files = await C.read('files');
+    const ok = text === 'zilt-linux-clipboard' &&
+      typeof html === 'string' && html.includes('<b>zilt</b>') &&
+      Array.isArray(files) && files.length === 2 && files[0] === '/tmp/a.txt' && files[1] === '/tmp/b c.txt';
+    check('clipboard', ok, `text=${text} html=${String(html).slice(0, 30)} files=${JSON.stringify(files)}`);
+  } catch (e) { check('clipboard', false, String(e.message || e)); }
+
+  // ---- v0.2.2：通知（GNotification；需要 D-Bus session bus）----
+  // 无会话总线（纯 Xvfb、无 dbus-run-session）时框架按设计降级：
+  // status = disabled_for_application 且 show 不抛异常 —— 两者都算通过。
+  try {
+    const st = await Z().notification.status();
+    const enabled = !!st && st.status === 'enabled';
+    if (enabled) {
+      await Z().notification.show({ title: 'Zilt Linux Smoke', body: 'GNotification', tag: 'smoke' });
+      await Z().notification.update({ tag: 'smoke', title: 'Zilt Linux Smoke', text: 'updated' });
+    }
+    check('notification', !!st && (enabled || st.status === 'disabled_for_application'), `status=${JSON.stringify(st)}`);
+  } catch (e) { check('notification', false, String(e.message || e)); }
 
   // ---- v0.2.1：clearStorage（WebKitWebsiteDataManager::clear）----
   try {
