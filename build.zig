@@ -121,6 +121,7 @@ fn linkLinuxWebviewLibs(b: *std.Build, module: *std.Build.Module) void {
     module.linkSystemLibrary(gtk_pkg_name, .{});
     module.linkSystemLibrary(webkit_pkg_name, .{});
     module.linkSystemLibrary("libsoup-3.0", .{}); // scheme 响应头（CSP/security.headers）
+    module.linkSystemLibrary("x11", .{}); // 全局快捷键 XGrabKey（v0.2.6）
 }
 
 /// pkg-config 的库搜索目录：`--libs-only-L` 的 `-L` 加上 `--variable=libdir`。

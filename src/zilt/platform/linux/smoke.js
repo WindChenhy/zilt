@@ -742,6 +742,36 @@ function runSecondWindowProbe() {
       `echo=${echoResp.status} "${echoBody.slice(0, 40)}" json=${jsonResp.status} bin=${binBuf.byteLength}`);
   } catch (e) { check('proto', false, String(e.message || e)); }
 
+  // ---- v0.2.6：窗口事件面——close-request 拦截（per-window opt-in，无头可测；
+  //      windowMoved/Resized/Focus/Blur 由 configure/focus 信号驱动，Xvfb 无 WM
+  //      不触发，实现与桌面行为同代码路径）----
+  try {
+    const W = Z().window;
+    // 主窗口在冒烟模式下被后端 opt-in close-request：close 触发 delete-event
+    // → 拦截 → windowCloseRequested（发给本窗口）→ 窗口存活（前端确认语义）
+    const reqSeen = await new Promise((resolve) => {
+      const off = Z().on('windowCloseRequested', (p) => { if (p.id === 1) { off(); resolve(true); } });
+      W.close(1).catch(() => {});
+      setTimeout(() => { off(); resolve(false); }, 3000);
+    });
+    let stillAlive = false;
+    try { const st = await W.state(1); stillAlive = !!st && st.id === 1; } catch (_) {}
+    check('win.closereq', reqSeen && stillAlive, `req=${reqSeen} alive=${stillAlive}`);
+  } catch (e) { check('win.closereq', false, String(e.message || e)); }
+
+  // ---- v0.2.6：全局快捷键（X11 XGrabKey；register → list → unregister）----
+  try {
+    const H = Z().hotkey;
+    const reg = await H.register('smoke-hotkey-v026', 'Ctrl+Alt+F9');
+    const list1 = await H.list();
+    const inList = (list1 || []).some((e) => e.id === 'smoke-hotkey-v026' && e.accel === 'Ctrl+Alt+F9');
+    const un = await H.unregister('smoke-hotkey-v026');
+    const list2 = await H.list();
+    const gone = !(list2 || []).some((e) => e.id === 'smoke-hotkey-v026');
+    check('hotkey.x11', reg === true && inList && un === true && gone,
+      `reg=${reg} list=${JSON.stringify(list1).slice(0, 80)} un=${un}`);
+  } catch (e) { check('hotkey.x11', false, String(e.message || e)); }
+
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {
     await Z().invoke('__zilt.linuxSmoke', {

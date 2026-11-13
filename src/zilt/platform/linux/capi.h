@@ -15,3 +15,5 @@
 /* 响应头（CSP / security.headers）需要 SoupMessageHeaders，
  * webkit2.h 虽然会顺带引入，但显式声明依赖更稳。 */
 #include <libsoup/soup.h>
+/* 全局快捷键（XGrabKey/XOpenDisplay，v0.2.6） */
+#include <X11/Xlib.h>

@@ -122,6 +122,7 @@ const notification = @import("../../notification.zig");
 const window_state = @import("window_state.zig");
 const sys = @import("../../sys.zig");
 const gtk_compat = @import("gtk_compat.zig");
+const hotkey_mod = @import("hotkey.zig");
 const deep_link = @import("deep_link.zig");
 const desktop_entry = @import("desktop_entry.zig");
 const sysinfo_linux = @import("sysinfo_linux.zig");
@@ -497,7 +498,7 @@ pub fn run(comptime config: Config) !void {
     self.initTray();
 
     // 主窗口（id 固定 1）；spawn 的窗口走同一个创建函数（createWindowInternal）
-    const main_opts = ipc.WindowOptions{
+    var main_opts = ipc.WindowOptions{
         .label = "main",
         .title = config.title,
         .width = config.width,
@@ -517,6 +518,9 @@ pub fn run(comptime config: Config) !void {
         // background_color / icon / proxy / user_agent / titlebar_overlay / transparent：
         // Linux 侧暂无对应实现，主窗口与 spawn 窗口一致地忽略。
     };
+    // 冒烟：主窗口 opt-in 关闭请求事件（windowCloseRequested 发给本窗口——
+    // 冒烟在主窗口自测「拦截 → 存活」闭环；桌面应用走 config.close_requested_event）
+    if (self.smoke) main_opts.close_requested_event = true;
     _ = try self.createWindowInternal(main_opts);
 
     log.print("[linux] main window ready (gtk={d}.{d}.{d}, smoke={s})", .{
@@ -531,6 +535,9 @@ pub fn run(comptime config: Config) !void {
 
     // v0.2.3：本地存储（store.json / acl.json，与 windowState 同根）
     self.initStorage();
+
+    // v0.2.6：X11 全局快捷键（config.hotkeys 声明式注册 + hotkey.* 运行时 op）
+    self.initHotkeys();
 
     // v0.2.3：应用自定义协议 → 真 scheme（Config.protocols；每协议一个 scheme）
     self.registerProtocolSchemes(wc);
@@ -642,6 +649,13 @@ fn Backend(comptime config: Config) type {
             accel_group: ?*c.GtkAccelGroup = null,
             /// 页面是否已完成首次加载（runtime 注入就绪）——深链事件投递的前置条件
             loaded: bool = false,
+            /// v0.2.6：窗口事件去重（configure/focus 抖动过滤 + 关闭请求 opt-in）
+            reported_x: i32 = -2147483647,
+            reported_y: i32 = -2147483647,
+            reported_w: i64 = -1,
+            reported_h: i64 = -1,
+            reported_focus: bool = false,
+            close_requested_event: bool = false,
         };
 
         /// 子 WebView（webviews.* op 管理的窗口内附加视图）。
@@ -855,6 +869,8 @@ fn Backend(comptime config: Config) type {
         next_fs_stream_id: i64 = 1,
         /// SQL lib 缓存（进程内一次加载）
         sqlite_lib: ?*linux_sqlite.Lib = null,
+        /// X11 全局快捷键（v0.2.6；config.hotkeys 启动注册 + hotkey.* 运行时 op）
+        hotkeys: ?*hotkey_mod.Manager = null,
         /// HTTP（libsoup3；事件 httpResponse / httpChunk）
         next_http_id_seq: i64 = 1,
         /// WebSocket 连接表（SoupWebsocketConnection 所有权在此）
@@ -894,6 +910,7 @@ fn Backend(comptime config: Config) type {
             if (self.tray) |*t| t.lib.close();
             if (self.gapp) |app| c.g_object_unref(@ptrCast(app));
             if (self.pending_launch) |*launch| launch.deinit(self.allocator);
+            if (self.hotkeys) |m| m.deinit();
             // v0.2.3：存储 / fs / SQL
             for (self.fs_watches.items) |w| fs_watch_mod.stop(w);
             self.fs_watches.deinit(self.allocator);
@@ -1330,6 +1347,7 @@ fn Backend(comptime config: Config) type {
                 .geom_width = opts.width,
                 .geom_height = opts.height,
                 .always_on_top = opts.always_on_top,
+                .close_requested_event = opts.close_requested_event orelse config.close_requested_event,
                 .min_width = opts.min_width orelse 0,
                 .min_height = opts.min_height orelse 0,
                 .max_width = opts.max_width orelse 0,
@@ -1418,6 +1436,12 @@ fn Backend(comptime config: Config) type {
             // 之前的错误路径（errdefer destroy(st)）绝不能有 destroy 处理器存活。
             _ = c.g_signal_connect_data(win, "destroy", @ptrCast(&Self.onDestroy), st, null, 0);
             _ = c.g_signal_connect_data(win, "configure-event", @ptrCast(&Self.onConfigureEvent), st, null, 0);
+            // v0.2.6：窗口事件面——焦点（focus-in/out）+ 关闭请求（delete-event，
+            // config.close_requested_event=true 时不销毁、发 windowCloseRequested
+            // 由前端确认后调 windowClose——对齐 Windows 的 WM_CLOSE opt-in 语义）
+            _ = c.g_signal_connect_data(win, "focus-in-event", @ptrCast(&Self.onFocusChange), st, null, 0);
+            _ = c.g_signal_connect_data(win, "focus-out-event", @ptrCast(&Self.onFocusChange), st, null, 0);
+            _ = c.g_signal_connect_data(win, "delete-event", @ptrCast(&Self.onDeleteEvent), st, null, 0);
             _ = c.g_signal_connect_data(
                 overlay,
                 "get-child-position",
@@ -1506,7 +1530,17 @@ fn Backend(comptime config: Config) type {
                 .show => c.gtk_widget_show_all(widget),
                 .hide => c.gtk_widget_hide(widget),
                 .focus => c.gtk_window_present(win),
-                .close => c.gtk_window_close(win),
+                .close => {
+                    // opt-in：直接发 delete-event 信号（本 GTK3 构建的 gtk_window_close
+                    // 实测不派发 delete-event；真实 WM 的关闭请求会自然到达该信号）
+                    if (st.close_requested_event) {
+                        var handled: c.gboolean = 0;
+                        c.g_signal_emit_by_name(@ptrCast(win), "delete-event", @as(?*anyopaque, null), &handled);
+                        if (handled == 0) c.gtk_window_close(win); // 未拦截（理论不达）兜底
+                    } else {
+                        c.gtk_window_close(win);
+                    }
+                },
                 .start_dragging => {
                     // 无鼠标事件上下文也能拖：取指针根坐标 + GLib 当前事件时间戳
                     const display = c.gdk_display_get_default() orelse return false;
@@ -3562,6 +3596,7 @@ fn Backend(comptime config: Config) type {
                 .fs => |op| return self.runFsOp(op, alloc),
                 .acl => |op| return self.runAclOp(op, alloc),
                 .sql => |op| return self.runSqlOp(op, alloc),
+                .hotkey => |op| return self.runHotkeyOp(op, alloc),
                 .http => |op| return self.runHttpOp(op, alloc),
                 .ws => |op| return self.runWsOp(op, alloc),
                 // 托盘运行时 op/快捷键/process/... 属后续版本；NotSupported
@@ -4518,6 +4553,101 @@ fn Backend(comptime config: Config) type {
             }
             job.backend.emitFsChunk(job.id, 0, true, "");
             return G_SOURCE_REMOVE;
+        }
+
+        // ------------------------------------------------------------------
+        // 全局快捷键（v0.2.6，X11 XGrabKey；绑定见 hotkey.zig）
+        // ------------------------------------------------------------------
+
+        fn onHotkeyPress(ctx: ?*anyopaque, id: []const u8) void {
+            const self: *Self = @ptrCast(@alignCast(ctx orelse return));
+            const w = self.windowById(0) orelse return;
+            const id_json = jsonStr(self.allocator, id) orelse return;
+            defer self.allocator.free(id_json);
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"id\":{s}}}", .{id_json}) catch return;
+            defer self.allocator.free(payload);
+            self.emitRawToWindow(w.id, "hotkey", payload);
+        }
+
+        fn initHotkeys(self: *Self) void {
+            const m = hotkey_mod.Manager.init(self.allocator, onHotkeyPress, self) catch |err| {
+                log.print("[hotkey] X11 unavailable ({s}) — global hotkeys disabled", .{@errorName(err)});
+                return;
+            };
+            self.hotkeys = m;
+            // config.hotkeys 声明式注册（对齐 Windows 启动注册；冲突/占用优雅降级）
+            for (config.hotkeys orelse &.{}) |hk| {
+                const keyval = keyvalForGtk(hk.key) orelse continue;
+                const keysym_name = hotkey_mod.keysymNameFor(self.allocator, keyval) catch null;
+                if (keysym_name) |kn| {
+                    defer self.allocator.free(kn);
+                    const mods: c_uint = (if (hk.shift) @as(c_uint, 1) else 0) |
+                        (if (hk.ctrl) @as(c_uint, 4) else 0) |
+                        (if (hk.alt) @as(c_uint, 8) else 0) |
+                        (if (hk.win) @as(c_uint, 1 << 26) else 0);
+                    const accel_text = accelTextOf(hk);
+                    m.register(hk.id, accel_text, kn, mods) catch |err| {
+                        log.print("[hotkey] config '{s}' register failed ({s})——占用/无效键位不致命", .{ hk.id, @errorName(err) });
+                        continue;
+                    };
+                    log.print("[hotkey] config '{s}' = {s} registered", .{ hk.id, accel_text });
+                }
+            }
+        }
+
+        /// config.hotkeys 的展示文本（"Ctrl+Alt+N"——与 Windows 的 accel 格式一致）。
+        var accel_text_buf: [64]u8 = undefined;
+        fn accelTextOf(hk: Config.Hotkey) []const u8 {
+            var w: std.Io.Writer = .fixed(&accel_text_buf);
+            if (hk.ctrl) w.writeAll("Ctrl+") catch {};
+            if (hk.alt) w.writeAll("Alt+") catch {};
+            if (hk.shift) w.writeAll("Shift+") catch {};
+            if (hk.win) w.writeAll("Super+") catch {};
+            w.writeAll(hk.key) catch {};
+            return accel_text_buf[0..w.end];
+        }
+
+        fn runHotkeyOp(self: *Self, op: system_api.HotkeyOp, alloc: std.mem.Allocator) !system_api.Result {
+            const m = self.hotkeys orelse return error.HotkeyNotAvailable;
+            switch (op) {
+                .list => {
+                    var out: std.ArrayListUnmanaged(u8) = .empty;
+                    errdefer out.deinit(alloc);
+                    try out.append(alloc, '[');
+                    const items = try m.list(alloc);
+                    defer alloc.free(items);
+                    for (items, 0..) |e, i| {
+                        if (i != 0) try out.appendSlice(alloc, ",");
+                        const id = try std.json.Stringify.valueAlloc(alloc, e.id, .{});
+                        defer alloc.free(id);
+                        const accel = try std.json.Stringify.valueAlloc(alloc, e.accel, .{});
+                        defer alloc.free(accel);
+                        try out.appendSlice(alloc, "{\"id\":");
+                        try out.appendSlice(alloc, id);
+                        try out.appendSlice(alloc, ",\"accel\":");
+                        try out.appendSlice(alloc, accel);
+                        try out.appendSlice(alloc, "}");
+                    }
+                    try out.append(alloc, ']');
+                    return .{ .json = try out.toOwnedSlice(alloc) };
+                },
+                .register => |spec| {
+                    const parsed = parseAccelGtk(spec.accel) orelse return error.InvalidAccel;
+                    const keysym_name = (hotkey_mod.keysymNameFor(self.allocator, parsed.keyval) catch null) orelse return error.InvalidAccel;
+                    defer self.allocator.free(keysym_name);
+                    m.register(spec.id, spec.accel, keysym_name, @intCast(parsed.mods)) catch |err| return switch (err) {
+                        error.XGrabFailed => error.HotkeyConflict,
+                        else => err,
+                    };
+                    log.print("[hotkey] runtime registered {s} = {s}", .{ spec.id, spec.accel });
+                    return .{ .ok = true };
+                },
+                .unregister => |id| {
+                    const ok = m.unregister(id);
+                    log.print("[hotkey] runtime unregistered {s} (ok={})", .{ id, ok });
+                    return .{ .ok = ok };
+                },
+            }
         }
 
         // ------------------------------------------------------------------
@@ -5515,7 +5645,117 @@ fn Backend(comptime config: Config) type {
                 st.geom_width = @intCast(cfg.*.width);
                 st.geom_height = @intCast(cfg.*.height);
             }
+            // v0.2.6：windowMoved / windowResized（去重——configure 抖动/重复很常见）
+            const moved = st.geom_x != st.reported_x or st.geom_y != st.reported_y;
+            const resized = @as(i64, st.geom_width) != st.reported_w or @as(i64, st.geom_height) != st.reported_h;
+            if (moved) {
+                st.reported_x = st.geom_x;
+                st.reported_y = st.geom_y;
+                st.backend.emitWindowEvent(st, "windowMoved", &.{
+                    .{ .name = "id", .value = st.id },
+                    .{ .name = "x", .value = st.geom_x },
+                    .{ .name = "y", .value = st.geom_y },
+                });
+            }
+            if (resized) {
+                st.reported_w = @intCast(st.geom_width);
+                st.reported_h = @intCast(st.geom_height);
+                st.backend.emitWindowEvent(st, "windowResized", &.{
+                    .{ .name = "id", .value = st.id },
+                    .{ .name = "width", .value = @as(i64, st.geom_width) },
+                    .{ .name = "height", .value = @as(i64, st.geom_height) },
+                });
+            }
             return 0;
+        }
+
+        /// 窗口事件的字段发射器（小而固定的 payload；数值直出、无字符串转义）。
+        const WinEventField = struct { name: []const u8, value: i64 };
+
+        fn emitWindowEvent(self: *Self, st: *WinState, name: []const u8, fields: []const WinEventField) void {
+            // 经 idle 封送：本函数常在 script-message 回调（invoke 处理）内触发，
+            // 回调里直接 evaluate_javascript 实测会被丢弃（与 emitEntry 同理）
+            const task = self.allocator.create(WindowEventTask) catch return;
+            const name_copy = self.allocator.dupe(u8, name) catch {
+                self.allocator.destroy(task);
+                return;
+            };
+            var payload: std.ArrayListUnmanaged(u8) = .empty;
+            payload.append(self.allocator, '{') catch {
+                self.allocator.free(name_copy);
+                self.allocator.destroy(task);
+                return;
+            };
+            for (fields, 0..) |f, i| {
+                if (i != 0) payload.append(self.allocator, ',') catch break;
+                payload.append(self.allocator, '"') catch break;
+                payload.appendSlice(self.allocator, f.name) catch break;
+                payload.appendSlice(self.allocator, "\":") catch break;
+                var buf: [24]u8 = undefined;
+                const printed = std.fmt.bufPrint(&buf, "{d}", .{f.value}) catch continue;
+                payload.appendSlice(self.allocator, printed) catch break;
+            }
+            payload.append(self.allocator, '}') catch {
+                self.allocator.free(name_copy);
+                payload.deinit(self.allocator);
+                self.allocator.destroy(task);
+                return;
+            };
+            task.* = .{
+                .backend = self,
+                .win_id = st.id,
+                .name = name_copy,
+                .payload = payload.items,
+            };
+            if (c.g_idle_add(windowEventIdle, task) == 0) {
+                self.allocator.free(name_copy);
+                self.allocator.free(payload.items);
+                self.allocator.destroy(task);
+            }
+        }
+
+        const WindowEventTask = struct {
+            backend: *Self,
+            win_id: u32,
+            name: []u8,
+            payload: []u8,
+        };
+
+        fn windowEventIdle(data: c.gpointer) callconv(.c) c.gboolean {
+            const task: *WindowEventTask = @ptrCast(@alignCast(data orelse return G_SOURCE_REMOVE));
+            const self = task.backend;
+            defer {
+                self.allocator.free(task.name);
+                self.allocator.free(task.payload);
+                self.allocator.destroy(task);
+            }
+            self.emitRawToWindow(task.win_id, task.name, task.payload);
+            return G_SOURCE_REMOVE;
+        }
+
+        /// focus-in/out → windowFocus/windowBlur（去重）。
+        fn onFocusChange(_: [*c]c.GtkWidget, event: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
+            const st: *WinState = @ptrCast(@alignCast(user_data orelse return 0));
+            const ev: [*c]c.GdkEventFocus = @ptrCast(@alignCast(event orelse return 0));
+            const focused = ev.*.in != 0;
+            if (focused == st.reported_focus) return 0;
+            st.reported_focus = focused;
+            st.backend.emitWindowEvent(st, if (focused) "windowFocus" else "windowBlur", &.{
+                .{ .name = "id", .value = st.id },
+            });
+            return 0;
+        }
+
+        /// delete-event → close_requested_event=true 时拦截（发 windowCloseRequested
+        /// 由前端确认；false = 走默认销毁）。
+        fn onDeleteEvent(_: [*c]c.GtkWidget, _: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
+            const st: *WinState = @ptrCast(@alignCast(user_data orelse return 0));
+            if (!st.close_requested_event) return 0; // 默认销毁
+            log.print("[window] close requested (window #{d})", .{st.id});
+            st.backend.emitWindowEvent(st, "windowCloseRequested", &.{
+                .{ .name = "id", .value = st.id },
+            });
+            return 1; // 拦截：不销毁，等前端确认
         }
 
         /// GtkOverlay 的 get-child-position：子 WebView 按存储的布局矩形放置。

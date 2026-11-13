@@ -214,6 +214,18 @@
       （scripts/linux/dev-perf.sh，ReleaseSafe：构建缓存 3.4s、冒烟全程
       ~8.4s、峰值 RSS ~215MB，2026-11-14 记录）。Wayland 实测/输入法/无障碍
       仍在清单上（需桌面会话环境）。
+- [x] **v0.2.6 Linux 收尾**（2026-11-14）：**窗口事件面**——windowMoved/
+      windowResized（configure-event 去重上报）+ windowFocus/windowBlur
+      （focus-in/out）+ **windowCloseRequested**（delete-event 拦截；
+      per-window `closeRequested` opt-in（`window.create({closeRequested})`，
+      两平台同接——Windows 的 WM_CLOSE 判断复用同一字段）+ 冒烟模式主窗口
+      自测「拦截 → 存活」闭环）；**X11 全局快捷键**（`hotkey.zig`：XGrabKey
+      + 事件线程，BadAccess 经 XSetErrorHandler 计数检测——XGrabKey 返回值
+      实测非状态码；lock 组合全抓取；config.hotkeys 启动注册 + hotkey.* op，
+      冒烟 register→list→unregister 实测）；CI apt 列表补 libx11-dev。
+      未做（如实记录）：headless 服务 / WebKitWebDriver E2E（Linux）——留待
+      后续；windowMoved/Resized/Focus/Blur 的冒烟断言需 WM（Xvfb 无 WM 不触发
+      configure/focus，实现与桌面同代码路径）。
 - [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）——v0.3+
 - [x] 平台差异收敛原则：平台无关层（ipc/security/fs_api/protocol/net/sql/store/patch/pack_formats）
       两平台共用，差异只出现在 `platform/<os>/`

@@ -56,6 +56,8 @@ pub const Args = struct {
     child: ?bool = null,
     /// v0.2.1：窗口状态持久化键（window.create({stateKey}) → __zilt.window）
     state_key: ?[]const u8 = null,
+    /// v0.2.6：per-window 关闭请求事件（window.create({closeRequested})）
+    close_requested_event: ?bool = null,
     zoom: ?f64 = null,
     download_id: ?u64 = null,
     /// v0.1.24：窗口/WebView 的 User-Agent
@@ -324,6 +326,7 @@ fn windowCmd(ctx: ipc.Context, a: Args) ![]u8 {
             .modal = a.modal orelse false,
             .child = a.child orelse false,
             .state_key = a.state_key,
+            .close_requested_event = a.close_requested_event,
             .proxy = a.proxy,
             .user_agent = a.user_agent,
         };

@@ -142,7 +142,9 @@ pub const WindowOptions = struct {
     /// WebView 默认背景色（0xRRGGBB；null = 白色）
     background_color: ?u32 = null,
     /// 关闭前发 windowCloseRequested，由前端调用 windowClose 才真正关闭
-    close_requested_event: bool = false,
+    /// v0.2.6：per-window 关闭请求事件（window.create({closeRequested: true})；
+    /// null = 跟随 config.close_requested_event）
+    close_requested_event: ?bool = null,
     /// 每窗口图标（资产路径；null = 应用默认图标）
     icon: ?[]const u8 = null,
     /// v0.1.23：本窗口专用代理（`127.0.0.1:7890` / `http://host:port`）。
@@ -917,6 +919,7 @@ const runtime_js_head =
     \\        if (o.userAgent !== undefined) o.user_agent = o.userAgent;
     \\        // v0.2.1: stateKey → state_key（窗口状态持久化键）
     \\        if (o.stateKey !== undefined) o.state_key = o.stateKey;
+    \\        if (o.closeRequested !== undefined) o.close_requested_event = o.closeRequested;
     \\        return winApi('create', o);
     \\      },
     \\      close: (id) => winApi('close', { window_id: id }),

@@ -49,7 +49,7 @@ ok=1
     code=$?
     echo "INSTALLED_SMOKE_EXIT=$code"
     [ "$code" = "0" ] || ok=0
-    grep -aq "ALL 57 CHECKS PASSED" zilt.log || { echo "SMOKE NOT GREEN"; ok=0; }
+    grep -aq "ALL 59 CHECKS PASSED" zilt.log || { echo "SMOKE NOT GREEN"; ok=0; }
   else
     echo "EXTRACTED EXE MISSING"; ok=0
   fi
@@ -61,7 +61,7 @@ ok=1
     code=$?
     echo "APPRUN_SMOKE_EXIT=$code"
     [ "$code" = "0" ] || ok=0
-    grep -aq "ALL 57 CHECKS PASSED" zilt.log || { echo "SMOKE NOT GREEN"; ok=0; }
+    grep -aq "ALL 59 CHECKS PASSED" zilt.log || { echo "SMOKE NOT GREEN"; ok=0; }
   else
     echo "APPRUN MISSING at $APPDIR"; ok=0
   fi
