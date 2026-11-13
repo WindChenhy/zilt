@@ -11,6 +11,11 @@
 //!   - **URL 形态**：WebKitGTK 只能注册自有 scheme，不能接管 `https`。因此
 //!     `config.url = https://zilt.app/index.html` 在 Linux 上映射为
 //!     `zilt://app/index.html`；ACL 判定用的 app_url 也换成 `zilt://app/...`。
+//!   - v0.2.1 切片 1：窗口 API（`window_fn` / `window_query_fn`）已接通——
+//!     set_title / minimize / maximize / restore / fullscreen / size / position /
+//!     show / hide / focus / close / start_dragging / always_on_top(_bottom) /
+//!     skip_taskbar / focusable / enabled / theme(dark) / limits / fullscreen_monitor。
+//!     光标系列、ignore_cursor、content_protected、shadow、icon 留 false（后续切片）。
 //!   - 尚未实现（钩子留 null → 前端拿到与 Windows 相同的固定降级错误名）：
 //!     剪贴板 / 通知 / 对话框 / 系统集成 / 多窗口 / 下载 / 托盘 / 菜单 / 快捷键。
 //!     这些属于 v0.2.1–v0.2.3，`platform/interface.zig` 的能力矩阵逐项打勾。
@@ -81,6 +86,10 @@ fn reasonFor(status: u16) [:0]const u8 {
         500 => "Internal Server Error",
         else => "OK",
     };
+}
+
+fn boolStr(b: bool) []const u8 {
+    return if (b) "true" else "false";
 }
 
 pub fn run(comptime config: Config) !void {
@@ -192,6 +201,15 @@ fn Backend(comptime config: Config) type {
         asset_cache: std.StringHashMapUnmanaged([]u8) = .empty,
         /// 已登记的用户脚本（WebKit 侧持 ref，进程结束时统一释放）
         scripts: std.ArrayListUnmanaged(?*c.WebKitUserScript) = .empty,
+        // ---- 窗口状态跟踪（v0.2.1；WM 参与的状态以 GTK 查询为准，这里只存客户端可查项）----
+        fullscreen: bool = false,
+        always_on_top: bool = false,
+        always_on_bottom: bool = false,
+        /// 尺寸约束（0 = 无约束；对应 __zilt.window setMinMax）
+        min_width: u32 = 0,
+        min_height: u32 = 0,
+        max_width: u32 = 0,
+        max_height: u32 = 0,
 
         fn deinit(self: *Self) void {
             var it = self.asset_cache.iterator();
@@ -256,6 +274,8 @@ fn Backend(comptime config: Config) type {
                 .window_id = 0,
                 .emit_fn = emitEntry,
                 .quit_fn = quitEntry,
+                .window_fn = windowEntry,
+                .window_query_fn = windowQueryEntry,
                 // 其余钩子留 null：调用方按 platform/interface.zig 的固定错误名降级
             };
         }
@@ -278,6 +298,162 @@ fn Backend(comptime config: Config) type {
         fn quitEntry(_: *anyopaque, code: u8) void {
             _ = code;
             _ = c.g_idle_add(quitIdle, null);
+        }
+
+        // ---- 窗口控制（v0.2.1 切片 1）----
+        //
+        // 与 Windows 的差异：Windows 经 SendMessageW(WM_ZILT_WINCTL) 封送到窗口线程，
+        // Linux 的 script-message-received 本身就是 GTK 主循环信号（UI 线程），
+        // 直接调用 GTK API 即可，无需再封送。
+
+        /// 尺寸约束 → gdk geometry hints（0 = 无约束；全空则不下发任何 hint 位）。
+        /// 注意 WM 才会执行约束，Xvfb 下无 WM——所以 query 读跟踪值而非 hint。
+        fn applyGeometryHints(self: *Self, win: [*c]c.GtkWindow) void {
+            var geom: c.GdkGeometry = std.mem.zeroes(c.GdkGeometry);
+            var flags: c.GdkWindowHints = 0;
+            if (self.min_width != 0 or self.min_height != 0) {
+                geom.min_width = @intCast(self.min_width);
+                geom.min_height = @intCast(self.min_height);
+                flags |= c.GDK_HINT_MIN_SIZE;
+            }
+            if (self.max_width != 0 or self.max_height != 0) {
+                geom.max_width = @intCast(self.max_width);
+                geom.max_height = @intCast(self.max_height);
+                flags |= c.GDK_HINT_MAX_SIZE;
+            }
+            // geometry_widget 传 null = 约束相对窗口自身
+            c.gtk_window_set_geometry_hints(win, null, &geom, flags);
+        }
+
+        fn windowEntry(backend: *anyopaque, window_id: u32, cmd: ipc.WindowCmd) bool {
+            _ = window_id; // 骨架只有主窗口
+            const self: *Self = @ptrCast(@alignCast(backend));
+            const win = self.window orelse return false;
+            const widget: [*c]c.GtkWidget = @ptrCast(win);
+
+            switch (cmd) {
+                .set_title => |t| {
+                    const z = dupeZ(self.allocator, t) catch return false;
+                    defer self.allocator.free(z);
+                    c.gtk_window_set_title(win, z.ptr);
+                },
+                .minimize => c.gtk_window_iconify(win),
+                .maximize => c.gtk_window_maximize(win),
+                .restore => {
+                    // 全屏 → 最大化 → 最小化，逐层退出（与 Windows restore 语义对齐）
+                    if (self.fullscreen) {
+                        c.gtk_window_unfullscreen(win);
+                        self.fullscreen = false;
+                    }
+                    if (c.gtk_window_is_maximized(win) != 0) c.gtk_window_unmaximize(win);
+                    _ = c.gtk_window_deiconify(win);
+                },
+                .fullscreen => |on| {
+                    if (on) c.gtk_window_fullscreen(win) else c.gtk_window_unfullscreen(win);
+                    self.fullscreen = on;
+                },
+                .size => |s| c.gtk_window_resize(win, @intCast(s.width), @intCast(s.height)),
+                .position => |p| c.gtk_window_move(win, p.x, p.y),
+                .show => c.gtk_widget_show_all(widget),
+                .hide => c.gtk_widget_hide(widget),
+                .focus => c.gtk_window_present(win),
+                .close => c.gtk_window_close(win),
+                .start_dragging => {
+                    // 无鼠标事件上下文也能拖：取指针根坐标 + GLib 当前事件时间戳
+                    const display = c.gdk_display_get_default() orelse return false;
+                    const seat = c.gdk_display_get_default_seat(display) orelse return false;
+                    var x: c.gint = 0;
+                    var y: c.gint = 0;
+                    c.gdk_device_get_position(c.gdk_seat_get_pointer(seat), null, &x, &y);
+                    c.gtk_window_begin_move_drag(win, 1, x, y, c.gtk_get_current_event_time());
+                },                .always_on_top => |on| {
+                    c.gtk_window_set_keep_above(win, @intFromBool(on));
+                    self.always_on_top = on;
+                },
+                .always_on_bottom => |on| {
+                    c.gtk_window_set_keep_below(win, @intFromBool(on));
+                    self.always_on_bottom = on;
+                },
+                .skip_taskbar => |on| c.gtk_window_set_skip_taskbar_hint(win, @intFromBool(on)),
+                .focusable => |on| c.gtk_window_set_accept_focus(win, @intFromBool(on)),
+                .enabled => |on| c.gtk_widget_set_sensitive(widget, @intFromBool(on)),
+                .theme => |t| {
+                    // GTK3 只有暗色偏好这一项可映射；caption/border 等 DWM 配色是 Windows 独占
+                    if (t.dark) |dark| {
+                        const settings = c.gtk_settings_get_default() orelse return false;
+                        c.g_object_set(
+                            @ptrCast(settings),
+                            "gtk-application-prefer-dark-theme",
+                            @as(c.gboolean, @intFromBool(dark)),
+                            @as(?*anyopaque, null),
+                        );
+                    }
+                },
+                .limits => |lim| {
+                    // null = 不改，0 = 清除该约束（与 Windows 语义一致）
+                    if (lim.min_width) |v| self.min_width = @intCast(v) else self.min_width = 0;
+                    if (lim.min_height) |v| self.min_height = @intCast(v) else self.min_height = 0;
+                    if (lim.max_width) |v| self.max_width = @intCast(v) else self.max_width = 0;
+                    if (lim.max_height) |v| self.max_height = @intCast(v) else self.max_height = 0;
+                    self.applyGeometryHints(win);
+                },
+                .fullscreen_monitor => |idx| {
+                    // GTK3 的 API 走 GdkScreen（3.22 起才有 GdkMonitor 版本）
+                    const screen = c.gdk_screen_get_default() orelse return false;
+                    if (idx >= @as(u32, @intCast(c.gdk_screen_get_n_monitors(screen)))) return false;
+                    c.gtk_window_fullscreen_on_monitor(win, screen, @intCast(idx));
+                    self.fullscreen = true;
+                },
+                // 光标系列 / 穿透 / 截图保护 / 阴影 / 图标：后续切片（false = 前端拿到明确失败）
+                .cursor, .cursor_visible, .cursor_grab, .cursor_position => return false,
+                .ignore_cursor, .content_protected, .shadow, .icon => return false,
+                // builtin 的 state 动作在调用 window_fn 之前已走 window_query_fn
+                .state => return true,
+            }
+            return true;
+        }
+
+        /// 窗口状态查询 → JSON（字段名与 Windows 的 runWindowQuery 对齐，
+        /// style/ex_style 等 Win32 概念在 Linux 恒为 0/false）。
+        fn windowQueryEntry(backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator) ?[]u8 {
+            _ = window_id;
+            const self: *Self = @ptrCast(@alignCast(backend));
+            const win = self.window orelse return null;
+            const widget: [*c]c.GtkWidget = @ptrCast(win);
+
+            var x: c.gint = 0;
+            var y: c.gint = 0;
+            c.gtk_window_get_position(win, &x, &y);
+            var width: c.gint = 0;
+            var height: c.gint = 0;
+            c.gtk_window_get_size(win, &width, &height);
+
+            var iconic = false;
+            if (c.gtk_widget_get_window(widget)) |gdk_win| {
+                iconic = (c.gdk_window_get_state(gdk_win) & c.GDK_WINDOW_STATE_ICONIFIED) != 0;
+            }
+
+            return std.fmt.allocPrint(alloc,
+                \\{{"id":1,"x":{d},"y":{d},"width":{d},"height":{d},"style":0,"ex_style":0,"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":false,"focusable":{s},"content_protected":false,"overlay":false,"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":0}}
+            , .{
+                x,
+                y,
+                width,
+                height,
+                boolStr(c.gtk_widget_get_sensitive(widget) != 0),
+                boolStr(c.gtk_widget_get_visible(widget) != 0),
+                boolStr(c.gtk_window_is_active(win) != 0),
+                boolStr(c.gtk_window_is_maximized(win) != 0),
+                boolStr(iconic),
+                boolStr(self.fullscreen),
+                boolStr(self.always_on_top),
+                boolStr(self.always_on_bottom),
+                boolStr(c.gtk_window_get_accept_focus(win) != 0),
+                self.min_width,
+                self.min_height,
+                self.max_width,
+                self.max_height,
+            }) catch null;
         }
 
         // ---- 消息处理 ----

@@ -1,13 +1,18 @@
-// Linux 冒烟脚本（v0.2.0）——只覆盖本版**已实现**的能力。
+// Linux 冒烟脚本（v0.2.1）——只覆盖**已实现**的能力。
 //
 // 由 platform/linux/backend.zig 在 ZILT_LINUX_SMOKE=1 时作为 document-start
 // 用户脚本注入；跑完通过 `__zilt.linuxSmoke` 把结果回传，后端据此决定退出码。
 //
-// 刻意不测：剪贴板 / 通知 / 对话框 / 多窗口（v0.2.1–v0.2.3 才实现）。
+// 窗口检查注意：xvfb-run 默认没有窗口管理器，WM 参与的状态（maximized/iconic、
+// keep-above 的实际置顶、geometry hint 的强制执行）不可断言——只断言客户端
+// 可查字段（size/position/tracked 标志）与命令返回值。
+//
+// 刻意不测：剪贴板 / 通知 / 对话框 / 多窗口（v0.2.2–v0.2.3 才实现）。
 (async () => {
   const results = [];
   const check = (name, ok, note) => results.push({ name, ok: !!ok, note: String(note ?? '') });
   const Z = () => window.zilt;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // 1. 命令调用 + 嵌套返回字段
   try {
@@ -70,6 +75,81 @@
 
   // 8. runtime 注入的版本号
   check('version', typeof Z().version === 'string' && Z().version.length > 0, Z().version);
+
+  // ---- v0.2.1：窗口 API（window_fn / window_query_fn）----
+  try {
+    const W = Z().window;
+    const state = async () => await W.state();
+    const isObj = (s) => !!s && typeof s === 'object' && s.id === 1;
+    let s = await state();
+    check('win.state', isObj(s) && s.width > 0 && s.height > 0 && s.enabled === true, JSON.stringify(s).slice(0, 120));
+
+    // setSize：客户端尺寸（无 WM 时 gtk_window_get_size 即所设值）
+    await W.setSize(800, 600);
+    await wait(120);
+    s = await state();
+    check('win.size', s.width === 800 && s.height === 600, `${s.width}x${s.height}`);
+
+    // setPosition：无 WM 时 gtk_window_move 的坐标原样生效
+    await W.setPosition(60, 40);
+    await wait(120);
+    s = await state();
+    check('win.pos', s.x === 60 && s.y === 40, `${s.x},${s.y}`);
+
+    // setTitle：命令被接受即可（state JSON 不含标题）
+    check('win.title', (await W.setTitle('Zilt Linux Smoke')) === true, 'ok');
+
+    // fullscreen：状态跟踪开/关往返
+    await W.fullscreen(true);
+    const fsOn = (await state()).fullscreen === true;
+    await W.fullscreen(false);
+    const fsOff = (await state()).fullscreen === false;
+    check('win.fullscreen', fsOn && fsOff, `on=${fsOn} off=${fsOff}`);
+
+    // alwaysOnTop：状态跟踪
+    await W.alwaysOnTop(true);
+    const topOn = (await state()).always_on_top === true;
+    await W.alwaysOnTop(false);
+    const topOff = (await state()).always_on_top === false;
+    check('win.ontop', topOn && topOff, `on=${topOn} off=${topOff}`);
+
+    // setMinMax：约束跟踪值可查，清除后归零
+    await Z().invoke('__zilt.window', { action: 'setMinMax', min_width: 480, min_height: 320, max_width: 1600, max_height: 1200 });
+    s = await state();
+    const limOn = s.min_width === 480 && s.min_height === 320 && s.max_width === 1600 && s.max_height === 1200;
+    await Z().invoke('__zilt.window', { action: 'setMinMax' });
+    s = await state();
+    check('win.limits', limOn && s.min_width === 0 && s.max_width === 0, `on=${limOn} min=${s.min_width}`);
+
+    // setEnabled / setFocusable：GTK 查询值往返
+    await W.setEnabled(false);
+    const disOk = (await state()).enabled === false;
+    await W.setEnabled(true);
+    await W.setFocusable(false);
+    const focOk = (await state()).focusable === false;
+    await W.setFocusable(true);
+    s = await state();
+    check('win.sensitive', disOk && focOk && s.enabled === true && s.focusable === true, `dis=${disOk} foc=${focOk}`);
+
+    // hide/show：可见性往返
+    await W.hide();
+    const hidOk = (await state()).visible === false;
+    await W.show();
+    const showOk = (await state()).visible === true;
+    check('win.vis', hidOk && showOk, `hide=${hidOk} show=${showOk}`);
+
+    // minimize/maximize/restore/startDragging：Xvfb 无 WM，只验证命令被接受不崩
+    const rMin = await W.minimize();
+    await W.restore();
+    const rMax = await W.maximize();
+    await W.restore();
+    const rDrag = await W.startDragging();
+    check('win.wmcalls', rMin === true && rMax === true && rDrag === true, `min=${rMin} max=${rMax} drag=${rDrag}`);
+
+    // 未实现项：明确返回 false（不抛异常），错误名对齐 Windows 语义
+    const rCursor = await W.setCursor('hand');
+    check('win.unimpl', rCursor === false, `cursor=${rCursor}`);
+  } catch (e) { check('win.state', false, String(e.message || e)); }
 
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {
