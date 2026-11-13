@@ -1,4 +1,4 @@
-// Linux 冒烟脚本（v0.2.1）——只覆盖**已实现**的能力。
+// Linux 冒烟脚本（v0.2.2）——只覆盖**已实现**的能力。
 //
 // 由 platform/linux/backend.zig 在 ZILT_LINUX_SMOKE=1 时作为 document-start
 // 用户脚本注入（**每个窗口/子 WebView 都注入**——因此按 location.pathname 分流：
@@ -12,7 +12,8 @@
 // 可查字段（size/position/tracked 标志）与命令返回值。
 //
 // 刻意不测：原生对话框（模态、需要人工交互）。
-// 剪贴板/通知/菜单栏/托盘在 v0.2.2 已覆盖（通知无 D-Bus 时按降级语义断言）。
+// 剪贴板/通知/菜单栏/托盘/运行时菜单模型/系统信息/自启动/拖放/深链在 v0.2.2 已覆盖
+//（通知无 D-Bus 时按降级语义断言；拖入由后端模拟投递覆盖事件链路）。
 //
 // reload 刻意不做探测：报告 invoke 刚 post 就导航，消息会在导航中丢失
 // （实测导致「reload → 脚本重跑 → 再 reload」无限循环）；且 reload 与 stop
@@ -39,6 +40,17 @@ function runSecondWindowProbe() {
   const path = location.pathname || '/';
   if (path === '/second.html') return runSecondWindowProbe();
   if (path !== '/index.html') return; // probe 等辅助页面不动作
+
+  // 深链持久记录（先于任何 await 注册——启动深链在 load-finished 时补发，
+  // 可能早于后面的 deeplink.startup 检查执行）；同时打 Zig 日志留 E2E 证据。
+  window.__ziltDeepLinkSeen = null;
+  try {
+    window.zilt.on('deepLink', (p) => {
+      window.__ziltDeepLinkSeen = p;
+      window.zilt.emit('frontendLog', { msg: 'deeplink-event ' + JSON.stringify(p) });
+    });
+  } catch (_) {}
+
   // 防重入：本脚本在每个窗口都注入，而前端 app.js 的 c-windowapi 检查会再开一个
   // 加载 index.html 的窗口——只有主窗口（id=1，state() 的 window_id 路由返回自身）
   // 跑完整套件，避免双套件并发创建多窗口/分区的竞态。
@@ -483,6 +495,85 @@ function runSecondWindowProbe() {
     const st = await Z().webview.clearStorage();
     check('storage.clear', st !== false, JSON.stringify(st));
   } catch (e) { check('storage.clear', false, String(e.message || e)); }
+
+  // ---- v0.2.2：运行时菜单模型（menu.* —— config.tray.menu 初始化，与 Windows 同构）----
+  try {
+    const M = Z().menu;
+    const findNode = (nodes, id) => {
+      for (const n of nodes || []) {
+        if (n.id === id) return n;
+        const hit = findNode(n.children, id);
+        if (hit) return hit;
+      }
+      return null;
+    };
+    const list0 = await M.list();
+    const baseOk = Array.isArray(list0) && list0.length >= 1;
+    // add（根级）→ set（勾选）→ list 校验 → remove
+    await M.add({ title: '冒烟项', path: 'smoke-item' });
+    const list1 = await M.list();
+    const added = !!findNode(list1, 'smoke-item');
+    const setRes = await M.set('smoke-item', { checked: true });
+    const node = findNode(await M.list(), 'smoke-item');
+    const checkedOk = !!node && node.checked === true;
+    const rm = await M.remove('smoke-item');
+    const removed = !findNode(await M.list(), 'smoke-item');
+    check('menu.model', baseOk && added && setRes !== false && checkedOk && rm === true && removed,
+      `base=${list0.length} add=${added} set=${setRes}/${checkedOk} rm=${rm}/${removed}`);
+
+    // popup：程序化弹出（Xvfb 无 WM 也可弹）→ 不崩且返回 ok；deactivate 后由
+    // 后端销毁（这里只验证命令路径）
+    const pop = await M.popup(24, 24);
+    check('menu.popup', pop === true, JSON.stringify(pop));
+  } catch (e) { check('menu.model', false, String(e.message || e)); }
+
+  // ---- v0.2.2：系统信息（/etc/os-release + GDK monitors）----
+  try {
+    const os = await Z().system.os();
+    const mons = await Z().system.monitors();
+    const ok = !!os && typeof os.name === 'string' && os.name.length > 0 &&
+      typeof os.locale === 'string' && os.locale.length > 0 &&
+      Array.isArray(mons) && mons.length >= 1 &&
+      mons[0].width > 0 && mons[0].height > 0 && mons[0].dpi >= 96;
+    check('sysinfo', ok, `os=${JSON.stringify(os).slice(0, 110)} mon0=${JSON.stringify((mons || [])[0] || {}).slice(0, 110)}`);
+  } catch (e) { check('sysinfo', false, String(e.message || e)); }
+
+  // ---- v0.2.2：自启动（真实写/删 ~/.config/autostart/<app_id>.desktop）----
+  try {
+    const en = await Z().autostart.enable();
+    const q1 = await Z().autostart.query();
+    const dis = await Z().autostart.disable();
+    const q2 = await Z().autostart.query();
+    check('autostart', !!en && en.enabled === true && q1.enabled === true && dis && q2.enabled === false,
+      `en=${JSON.stringify(en)} q1=${JSON.stringify(q1)} q2=${JSON.stringify(q2)}`);
+  } catch (e) { check('autostart', false, String(e.message || e)); }
+
+  // ---- v0.2.2：拖放（后端经 __zilt.linuxSmokeDrop 触发模拟投递 → dropFiles 事件）----
+  // 真实 X11 拖拽需要指针自动化；这里覆盖「uri-list 解析 → dropFiles 事件 →
+  // 前端监听」全链路（GDK 信号接线由单测 + 日志保证）。
+  try {
+    const files = await new Promise((resolve) => {
+      const off = Z().on('dropFiles', (p) => { off(); resolve(p.files); });
+      Z().invoke('__zilt.linuxSmokeDrop', {}).catch(() => {});
+      setTimeout(() => { off(); resolve(null); }, 4000);
+    });
+    check('drop.files', Array.isArray(files) && files.length === 2 &&
+      files[0] === '/tmp/zilt-smoke-a.txt' && files[1] === '/tmp/zilt-smoke-b.txt', JSON.stringify(files));
+  } catch (e) { check('drop.files', false, String(e.message || e)); }
+
+  // ---- v0.2.2：深链（启动深链经 pending_launch 在页面就绪后补发）----
+  // 注入 ZILT_LINUX_SMOKE_DEEPLINK 时断言事件 url 精确匹配；未注入时事件不达
+  //（__ziltDeepLinkSeen 一直为 null）也算通过——同一脚本覆盖两种环境。
+  try {
+    const want = window.__ziltSmokeDeepLink || null;
+    const dl = await new Promise((resolve) => {
+      if (window.__ziltDeepLinkSeen) return resolve(window.__ziltDeepLinkSeen);
+      const off = Z().on('deepLink', (p) => { off(); resolve(p); });
+      setTimeout(() => { off(); resolve(window.__ziltDeepLinkSeen); }, 1500);
+    });
+    const ok = want ? (!!dl && dl.url === want) : (dl == null || typeof dl.url === 'string');
+    check('deeplink.startup', ok, `want=${want} got=${JSON.stringify(dl)}`);
+  } catch (e) { check('deeplink.startup', false, String(e.message || e)); }
 
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {

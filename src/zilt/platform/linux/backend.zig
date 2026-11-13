@@ -38,19 +38,33 @@
 //!       哈希文件名）→ state_key / persist_window_state 在创建时恢复、销毁时保存；
 //!       `window.zilt.windowState.get/save` 走 system_fn 的 `.window_state` op。
 //!     print 仍返回 NotSupported（P2，见能力清单）。
-//!   - v0.2.2（进行中）：系统集成第一批——
+//!   - v0.2.2（2026-11-13 完成）：系统集成——
 //!     * **剪贴板**：文本 / HTML / 文件列表 / 图片读写（GTK 剪贴板；HTML 与
 //!       URI 列表走延迟提供，owner-change 可选发 clipboardChanged 事件）。
 //!     * **原生对话框**：消息框 / 打开 / 保存 / 选文件夹 / 多选 / 颜色 / 字体
 //!       （GtkFileChooserNative 在有 portal 时走 portal；字体用 Pango 描述解析）。
 //!     * **通知**：GApplication + GNotification（tag 替换语义）；无 D-Bus 会话总线时
 //!       按设计降级为 status=disabled_for_application，不阻断启动。
-//!     * **菜单栏**：config.menu → 每窗口 GtkMenuBar，叶子 activate 发 `menu` 事件
-//!       {id}；无 id 叶子置灰（加速键文本/角色分发尚未接）。
-//!     * **托盘**：libayatana-appindicator3 **dlopen 可选依赖**（缺失只日志），
-//!       Config.tray.menu → GtkMenu，激活发 `trayMenu` 事件 {id}。
-//!     * 尚未做：单实例 + 深链（GApplication 唯一 ID/命令行转交）、运行时菜单模型
-//!       （menu.* op）、拖放、自启动/系统信息（P2）。
+//!     * **菜单栏**：config.menu → 每窗口 GtkMenuBar；叶子 activate 发 `menu`
+//!       事件 {id}；无 id 叶子置灰；accel 解析挂 GtkAccelGroup（展示+真实触发），
+//!       role（undo/redo/cut/copy/paste/select_all）→ WebKit 编辑命令 +
+//!       menuRole 事件，delete → document.execCommand。
+//!     * **托盘**：libayatana-appindicator3 **dlopen 可选依赖**（缺失只日志）；
+//!       菜单构建与 indicator 解耦——**运行时菜单模型**（`menu_model`，由
+//!       config.tray.menu 初始化，与 Windows 同构）驱动托盘菜单：
+//!       `menu.*` op（list/add/remove/set → 重建 + popup）无 libayatana 也可用。
+//!     * **单实例 + 深链**：GApplication 唯一 ID（HANDLES_COMMAND_LINE）——
+//!       主实例走 g_application_run，第二实例 argv 经 command-line 转交后
+//!       exit 5（对齐 Windows）；`deepLink` 事件 {url, files} 在页面加载后投递
+//!       （pending_launch 兜底）；无参二次启动聚焦主窗口。深链/文件关联注册 =
+//!       应用级 `.desktop`（MimeType=x-scheme-handler/<scheme>）+ `xdg-mime
+//!       default`。**无 D-Bus 时降级**：本地解析启动参数 + gtk_main。
+//!     * **拖放**：主 WebView 挂 drag dest（drag-drop 拦截 WebKit 默认导航 +
+//!       drag-data-received 解析 text/uri-list）→ `dropFiles` {files} 事件。
+//!     * **自启动**：`~/.config/autostart/<app_id>.desktop`（autostart.* op）。
+//!     * **系统信息**：/etc/os-release + locale/theme 推导 + GDK 显示器枚举
+//!       （`system.info('os'|'monitors'|'all')`，JSON 形状与 Windows 同构）。
+//!     * print 仍为 NotSupported（P2，规划随 v0.2.5）。
 //!   - v0.2.1 切片 3：**多窗口 + 子 WebView + 数据分区**已接通——
 //!     * 窗口注册表：每窗口独立 GtkWindow/WebView/UCM/脚本/状态跟踪，id 从 1 起
 //!       （主窗口固定 1）；`window_fn` / `window_query_fn` / `webview_request_fn` /
@@ -83,9 +97,11 @@
 //!       时子 WebView 随控件树一并释放。
 //!   - 尚未实现（钩子留 null → 前端拿到与 Windows 相同的固定降级错误名）：
 //!     快捷键 / http/ws/fs/SQL（v0.2.3）。`platform/interface.zig` 的能力矩阵逐项打勾。
-//!   - 冒烟（ZILT_LINUX_SMOKE=1）：42 项检查。WSLg 环境必须 `GDK_BACKEND=x11`
+//!   - 冒烟（ZILT_LINUX_SMOKE=1）：48 项检查。WSLg 环境必须 `GDK_BACKEND=x11`
 //!     跑 xvfb-run——Wayland 路径实测在多窗口场景触发协议错误（Error 71）断连。
 //!     通知/托盘完整路径建议 `dbus-run-session -- xvfb-run …`（无总线时按设计降级）。
+//!     单实例转交 E2E：主实例带 `ZILT_LINUX_SMOKE_STAY=<秒>` 存活，第二实例带
+//!     `zilt://…` 参数启动 → exit 5 + 主实例日志 deepLink 事件。
 //!
 //! 依赖（构建期）：pkg-config + libgtk-3-dev + libwebkit2gtk-4.1-dev。
 //! Zig 0.17 移除了 `@cImport`，C 绑定由 `build.zig` 的 `addTranslateC` 从 `capi.h` 生成。
@@ -104,6 +120,12 @@ const system_api = @import("../../system_api.zig");
 const clipboard = @import("../../clipboard.zig");
 const notification = @import("../../notification.zig");
 const window_state = @import("window_state.zig");
+const deep_link = @import("deep_link.zig");
+const desktop_entry = @import("desktop_entry.zig");
+const sysinfo_linux = @import("sysinfo_linux.zig");
+const menu_model = @import("../../menu_model.zig");
+const shared_sysinfo = @import("../../sysinfo.zig");
+const autostart_mod = @import("../../autostart.zig");
 const Config = @import("../../config.zig").Config;
 
 pub const platform_name = "linux";
@@ -139,6 +161,14 @@ pub fn entryPath(url: []const u8) []const u8 {
 fn smokeEnabled() bool {
     const raw = std.c.getenv("ZILT_LINUX_SMOKE") orelse return false;
     return std.mem.eql(u8, std.mem.span(raw), "1");
+}
+
+/// ZILT_LINUX_SMOKE_STAY=<秒>：冒烟检查完成后主实例保持存活（单实例转交
+/// E2E 用；上限 120 秒，防止 CI 挂死）。
+fn smokeStaySeconds() u32 {
+    const raw = std.c.getenv("ZILT_LINUX_SMOKE_STAY") orelse return 0;
+    const n = std.fmt.parseInt(u32, std.mem.span(raw), 10) catch return 0;
+    return @min(n, 120);
 }
 
 /// 状态码 → reason phrase（scheme 响应需要显式给）。
@@ -287,6 +317,127 @@ fn makeDirPath(alloc: std.mem.Allocator, path: []const u8) void {
     }
 }
 
+/// 后端本地的线程同步 Io（文件写入/读取/删除；同 window_state.zig 的惰性模式）。
+var g_backend_io: std.Io.Threaded = undefined;
+var g_backend_io_ready = false;
+fn sharedIo() std.Io {
+    if (!g_backend_io_ready) {
+        g_backend_io = .init(std.heap.page_allocator, .{});
+        g_backend_io_ready = true;
+    }
+    return g_backend_io.io();
+}
+
+/// 命令行参数 → char**（g_application_run 的入参；缓冲与指针表进程生命周期内
+/// 持有，不释放——c_allocator 且参数表在 main loop 退出前必须存活）。
+/// 0.17 的 argv 走 `std.process.Init`（main 入口），后端拿不到 → 直接读
+/// /proc/self/cmdline（Linux 专属，与后端限定一致）。
+/// 冒烟模式把 ZILT_LINUX_SMOKE_DEEPLINK 追加为伪参数（模拟深链启动，与
+/// Windows 的 `zilt-app zilt://startup?demo=1` E2E 同思路）。
+fn collectArgv(alloc: std.mem.Allocator) ![][*c]u8 {
+    var list: std.ArrayListUnmanaged([*c]u8) = .empty;
+    if (readCmdlineAlloc(alloc)) |data| {
+        // 格式：argv0<NUL>argv1<NUL>...（尾随 NUL；参数内不含 NUL）
+        var i: usize = 0;
+        while (i < data.len) {
+            const end = std.mem.indexOfScalarPos(u8, data, i, 0) orelse data.len;
+            if (end > i) try list.append(alloc, data[i..end].ptr);
+            i = end + 1;
+        }
+    } else |_| {
+        // 极端环境拿不到 cmdline → 空参数表（g_application_run 用 argc=0 也能跑）
+    }
+    if (smokeEnabled()) {
+        if (std.c.getenv("ZILT_LINUX_SMOKE_DEEPLINK")) |u| {
+            const s = std.mem.span(u);
+            if (s.len > 0) try list.append(alloc, @constCast(s.ptr));
+        }
+    }
+    return list.items;
+}
+
+/// /proc/self/cmdline 全量读取（libc stdio——0.17 的 readFileAlloc 依赖
+/// stat size，procfs 恒报 0，实测读回空；本后端本就链接 libc）。
+fn readCmdlineAlloc(alloc: std.mem.Allocator) ![]u8 {
+    const f = std.c.fopen("/proc/self/cmdline", "rb") orelse return error.CmdlineUnavailable;
+    defer _ = std.c.fclose(f);
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.fread(&tmp, 1, tmp.len, f);
+        if (n == 0) break;
+        try buf.appendSlice(alloc, tmp[0..n]);
+        if (buf.items.len > 64 * 1024) return error.CmdlineTooLong;
+    }
+    return buf.items;
+}
+
+/// text/uri-list 解析（拖放 / 深链文件列表共用）：\r\n 分隔、`#` 注释跳过、
+/// `file://` → 本地路径；非 file URI（http:// 等）与远端 host 拒绝（跳过）。
+pub fn parseDropUris(alloc: std.mem.Allocator, uri_list: []const u8) ![][]u8 {
+    var out: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        for (out.items) |p| alloc.free(p);
+        out.deinit(alloc);
+    }
+    var it = std.mem.splitAny(u8, uri_list, "\r\n");
+    while (it.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t");
+        if (line.len == 0 or line[0] == '#') continue;
+        const path = fileUriToPath(alloc, line) catch continue;
+        try out.append(alloc, path);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// 加速键解析结果（GDK 修饰符掩码 + keysym）。
+pub const AccelGtk = struct { mods: c.GdkModifierType, keyval: c.guint };
+
+/// "Ctrl+Alt+N" → (GDK_CONTROL_MASK|GDK_MOD1_MASK, GDK_KEY_n)。
+/// 修饰符：Ctrl/Control、Shift、Alt/Mod1、Super；键位：A-Z / 0-9 / F1-F12
+///（与 Windows 侧 config.hotkeys 的合法键位集一致）。无法解析返回 null。
+pub fn parseAccelGtk(accel: []const u8) ?AccelGtk {
+    var mods: c.GdkModifierType = 0;
+    var keyval: c.guint = 0;
+    var it = std.mem.splitScalar(u8, accel, '+');
+    while (it.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t");
+        if (part.len == 0) return null;
+        if (std.ascii.eqlIgnoreCase(part, "Ctrl") or std.ascii.eqlIgnoreCase(part, "Control")) {
+            mods |= c.GDK_CONTROL_MASK;
+        } else if (std.ascii.eqlIgnoreCase(part, "Shift")) {
+            mods |= c.GDK_SHIFT_MASK;
+        } else if (std.ascii.eqlIgnoreCase(part, "Alt") or std.ascii.eqlIgnoreCase(part, "Mod1")) {
+            mods |= c.GDK_MOD1_MASK;
+        } else if (std.ascii.eqlIgnoreCase(part, "Super")) {
+            mods |= c.GDK_SUPER_MASK;
+        } else {
+            if (keyval != 0) return null; // 两个键位
+            keyval = keyvalForGtk(part) orelse return null;
+        }
+    }
+    if (keyval == 0) return null;
+    return .{ .mods = mods, .keyval = keyval };
+}
+
+/// 键名 → GDK keysym：字母 GDK_KEY_A=0x41..，数字 GDK_KEY_0=0x30..，
+/// 功能键 GDK_KEY_F1=0xffbe 起。
+fn keyvalForGtk(part: []const u8) ?c.guint {
+    if (part.len == 1) {
+        const ch = part[0];
+        if (ch >= 'A' and ch <= 'Z') return ch;
+        if (ch >= 'a' and ch <= 'z') return ch - 32; // 统一大写键位
+        if (ch >= '0' and ch <= '9') return ch;
+        return null;
+    }
+    if (part.len >= 2 and (part[0] == 'F' or part[0] == 'f')) {
+        const n = std.fmt.parseInt(u8, part[1..], 10) catch return null;
+        if (n >= 1 and n <= 12) return 0xffbe + @as(c.guint, n - 1);
+    }
+    return null;
+}
+
 pub fn run(comptime config: Config) !void {
     // 进程级长生命周期分配器：emit 可能来自任意 worker 线程，必须线程安全；
     // 后端已链接 libc，c_allocator 是最稳的选择（无泄漏检测开销，也不需要 deinit）。
@@ -298,6 +449,7 @@ pub fn run(comptime config: Config) !void {
     self.* = .{
         .allocator = alloc,
         .smoke = smokeEnabled(),
+        .smoke_stay = smokeStaySeconds(),
     };
     defer {
         self.deinit();
@@ -313,6 +465,28 @@ pub fn run(comptime config: Config) !void {
     c.webkit_web_context_register_uri_scheme(wc, scheme, Self.onSchemeRequest, self, null);
     // v0.2.1：下载事件（分区 context 在 createPartitionContext 里同样注册）
     _ = c.g_signal_connect_data(wc, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
+
+    // v0.2.2：GApplication 宿主 = 通知 + 单实例 + 深链转交三合一。
+    // **先注册再建窗口**：第二实例在远端检测命中后立即转交退出（不建窗口、
+    // 不注入脚本）。命令行参数（char**）进程生命周期内持有；冒烟模式会把
+    // ZILT_LINUX_SMOKE_DEEPLINK 追加为伪参数，覆盖「启动深链」链路。
+    const argv = try collectArgv(alloc);
+    const app_mode = self.initApplication();
+
+    switch (app_mode) {
+        .remote => {
+            // 第二实例：g_application_run 把 argv 经 command-line 转交主实例后
+            // 立即返回 → 退出码 5（对齐 Windows 单实例第二实例语义）
+            _ = c.g_application_run(self.gapp.?, @intCast(argv.len), argv.ptr);
+            log.print("[single-instance] args forwarded to primary -> exit 5", .{});
+            std.process.exit(5);
+        },
+        else => {},
+    }
+
+    // v0.2.2：运行时菜单模型（托盘菜单驱动）+ 托盘（libayatana 可选，缺失仅日志）
+    self.initMenuModel();
+    self.initTray();
 
     // 主窗口（id 固定 1）；spawn 的窗口走同一个创建函数（createWindowInternal）
     const main_opts = ipc.WindowOptions{
@@ -344,9 +518,8 @@ pub fn run(comptime config: Config) !void {
         boolStr(self.smoke),
     });
 
-    // v0.2.2：通知宿主（GApplication）与托盘（可选依赖，缺失仅日志）
-    self.initNotifications();
-    self.initTray();
+    // 深链 / 文件关联注册（.desktop + xdg-mime；config.deep_link.register）
+    self.registerDeepLink();
 
     // v0.2.2：剪贴板变化监听（owner-change → clipboardChanged 事件）
     if (config.clipboard_change_event) {
@@ -357,7 +530,25 @@ pub fn run(comptime config: Config) !void {
         }
     }
 
-    c.gtk_main();
+    if (app_mode == .primary) {
+        // 主实例：g_application_run 兼任主循环（command-line 信号承载深链/聚焦）。
+        // HANDLES_COMMAND_LINE 的应用在 command-line 处理完、use count 为 0 时
+        // 会直接退出 → 先 hold，requestQuit 里再 release+quit。
+        c.g_application_hold(self.gapp.?);
+        self.app_held = true;
+        _ = c.g_application_run(self.gapp.?, @intCast(argv.len), argv.ptr);
+    } else {
+        // 降级（无 D-Bus）：本地分类启动参数（深链启动载荷），gtk_main 承担主循环
+        var args_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer args_list.deinit(alloc);
+        for (argv[1..]) |a| { // 跳过程序自身
+            if (a == null) continue;
+            args_list.append(alloc, std.mem.span(a)) catch break;
+        }
+        if (args_list.items.len > 0) self.handleLaunchArgs(args_list.items);
+        c.gtk_main();
+    }
+
     // 主循环退出时窗口通常还没 destroy（ctx.quit 路径）→ 逐窗口落盘状态
     for (self.windows.items) |st| self.saveWindowState(st);
     log.print("[linux] main loop exited", .{});
@@ -433,6 +624,10 @@ fn Backend(comptime config: Config) type {
             // ---- v0.2.1 切片 3：窗口内附加子 WebView ----
             child_webviews: std.ArrayListUnmanaged(*ChildView) = .empty,
             next_child_webview_id: u32 = 1,
+            /// v0.2.2：菜单加速键的 GtkAccelGroup（惰性创建；窗口销毁时随 GTK 释放）
+            accel_group: ?*c.GtkAccelGroup = null,
+            /// 页面是否已完成首次加载（runtime 注入就绪）——深链事件投递的前置条件
+            loaded: bool = false,
         };
 
         /// 子 WebView（webviews.* op 管理的窗口内附加视图）。
@@ -503,6 +698,8 @@ fn Backend(comptime config: Config) type {
             win_id: u32,
             kind: MenuKind,
             id: []u8,
+            /// v0.2.2：预定义角色（undo/redo/cut/copy/paste/delete/select_all）
+            role: ?[]u8 = null,
         };
         const MenuKind = enum { menu, tray_menu };
 
@@ -563,8 +760,26 @@ fn Backend(comptime config: Config) type {
         /// GNotification 宿主（v0.2.2；注册失败时通知降级为日志）
         gapp: ?*c.GApplication = null,
         gapp_registered: bool = false,
+        /// g_application_run 的 hold 标记（HANDLES_COMMAND_LINE 下 command-line
+        /// 处理完若无 hold 会直接退出主循环——必须显式 hold 到 quit）
+        app_held: bool = false,
         /// 托盘（libayatana 动态加载；null = 不可用/未配置）
         tray: ?Tray = null,
+        /// ---- v0.2.2：运行时菜单模型 / 深链 / 拖放 ----
+        /// 菜单模型（与 Windows 对齐：config.tray.menu 初始化；menu.* op 可变，
+        /// 变更后重建托盘菜单；每窗口菜单栏仍是 config.menu 静态树）
+        menu_state: ?menu_model.Model = null,
+        /// 模型驱动的托盘 GtkMenu。有 indicator 时所有权归 indicator（替换后旧菜单
+        /// 由 indicator 析构，绝不能再 destroy）；无 indicator 时归我们
+        ///（tray_menu_owned = true，替换/退出时 destroy）。
+        tray_menu_widget: ?*c.GtkMenu = null,
+        tray_menu_owned: bool = false,
+        /// 启动 / 第二实例转交的深链载荷（页面尚未就绪时挂起，load-finished 补发）
+        pending_launch: ?deep_link.Launch = null,
+        /// 冒烟：dropFiles 模拟投递只发一次
+        smoke_drop_sent: bool = false,
+        /// 冒烟：主实例保持存活的秒数（ZILT_LINUX_SMOKE_STAY，第二实例转交 E2E 用）
+        smoke_stay: u32 = 0,
 
         fn deinit(self: *Self) void {
             // 主循环退出后可能仍有窗口未 destroy（ctx.quit 路径）→ 逐个释放记录
@@ -589,6 +804,16 @@ fn Backend(comptime config: Config) type {
                 self.allocator.destroy(p);
                 self.clip_payload = null;
             }
+            // v0.2.2：菜单模型（arena 统一回收节点与字符串）
+            if (self.menu_state) |*m| m.deinit();
+            // 托盘菜单：有 indicator 时归它（进程退出无需释放）；无 indicator 归我们
+            if (self.tray_menu_widget) |menu| {
+                if (self.tray_menu_owned) c.gtk_widget_destroy(@ptrCast(menu));
+                self.tray_menu_widget = null;
+            }
+            if (self.tray) |*t| t.lib.close();
+            if (self.gapp) |app| c.g_object_unref(@ptrCast(app));
+            if (self.pending_launch) |*launch| launch.deinit(self.allocator);
         }
 
         // ------------------------------------------------------------------
@@ -629,6 +854,7 @@ fn Backend(comptime config: Config) type {
             st.scripts.deinit(self.allocator);
             for (st.menu_actions.items) |action| {
                 self.allocator.free(action.id);
+                if (action.role) |r| self.allocator.free(r);
                 self.allocator.destroy(action);
             }
             st.menu_actions.deinit(self.allocator);
@@ -795,7 +1021,23 @@ fn Backend(comptime config: Config) type {
             );
             self.addUserScriptTo(scripts, ucm, ipc.runtime_js);
             for (config.init_scripts) |script| self.addUserScriptTo(scripts, ucm, script);
-            if (self.smoke) self.addUserScriptTo(scripts, ucm, smoke_script);
+            if (self.smoke) {
+                self.addUserScriptTo(scripts, ucm, smoke_script);
+                // 冒烟：把注入的启动深链暴露给检查脚本（ZILT_LINUX_SMOKE_DEEPLINK）
+                if (std.c.getenv("ZILT_LINUX_SMOKE_DEEPLINK")) |u| {
+                    const s = std.mem.span(u);
+                    if (s.len > 0) {
+                        if (jsonStr(self.allocator, s)) |uj| {
+                            defer self.allocator.free(uj);
+                            const marker = std.fmt.allocPrint(self.allocator, "window.__ziltSmokeDeepLink = {s};", .{uj}) catch null;
+                            if (marker) |mk| {
+                                defer self.allocator.free(mk);
+                                self.addUserScriptTo(scripts, ucm, mk);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         /// 执行一段 JS（UI 线程）。WebKit 会把脚本复制进异步任务，返回后即可释放入参。
@@ -872,9 +1114,10 @@ fn Backend(comptime config: Config) type {
             }
         }
 
-        fn quitEntry(_: *anyopaque, code: u8) void {
+        fn quitEntry(backend: *anyopaque, code: u8) void {
             _ = code;
-            _ = c.g_idle_add(quitIdle, null);
+            const self: *Self = @ptrCast(@alignCast(backend));
+            _ = c.g_idle_add(quitIdle, self);
         }
 
         /// UI 线程：把 emit 消息投递到目标窗口（窗口可能已销毁 → 只释放）。
@@ -893,9 +1136,27 @@ fn Backend(comptime config: Config) type {
             return G_SOURCE_REMOVE;
         }
 
-        fn quitIdle(_: c.gpointer) callconv(.c) c.gboolean {
-            c.gtk_main_quit();
+        fn quitIdle(data: c.gpointer) callconv(.c) c.gboolean {
+            const self: *Self = @ptrCast(@alignCast(data orelse {
+                c.gtk_main_quit();
+                return G_SOURCE_REMOVE;
+            }));
+            self.requestQuit();
             return G_SOURCE_REMOVE;
+        }
+
+        /// 退出主循环：primary 走 release + g_application_quit（g_application_run
+        /// 的循环）；降级 / 未注册走 gtk_main_quit。
+        fn requestQuit(self: *Self) void {
+            if (self.gapp != null and self.gapp_registered) {
+                if (self.app_held) {
+                    c.g_application_release(self.gapp.?);
+                    self.app_held = false;
+                }
+                c.g_application_quit(self.gapp.?);
+            } else {
+                c.gtk_main_quit();
+            }
         }
 
         // ------------------------------------------------------------------
@@ -1029,6 +1290,24 @@ fn Backend(comptime config: Config) type {
                 0,
             );
             self.attachIpc(sink, ucm, &st.scripts);
+
+            // v0.2.2：拖放（文件拖入）。dest 与信号挂主 WebView：drag-drop 里
+            // gtk_drag_get_data 后返回 TRUE（user handler 先于 WebKit 的 class
+            // handler 运行，拦截「拖入文件即导航」的默认行为）；drag-data-received
+            // 解析 text/uri-list → dropFiles 事件（对齐 Windows WM_DROPFILES）。
+            const dnd_targets = [_]c.GtkTargetEntry{
+                .{ .target = @constCast("text/uri-list"), .flags = 0, .info = 0 },
+                .{ .target = @constCast("text/plain"), .flags = 0, .info = 1 },
+            };
+            c.gtk_drag_dest_set(
+                view_widget,
+                c.GTK_DEST_DEFAULT_ALL,
+                &dnd_targets,
+                dnd_targets.len,
+                c.GDK_ACTION_COPY,
+            );
+            _ = c.g_signal_connect_data(@ptrCast(view_widget), "drag-drop", @ptrCast(&Self.onDragDrop), sink, null, 0);
+            _ = c.g_signal_connect_data(@ptrCast(view_widget), "drag-data-received", @ptrCast(&Self.onDragDataReceived), sink, null, 0);
 
             // geometry hints（min/max；Xvfb 无 WM 不执行，真实桌面生效）
             applyGeometryHints(st, win_typed);
@@ -1575,31 +1854,8 @@ fn Backend(comptime config: Config) type {
                         c.gtk_menu_item_set_submenu(@ptrCast(menu_item), sub);
                     }
                 } else if (item.id) |id| {
-                    const action = self.allocator.create(MenuAction) catch {
-                        c.gtk_widget_destroy(menu_item);
-                        continue;
-                    };
-                    const id_copy = self.allocator.dupe(u8, id) catch {
-                        self.allocator.destroy(action);
-                        c.gtk_widget_destroy(menu_item);
-                        continue;
-                    };
-                    action.* = .{ .backend = self, .win_id = win_id, .kind = kind, .id = id_copy };
-                    const owner = self.windowById(win_id);
-                    if (owner) |w| {
-                        w.menu_actions.append(self.allocator, action) catch {
-                            self.allocator.free(id_copy);
-                            self.allocator.destroy(action);
-                            c.gtk_widget_destroy(menu_item);
-                            continue;
-                        };
-                    } else {
-                        self.allocator.free(id_copy);
-                        self.allocator.destroy(action);
-                        c.gtk_widget_destroy(menu_item);
-                        continue;
-                    }
-                    _ = c.g_signal_connect_data(@ptrCast(menu_item), "activate", @ptrCast(&onMenuActivate), action, null, 0);
+                    // 统一绑定：activate → menu/trayMenu 事件 + accel + role
+                    self.bindMenuItem(menu_item, id, item.accel, item.role, win_id, kind);
                 } else {
                     c.gtk_widget_set_sensitive(menu_item, 0);
                 }
@@ -1615,6 +1871,10 @@ fn Backend(comptime config: Config) type {
                 .menu => "menu",
                 .tray_menu => "trayMenu",
             };
+            // role：编辑命令 + menuRole 事件（对齐 Windows 的 dispatchRole）
+            if (action.role) |role| {
+                if (self.windowById(action.win_id)) |w| self.dispatchMenuRole(w, action.id, role);
+            }
             log.print("[menu] {s} -> {s}", .{ name, action.id });
             const id_json = jsonStr(self.allocator, action.id) orelse return;
             defer self.allocator.free(id_json);
@@ -1625,11 +1885,224 @@ fn Backend(comptime config: Config) type {
             self.emitRawToWindow(w.id, name, payload);
         }
 
-        /// 托盘初始化：dlopen libayatana-appindicator3.so.1（缺失 → 日志 + 无托盘）。
+        /// 菜单角色 → WebKit 编辑命令（undo/redo/cut/copy/paste/select_all；
+        /// delete 无专属命令 → document.execCommand）。同时发 menuRole {id, role}。
+        fn dispatchMenuRole(self: *Self, w: *WinState, id: []const u8, role: []const u8) void {
+            const command: ?[*:0]const u8 = if (std.mem.eql(u8, role, "undo"))
+                "Undo"
+            else if (std.mem.eql(u8, role, "redo"))
+                "Redo"
+            else if (std.mem.eql(u8, role, "cut"))
+                "Cut"
+            else if (std.mem.eql(u8, role, "copy"))
+                "Copy"
+            else if (std.mem.eql(u8, role, "paste"))
+                "Paste"
+            else if (std.mem.eql(u8, role, "select_all"))
+                "SelectAll"
+            else
+                null;
+            if (command) |cmd| {
+                c.webkit_web_view_execute_editing_command(w.view, cmd);
+            } else if (std.mem.eql(u8, role, "delete")) {
+                evalScriptOn(w.view, "document.execCommand('delete', false, null)");
+            } else return;
+            const id_json = jsonStr(self.allocator, id) orelse return;
+            defer self.allocator.free(id_json);
+            const role_json = jsonStr(self.allocator, role) orelse return;
+            defer self.allocator.free(role_json);
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"id\":{s},\"role\":{s}}}", .{ id_json, role_json }) catch return;
+            defer self.allocator.free(payload);
+            self.emitRawToWindow(w.id, "menuRole", payload);
+        }
+
+        /// 叶子项统一绑定：activate → menu/trayMenu 事件；accel → 窗口
+        /// GtkAccelGroup（GTK_ACCEL_VISIBLE 同时给出右对齐展示）；role 随激活分发。
+        fn bindMenuItem(self: *Self, menu_item: [*c]c.GtkWidget, id: []const u8, accel: ?[]const u8, role: ?[]const u8, win_id: u32, kind: MenuKind) void {
+            const owner = self.windowById(win_id) orelse return;
+            const action = self.allocator.create(MenuAction) catch return;
+            const id_copy = self.allocator.dupe(u8, id) catch {
+                self.allocator.destroy(action);
+                return;
+            };
+            const role_copy: ?[]u8 = if (role) |r| (self.allocator.dupe(u8, r) catch null) else null;
+            action.* = .{ .backend = self, .win_id = win_id, .kind = kind, .id = id_copy, .role = role_copy };
+            w_menu_actions_append: {
+                owner.menu_actions.append(self.allocator, action) catch break :w_menu_actions_append;
+                _ = c.g_signal_connect_data(@ptrCast(menu_item), "activate", @ptrCast(&onMenuActivate), action, null, 0);
+                if (accel) |a| self.attachAccel(owner, menu_item, a);
+                return;
+            }
+            self.allocator.free(id_copy);
+            if (role_copy) |r| self.allocator.free(r);
+            self.allocator.destroy(action);
+        }
+
+        /// 加速键：解析 "Ctrl+S" → (mods, keyval)，挂进窗口的 GtkAccelGroup。
+        /// 解析失败忽略（与 Windows 的「加速键展示失败不致命」一致）。
+        fn attachAccel(self: *Self, w: *WinState, menu_item: [*c]c.GtkWidget, accel: []const u8) void {
+            _ = self;
+            const parsed = parseAccelGtk(accel) orelse return;
+            if (w.accel_group == null) {
+                const group = c.gtk_accel_group_new();
+                if (group == null) return;
+                c.gtk_window_add_accel_group(w.win, @ptrCast(group));
+                c.g_object_unref(@ptrCast(group)); // add_accel_group 已持引用
+                w.accel_group = group;
+            }
+            c.gtk_widget_add_accelerator(menu_item, "activate", w.accel_group, parsed.keyval, parsed.mods, c.GTK_ACCEL_VISIBLE);
+        }
+
+        /// 模型驱动的托盘菜单（menu.* 变更后整树重建）。
+        fn buildTrayMenuFromModel(self: *Self, model: *menu_model.Model) ?*c.GtkMenu {
+            const menu_widget = c.gtk_menu_new() orelse return null;
+            const menu: *c.GtkMenu = @ptrCast(menu_widget);
+            const win_id = if (self.windowById(0)) |w| w.id else 1;
+            self.appendModelItems(@ptrCast(menu), model.roots.items, win_id, .tray_menu);
+            c.gtk_widget_show_all(@ptrCast(menu));
+            return menu;
+        }
+
+        /// 递归建菜单（模型节点）：分隔符/子菜单/勾选（GtkCheckMenuItem）/禁用/
+        /// 加速键/角色。与 Windows 的 menu_runtime.buildPopup 同构。
+        fn appendModelItems(self: *Self, shell: [*c]c.GtkMenuShell, nodes: []*menu_model.Node, win_id: u32, kind: MenuKind) void {
+            for (nodes) |node| {
+                if (node.isSeparator()) {
+                    const sep = c.gtk_separator_menu_item_new();
+                    if (sep != null) {
+                        c.gtk_menu_shell_append(shell, sep);
+                        c.gtk_widget_show(sep);
+                    }
+                    continue;
+                }
+                const label_z = dupeZ(self.allocator, node.label) catch continue;
+                defer self.allocator.free(label_z);
+                const menu_item: [*c]c.GtkWidget = if (node.checked)
+                    @ptrCast(c.gtk_check_menu_item_new_with_label(label_z.ptr))
+                else
+                    @ptrCast(c.gtk_menu_item_new_with_label(label_z.ptr));
+                if (menu_item == null) continue;
+                if (node.checked) c.gtk_check_menu_item_set_active(@ptrCast(menu_item), 1);
+
+                if (node.children.items.len != 0) {
+                    const sub = c.gtk_menu_new();
+                    if (sub != null) {
+                        self.appendModelItems(@ptrCast(sub), node.children.items, win_id, kind);
+                        c.gtk_menu_item_set_submenu(@ptrCast(menu_item), sub);
+                    }
+                } else if (!node.enabled or node.id.len == 0) {
+                    // 无 id 的叶子置灰（与 Windows 的 id 表语义一致）
+                    c.gtk_widget_set_sensitive(menu_item, 0);
+                } else {
+                    self.bindMenuItem(menu_item, node.id, node.accel, node.role, win_id, kind);
+                }
+                c.gtk_menu_shell_append(shell, @ptrCast(menu_item));
+                c.gtk_widget_show(menu_item);
+            }
+        }
+
+        /// 程序化弹出（右键上下文菜单）：模型 → 临时 GtkMenu → gtk_menu_popup_at_rect。
+        /// deactivate 即销毁（MenuAction 挂在窗口注册表，随窗口释放——与 Windows
+        /// 的 TrackPopupMenu 每次全量构建同构）。
+        fn popupMenu(self: *Self, x: i32, y: i32) !system_api.Result {
+            const model = if (self.menu_state) |*m| m else return error.MenuNotConfigured;
+            const w = self.windowById(0) orelse return error.WindowNotFound;
+            const menu_widget = c.gtk_menu_new() orelse return error.MenuNotConfigured;
+            self.appendModelItems(@ptrCast(menu_widget), model.roots.items, w.id, .menu);
+            c.gtk_widget_show_all(menu_widget);
+            _ = c.g_signal_connect_data(@ptrCast(menu_widget), "deactivate", @ptrCast(&onPopupDeactivate), menu_widget, null, 0);
+            var rect = c.GdkRectangle{ .x = x, .y = y, .width = 1, .height = 1 };
+            const gdk_win = c.gtk_widget_get_window(@ptrCast(w.win));
+            c.gtk_menu_popup_at_rect(
+                @ptrCast(menu_widget),
+                gdk_win,
+                &rect,
+                c.GDK_GRAVITY_SOUTH_WEST,
+                c.GDK_GRAVITY_NORTH_WEST,
+                null,
+            );
+            log.print("[menu] popup at {d},{d} ({d} roots)", .{ x, y, model.roots.items.len });
+            return .{ .ok = true };
+        }
+
+        fn onPopupDeactivate(widget: [*c]c.GtkWidget, _: c.gpointer) callconv(.c) void {
+            c.gtk_widget_destroy(widget);
+        }
+
+        /// 运行时菜单模型 op（v0.2.2）：list/add/remove/set/popup。
+        /// 与 Windows 的 runMenuOp 同构——模型来自 config.tray.menu，
+        /// 变更后重建托盘菜单；每窗口菜单栏保持静态（Windows 同此边界）。
+        fn runMenuOp(self: *Self, op: system_api.MenuOp, alloc: std.mem.Allocator) !system_api.Result {
+            switch (op) {
+                .list => {
+                    if (self.menu_state) |*m| return .{ .json = try m.toJson(alloc) };
+                    return .{ .json = try alloc.dupe(u8, "[]") };
+                },
+                .add => |spec| {
+                    const model = if (self.menu_state) |*m| m else return error.MenuNotConfigured;
+                    _ = try model.add(spec.parent, spec.index, .{
+                        .id = spec.id,
+                        .label = spec.label,
+                        .accel = spec.accel,
+                        .checked = spec.checked,
+                        .enabled = spec.enabled,
+                        .role = spec.role,
+                    });
+                    self.rebuildTrayMenu();
+                    log.print("[menu] added '{s}' under {s}", .{ spec.label, spec.parent orelse "<root>" });
+                    return .{ .ok = true };
+                },
+                .remove => |path| {
+                    const model = if (self.menu_state) |*m| m else return error.MenuNotConfigured;
+                    const removed = model.remove(path);
+                    if (removed) self.rebuildTrayMenu();
+                    log.print("[menu] remove '{s}' (ok={})", .{ path, removed });
+                    return .{ .ok = removed };
+                },
+                .set => |spec| {
+                    const model = if (self.menu_state) |*m| m else return error.MenuNotConfigured;
+                    var changed = false;
+                    if (spec.label) |label| changed = model.setLabel(spec.path, label) or changed;
+                    if (spec.checked) |checked| changed = model.setChecked(spec.path, checked) or changed;
+                    if (spec.enabled) |enabled| changed = model.setEnabled(spec.path, enabled) or changed;
+                    if (spec.accel) |a| changed = model.setAccel(spec.path, a) or changed;
+                    if (changed) self.rebuildTrayMenu();
+                    log.print("[menu] set '{s}' (changed={})", .{ spec.path, changed });
+                    return .{ .ok = changed };
+                },
+                .popup => |pt| return self.popupMenu(pt.x, pt.y),
+            }
+        }
+
+        /// 运行时菜单模型（v0.2.2，与 Windows 对齐）：config.tray.menu 初始化 ——
+        /// menu.* op（list/add/remove/set）作用于它并重建托盘菜单；每窗口菜单栏
+        /// 仍是 config.menu 的静态树（与 Windows 的 per-window HMENU 行为一致）。
+        fn initMenuModel(self: *Self) void {
+            const tray_cfg = config.tray orelse return;
+            const items = tray_cfg.menu orelse return;
+            self.menu_state = menu_model.Model.fromConfig(self.allocator, items) catch |err| {
+                log.print("[menu] model init failed: {s}（回退静态菜单）", .{@errorName(err)});
+                return;
+            };
+        }
+
+        /// 托盘初始化：先建菜单（模型驱动，不依赖 libayatana —— menu.* op 与
+        /// popup 无 indicator 也可用），再 dlopen libayatana-appindicator3.so.1
+        ///（**可选依赖**：缺失/符号缺失只记日志）。
         fn initTray(self: *Self) void {
             const tray_cfg = config.tray orelse return;
+            // 1) 菜单：模型优先（menu.* 可变）；模型缺失回退静态树
+            if (self.menu_state) |*model| {
+                if (self.buildTrayMenuFromModel(model)) |menu| self.setTrayMenu(menu);
+            } else if (tray_cfg.menu) |items| {
+                if (self.buildTrayMenu(items, if (self.windowById(0)) |w| w.id else 1)) |menu| {
+                    self.setTrayMenu(@ptrCast(menu));
+                }
+            }
+
+            // 2) indicator：dlopen（缺失 → 无托盘图标，但菜单/模型仍然可用）
             var lib = std.DynLib.open("libayatana-appindicator3.so.1") catch |err| {
-                log.print("[tray] libayatana-appindicator3 unavailable ({s}) — running without tray", .{@errorName(err)});
+                log.print("[tray] libayatana-appindicator3 unavailable ({s}) — running without tray icon", .{@errorName(err)});
                 return;
             };
             const new_fn = lib.lookup(
@@ -1684,11 +2157,8 @@ fn Backend(comptime config: Config) type {
                     f(indicator, tz.ptr);
                 }
             }
-            if (tray_cfg.menu) |items| {
-                if (self.buildTrayMenu(items, if (self.windowById(0)) |w| w.id else 1)) |menu| {
-                    set_menu_fn(indicator, menu);
-                }
-            }
+            // 菜单已在上面构建（setTrayMenu）；交给 indicator 后所有权归它
+            if (self.tray_menu_widget) |menu| set_menu_fn(indicator, menu);
             // APP_INDICATOR_STATUS_ACTIVE = 1
             set_status_fn(indicator, 1);
             self.tray = .{
@@ -1697,28 +2167,228 @@ fn Backend(comptime config: Config) type {
                 .set_status = set_status_fn,
                 .set_menu = set_menu_fn,
             };
-            log.print("[tray] indicator created (icon={s}, menu={})", .{ icon_name, tray_cfg.menu != null });
+            self.tray_menu_owned = false;
+            log.print("[tray] indicator created (icon={s}, menu={})", .{ icon_name, self.tray_menu_widget != null });
+        }
+
+        /// 托盘菜单替换。有 indicator 时所有权归它（旧菜单由 indicator 在
+        /// set_menu 替换时析构——悬浮引用已被 sink，**绝不能再 destroy**）；
+        /// 无 indicator 时归我们（tray_menu_owned = true）。
+        fn setTrayMenu(self: *Self, menu: ?*c.GtkMenu) void {
+            if (self.tray_menu_widget) |old| {
+                if (self.tray_menu_owned) c.gtk_widget_destroy(@ptrCast(old));
+            }
+            self.tray_menu_widget = menu;
+            self.tray_menu_owned = self.tray == null;
+            if (self.tray) |*t| {
+                if (menu) |m| t.set_menu(t.indicator, m);
+            }
+        }
+
+        fn rebuildTrayMenu(self: *Self) void {
+            const model = if (self.menu_state) |*m| m else return;
+            if (self.buildTrayMenuFromModel(model)) |menu| self.setTrayMenu(menu);
         }
 
         // ------------------------------------------------------------------
         // 通知（v0.2.2）：GNotification（需要 D-Bus session bus；缺失时降级为日志）
         // ------------------------------------------------------------------
 
-        fn initNotifications(self: *Self) void {
-            const app_id_z = dupeZ(self.allocator, config.app_id) catch return;
+        // ------------------------------------------------------------------
+        // GApplication 宿主（v0.2.2）：通知 + 单实例 + 深链转交三合一
+        // ------------------------------------------------------------------
+        //
+        // - flags = HANDLES_COMMAND_LINE：主实例通过 command-line 信号收到
+        //   第二实例转交的 argv（GApplication 内部经 D-Bus 完成，无需 WM_COPYDATA）。
+        // - single_instance=false 时追加 NON_UNIQUE（各自注册，不转交）。
+        // - 无 D-Bus 会话总线时 register 失败 → unavailable：通知降级、启动参数
+        //   本地解析、主循环退回 gtk_main（对齐「无总线不阻断启动」的设计）。
+
+        const AppMode = enum { primary, remote, unavailable };
+
+        fn initApplication(self: *Self) AppMode {
+            var flags: c.GApplicationFlags = c.G_APPLICATION_HANDLES_COMMAND_LINE;
+            if (!config.single_instance) flags |= c.G_APPLICATION_NON_UNIQUE;
+            const app_id_z = dupeZ(self.allocator, config.app_id) catch return .unavailable;
             defer self.allocator.free(app_id_z);
-            const app = c.g_application_new(app_id_z.ptr, 0) orelse {
-                log.print("[notify] g_application_new failed", .{});
-                return;
-            };
-            self.gapp = app;
+            const app = c.g_application_new(app_id_z.ptr, flags) orelse return .unavailable;
+            _ = c.g_signal_connect_data(@ptrCast(app), "command-line", @ptrCast(&Self.onCommandLine), self, null, 0);
             var err: [*c]c.GError = null;
-            self.gapp_registered = c.g_application_register(app, null, &err) != 0;
+            const registered = c.g_application_register(app, null, &err) != 0;
             if (err != null) {
-                log.print("[notify] GApplication register failed: {s}", .{std.mem.span(err.*.message)});
+                log.print("[app] GApplication register failed: {s}", .{std.mem.span(err.*.message)});
                 c.g_error_free(err);
             }
-            log.print("[notify] GApplication ready (id={s}, registered={})", .{ config.app_id, self.gapp_registered });
+            if (!registered) {
+                c.g_object_unref(@ptrCast(app));
+                self.gapp = null;
+                self.gapp_registered = false;
+                log.print("[app] no session bus — single-instance/deep-link forwarding degraded (notifications unavailable)", .{});
+                return .unavailable;
+            }
+            self.gapp = app;
+            self.gapp_registered = true;
+            if (config.single_instance and c.g_application_get_is_remote(app) != 0) return .remote;
+            log.print("[app] GApplication primary (id={s}, single_instance={s})", .{ config.app_id, boolStr(config.single_instance) });
+            return .primary;
+        }
+
+        /// 主实例收到命令行（自身启动 或 第二实例转交）→ 深链分类 → 事件 / 聚焦。
+        /// argv[0] 是程序自身路径，跳过（第二实例转交的是完整 argv）。
+        fn onCommandLine(_: *c.GApplication, cmdline: ?*c.GApplicationCommandLine, user_data: c.gpointer) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return));
+            var argc: c_int = 0;
+            const argv = c.g_application_command_line_get_arguments(cmdline, &argc);
+            if (argv == null) return;
+            defer c.g_strfreev(argv);
+            var list: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer list.deinit(self.allocator);
+            var i: usize = 1; // 跳过程序自身
+            while (i < @as(usize, @intCast(argc))) : (i += 1) {
+                list.append(self.allocator, std.mem.span(argv[i])) catch break;
+            }
+            log.print("[command-line] {d} args (first={s})", .{ list.items.len, if (list.items.len > 0) list.items[0] else "-" });
+            self.handleLaunchArgs(list.items);
+        }
+
+        /// 参数分类 → deepLink 事件 / 无参聚焦（与 Windows 的 deep_link 语义对齐）。
+        fn handleLaunchArgs(self: *Self, args: []const []const u8) void {
+            var launch = deep_link.parseArgs(self.allocator, args, scheme, null, deep_link.pathExists) catch return;
+            if (launch.isEmpty()) {
+                launch.deinit(self.allocator);
+                // 无参二次启动 → 聚焦已有主窗口（对齐 Windows）
+                if (self.windowById(0)) |w| c.gtk_window_present(w.win);
+                return;
+            }
+            log.print("[deep-link] launch (url={s}, files={d})", .{ launch.url orelse "-", launch.files.len });
+            if (self.emitLaunch(launch)) return;
+            // 页面尚未就绪（启动深链）→ 挂起，主窗口 load-finished 时补发
+            if (self.pending_launch) |*old| old.deinit(self.allocator);
+            self.pending_launch = launch;
+        }
+
+        /// deepLink 事件 {url, files}：投递成功返回 true（launch 所有权随之消耗）。
+        /// 页面未完成首次加载时返回 false（runtime 未就绪，事件会丢）→ 调用方挂起。
+        fn emitLaunch(self: *Self, launch_in: deep_link.Launch) bool {
+            var launch = launch_in;
+            const w = self.windowById(0) orelse return false;
+            if (!w.loaded) return false;
+            defer launch.deinit(self.allocator);
+            const url_json = if (launch.url) |u|
+                (jsonStr(self.allocator, u) orelse return false)
+            else
+                self.allocator.dupe(u8, "null") catch return false;
+            defer self.allocator.free(url_json);
+            var payload: std.ArrayListUnmanaged(u8) = .empty;
+            defer payload.deinit(self.allocator);
+            payload.appendSlice(self.allocator, "{\"url\":") catch return false;
+            payload.appendSlice(self.allocator, url_json) catch return false;
+            payload.appendSlice(self.allocator, ",\"files\":[") catch return false;
+            for (launch.files, 0..) |f, i| {
+                if (i != 0) payload.append(self.allocator, ',') catch return false;
+                const fj = jsonStr(self.allocator, f) orelse return false;
+                defer self.allocator.free(fj);
+                payload.appendSlice(self.allocator, fj) catch return false;
+            }
+            payload.appendSlice(self.allocator, "]}") catch return false;
+            self.emitRawToWindow(w.id, "deepLink", payload.items);
+            return true;
+        }
+
+        /// 页面加载完成 → 补发挂起的启动深链（一次性）。
+        fn flushPendingLaunch(self: *Self) void {
+            const launch = self.pending_launch orelse return;
+            if (self.emitLaunch(launch)) self.pending_launch = null;
+        }
+
+        /// 深链 / 文件关联注册：应用级 .desktop（MimeType=x-scheme-handler/<scheme>
+        /// [+ application/x-<ext>]）+ `xdg-mime default`。完整 MIME 包（glob 映射）
+        /// 随 v0.2.4 打包补齐；xdg-mime 缺失/失败只记日志（best-effort）。
+        fn registerDeepLink(self: *Self) void {
+            const dl = config.deep_link orelse return;
+            if (!dl.register) return;
+            const exe = deep_link.exePath(self.allocator) catch return;
+            defer self.allocator.free(exe);
+            const dir = deep_link.applicationsDir(self.allocator) catch return;
+            defer self.allocator.free(dir);
+            makeDirPath(self.allocator, dir);
+
+            const name = desktop_entry.entryFileName(self.allocator, config.app_id) catch return;
+            defer self.allocator.free(name);
+
+            var mimes: std.ArrayListUnmanaged([]u8) = .empty;
+            defer {
+                for (mimes.items) |m| self.allocator.free(m);
+                mimes.deinit(self.allocator);
+            }
+            {
+                const scheme_mime = std.fmt.allocPrint(self.allocator, "x-scheme-handler/{s}", .{dl.scheme}) catch return;
+                mimes.append(self.allocator, scheme_mime) catch {
+                    self.allocator.free(scheme_mime);
+                    return;
+                };
+            }
+            if (dl.file_ext) |ext| {
+                const bare = if (ext.len > 0 and ext[0] == '.') ext[1..] else ext;
+                if (bare.len > 0) {
+                    if (std.fmt.allocPrint(self.allocator, "application/x-{s}", .{bare})) |m| {
+                        mimes.append(self.allocator, m) catch self.allocator.free(m);
+                    } else |_| {}
+                }
+            }
+
+            const exec = desktop_entry.formatExec(self.allocator, exe, "%u") catch return;
+            defer self.allocator.free(exec);
+            const text = desktop_entry.content(self.allocator, .{
+                .name = config.title,
+                .exec = exec,
+                .icon = trayIconName(config.icon),
+                .comment = config.title,
+                .mime_types = mimes.items,
+                .wmclass = config.app_id,
+            }) catch return;
+            defer self.allocator.free(text);
+
+            const path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, name }) catch return;
+            defer self.allocator.free(path);
+            self.writeFileAtomic(path, text) catch |err| {
+                log.print("[deep-link] .desktop write failed ({s}): {s}", .{ @errorName(err), path });
+                return;
+            };
+            self.runXdgMime(name, mimes.items);
+            log.print("[deep-link] registered scheme '{s}' -> {s}", .{ dl.scheme, path });
+        }
+
+        fn runXdgMime(self: *Self, desktop_name: []const u8, mimes: []const []u8) void {
+            for (mimes) |mime| {
+                const argv = [_][]const u8{ "xdg-mime", "default", desktop_name, mime };
+                const result = std.process.run(self.allocator, sharedIo(), .{
+                    .argv = &argv,
+                    .stdout_limit = .limited(4096),
+                    .stderr_limit = .limited(4096),
+                }) catch |err| {
+                    log.print("[deep-link] xdg-mime spawn failed ({s}) for {s}", .{ @errorName(err), mime });
+                    continue;
+                };
+                defer self.allocator.free(result.stdout);
+                defer self.allocator.free(result.stderr);
+                const ok = result.term.success();
+                log.print("[deep-link] xdg-mime default {s} ({s}, ok={})", .{ mime, desktop_name, ok });
+            }
+        }
+
+        /// 小文件写入（.desktop / 自启动条目；先建父目录，覆盖式）。
+        fn writeFileAtomic(_: *Self, path: []const u8, data: []const u8) !void {
+            const io = sharedIo();
+            if (std.fs.path.dirname(path)) |dir| {
+                _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
+            }
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
+        }
+
+        fn readFileSmall(self: *Self, path: []const u8) ![]u8 {
+            const io = sharedIo();
+            return std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(256 * 1024));
         }
 
         fn sendNotification(self: *Self, tag: ?[]const u8, title: []const u8, body: []const u8) !void {
@@ -2782,7 +3452,11 @@ fn Backend(comptime config: Config) type {
             switch (req) {
                 .webviews => |op| return self.runWebviewsOp(w, op, alloc),
                 .window_state => |op| return self.runWindowStateOp(w, op, alloc),
-                // 菜单/托盘/快捷键/http/ws/fs/... 属 v0.2.2–v0.2.3；NotSupported
+                // v0.2.2：运行时菜单模型 / 系统信息 / 自启动
+                .menu => |op| return self.runMenuOp(op, alloc),
+                .info => |kind| return .{ .json = try self.collectSystemInfo(kind, alloc) },
+                .autostart => |op| return .{ .state = try self.runAutostartOp(op, alloc) },
+                // 托盘运行时 op/快捷键/http/ws/fs/... 属 v0.2.3+；NotSupported
                 // 与 Windows 的降级语义同构（platform/interface.zig 契约不受影响）
                 else => return error.NotSupported,
             }
@@ -2967,6 +3641,170 @@ fn Backend(comptime config: Config) type {
         }
 
         // ------------------------------------------------------------------
+        // 系统信息（v0.2.2）：/etc/os-release + locale/theme 推导 + GDK 显示器
+        // JSON 形状与 Windows 同构（shared sysinfo.osToJson / monitorsToJson）
+        // ------------------------------------------------------------------
+
+        fn collectSystemInfo(self: *Self, kind: system_api.InfoKind, alloc: std.mem.Allocator) ![]u8 {
+            switch (kind) {
+                .os => {
+                    var info = try self.collectOsInfo(alloc);
+                    defer sysinfo_linux.freeOsInfo(alloc, &info);
+                    return shared_sysinfo.osToJson(alloc, info);
+                },
+                .monitors => {
+                    const monitors = try self.collectMonitors(alloc);
+                    defer alloc.free(monitors);
+                    return shared_sysinfo.monitorsToJson(alloc, monitors);
+                },
+                .all => {
+                    var info = try self.collectOsInfo(alloc);
+                    defer sysinfo_linux.freeOsInfo(alloc, &info);
+                    const os_json = try shared_sysinfo.osToJson(alloc, info);
+                    defer alloc.free(os_json);
+                    const monitors = try self.collectMonitors(alloc);
+                    defer alloc.free(monitors);
+                    const mons_json = try shared_sysinfo.monitorsToJson(alloc, monitors);
+                    defer alloc.free(mons_json);
+                    return std.fmt.allocPrint(alloc, "{{\"os\":{s},\"monitors\":{s}}}", .{ os_json, mons_json });
+                },
+            }
+        }
+
+        fn collectOsInfo(self: *Self, alloc: std.mem.Allocator) !shared_sysinfo.OsInfo {
+            _ = self;
+            const text = std.Io.Dir.cwd().readFileAlloc(sharedIo(), "/etc/os-release", alloc, .limited(64 * 1024)) catch null;
+            defer if (text) |t| alloc.free(t);
+            var release = try sysinfo_linux.parseOsRelease(alloc, text orelse "");
+            defer sysinfo_linux.freeOsRelease(alloc, &release);
+            const lc_all: ?[]const u8 = if (std.c.getenv("LC_ALL")) |v| std.mem.span(v) else null;
+            const lang: ?[]const u8 = if (std.c.getenv("LANG")) |v| std.mem.span(v) else null;
+            const locale = try sysinfo_linux.localeFromEnv(alloc, lc_all, lang);
+            defer alloc.free(locale);
+            const dark = blk: {
+                const settings = c.gtk_settings_get_default() orelse break :blk false;
+                var name_ptr: ?[*:0]const u8 = null;
+                c.g_object_get(@ptrCast(settings), "gtk-theme-name", &name_ptr, @as(?*anyopaque, null));
+                defer if (name_ptr) |p| c.g_free(@constCast(p));
+                break :blk sysinfo_linux.isDarkThemeName(if (name_ptr) |p| std.mem.span(p) else null);
+            };
+            return sysinfo_linux.osInfo(alloc, release, locale, dark);
+        }
+
+        fn collectMonitors(self: *Self, alloc: std.mem.Allocator) ![]shared_sysinfo.Monitor {
+            _ = self;
+            const display = c.gdk_display_get_default() orelse return try alloc.alloc(shared_sysinfo.Monitor, 0);
+            const n: usize = @intCast(c.gdk_display_get_n_monitors(display));
+            const out = try alloc.alloc(shared_sysinfo.Monitor, n);
+            errdefer alloc.free(out);
+            const primary = c.gdk_display_get_primary_monitor(display);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                const mon = c.gdk_display_get_monitor(display, @intCast(i));
+                var geom: c.GdkRectangle = std.mem.zeroes(c.GdkRectangle);
+                var work: c.GdkRectangle = std.mem.zeroes(c.GdkRectangle);
+                var scale: c_int = 1;
+                if (mon != null) {
+                    c.gdk_monitor_get_geometry(mon, &geom);
+                    c.gdk_monitor_get_workarea(mon, &work);
+                    scale = c.gdk_monitor_get_scale_factor(mon);
+                }
+                const scale_abs: u32 = @intCast(@max(1, scale));
+                out[i] = .{
+                    .index = @intCast(i),
+                    .primary = mon != null and mon == primary,
+                    .x = geom.x,
+                    .y = geom.y,
+                    .width = @intCast(@max(0, geom.width)),
+                    .height = @intCast(@max(0, geom.height)),
+                    .work_x = work.x,
+                    .work_y = work.y,
+                    .work_width = @intCast(@max(0, work.width)),
+                    .work_height = @intCast(@max(0, work.height)),
+                    .dpi = scale_abs * 96,
+                    .scale = @floatFromInt(scale_abs),
+                };
+            }
+            return out;
+        }
+
+        // ------------------------------------------------------------------
+        // 自启动（v0.2.2）：~/.config/autostart/<app_id>.desktop
+        // enable = 写条目（Exec=/proc/self/exe [+ args]）；disable = 删除文件
+        // ------------------------------------------------------------------
+
+        fn runAutostartOp(self: *Self, op: system_api.AutostartOp, alloc: std.mem.Allocator) !autostart_mod.State {
+            const exe = deep_link.exePath(self.allocator) catch return error.AutostartNotAvailable;
+            defer self.allocator.free(exe);
+            const dir = deep_link.autostartDir(self.allocator) catch return error.AutostartNotAvailable;
+            defer self.allocator.free(dir);
+            const name = desktop_entry.entryFileName(self.allocator, config.app_id) catch return error.AutostartNotAvailable;
+            defer self.allocator.free(name);
+            const path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, name }) catch return error.OutOfMemory;
+            defer self.allocator.free(path);
+
+            switch (op) {
+                .query => {
+                    const text = self.readFileSmall(path) catch null;
+                    defer if (text) |t| self.allocator.free(t);
+                    return self.autostartStateCopied(alloc, text, exe);
+                },
+                .enable => |args| {
+                    try self.enableAutostart(dir, path, exe, args);
+                    const text = self.readFileSmall(path) catch null;
+                    defer if (text) |t| self.allocator.free(t);
+                    return self.autostartStateCopied(alloc, text, exe);
+                },
+                .disable => {
+                    std.Io.Dir.cwd().deleteFile(sharedIo(), path) catch {};
+                    log.print("[autostart] disabled (removed {s})", .{path});
+                    return .{ .enabled = false, .command = null };
+                },
+                .toggle => {
+                    const text = self.readFileSmall(path) catch null;
+                    defer if (text) |t| self.allocator.free(t);
+                    const state = desktop_entry.autostartState(alloc, text, exe);
+                    if (state.enabled) {
+                        std.Io.Dir.cwd().deleteFile(sharedIo(), path) catch {};
+                        log.print("[autostart] toggled off", .{});
+                        return .{ .enabled = false, .command = null };
+                    }
+                    try self.enableAutostart(dir, path, exe, null);
+                    const after = self.readFileSmall(path) catch null;
+                    defer if (after) |t| self.allocator.free(t);
+                    return self.autostartStateCopied(alloc, after, exe);
+                },
+            }
+        }
+
+        /// State.command 指向 text（self.allocator、本调用作用域内存），
+        /// 结果要跨回 IPC 编码 → 拷到结果分配器（per-message arena）。
+        fn autostartStateCopied(_: *Self, alloc: std.mem.Allocator, text: ?[]const u8, exe: []const u8) !autostart_mod.State {
+            const state = desktop_entry.autostartState(alloc, text, exe);
+            if (state.command) |cmd| {
+                return .{ .enabled = state.enabled, .command = try alloc.dupe(u8, cmd) };
+            }
+            return .{ .enabled = false, .command = null };
+        }
+
+        fn enableAutostart(self: *Self, dir: []const u8, path: []const u8, exe: []const u8, args: ?[]const u8) !void {
+            makeDirPath(self.allocator, dir);
+            const exec = try desktop_entry.formatExec(self.allocator, exe, args);
+            defer self.allocator.free(exec);
+            const text = try desktop_entry.content(self.allocator, .{
+                .name = config.title,
+                .exec = exec,
+                .icon = trayIconName(config.icon),
+                .comment = config.title,
+                .wmclass = config.app_id,
+                .autostart = true,
+            });
+            defer self.allocator.free(text);
+            try self.writeFileAtomic(path, text);
+            log.print("[autostart] enabled: {s}", .{path});
+        }
+
+        // ------------------------------------------------------------------
         // 消息处理
         // ------------------------------------------------------------------
 
@@ -2990,6 +3828,17 @@ fn Backend(comptime config: Config) type {
                     // 框架内部：冒烟结果回传（不经过应用命令表，也不受 ACL 约束）
                     if (std.mem.eql(u8, inv.method, "__zilt.linuxSmoke")) {
                         self.finishSmoke(inv.args_json);
+                        return;
+                    }
+                    // 框架内部：冒烟的拖放模拟——invoke 先 resolve，事件在下一拍
+                    // 经 g_idle_add 投递（保证前端监听器已就位）
+                    if (std.mem.eql(u8, inv.method, "__zilt.linuxSmokeDrop")) {
+                        self.smoke_drop_sent = true;
+                        log.print("[dnd] simulated drop (smoke, via invoke)", .{});
+                        _ = c.g_idle_add(smokeDropIdle, self);
+                        const resp = try ipc.encodeResolve(self.allocator, inv.id, "\"queued\"");
+                        defer self.allocator.free(resp);
+                        self.deliverAlloc(sink.view, resp);
                         return;
                     }
 
@@ -3091,7 +3940,79 @@ fn Backend(comptime config: Config) type {
         fn onLoadChanged(_: [*c]c.WebKitWebView, event: c.WebKitLoadEvent, user_data: c.gpointer) callconv(.c) void {
             if (event != c.WEBKIT_LOAD_FINISHED) return;
             const sink: *IpcSink = @ptrCast(@alignCast(user_data orelse return));
-            sink.backend.diagnoseRuntime(sink.view);
+            const self = sink.backend;
+            if (self.windowById(sink.win_id)) |w| w.loaded = true;
+            self.diagnoseRuntime(sink.view);
+            // 启动深链兜底：页面就绪后补发（窗口未就绪时 handleLaunchArgs 挂起的载荷）
+            self.flushPendingLaunch();
+        }
+
+        // ------------------------------------------------------------------
+        // 拖放（v0.2.2）：文件拖入 → dropFiles {files}
+        // ------------------------------------------------------------------
+
+        /// drag-drop：取数据（uri-list 优先）后返回 TRUE，拦截 WebKit 默认导航。
+        fn onDragDrop(
+            _: [*c]c.GtkWidget,
+            drag_ctx: ?*c.GdkDragContext,
+            _: c.gint,
+            _: c.gint,
+            time: c.guint,
+            user_data: c.gpointer,
+        ) callconv(.c) c.gboolean {
+            const sink: *IpcSink = @ptrCast(@alignCast(user_data orelse return 0));
+            const widget: [*c]c.GtkWidget = @ptrCast(sink.view);
+            const target = c.gtk_drag_dest_find_target(widget, drag_ctx, null);
+            if (target == null) {
+                c.gtk_drag_finish(drag_ctx, 0, 0, time);
+                return 1;
+            }
+            c.gtk_drag_get_data(widget, drag_ctx, target, time);
+            return 1;
+        }
+
+        /// drag-data-received：解析 selection 数据（text/uri-list）→ dropFiles。
+        fn onDragDataReceived(
+            _: [*c]c.GtkWidget,
+            drag_ctx: ?*c.GdkDragContext,
+            _: c.gint,
+            _: c.gint,
+            data: ?*c.GtkSelectionData,
+            _: c.guint,
+            time: c.guint,
+            user_data: c.gpointer,
+        ) callconv(.c) void {
+            const sink: *IpcSink = @ptrCast(@alignCast(user_data orelse return));
+            const self = sink.backend;
+            defer c.gtk_drag_finish(drag_ctx, 1, 0, time);
+            if (data == null) return;
+            const len: usize = @intCast(c.gtk_selection_data_get_length(data));
+            if (len == 0) return;
+            const raw_ptr = c.gtk_selection_data_get_data(data);
+            if (raw_ptr == null) return;
+            self.handleDropUris(sink.win_id, raw_ptr[0..len]);
+        }
+
+        /// uri-list → dropFiles 事件（冒烟的模拟投递同走这里）。
+        fn handleDropUris(self: *Self, win_id: u32, uri_list: []const u8) void {
+            const paths = parseDropUris(self.allocator, uri_list) catch return;
+            defer {
+                for (paths) |p| self.allocator.free(p);
+                self.allocator.free(paths);
+            }
+            if (paths.len == 0) return;
+            log.print("[dnd] drop on window #{d} ({d} files)", .{ win_id, paths.len });
+            var payload: std.ArrayListUnmanaged(u8) = .empty;
+            defer payload.deinit(self.allocator);
+            payload.appendSlice(self.allocator, "{\"files\":[") catch return;
+            for (paths, 0..) |p, i| {
+                if (i != 0) payload.append(self.allocator, ',') catch return;
+                const pj = jsonStr(self.allocator, p) orelse return;
+                defer self.allocator.free(pj);
+                payload.appendSlice(self.allocator, pj) catch return;
+            }
+            payload.appendSlice(self.allocator, "]}") catch return;
+            self.emitRawToWindow(win_id, "dropFiles", payload.items);
         }
 
         /// ACL 用的 Options：把 `zilt` 登记为应用自有 scheme。
@@ -3110,11 +4031,11 @@ fn Backend(comptime config: Config) type {
             const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), args_json, .{}) catch {
                 log.print("[linux-smoke] FAILED to parse result: {s}", .{args_json});
                 self.smoke_code = 1;
-                return c.gtk_main_quit();
+                return self.requestQuit();
             };
             if (parsed != .object) {
                 self.smoke_code = 1;
-                return c.gtk_main_quit();
+                return self.requestQuit();
             }
             const obj = parsed.object;
 
@@ -3147,7 +4068,28 @@ fn Backend(comptime config: Config) type {
             } else {
                 log.print("[linux-smoke] FAILED {d}/{d} (failed: {s})", .{ total - passed, total, failed });
             }
-            c.gtk_main_quit();
+            // E2E 辅助：主实例保持存活若干秒，供第二实例转交深链
+            //（ZILT_LINUX_SMOKE_STAY=<秒>，超时后自行退出，退出码仍按检查结果）
+            if (self.smoke_stay > 0) {
+                log.print("[linux-smoke] staying alive {d}s (second-instance window)", .{self.smoke_stay});
+                _ = c.g_timeout_add_seconds(self.smoke_stay, stayQuit, self);
+                return;
+            }
+            self.requestQuit();
+        }
+
+        fn stayQuit(user_data: c.gpointer) callconv(.c) c.gboolean {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return G_SOURCE_REMOVE));
+            log.print("[linux-smoke] stay window over -> quit", .{});
+            self.requestQuit();
+            return G_SOURCE_REMOVE;
+        }
+
+        /// 冒烟的拖放模拟投递（idle 下一拍；见 handleMessage 的 __zilt.linuxSmokeDrop）。
+        fn smokeDropIdle(data: c.gpointer) callconv(.c) c.gboolean {
+            const self: *Self = @ptrCast(@alignCast(data orelse return G_SOURCE_REMOVE));
+            self.handleDropUris(1, "file:///tmp/zilt-smoke-a.txt\r\nfile:///tmp/zilt-smoke-b.txt\r\n");
+            return G_SOURCE_REMOVE;
         }
 
         fn currentUri(view: [*c]c.WebKitWebView, fallback: []const u8) []const u8 {
@@ -3291,10 +4233,10 @@ fn Backend(comptime config: Config) type {
                 log.print("[linux] cascade close window #{d} (parent #{d} gone)", .{ child.id, closed_id });
                 c.gtk_widget_destroy(@ptrCast(child.win));
             }
-            // 全部窗口都销毁才 gtk_main_quit
+            // 全部窗口都销毁才退出主循环（primary / 降级两种主循环形态统一走这里）
             if (self.windows.items.len == 0) {
                 log.print("[linux] all windows destroyed -> quit main loop", .{});
-                c.gtk_main_quit();
+                self.requestQuit();
             }
         }
 
@@ -3433,4 +4375,52 @@ test "sanitizePartition: 安全字符保留、其余替换、截断与空名兜�
     const e = try sanitizePartition(testing.allocator, "");
     defer testing.allocator.free(e);
     try testing.expectEqualStrings("default", e);
+}
+
+test "parseDropUris: 注释/非 file URI/百分号解码" {
+    const a = testing.allocator;
+    const list = "# comment\r\nfile:///tmp/zilt-smoke-a.txt\r\n\r\nhttps://example.com/x\r\nfile:///tmp/a%20b.txt\r\n";
+    const paths = try parseDropUris(a, list);
+    defer {
+        for (paths) |p| a.free(p);
+        a.free(paths);
+    }
+    try testing.expectEqual(@as(usize, 2), paths.len);
+    try testing.expectEqualStrings("/tmp/zilt-smoke-a.txt", paths[0]);
+    try testing.expectEqualStrings("/tmp/a b.txt", paths[1]);
+
+    const empty = try parseDropUris(a, "https://only/remote");
+    defer {
+        for (empty) |p| a.free(p);
+        a.free(empty);
+    }
+    try testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "parseAccelGtk: 修饰符组合 / 键位 / 非法输入" {
+    const cases = [_]struct { accel: []const u8, mods: c.GdkModifierType, keyval: c.guint }{
+        .{ .accel = "Ctrl+S", .mods = c.GDK_CONTROL_MASK, .keyval = 'S' },
+        .{ .accel = "Ctrl+N", .mods = c.GDK_CONTROL_MASK, .keyval = 'N' },
+        .{ .accel = "Ctrl+Alt+N", .mods = c.GDK_CONTROL_MASK | c.GDK_MOD1_MASK, .keyval = 'N' },
+        .{ .accel = "Ctrl+Shift+P", .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .keyval = 'P' },
+        .{ .accel = "Alt+F4", .mods = c.GDK_MOD1_MASK, .keyval = 0xffbe + 3 },
+        .{ .accel = "F7", .mods = 0, .keyval = 0xffbe + 6 },
+        .{ .accel = "F12", .mods = 0, .keyval = 0xffbe + 11 },
+        .{ .accel = "5", .mods = 0, .keyval = '5' },
+    };
+    for (cases) |tc| {
+        const parsed = parseAccelGtk(tc.accel) orelse {
+            std.debug.print("parseAccelGtk('{s}') unexpectedly null\n", .{tc.accel});
+            return error.TestUnexpectedResult;
+        };
+        try testing.expectEqual(tc.mods, parsed.mods);
+        try testing.expectEqual(tc.keyval, parsed.keyval);
+    }
+    // 非法：空段 / 未知键名 / 两个键位 / 仅修饰符
+    try testing.expect(parseAccelGtk("") == null);
+    try testing.expect(parseAccelGtk("Ctrl+") == null);
+    try testing.expect(parseAccelGtk("Ctrl+Space+X") == null);
+    try testing.expect(parseAccelGtk("Ctrl+Foo") == null);
+    try testing.expect(parseAccelGtk("Ctrl+Alt") == null);
+    try testing.expect(parseAccelGtk("Ctrl+A+B") == null);
 }

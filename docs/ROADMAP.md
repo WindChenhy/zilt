@@ -143,7 +143,7 @@
             冒烟 33 → **40 项 exit 0**
       - [ ] print（P2）：Linux 仍 NotSupported——WebKit 打印 UI 走 GTK PrintOperation，
             规划随 v0.2.5 稳定化补齐（能力清单里本来就列为 P2）
-- [~] **v0.2.2 系统集成**（2026-11-13 进行中；Linux 侧第一批已落地）：
+- [x] **v0.2.2 系统集成**（2026-11-13/14 完成；Linux 侧两批全部落地）：
       - [x] **剪贴板**：文本 / HTML / 文件列表 / 图片读写（GTK 剪贴板；HTML 与
             URI 列表走延迟提供）；`clipboard_change_event` → `clipboardChanged`
       - [x] **原生对话框**：消息框 / 打开 / 保存 / 选文件夹 / 多选 / 颜色 / 字体
@@ -151,13 +151,32 @@
       - [x] **通知**：GApplication + GNotification（tag 替换）；无 D-Bus 总线时
             降级 `disabled_for_application`，不阻断启动
       - [x] **菜单栏**：config.menu → 每窗口 GtkMenuBar；叶子 activate → `menu` 事件
-            {id}；无 id 叶子置灰（加速键/角色分发未接）
+            {id}；无 id 叶子置灰；accel 挂 GtkAccelGroup（展示+触发）；role →
+            WebKit 编辑命令 + menuRole 事件（delete → execCommand）
       - [x] **托盘**：libayatana-appindicator3 **dlopen 可选依赖**（缺失仅日志）；
-            Config.tray.menu → GtkMenu；激活 → `trayMenu` {id}
-      - [ ] **单实例 + 深链**：GApplication 唯一 ID + G_APPLICATION_HANDLES_COMMAND_LINE、
-            `.desktop` + `xdg-mime` 注册、第二实例 argv 转交
-      - [ ] 运行时菜单模型（`window.zilt.menu.*` 的 list/add/remove/set/popup）、
-            拖放、自启动/系统信息（P2）
+            菜单构建与 indicator 解耦——运行时菜单模型驱动托盘菜单
+      - [x] **单实例 + 深链**（第二批，2026-11-14）：GApplication 唯一 ID
+            （HANDLES_COMMAND_LINE，先注册再建窗口）——主实例 g_application_run
+            （command-line 信号承载深链/聚焦，显式 hold 防 command-line 处理完即退）；
+            第二实例远端命中后转交 argv → **exit 5**（对齐 Windows）；`deepLink`
+            {url,files} 事件经 pending_launch 在页面就绪后补发（loaded 守卫防丢）；
+            注册 = 应用级 `.desktop`（x-scheme-handler + 文件 MIME）+ `xdg-mime
+            default`（缺失仅日志）；无 D-Bus 降级为本地解析启动参数 + gtk_main。
+            新模块 `deep_link.zig`（参数分类/转交载荷/XDG 目录，注入式 exists 可测）
+            + `desktop_entry.zig`（.desktop 生成/自启动状态解析）
+      - [x] **运行时菜单模型**（第二批）：`menu_model`（config.tray.menu 初始化，
+            与 Windows 同构）→ `menu.*` op（list/add/remove/set → 整树重建托盘菜单
+            + popup at rect，无 libayatana 也可用）；勾选项用 GtkCheckMenuItem
+      - [x] **拖放**（第二批）：主 WebView 挂 drag dest——drag-drop 拦截 WebKit
+            默认文件导航 + drag-data-received 解析 text/uri-list → `dropFiles`
+            {files}；解析 `parseDropUris` 纯函数单测；冒烟经 `__zilt.linuxSmokeDrop`
+            模拟投递覆盖事件链路
+      - [x] **自启动/系统信息**（第二批）：`~/.config/autostart/<app_id>.desktop`
+            （autostart.* op，enable 写条目/disable 删文件/query 解析 Exec 匹配）；
+            `system.info` = /etc/os-release + locale 推导 + GTK 主题深色判定 +
+            GDK 显示器枚举（JSON 与 Windows 同构；新模块 `sysinfo_linux.zig`）
+      - [ ] print（P2）：Linux 仍 NotSupported——WebKit 打印 UI 走 GTK PrintOperation，
+            规划随 v0.2.5 稳定化补齐（能力清单里本来就列为 P2）
 - [ ] **v0.2.3 安全与数据**：capability/scope 全链路、CSP、`Config.protocols` → 真 scheme、
       fs watch（inotify）/流式、SQL（libsqlite3）、http/ws（libsoup）
 - [ ] **v0.2.4 打包与 CI**：deb/rpm/AppImage/Flatpak + Xvfb 冒烟 + WebKitWebDriver
