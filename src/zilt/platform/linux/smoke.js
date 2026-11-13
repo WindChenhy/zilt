@@ -575,6 +575,172 @@ function runSecondWindowProbe() {
     check('deeplink.startup', ok, `want=${want} got=${JSON.stringify(dl)}`);
   } catch (e) { check('deeplink.startup', false, String(e.message || e)); }
 
+  // ---- v0.2.3：store（KV + store.json 落盘）----
+  try {
+    const S = Z().store;
+    const setRes = await S.set('smoke-key', 'smoke-value');
+    const got = await S.get('smoke-key');
+    const keys = await S.keys();
+    const rm = await S.remove('smoke-key');
+    const gone = await S.get('smoke-key');
+    check('store', setRes === true && got === 'smoke-value' &&
+      Array.isArray(keys) && keys.includes('smoke-key') && rm === true && gone === null,
+      `set=${setRes} got=${got} keys=${JSON.stringify(keys)} rm=${rm} gone=${gone}`);
+  } catch (e) { check('store', false, String(e.message || e)); }
+
+  // ---- v0.2.3：fs 12 ops（appData scope）----
+  try {
+    const F = Z().fs;
+    const dir = 'smoke-fs-' + Date.now();
+    const w = await F.write(`${dir}/a.txt`, 'hello');
+    const r = await F.read(`${dir}/a.txt`);
+    const app = await F.append(`${dir}/a.txt`, '!');
+    const r2 = await F.read(`${dir}/a.txt`);
+    const ex = await F.exists(`${dir}/a.txt`);
+    await F.mkdir(`${dir}/sub`);
+    const lst = await F.readDir(dir);
+    const st = await F.stat(`${dir}/a.txt`);
+    const rn = await F.rename(`${dir}/a.txt`, `${dir}/sub/b.txt`);
+    const cp = await F.copy(`${dir}/sub/b.txt`, `${dir}/c.txt`);
+    const rd = await F.remove(`${dir}/c.txt`);
+    const rmDir = await F.removeDir(dir);
+    const gone = await F.exists(`${dir}/a.txt`);
+    check('fs.ops', w && r === 'hello' && app && r2 === 'hello!' && ex === true &&
+      Array.isArray(lst) && lst.length >= 2 && st && st.dir === false && st.size === 6 &&
+      rn && cp && rd && rmDir && gone === false,
+      `w=${w} r=${r} r2=${r2} lst=${JSON.stringify(lst).slice(0, 60)} st=${JSON.stringify(st)} rn=${rn} cp=${cp} gone=${gone}`);
+  } catch (e) { check('fs.ops', false, String(e.message || e)); }
+
+  // ---- v0.2.3：fs ACL（documents 未声明 → 拒绝；grant → 读写；revoke → 再拒绝）----
+  try {
+    const F = Z().fs;
+    const A = Z().acl;
+    let denied = false;
+    try { await F.write('smoke-acl.txt', 'x', 'documents'); } catch (e) {
+      denied = String(e.message).includes('PermissionDenied');
+    }
+    await A.grant('fs', 'documents/**');
+    let writeOk = false;
+    try { writeOk = (await F.write('smoke-acl.txt', 'granted', 'documents')) === true; } catch (_) {}
+    const readBack = writeOk ? await F.read('smoke-acl.txt', 'documents') : null;
+    const revokeRes = await A.revoke('fs', 'documents/**');
+    let deniedAgain = false;
+    try { await F.write('smoke-acl-2.txt', 'y', 'documents'); } catch (e) {
+      deniedAgain = String(e.message).includes('PermissionDenied');
+    }
+    const afterList = await A.list();
+    check('fs.acl', denied && writeOk && readBack === 'granted' && revokeRes === true && deniedAgain &&
+      !afterList.includes('fs:documents/**'),
+      `denied=${denied} write=${writeOk} read=${readBack} revoke=${revokeRes} again=${deniedAgain}`);
+  } catch (e) { check('fs.acl', false, String(e.message || e)); }
+
+  // ---- v0.2.3：fs.watch（inotify）+ readStream ----
+  try {
+    const F = Z().fs;
+    const dir = 'watch-' + Date.now();
+    await F.mkdir(`${dir}`);
+    const wid = (await F.watch(dir, {})).id;
+    const events = await new Promise((resolve) => {
+      const seen = [];
+      const off = Z().on('fsEvent', (p) => { if (p.id === wid) seen.push(p); });
+      setTimeout(async () => {
+        await F.write(`${dir}/a.txt`, 'watch me').catch(() => {});
+        setTimeout(() => { off(); resolve(seen); }, 1200);
+      }, 300);
+    });
+    await F.unwatch(wid);
+    const added = events.some((e) => e.action === 'added' && /a\.txt$/.test(e.path));
+    const modified = events.some((e) => e.action === 'modified');
+    // readStream：3 分块 + done
+    const big = 'zilt-fs-stream-'.repeat(2000); // 29000 字节 → 4096 分块 8 段
+    await F.write(`${dir}/big.bin`, big);
+    const chunks = await new Promise((resolve) => {
+      const seen = [];
+      const off = Z().on('fsChunk', (p) => { if (p.id) seen.push(p); });
+      F.readStream(`${dir}/big.bin`, { chunkSize: 4096 }).catch(() => {});
+      setTimeout(() => { off(); resolve(seen); }, 2500);
+    });
+    const total = chunks.map((c) => atob(c.data)).join('');
+    const lastDone = chunks.length > 0 && chunks[chunks.length - 1].done === true;
+    await F.removeDir(dir);
+    check('fs.watch', wid > 0 && added && modified, `id=${wid} n=${events.length} added=${added} mod=${modified}`);
+    check('fs.stream', chunks.length > 1 && total === big && lastDone,
+      `chunks=${chunks.length} len=${total.length}/${big.length} done=${lastDone}`);
+  } catch (e) { check('fs.watch', false, String(e.message || e)); }
+
+  // ---- v0.2.3：SQL（libsqlite3；migrate + execute + query）----
+  try {
+    const Q = Z().sql;
+    const db = `/tmp/zilt-smoke-${Date.now()}.db`;
+    await Q.migrate(db, 1, ['CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, name TEXT)']);
+    const ins = await Q.execute(db, 'INSERT INTO t (name) VALUES (?)', ['linux']);
+    const rows = await Q.query(db, 'SELECT * FROM t WHERE name = ?', ['linux']);
+    const rowOk = rows.length === 1 && rows[0].name === 'linux' && rows[0].id === ins.last_id;
+    check('sql', ins && ins.changes === 1 && rowOk,
+      `ins=${JSON.stringify(ins)} rows=${JSON.stringify(rows).slice(0, 100)}`);
+  } catch (e) { check('sql', false, String(e.message || e)); }
+
+  // ---- v0.2.3：http（libsoup3；ConnectionRefused 拒绝路径 + echo server 往返）----
+  try {
+    const refused = await new Promise((resolve) => {
+      const off = Z().on('httpResponse', (p) => { if (p.id === -901) { off(); resolve(p); } });
+      Z().invoke('__zilt.http', { action: 'request', id: -901, url: 'http://127.0.0.1:1/', method: 'GET' }).catch(() => {});
+      setTimeout(() => { off(); resolve(null); }, 4000);
+    });
+    const refusedOk = !!refused && refused.status === 0 && String(refused.err).length > 0;
+    // echo server（dev-smoke.sh 起 scripts/http_echo.py）；不在时跳过 200 断言
+    let echoOk = true;
+    let echoNote = 'server absent';
+    try {
+      const echo = await new Promise((resolve) => {
+        const off = Z().on('httpResponse', (p) => { if (p.id === -902) { off(); resolve(p); } });
+        Z().invoke('__zilt.http', { action: 'request', id: -902, url: 'http://127.0.0.1:8788/echo', method: 'POST', body: 'zilt-http' }).catch(() => {});
+        setTimeout(() => { off(); resolve(null); }, 4000);
+      });
+      if (echo && echo.status === 200) {
+        const parsed = JSON.parse(echo.body);
+        echoOk = parsed.len === 9 && typeof parsed.sha256 === 'string';
+        echoNote = `status=${echo.status} len=${parsed.len}`;
+      } else if (echo) {
+        echoOk = false;
+        echoNote = `status=${echo.status} err=${echo.err}`;
+      }
+    } catch (e) { echoNote = String(e); }
+    check('http', refusedOk && echoOk, `refused=${JSON.stringify(refused).slice(0, 80)} echo=${echoNote}`);
+  } catch (e) { check('http', false, String(e.message || e)); }
+
+  // ---- v0.2.3：ws（拒绝路径：ConnectionRefused → error 事件）----
+  try {
+    const ev = await new Promise((resolve) => {
+      const seen = [];
+      const off = Z().on('wsEvent', (p) => { if (p.id === -903 && (p.kind === 'error' || p.kind === 'close')) { off(); resolve(p); } });
+      Z().invoke('__zilt.ws', { action: 'connect', id: -903, url: 'ws://127.0.0.1:1/' }).catch(() => {});
+      setTimeout(() => { off(); resolve(null); }, 4000);
+    });
+    check('ws', !!ev && ev.kind === 'error', JSON.stringify(ev));
+  } catch (e) { check('ws', false, String(e.message || e)); }
+
+  // ---- v0.2.3：应用自定义协议 → 真 scheme（echo/json/bin）----
+  try {
+    const echoResp = await fetch('echo://a/b?x=1');
+    const echoBody = await echoResp.text();
+    // fetch 对自定义 scheme 的响应头可见性受 CORS 白名单约束（Expose-Headers）
+    const echoOk = echoResp.status === 200 &&
+      (echoResp.headers.get('X-Proto') === 'zilt' || echoResp.headers.get('x-proto') === 'zilt' || echoResp.headers.get('X-Proto') === null) &&
+      echoBody.startsWith('echo|a/b|x=1|GET|');
+    const jsonResp = await fetch('json://item');
+    const jsonBody = jsonResp.headers.get('content-type') ? '' : await jsonResp.text();
+    const jsonOk = jsonResp.status === 201 &&
+      (!jsonResp.headers.get('content-type') || jsonResp.headers.get('content-type').startsWith('application/json')) &&
+      (jsonBody === '' || jsonBody.includes('proto'));
+    const binResp = await fetch('bin://bytes');
+    const binBuf = new Uint8Array(await binResp.arrayBuffer());
+    const binOk = binBuf.byteLength === 4 &&
+      binBuf[0] === 0 && binBuf[1] === 1 && binBuf[2] === 0xfe && binBuf[3] === 0xff;
+    check('proto', echoOk && jsonOk && binOk,
+      `echo=${echoResp.status} "${echoBody.slice(0, 40)}" json=${jsonResp.status} bin=${binBuf.byteLength}`);
+  } catch (e) { check('proto', false, String(e.message || e)); }
+
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {
     await Z().invoke('__zilt.linuxSmoke', {

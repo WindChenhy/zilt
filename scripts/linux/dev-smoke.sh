@@ -30,6 +30,14 @@ mkdir -p .zilt-probe
   export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
   export LIBGL_ALWAYS_SOFTWARE=1
 
+  # v0.2.3：http/ws 冒烟需要回声服务器（scripts/http_echo.py 8788 +
+  # ws_echo.py 8765；冒烟对 8788/echo 做 POST 断言，拒绝路径不依赖服务器）
+  python3 scripts/http_echo.py 8788 > /tmp/zilt-http-echo.log 2>&1 &
+  echo_pid=$!
+  python3 scripts/ws_echo.py 8765 > /tmp/zilt-ws-echo.log 2>&1 &
+  ws_pid=$!
+  trap 'kill $echo_pid $ws_pid 2>/dev/null' EXIT
+
   set +e
   timeout 240 xvfb-run -a --server-args="-screen 0 1280x800x24" ./zig-out/bin/zilt-app 2>&1 | tail -120
   code=${PIPESTATUS[0]}

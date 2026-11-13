@@ -23,6 +23,11 @@ export LIBGL_ALWAYS_SOFTWARE=1
   rm -f zilt.log
 } > "$LOG" 2>&1
 
+# 冒烟的 http 检查需要回声服务器（同 dev-smoke.sh）
+python3 scripts/http_echo.py 8788 > /tmp/zilt-http-echo.log 2>&1 &
+echo_pid=$!
+trap 'kill $echo_pid 2>/dev/null' EXIT
+
 set +e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 dbus-run-session -- bash "$SCRIPT_DIR/single-instance-inner.sh" >> "$LOG" 2>&1
@@ -37,7 +42,7 @@ ok=1
 grep -aq "\[single-instance\] args forwarded to primary -> exit 5" zilt.log || ok=0
 grep -aq "\[deep-link\] launch (url=zilt://second-instance" zilt.log || ok=0
 grep -aq "deeplink-event.*second-instance" zilt.log || ok=0
-grep -aq "ALL 48 CHECKS PASSED" zilt.log || ok=0
+grep -aq "ALL 57 CHECKS PASSED" zilt.log || ok=0
 
 {
   echo "SECOND_EXIT=$second_code"

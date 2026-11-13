@@ -177,8 +177,21 @@
             GDK 显示器枚举（JSON 与 Windows 同构；新模块 `sysinfo_linux.zig`）
       - [ ] print（P2）：Linux 仍 NotSupported——WebKit 打印 UI 走 GTK PrintOperation，
             规划随 v0.2.5 稳定化补齐（能力清单里本来就列为 P2）
-- [ ] **v0.2.3 安全与数据**：capability/scope 全链路、CSP、`Config.protocols` → 真 scheme、
-      fs watch（inotify）/流式、SQL（libsqlite3）、http/ws（libsoup）
+- [~] **v0.2.3 安全与数据**（2026-11-14 完成）：capability/scope 在 Linux 侧全链路生效
+      （fs/http/shell 执行点统一 `aclAllowed`，运行时授权 `window.zilt.acl` 落盘
+      acl.json 重启生效）；store（KV + store.json）；`Config.protocols` → **真
+      scheme**（每协议一个 scheme `<name>://…`，CORS 允许 + Expose-Headers）；
+      fs watch（inotify，`fs_watch.zig`：递归子目录动态补挂 + 自管道停止）/
+      流式读（fsChunk base64）；SQL（libsqlite3 dlopen，`sqlite.zig` 与 Windows
+      版同构：行集 JSON/{changes,last_id}/事务迁移）；http/ws/wss（libsoup3：
+      SoupSession 每请求建（对齐 WinHTTP），proxy/超时/忽略证书/重定向开关/
+      multipart，流式 httpChunk，WebSocket 事件 open/message/close/error）；
+      CSP 注入（scheme 响应带 CSP/security.headers，v0.2.1 已就位）。
+      **验收**：冒烟 48 → **57 项** exit 0（store/fs 12 ops/fs.acl 拒绝→授权→
+      撤销/fs.watch+readStream/sql 迁移+查询/http 拒绝+echo 往返/ws 拒绝路径/
+      真 scheme echo·json·bin fetch）；有/无 D-Bus 双环境 + 单实例转交 E2E 全过；
+      Windows 冒烟 47/49（clip/clipmulti 因桌面剪贴板被外部进程占用——
+      PowerShell Set-Clipboard 同样失败，环境问题非代码回归；Windows 代码零改动）。
 - [ ] **v0.2.4 打包与 CI**：deb/rpm/AppImage/Flatpak + Xvfb 冒烟 + WebKitWebDriver
 - [ ] **v0.2.5 GTK4 变体与稳定化**：`-Dgtk=gtk4`、Wayland/HiDPI、性能基线
 - [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）——v0.3+

@@ -120,12 +120,19 @@ const system_api = @import("../../system_api.zig");
 const clipboard = @import("../../clipboard.zig");
 const notification = @import("../../notification.zig");
 const window_state = @import("window_state.zig");
+const sys = @import("../../sys.zig");
 const deep_link = @import("deep_link.zig");
 const desktop_entry = @import("desktop_entry.zig");
 const sysinfo_linux = @import("sysinfo_linux.zig");
 const menu_model = @import("../../menu_model.zig");
 const shared_sysinfo = @import("../../sysinfo.zig");
 const autostart_mod = @import("../../autostart.zig");
+const fs_api_mod = @import("../../fs_api.zig");
+const store_mod = @import("../../store.zig");
+const protocol = @import("../../protocol.zig");
+const shared_net = @import("../../net.zig");
+const linux_sqlite = @import("sqlite.zig");
+const fs_watch_mod = @import("fs_watch.zig");
 const Config = @import("../../config.zig").Config;
 
 pub const platform_name = "linux";
@@ -521,6 +528,12 @@ pub fn run(comptime config: Config) !void {
     // 深链 / 文件关联注册（.desktop + xdg-mime；config.deep_link.register）
     self.registerDeepLink();
 
+    // v0.2.3：本地存储（store.json / acl.json，与 windowState 同根）
+    self.initStorage();
+
+    // v0.2.3：应用自定义协议 → 真 scheme（Config.protocols；每协议一个 scheme）
+    self.registerProtocolSchemes(wc);
+
     // v0.2.2：剪贴板变化监听（owner-change → clipboardChanged 事件）
     if (config.clipboard_change_event) {
         const cb = c.gtk_clipboard_get(c.GDK_SELECTION_CLIPBOARD);
@@ -727,6 +740,52 @@ fn Backend(comptime config: Config) type {
             rid: i64,
         };
 
+        /// fs watch / 流式读的封送任务（v0.2.3）。
+        const FsWatchEvent = struct {
+            backend: *Self,
+            id: i64,
+            action: []const u8,
+            path: []u8,
+        };
+        const FsChunkEvent = struct {
+            backend: *Self,
+            id: i64,
+            seq: u64,
+            done: bool,
+            data: []u8,
+        };
+        const FsStreamJob = struct {
+            backend: *Self,
+            id: i64,
+            path: []u8,
+            chunk_size: usize,
+        };
+
+        /// HTTP 请求上下文（send_async 完成回调的 user_data；libsoup 全程主循环）。
+        const HttpJob = struct {
+            backend: *Self,
+            id: i64,
+            session: [*c]c.SoupSession,
+            msg: ?*c.SoupMessage,
+            stream: ?[*c]c.GInputStream = null,
+            body: std.ArrayListUnmanaged(u8) = .empty,
+            stream_mode: bool = false,
+            seq: u64 = 0,
+        };
+
+        /// WebSocket 连接（soup_websocket_connect_async 的会话 + 连接 + 信号 id）。
+        const WsConn = struct {
+            backend: *Self,
+            id: i64,
+            session: [*c]c.SoupSession,
+            /// SoupWebsocketConnection 是 opaque → 单指针
+            conn: ?*c.SoupWebsocketConnection,
+            msg: ?*c.SoupMessage = null,
+            msg_handler: c.gulong = 0,
+            closed_handler: c.gulong = 0,
+            error_handler: c.gulong = 0,
+        };
+
         /// eval 任务（窗口主 WebView 与子 WebView 共用完成回调，见 evalFinished）。
         const EvalTask = struct {
             backend: *Self,
@@ -780,6 +839,26 @@ fn Backend(comptime config: Config) type {
         smoke_drop_sent: bool = false,
         /// 冒烟：主实例保持存活的秒数（ZILT_LINUX_SMOKE_STAY，第二实例转交 E2E 用）
         smoke_stay: u32 = 0,
+        /// 退出中（后台线程据此停止产出）
+        quitting: bool = false,
+        /// ---- v0.2.3：存储 / fs / SQL / 网络 ----
+        /// 应用数据根（store.json / acl.json；与 windowState 同根）
+        storage_root: ?[]u8 = null,
+        store: ?store_mod.Store = null,
+        /// 运行时授权（acl.json 持久化；对齐 Windows v0.1.21）
+        acl_grants: std.ArrayListUnmanaged([]const u8) = .empty,
+        acl_loaded: bool = false,
+        /// inotify 监视表 / 流式读 job
+        fs_watches: std.ArrayListUnmanaged(*fs_watch_mod.Watch) = .empty,
+        next_fs_watch_id: i64 = 1,
+        next_fs_stream_id: i64 = 1,
+        /// SQL lib 缓存（进程内一次加载）
+        sqlite_lib: ?*linux_sqlite.Lib = null,
+        /// HTTP（libsoup3；事件 httpResponse / httpChunk）
+        next_http_id_seq: i64 = 1,
+        /// WebSocket 连接表（SoupWebsocketConnection 所有权在此）
+        ws_conns: std.AutoHashMapUnmanaged(i64, *WsConn) = .empty,
+        next_ws_id_seq: i64 = 1,
 
         fn deinit(self: *Self) void {
             // 主循环退出后可能仍有窗口未 destroy（ctx.quit 路径）→ 逐个释放记录
@@ -814,6 +893,18 @@ fn Backend(comptime config: Config) type {
             if (self.tray) |*t| t.lib.close();
             if (self.gapp) |app| c.g_object_unref(@ptrCast(app));
             if (self.pending_launch) |*launch| launch.deinit(self.allocator);
+            // v0.2.3：存储 / fs / SQL
+            for (self.fs_watches.items) |w| fs_watch_mod.stop(w);
+            self.fs_watches.deinit(self.allocator);
+            for (self.acl_grants.items) |g| self.allocator.free(g);
+            self.acl_grants.deinit(self.allocator);
+            {
+                var ws_it = self.ws_conns.iterator();
+                while (ws_it.next()) |entry| self.freeWsConn(entry.value_ptr.*);
+                self.ws_conns.deinit(self.allocator);
+            }
+            if (self.store) |*st| st.deinit();
+            if (self.storage_root) |r| self.allocator.free(r);
         }
 
         // ------------------------------------------------------------------
@@ -3456,7 +3547,14 @@ fn Backend(comptime config: Config) type {
                 .menu => |op| return self.runMenuOp(op, alloc),
                 .info => |kind| return .{ .json = try self.collectSystemInfo(kind, alloc) },
                 .autostart => |op| return .{ .state = try self.runAutostartOp(op, alloc) },
-                // 托盘运行时 op/快捷键/http/ws/fs/... 属 v0.2.3+；NotSupported
+                // v0.2.3：存储 / fs / ACL / SQL / http / ws
+                .store => |op| return self.runStoreOp(op, alloc),
+                .fs => |op| return self.runFsOp(op, alloc),
+                .acl => |op| return self.runAclOp(op, alloc),
+                .sql => |op| return self.runSqlOp(op, alloc),
+                .http => |op| return self.runHttpOp(op, alloc),
+                .ws => |op| return self.runWsOp(op, alloc),
+                // 托盘运行时 op/快捷键/process/... 属后续版本；NotSupported
                 // 与 Windows 的降级语义同构（platform/interface.zig 契约不受影响）
                 else => return error.NotSupported,
             }
@@ -3804,6 +3902,1160 @@ fn Backend(comptime config: Config) type {
             log.print("[autostart] enabled: {s}", .{path});
         }
 
+
+        // ------------------------------------------------------------------
+        // 存储 / 受限 fs / 运行时授权（v0.2.3，对齐 Windows v0.1.16–v0.1.21）
+        // ------------------------------------------------------------------
+
+        /// 应用数据根（storage_root）：与 window_state 同根
+        /// <XDG_DATA_HOME|~/.local/share>/<app_id>。run() 早期调用一次。
+        fn initStorage(self: *Self) void {
+            if (self.storage_root != null) return;
+            const root = self.appDataRoot() orelse {
+                log.print("[store] app data root unavailable — store/acl/fs(appData) disabled", .{});
+                return;
+            };
+            makeDirPath(self.allocator, root);
+            self.storage_root = root;
+
+            var st = store_mod.Store.init(self.allocator);
+            {
+                const store_path = std.fmt.allocPrint(self.allocator, "{s}/store.json", .{root}) catch null;
+                if (store_path) |sp| {
+                    defer self.allocator.free(sp);
+                    if (std.Io.Dir.cwd().readFileAlloc(sharedIo(), sp, self.allocator, .limited(1024 * 1024))) |bytes| {
+                        defer self.allocator.free(bytes);
+                        st.fromJson(bytes) catch |err| {
+                            log.print("[store] parse failed: {s}（从空表开始）", .{@errorName(err)});
+                        };
+                    } else |_| {}
+                }
+            }
+            self.store = st;
+            log.print("[store] ready ({d} keys) {s}/store.json", .{ st.count(), root });
+
+            self.loadAclGrants();
+        }
+
+        fn persistStore(self: *Self) void {
+            const root = self.storage_root orelse return;
+            const st = if (self.store) |*v| v else return;
+            const json = st.toJson(self.allocator) catch return;
+            defer self.allocator.free(json);
+            const path = std.fmt.allocPrint(self.allocator, "{s}/store.json", .{root}) catch return;
+            defer self.allocator.free(path);
+            self.writeFileAtomic(path, json) catch |err| {
+                log.print("[store] persist failed: {s}", .{@errorName(err)});
+            };
+        }
+
+        fn runStoreOp(self: *Self, op: system_api.StoreOp, alloc: std.mem.Allocator) !system_api.Result {
+            const st = if (self.store) |*v| v else return error.StoreNotAvailable;
+            switch (op) {
+                .get => |key| {
+                    const v = st.get(key) orelse return .{ .json = try alloc.dupe(u8, "null") };
+                    return .{ .json = try std.json.Stringify.valueAlloc(alloc, v, .{}) };
+                },
+                .set => |kv| {
+                    try st.set(kv.key, kv.value);
+                    self.persistStore();
+                    log.print("[store] set {s} ({d} keys)", .{ kv.key, st.count() });
+                    return .{ .ok = true };
+                },
+                .remove => |key| {
+                    const removed = st.remove(key);
+                    if (removed) self.persistStore();
+                    return .{ .ok = removed };
+                },
+                .keys => {
+                    const keys = try st.keys(alloc);
+                    defer alloc.free(keys);
+                    return .{ .json = try std.json.Stringify.valueAlloc(alloc, keys, .{}) };
+                },
+                .all => return .{ .json = try st.toJson(alloc) },
+            }
+        }
+
+        /// v0.1.19 对齐：解析 scope 根目录（绝对路径）。
+        fn scopeRoot(self: *Self, scope: fs_api_mod.Scope, alloc: std.mem.Allocator) ?[]u8 {
+            switch (scope) {
+                .app_data => {
+                    const base = self.storage_root orelse return null;
+                    return alloc.dupe(u8, base) catch null;
+                },
+                .app_cache => return self.cacheRoot(alloc),
+                .app_config => return self.configRoot(alloc),
+                .temp => return alloc.dupe(u8, "/tmp") catch null,
+                .exe => {
+                    const exe = deep_link.exePath(alloc) catch return null;
+                    defer alloc.free(exe);
+                    const dir = std.fs.path.dirname(exe) orelse return null;
+                    return alloc.dupe(u8, dir) catch null;
+                },
+                else => {
+                    const home_z = std.c.getenv("HOME") orelse return null;
+                    const home = std.mem.span(home_z);
+                    if (home.len == 0) return null;
+                    const sub = fs_api_mod.userSubdir(scope) orelse return null;
+                    return std.fmt.allocPrint(alloc, "{s}/{s}", .{ home, sub }) catch null;
+                },
+            }
+        }
+
+        fn cacheRoot(self: *Self, alloc: std.mem.Allocator) ?[]u8 {
+            _ = self;
+            if (std.c.getenv("XDG_CACHE_HOME")) |x| {
+                const sv = std.mem.span(x);
+                if (sv.len > 0) return alloc.dupe(u8, sv) catch null;
+            }
+            const home_z = std.c.getenv("HOME") orelse return null;
+            const home = std.mem.span(home_z);
+            if (home.len == 0) return null;
+            return std.fmt.allocPrint(alloc, "{s}/.cache", .{home}) catch null;
+        }
+
+        fn configRoot(self: *Self, alloc: std.mem.Allocator) ?[]u8 {
+            _ = self;
+            if (std.c.getenv("XDG_CONFIG_HOME")) |x| {
+                const sv = std.mem.span(x);
+                if (sv.len > 0) return std.fmt.allocPrint(alloc, "{s}/{s}", .{ sv, config.app_id }) catch null;
+            }
+            const home_z = std.c.getenv("HOME") orelse return null;
+            const home = std.mem.span(home_z);
+            if (home.len == 0) return null;
+            return std.fmt.allocPrint(alloc, "{s}/.config/{s}", .{ home, config.app_id }) catch null;
+        }
+
+        /// fs scope 授权：appData/appConfig/appCache 默认可用；其它根目录需要
+        /// capability 声明 "fs:documents/**" 之类（或运行时 grant）。
+        fn fsAllowed(self: *Self, scope: fs_api_mod.Scope, rel: []const u8, alloc: std.mem.Allocator) bool {
+            if (scope.isAppPrivate()) return true;
+            const res = fs_api_mod.resourceString(alloc, scope, rel) catch return false;
+            defer alloc.free(res);
+            return self.aclAllowed("fs", res);
+        }
+
+        fn fsScopeOf(name: ?[]const u8) !fs_api_mod.Scope {
+            const n = name orelse return .app_data;
+            if (n.len == 0) return .app_data;
+            return fs_api_mod.Scope.fromName(n) catch error.UnknownScope;
+        }
+
+        fn aclAllowed(self: *Self, kind: []const u8, resource: []const u8) bool {
+            return security.scopeAllowedWith(config.security, self.acl_grants.items, kind, resource);
+        }
+
+        fn loadAclGrants(self: *Self) void {
+            if (self.acl_loaded) return;
+            self.acl_loaded = true;
+            const root = self.storage_root orelse return;
+            const path = std.fmt.allocPrint(self.allocator, "{s}/acl.json", .{root}) catch return;
+            defer self.allocator.free(path);
+            const bytes = std.Io.Dir.cwd().readFileAlloc(sharedIo(), path, self.allocator, .limited(256 * 1024)) catch return;
+            defer self.allocator.free(bytes);
+            var parsed = std.json.parseFromSlice([]const []const u8, self.allocator, bytes, .{}) catch return;
+            defer parsed.deinit();
+            for (parsed.value) |g| {
+                const copy = self.allocator.dupe(u8, g) catch continue;
+                self.acl_grants.append(self.allocator, copy) catch self.allocator.free(copy);
+            }
+            log.print("[acl] loaded {d} grants", .{self.acl_grants.items.len});
+        }
+
+        fn saveAclGrants(self: *Self) void {
+            const root = self.storage_root orelse return;
+            const path = std.fmt.allocPrint(self.allocator, "{s}/acl.json", .{root}) catch return;
+            defer self.allocator.free(path);
+            const json = std.json.Stringify.valueAlloc(self.allocator, self.acl_grants.items, .{}) catch return;
+            defer self.allocator.free(json);
+            self.writeFileAtomic(path, json) catch {
+                log.print("[acl] save failed", .{});
+            };
+        }
+
+        /// acl.list / grant / revoke（grant 落盘，重启后仍生效）。
+        fn runAclOp(self: *Self, op: system_api.AclOp, alloc: std.mem.Allocator) !system_api.Result {
+            switch (op) {
+                .list => return .{ .json = try std.json.Stringify.valueAlloc(alloc, self.acl_grants.items, .{}) },
+                .grant => |g| {
+                    if (g.kind.len == 0 or g.pattern.len == 0) return error.InvalidPattern;
+                    const pat = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ g.kind, g.pattern });
+                    defer self.allocator.free(pat);
+                    for (self.acl_grants.items) |cur| {
+                        if (std.mem.eql(u8, cur, pat)) return .{ .ok = true };
+                    }
+                    const copy = try self.allocator.dupe(u8, pat);
+                    errdefer self.allocator.free(copy);
+                    try self.acl_grants.append(self.allocator, copy);
+                    self.saveAclGrants();
+                    log.print("[acl] granted {s}", .{pat});
+                    return .{ .ok = true };
+                },
+                .revoke => |g| {
+                    const pat = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ g.kind, g.pattern });
+                    defer self.allocator.free(pat);
+                    var removed: usize = 0;
+                    var i: usize = 0;
+                    while (i < self.acl_grants.items.len) {
+                        if (!std.mem.eql(u8, self.acl_grants.items[i], pat)) {
+                            i += 1;
+                            continue;
+                        }
+                        self.allocator.free(self.acl_grants.orderedRemove(i));
+                        removed += 1;
+                    }
+                    if (removed > 0) self.saveAclGrants();
+                    log.print("[acl] revoked {s} ({d})", .{ pat, removed });
+                    return .{ .ok = removed > 0 };
+                },
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // fs 12 ops（v0.2.3；读写上限与路径校验复用共享 fs_api）
+        // ------------------------------------------------------------------
+
+        fn fileSizeOf(self: *Self, path: []const u8) ?u64 {
+            _ = self;
+            const st = std.Io.Dir.cwd().statFile(sharedIo(), path, .{}) catch return null;
+            return st.size;
+        }
+
+        fn fsReadFile(self: *Self, path: []const u8, max: usize) ![]u8 {
+            return std.Io.Dir.cwd().readFileAlloc(sharedIo(), path, self.allocator, .limited(max)) catch |err| switch (err) {
+                error.FileNotFound => error.FileNotFound,
+                else => error.ReadFailed,
+            };
+        }
+
+        fn fsWriteFile(self: *Self, path: []const u8, data: []const u8) !void {
+            if (std.fs.path.dirname(path)) |dir| {
+                makeDirPath(self.allocator, dir);
+            }
+            try std.Io.Dir.cwd().writeFile(sharedIo(), .{ .sub_path = path, .data = data });
+        }
+
+        fn fsAppendFile(self: *Self, path: []const u8, data: []const u8) !void {
+            const old = self.fsReadFile(path, (fs_api_mod.Limits{}).max_read) catch "";
+            defer if (old.len > 0) self.allocator.free(old);
+            const merged = try std.mem.concat(self.allocator, u8, &.{ old, data });
+            defer self.allocator.free(merged);
+            try self.fsWriteFile(path, merged);
+        }
+
+        fn fsDeleteTree(self: *Self, path: []const u8) bool {
+            _ = self;
+            std.Io.Dir.cwd().deleteTree(sharedIo(), path) catch return false;
+            return true;
+        }
+
+        /// 复制文件（读旧 + 写新；大小上限沿用读限制）。
+        fn fsCopyFile(self: *Self, from: []const u8, to: []const u8) !void {
+            const data = try self.fsReadFile(from, (fs_api_mod.Limits{}).max_read);
+            defer self.allocator.free(data);
+            try self.fsWriteFile(to, data);
+        }
+
+        /// stat JSON（形状与 Windows 同构：dir/size/modified/created/attributes；
+        /// modified/created Linux 侧无 mtime 暴露给该通道，恒 0）。
+        fn fsStatJson(alloc: std.mem.Allocator, path: []const u8) ?[]u8 {
+            const st = std.Io.Dir.cwd().statFile(sharedIo(), path, .{}) catch return null;
+            return std.fmt.allocPrint(alloc,
+                "{{\"dir\":{s},\"size\":{d},\"modified\":{d},\"created\":{d},\"attributes\":{d}}}",
+                .{ boolStr(st.kind == .directory), st.size, 0, 0, @intFromEnum(st.kind) },
+            ) catch null;
+        }
+
+        /// readDir JSON：[{name, dir, size}]（形状与 Windows 一致）。
+        fn fsListDirJson(self: *Self, alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+            var dir = std.Io.Dir.cwd().openDir(sharedIo(), path, .{ .iterate = true }) catch return error.FileNotFound;
+            defer dir.close(sharedIo());
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer out.deinit(alloc);
+            try out.append(alloc, '[');
+            var it = dir.iterate();
+            var first = true;
+            while (it.next(sharedIo()) catch null) |entry| {
+                if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+                if (!first) try out.append(alloc, ',');
+                first = false;
+                const is_dir = entry.kind == .directory;
+                var size: u64 = 0;
+                if (!is_dir) {
+                    const full = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ path, entry.name }) catch continue;
+                    defer self.allocator.free(full);
+                    size = self.fileSizeOf(full) orelse 0;
+                }
+                const name_json = try std.json.Stringify.valueAlloc(alloc, entry.name, .{});
+                defer alloc.free(name_json);
+                const chunk = try std.fmt.allocPrint(alloc, "{{\"name\":{s},\"dir\":{},\"size\":{d}}}", .{ name_json, is_dir, size });
+                defer alloc.free(chunk);
+                try out.appendSlice(alloc, chunk);
+            }
+            try out.append(alloc, ']');
+            return out.toOwnedSlice(alloc);
+        }
+
+        /// fs write / append 共用实现。
+        fn fsWriteOp(self: *Self, w: system_api.FsWrite, append: bool, alloc: std.mem.Allocator) !system_api.Result {
+            const scope = try fsScopeOf(w.scope);
+            if (!self.fsAllowed(scope, w.path, alloc)) return error.PermissionDenied;
+            if (w.data.len > (fs_api_mod.Limits{}).max_write) return error.FileTooLarge;
+            const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+            defer alloc.free(root);
+            const path = try fs_api_mod.joinChecked(alloc, root, w.path);
+            defer alloc.free(path);
+            if (append) {
+                self.fsAppendFile(path, w.data) catch return error.WriteFailed;
+            } else {
+                self.fsWriteFile(path, w.data) catch return error.WriteFailed;
+            }
+            log.print("[fs] {s} {d} bytes -> {s}/{s}", .{
+                if (append) "appended" else "wrote", w.data.len, scope.name(), w.path,
+            });
+            return .{ .ok = true };
+        }
+
+        /// fs rename / copy 共用实现。
+        fn fsTransferOp(self: *Self, m: system_api.FsMove, is_copy: bool, alloc: std.mem.Allocator) !system_api.Result {
+            const from_scope = try fsScopeOf(m.scope);
+            const to_scope = try fsScopeOf(m.to_scope orelse m.scope);
+            if (!self.fsAllowed(from_scope, m.from, alloc)) return error.PermissionDenied;
+            if (!self.fsAllowed(to_scope, m.to, alloc)) return error.PermissionDenied;
+            const from_root = self.scopeRoot(from_scope, alloc) orelse return error.ScopeUnavailable;
+            defer alloc.free(from_root);
+            const to_root = self.scopeRoot(to_scope, alloc) orelse return error.ScopeUnavailable;
+            defer alloc.free(to_root);
+            const from = try fs_api_mod.joinChecked(alloc, from_root, m.from);
+            defer alloc.free(from);
+            const to = try fs_api_mod.joinChecked(alloc, to_root, m.to);
+            defer alloc.free(to);
+            if (std.fs.path.dirname(to)) |dir| makeDirPath(self.allocator, dir);
+            if (is_copy) {
+                self.fsCopyFile(from, to) catch return error.CopyFailed;
+            } else {
+                std.Io.Dir.renameAbsolute(from, to, sharedIo()) catch return error.RenameFailed;
+            }
+            return .{ .ok = true };
+        }
+
+        /// fs 12 ops + watch/unwatch + readStream（v0.2.3）。
+        fn runFsOp(self: *Self, op: system_api.FsOp, alloc: std.mem.Allocator) !system_api.Result {
+            switch (op) {
+                .watch => |req| {
+                    const scope = try fsScopeOf(req.scope);
+                    if (!self.fsAllowed(scope, req.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const dir = if (req.path.len == 0 or std.mem.eql(u8, req.path, "."))
+                        try alloc.dupe(u8, root)
+                    else
+                        try fs_api_mod.joinChecked(alloc, root, req.path);
+                    defer alloc.free(dir);
+
+                    const id = self.next_fs_watch_id;
+                    const w = fs_watch_mod.start(
+                        std.heap.page_allocator,
+                        id,
+                        dir,
+                        req.recursive,
+                        onFsWatchEvent,
+                        self,
+                    ) catch |err| {
+                        log.print("[fs] watch failed: {s} ({s})", .{ @errorName(err), dir });
+                        return switch (err) {
+                            error.FileNotFound => error.FileNotFound,
+                            else => error.WatchFailed,
+                        };
+                    };
+                    self.next_fs_watch_id += 1;
+                    try self.fs_watches.append(self.allocator, w);
+                    log.print("[fs] watch #{d} {s} recursive={}", .{ id, dir, req.recursive });
+                    return .{ .json = try std.fmt.allocPrint(alloc, "{{\"id\":{d}}}", .{id}) };
+                },
+                .unwatch => |id| {
+                    for (self.fs_watches.items, 0..) |w, i| {
+                        if (w.id != id) continue;
+                        _ = self.fs_watches.swapRemove(i);
+                        fs_watch_mod.stop(w);
+                        return .{ .ok = true };
+                    }
+                    return .{ .ok = false };
+                },
+                .read_stream => |req| {
+                    const scope = try fsScopeOf(req.scope);
+                    if (!self.fsAllowed(scope, req.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, req.path);
+                    defer alloc.free(path);
+                    if (self.fileSizeOf(path) == null) return error.FileNotFound;
+
+                    const a2 = std.heap.page_allocator;
+                    const job = a2.create(FsStreamJob) catch return error.OutOfMemory;
+                    const id = self.next_fs_stream_id;
+                    self.next_fs_stream_id += 1;
+                    job.* = .{
+                        .backend = self,
+                        .id = id,
+                        .path = a2.dupe(u8, path) catch {
+                            a2.destroy(job);
+                            return error.OutOfMemory;
+                        },
+                        .chunk_size = @min(@max(req.chunk_size, 4096), 1024 * 1024),
+                    };
+                    const t = std.Thread.spawn(.{ .stack_size = sys.threadStackSize(256 * 1024) }, fsStreamMain, .{job}) catch {
+                        a2.free(job.path);
+                        a2.destroy(job);
+                        return error.SpawnFailed;
+                    };
+                    t.detach();
+                    log.print("[fs] readStream #{d} {s} chunk={d}", .{ id, path, job.chunk_size });
+                    return .{ .json = try std.fmt.allocPrint(alloc, "{{\"id\":{d}}}", .{id}) };
+                },
+                .roots => {
+                    var out: std.ArrayListUnmanaged(u8) = .empty;
+                    errdefer out.deinit(alloc);
+                    try out.append(alloc, '{');
+                    const scopes = [_]fs_api_mod.Scope{ .app_data, .app_config, .app_cache, .home, .desktop, .documents, .downloads, .pictures, .videos, .temp, .exe };
+                    var first = true;
+                    for (scopes) |sc| {
+                        const r = self.scopeRoot(sc, alloc) orelse continue;
+                        defer alloc.free(r);
+                        if (!first) try out.append(alloc, ',');
+                        first = false;
+                        try out.print(alloc, "\"{s}\":", .{sc.name()});
+                        const lit = try std.json.Stringify.valueAlloc(alloc, r, .{});
+                        defer alloc.free(lit);
+                        try out.appendSlice(alloc, lit);
+                    }
+                    try out.append(alloc, '}');
+                    return .{ .json = try out.toOwnedSlice(alloc) };
+                },
+                .read => |t| {
+                    const scope = try fsScopeOf(t.scope);
+                    if (!self.fsAllowed(scope, t.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, t.path);
+                    defer alloc.free(path);
+                    const bytes = self.fsReadFile(path, (fs_api_mod.Limits{}).max_read) catch return error.FileNotFound;
+                    defer self.allocator.free(bytes);
+                    return .{ .json = try std.json.Stringify.valueAlloc(alloc, bytes, .{}) };
+                },
+                .write => |w| return self.fsWriteOp(w, false, alloc),
+                .append => |w| return self.fsWriteOp(w, true, alloc),
+                .rename => |m| return self.fsTransferOp(m, false, alloc),
+                .copy => |m| return self.fsTransferOp(m, true, alloc),
+                .exists => |t| {
+                    const scope = try fsScopeOf(t.scope);
+                    if (!self.fsAllowed(scope, t.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, t.path);
+                    defer alloc.free(path);
+                    return .{ .ok = self.fileSizeOf(path) != null };
+                },
+                .remove => |t| {
+                    const scope = try fsScopeOf(t.scope);
+                    if (!self.fsAllowed(scope, t.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, t.path);
+                    defer alloc.free(path);
+                    std.Io.Dir.cwd().deleteFile(sharedIo(), path) catch return .{ .ok = false };
+                    return .{ .ok = true };
+                },
+                .mkdir => |t| {
+                    const scope = try fsScopeOf(t.scope);
+                    if (!self.fsAllowed(scope, t.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, t.path);
+                    defer alloc.free(path);
+                    makeDirPath(self.allocator, path);
+                    return .{ .ok = true };
+                },
+                .remove_dir => |t| {
+                    const scope = try fsScopeOf(t.scope);
+                    if (!self.fsAllowed(scope, t.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, t.path);
+                    defer alloc.free(path);
+                    return .{ .ok = self.fsDeleteTree(path) };
+                },
+                .read_dir => |t| {
+                    const scope = try fsScopeOf(t.scope);
+                    if (!self.fsAllowed(scope, t.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, t.path);
+                    defer alloc.free(path);
+                    return .{ .json = try self.fsListDirJson(alloc, path) };
+                },
+                .stat => |t| {
+                    const scope = try fsScopeOf(t.scope);
+                    if (!self.fsAllowed(scope, t.path, alloc)) return error.PermissionDenied;
+                    const root = self.scopeRoot(scope, alloc) orelse return error.ScopeUnavailable;
+                    defer alloc.free(root);
+                    const path = try fs_api_mod.joinChecked(alloc, root, t.path);
+                    defer alloc.free(path);
+                    return .{ .json = fsStatJson(alloc, path) orelse return error.FileNotFound };
+                },
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // fs 事件封送 / 流式读（v0.2.3）
+        // ------------------------------------------------------------------
+
+        /// fs watch 事件：监视线程 → g_idle_add → fsEvent {id, action, path}。
+        fn onFsWatchEvent(ctx: ?*anyopaque, id: i64, action: []const u8, path: []const u8) void {
+            const self: *Self = @ptrCast(@alignCast(ctx orelse return));
+            const task = self.allocator.create(FsWatchEvent) catch return;
+            const path_copy = self.allocator.dupe(u8, path) catch {
+                self.allocator.destroy(task);
+                return;
+            };
+            task.* = .{ .backend = self, .id = id, .action = action, .path = path_copy };
+            if (c.g_idle_add(fsWatchIdle, task) == 0) {
+                self.allocator.free(task.path);
+                self.allocator.destroy(task);
+            }
+        }
+
+        fn fsWatchIdle(data: c.gpointer) callconv(.c) c.gboolean {
+            const task: *FsWatchEvent = @ptrCast(@alignCast(data orelse return G_SOURCE_REMOVE));
+            const self = task.backend;
+            defer {
+                self.allocator.free(task.path);
+                self.allocator.destroy(task);
+            }
+            const w = self.windowById(0) orelse return G_SOURCE_REMOVE;
+            const action_json = jsonStr(self.allocator, task.action) orelse return G_SOURCE_REMOVE;
+            defer self.allocator.free(action_json);
+            const path_json = jsonStr(self.allocator, task.path) orelse return G_SOURCE_REMOVE;
+            defer self.allocator.free(path_json);
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"action\":{s},\"path\":{s}}}", .{ task.id, action_json, path_json }) catch return G_SOURCE_REMOVE;
+            defer self.allocator.free(payload);
+            self.emitRawToWindow(w.id, "fsEvent", payload);
+            return G_SOURCE_REMOVE;
+        }
+
+        /// fsChunk 事件（流式读）：{id, seq, done, data(base64)}。
+        fn emitFsChunk(self: *Self, id: i64, seq: u64, done: bool, data: []const u8) void {
+            const w = self.windowById(0) orelse return;
+            const encoder = std.base64.standard.Encoder;
+            const encoded = self.allocator.alloc(u8, encoder.calcSize(data.len)) catch return;
+            defer self.allocator.free(encoded);
+            _ = encoder.encode(encoded, data);
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"seq\":{d},\"done\":{},\"data\":\"{s}\"}}", .{ id, seq, done, encoded }) catch return;
+            defer self.allocator.free(payload);
+            self.emitRawToWindow(w.id, "fsChunk", payload);
+        }
+
+        fn fsStreamMain(job: *FsStreamJob) void {
+            const self = job.backend;
+            const a2 = std.heap.page_allocator;
+            defer {
+                a2.free(job.path);
+                a2.destroy(job);
+            }
+            // 一次读入（上限沿用 fs 读限制），再按 chunk 切片发事件——
+            // 0.17 的 Io.File 流式读 API 面向 reader 接口，这里内存版足够
+            //（fs.read 本身也是 32MB 上限）。
+            const data = std.Io.Dir.cwd().readFileAlloc(sharedIo(), job.path, a2, .limited((fs_api_mod.Limits{}).max_read)) catch {
+                _ = c.g_idle_add(fsStreamErrIdle, job);
+                return;
+            };
+            defer a2.free(data);
+            var off: usize = 0;
+            var seq: u64 = 0;
+            while (off < data.len) {
+                if (self.quitting) break;
+                const end = @min(off + job.chunk_size, data.len);
+                const chunk = a2.dupe(u8, data[off..end]) catch break;
+                const ev = a2.create(FsChunkEvent) catch {
+                    a2.free(chunk);
+                    break;
+                };
+                ev.* = .{ .backend = self, .id = job.id, .seq = seq, .done = end == data.len, .data = chunk };
+                _ = c.g_idle_add(fsChunkIdle, ev);
+                seq += 1;
+                off = end;
+                if (end == data.len) break;
+            }
+        }
+
+        fn fsChunkIdle(data: c.gpointer) callconv(.c) c.gboolean {
+            const ev: *FsChunkEvent = @ptrCast(@alignCast(data orelse return G_SOURCE_REMOVE));
+            const a2 = std.heap.page_allocator;
+            defer {
+                a2.free(ev.data);
+                a2.destroy(ev);
+            }
+            ev.backend.emitFsChunk(ev.id, ev.seq, ev.done, ev.data);
+            return G_SOURCE_REMOVE;
+        }
+
+        fn fsStreamErrIdle(data: c.gpointer) callconv(.c) c.gboolean {
+            const job: *FsStreamJob = @ptrCast(@alignCast(data orelse return G_SOURCE_REMOVE));
+            const a2 = std.heap.page_allocator;
+            defer {
+                a2.free(job.path);
+                a2.destroy(job);
+            }
+            job.backend.emitFsChunk(job.id, 0, true, "");
+            return G_SOURCE_REMOVE;
+        }
+
+        // ------------------------------------------------------------------
+        // SQL（v0.2.3）：libsqlite3 dlopen（绑定见 sqlite.zig）
+        // ------------------------------------------------------------------
+
+        fn runSqlOp(self: *Self, op: system_api.SqlOp, alloc: std.mem.Allocator) !system_api.Result {
+            if (self.sqlite_lib == null) {
+                const lib_ptr = self.allocator.create(linux_sqlite.Lib) catch return error.OutOfMemory;
+                lib_ptr.* = linux_sqlite.load() catch {
+                    self.allocator.destroy(lib_ptr);
+                    log.print("[sql] libsqlite3 not found — SQL disabled（apt install libsqlite3-0）", .{});
+                    return error.SqliteFailed;
+                };
+                self.sqlite_lib = lib_ptr;
+                log.print("[sql] libsqlite3 loaded", .{});
+            }
+
+            if (op == .migrate) {
+                const m = op.migrate;
+                linux_sqlite.migrate(alloc, m.db, m.statements, m.version) catch |e| {
+                    log.print("[sql] migrate failed: {s} (db={s})", .{ @errorName(e), m.db });
+                    return error.SqliteFailed;
+                };
+                log.print("[sql] migrated to v{d} ({d} statements)", .{ m.version, m.statements.len });
+                return .{ .ok = true };
+            }
+            const q = switch (op) {
+                .query => |x| x,
+                .execute => |x| x,
+                .migrate => unreachable,
+            };
+            const want_rows = switch (op) {
+                .query => true,
+                .execute, .migrate => false,
+            };
+            const out = linux_sqlite.run(alloc, q.db, q.sql, q.params, want_rows) catch |e| {
+                log.print("[sql] {s} failed: {s} (db={s})", .{ @tagName(op), @errorName(e), q.db });
+                return error.SqliteFailed;
+            };
+            return .{ .json = out };
+        }
+
+
+        // ------------------------------------------------------------------
+        // http / ws（v0.2.3，libsoup3；与 WebKit 共享 TLS 信任链/代理栈）
+        // 事件与 Windows 对齐：httpResponse {id,status,body,err?} /
+        // httpChunk {id,seq,data(base64)} / wsEvent {id,kind,data?,err?,binary?}
+        // ------------------------------------------------------------------
+
+        fn runHttpOp(self: *Self, op: system_api.HttpOp, alloc: std.mem.Allocator) !system_api.Result {
+            const req = op.request;
+            // v0.1.21 对齐：http scope 走 ACL（含 URL 形式资源）
+            if (!self.aclAllowed("http", req.url)) {
+                log.print("[http] denied: {s}", .{req.url});
+                return error.PermissionDenied;
+            }
+            return self.httpRequestStart(req, alloc);
+        }
+
+        fn newSoupSession(timeout_ms: u32, proxy: ?[]const u8) [*c]c.SoupSession {
+            const session = c.soup_session_new();
+            if (session == null) return null;
+            const secs: c_int = @intCast(@max(1, @min(@as(u32, 600), @max(timeout_ms, 1000) / 1000)));
+            c.g_object_set(@ptrCast(session), "timeout", secs, "idle-timeout", secs, @as(?*anyopaque, null));
+            if (proxy) |p| {
+                if (p.len > 0) {
+                    const pz = std.heap.c_allocator.allocSentinel(u8, p.len, 0) catch return session;
+                    defer std.heap.c_allocator.free(pz);
+                    @memcpy(pz[0..p.len], p);
+                    const resolver = c.g_simple_proxy_resolver_new(pz.ptr, null);
+                    if (resolver != null) {
+                        c.soup_session_set_proxy_resolver(session, @ptrCast(resolver));
+                        c.g_object_unref(@ptrCast(resolver));
+                    }
+                }
+            }
+            return session;
+        }
+
+        fn httpRequestStart(self: *Self, req: system_api.HttpRequest, alloc: std.mem.Allocator) !system_api.Result {
+            const id = if (req.id != 0) req.id else blk: {
+                const v = self.next_http_id_seq;
+                self.next_http_id_seq += 1;
+                break :blk v;
+            };
+
+            const url_z = try dupeZ(self.allocator, req.url);
+            defer self.allocator.free(url_z);
+            const method_z = try dupeZ(self.allocator, req.method);
+            defer self.allocator.free(method_z);
+            const msg = c.soup_message_new(method_z.ptr, url_z.ptr) orelse return error.InvalidUrl;
+
+            // 头（"A: 1\r\nB: 2" 单串）
+            var content_type: ?[]const u8 = null;
+            var hit = std.mem.splitSequence(u8, req.headers, "\r\n");
+            while (hit.next()) |line_raw| {
+                const line = std.mem.trim(u8, line_raw, " \t");
+                if (line.len == 0) continue;
+                const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+                const name = std.mem.trim(u8, line[0..colon], " \t");
+                const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+                if (name.len == 0) continue;
+                if (std.ascii.eqlIgnoreCase(name, "content-type")) content_type = value;
+                const name_z = try dupeZ(self.allocator, name);
+                defer self.allocator.free(name_z);
+                const value_z = try dupeZ(self.allocator, value);
+                defer self.allocator.free(value_z);
+                c.soup_message_headers_append(c.soup_message_get_request_headers(msg), name_z.ptr, value_z.ptr);
+            }
+
+            // body / multipart（multipart 覆盖 body 并自动 Content-Type）
+            var body_owned: ?[]u8 = null;
+            defer if (body_owned) |b| self.allocator.free(b);
+            var ct_owned: ?[]u8 = null;
+            defer if (ct_owned) |t| self.allocator.free(t);
+            if (req.multipart) |parts| {
+                const conv = try self.allocator.alloc(shared_net.Part, parts.len);
+                defer self.allocator.free(conv);
+                for (parts, 0..) |mp, i| {
+                    conv[i] = .{ .name = mp.name, .data = mp.data, .filename = mp.filename, .content_type = mp.content_type };
+                }
+                var boundary_buf: [32]u8 = undefined;
+                const boundary = std.fmt.bufPrint(&boundary_buf, "zilt-{x}", .{@as(u64, @bitCast(c.g_get_real_time()))}) catch "zilt-boundary";
+                var mp = try shared_net.buildMultipart(self.allocator, boundary, conv);
+                defer mp.deinit(self.allocator);
+                body_owned = try self.allocator.dupe(u8, mp.body);
+                ct_owned = try self.allocator.dupe(u8, mp.content_type);
+            } else if (req.body.len > 0) {
+                body_owned = try self.allocator.dupe(u8, req.body);
+            }
+            if (body_owned) |b| {
+                const ct = if (ct_owned) |t| t else (content_type orelse "application/octet-stream");
+                const ct_z = try dupeZ(self.allocator, ct);
+                defer self.allocator.free(ct_z);
+                const bytes = c.g_bytes_new(b.ptr, b.len);
+                defer c.g_bytes_unref(bytes);
+                c.soup_message_set_request_body_from_bytes(msg, ct_z.ptr, bytes);
+            }
+
+            if (!req.follow_redirects) {
+                // libsoup3 的 SoupMessage:follow-redirects 属性（缺失时 GLib 记警告但不崩）
+                c.g_object_set(@ptrCast(msg), "follow-redirects", @as(c.gboolean, 0), @as(?*anyopaque, null));
+            }
+            if (req.insecure_tls) {
+                _ = c.g_signal_connect_data(@ptrCast(msg), "accept-certificate", @ptrCast(&onHttpAcceptCert), null, null, 0);
+            }
+
+            const job = try self.allocator.create(HttpJob);
+            errdefer self.allocator.destroy(job);
+            job.* = .{
+                .backend = self,
+                .id = id,
+                .session = newSoupSession(req.timeout_ms, req.proxy),
+                .msg = msg,
+                .stream_mode = req.stream,
+            };
+            if (job.session == null) return error.SoupUnavailable;
+
+            log.print("[http] {s} {s} (id={d}, stream={s}, proxy={s})", .{
+                req.method, req.url, id, boolStr(req.stream), req.proxy orelse "-",
+            });
+            c.soup_session_send_async(job.session, msg, 0, null, httpSendDone, job);
+            // 立即返回；结果走 httpResponse / httpChunk 事件（对齐 Windows）
+            return .{ .json = try std.fmt.allocPrint(alloc, "{{\"id\":{d},\"pending\":true}}", .{id}) };
+        }
+
+        fn onHttpAcceptCert(_: ?*c.SoupMessage, cert: ?*anyopaque, errors_flags: c_int, _: c.gpointer) callconv(.c) c.gboolean {
+            _ = cert;
+            _ = errors_flags;
+            log.print("[http] insecure_tls: certificate accepted", .{});
+            return 1;
+        }
+
+        fn httpSendDone(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
+            const job: *HttpJob = @ptrCast(@alignCast(user_data orelse return));
+            const self = job.backend;
+            var err: [*c]c.GError = null;
+            const stream = c.soup_session_send_finish(@ptrCast(source), res, &err);
+            if (err != null) {
+                // GError 的 message 在 g_error_free 后失效 → 先拷贝再释放
+                const reason = self.allocator.dupe(u8, std.mem.span(err.*.message)) catch "";
+                defer if (reason.len > 0) self.allocator.free(reason);
+                log.print("[http] id={d} failed: {s}", .{ job.id, reason });
+                c.g_error_free(err);
+                self.emitHttpResponse(job.id, 0, "", reason);
+                self.freeHttpJob(job);
+                return;
+            }
+            job.stream = stream;
+            self.httpReadNext(job);
+        }
+
+        /// 继续读响应体（64KB 分块；stream 模式逐块发 httpChunk，普通模式累积）。
+        fn httpReadNext(self: *Self, job: *HttpJob) void {
+            _ = self;
+            c.g_input_stream_read_bytes_async(job.stream.?, 64 * 1024, 0, null, httpReadDone, job);
+        }
+
+        fn httpReadDone(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
+            const job: *HttpJob = @ptrCast(@alignCast(user_data orelse return));
+            const self = job.backend;
+            var gerr: [*c]c.GError = null;
+            const bytes = c.g_input_stream_read_bytes_finish(@ptrCast(source), res, &gerr);
+            if (gerr != null) c.g_error_free(gerr);
+            if (bytes == null) return self.httpFinish(job);
+            var size: c.gsize = 0;
+            const data_ptr = c.g_bytes_get_data(bytes, &size);
+            if (size == 0) {
+                c.g_bytes_unref(bytes);
+                return self.httpFinish(job);
+            }
+            const data: [*]const u8 = @ptrCast(data_ptr);
+            if (job.stream_mode) {
+                c.g_bytes_unref(bytes);
+                self.emitHttpChunk(job.id, job.seq, data[0..size]);
+                job.seq += 1;
+                return self.httpReadNext(job);
+            }
+            job.body.appendSlice(self.allocator, data[0..size]) catch {
+                c.g_bytes_unref(bytes);
+                return self.httpFinish(job);
+            };
+            c.g_bytes_unref(bytes);
+            self.httpReadNext(job);
+        }
+
+        fn httpFinish(self: *Self, job: *HttpJob) void {
+            const status: u16 = @intCast(c.soup_message_get_status(job.msg.?));
+            const body: []const u8 = if (job.stream_mode) "" else job.body.items;
+            log.print("[http] done id={d} status={d} bytes={d}", .{ job.id, status, body.len });
+            self.emitHttpResponse(job.id, status, body, null);
+            self.freeHttpJob(job);
+        }
+
+        fn freeHttpJob(self: *Self, job: *HttpJob) void {
+            if (job.stream) |st| {
+                _ = c.g_input_stream_close(st, null, null);
+                c.g_object_unref(@ptrCast(st));
+            }
+            if (job.msg) |m| c.g_object_unref(@ptrCast(m));
+            c.g_object_unref(@ptrCast(job.session));
+            job.body.deinit(self.allocator);
+            self.allocator.destroy(job);
+        }
+
+        fn emitHttpResponse(self: *Self, id: i64, status: u16, body: []const u8, err: ?[]const u8) void {
+            const w = self.windowById(0) orelse return;
+            const body_json = std.json.Stringify.valueAlloc(self.allocator, body, .{}) catch return;
+            defer self.allocator.free(body_json);
+            const err_json = if (err) |e| (jsonStr(self.allocator, e) orelse return) else self.allocator.dupe(u8, "null") catch return;
+            defer self.allocator.free(err_json);
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"status\":{d},\"body\":{s},\"err\":{s}}}", .{ id, status, body_json, err_json }) catch return;
+            defer self.allocator.free(payload);
+            self.emitRawToWindow(w.id, "httpResponse", payload);
+        }
+
+        fn emitHttpChunk(self: *Self, id: i64, seq: u64, data: []const u8) void {
+            const w = self.windowById(0) orelse return;
+            const encoder = std.base64.standard.Encoder;
+            const encoded = self.allocator.alloc(u8, encoder.calcSize(data.len)) catch return;
+            defer self.allocator.free(encoded);
+            _ = encoder.encode(encoded, data);
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"seq\":{d},\"data\":\"{s}\"}}", .{ id, seq, encoded }) catch return;
+            defer self.allocator.free(payload);
+            self.emitRawToWindow(w.id, "httpChunk", payload);
+        }
+
+        // ---- WebSocket（SoupWebsocketConnection）----
+
+        fn runWsOp(self: *Self, op: system_api.WsOp, alloc: std.mem.Allocator) !system_api.Result {
+            switch (op) {
+                .connect => |req| {
+                    if (!self.aclAllowed("http", req.url)) {
+                        log.print("[ws] denied: {s}", .{req.url});
+                        return error.PermissionDenied;
+                    }
+                    const id = if (req.id != 0) req.id else blk: {
+                        const v = self.next_ws_id_seq;
+                        self.next_ws_id_seq += 1;
+                        break :blk v;
+                    };
+                    const url_z = try dupeZ(self.allocator, req.url);
+                    defer self.allocator.free(url_z);
+                    const msg = c.soup_message_new("GET", url_z.ptr) orelse return error.InvalidUrl;
+                    // 头（cookie/子协议等）
+                    var hit = std.mem.splitSequence(u8, req.headers, "\r\n");
+                    while (hit.next()) |line_raw| {
+                        const line = std.mem.trim(u8, line_raw, " \t");
+                        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+                        const name = std.mem.trim(u8, line[0..colon], " \t");
+                        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+                        if (name.len == 0) continue;
+                        const name_z = try dupeZ(self.allocator, name);
+                        defer self.allocator.free(name_z);
+                        const value_z = try dupeZ(self.allocator, value);
+                        defer self.allocator.free(value_z);
+                        c.soup_message_headers_append(c.soup_message_get_request_headers(msg), name_z.ptr, value_z.ptr);
+                    }
+
+                    const job = try self.allocator.create(WsConn);
+                    errdefer self.allocator.destroy(job);
+                    job.* = .{
+                        .backend = self,
+                        .id = id,
+                        .session = newSoupSession(30_000, req.proxy),
+                        .conn = null,
+                    };
+                    if (job.session == null) return error.SoupUnavailable;
+                    if (req.insecure_tls) {
+                        _ = c.g_signal_connect_data(@ptrCast(msg), "accept-certificate", @ptrCast(&onHttpAcceptCert), null, null, 0);
+                    }
+                    log.print("[ws] connect id={d} {s}", .{ id, req.url });
+                    c.soup_session_websocket_connect_async(job.session, msg, null, null, 0, null, wsConnectDone, job);
+                    return .{ .json = try std.fmt.allocPrint(alloc, "{{\"id\":{d},\"pending\":true}}", .{id}) };
+                },
+                .send => |req| {
+                    const conn = (self.ws_conns.get(req.id) orelse return .{ .ok = false }).conn orelse return .{ .ok = false };
+                    // 文本优先；非法 UTF-8 → 二进制
+                    if (std.unicode.utf8ValidateSlice(req.data)) {
+                        const z = try dupeZ(self.allocator, req.data);
+                        defer self.allocator.free(z);
+                        c.soup_websocket_connection_send_text(conn, z.ptr);
+                    } else {
+                        c.soup_websocket_connection_send_binary(conn, req.data.ptr, @intCast(req.data.len));
+                    }
+                    return .{ .ok = true };
+                },
+                .close => |req| {
+                    const conn = (self.ws_conns.get(req.id) orelse return .{ .ok = false }).conn orelse return .{ .ok = false };
+                    const reason_z: ?[:0]u8 = if (req.reason.len > 0) try dupeZ(self.allocator, req.reason) else null;
+                    defer if (reason_z) |z| self.allocator.free(z);
+                    c.soup_websocket_connection_close(conn, @intCast(req.code), if (reason_z) |z| @as([*c]const u8, @ptrCast(z.ptr)) else "");
+                    return .{ .ok = true };
+                },
+            }
+        }
+
+        fn wsConnectDone(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
+            const job: *WsConn = @ptrCast(@alignCast(user_data orelse return));
+            const self = job.backend;
+            var err: [*c]c.GError = null;
+            const conn = c.soup_session_websocket_connect_finish(@ptrCast(source), res, &err);
+            if (err != null) {
+                // GError 的 message 在 g_error_free 后失效 → 先拷贝再释放
+                const reason = self.allocator.dupe(u8, std.mem.span(err.*.message)) catch "";
+                defer if (reason.len > 0) self.allocator.free(reason);
+                log.print("[ws] id={d} connect failed: {s}", .{ job.id, reason });
+                c.g_error_free(err);
+                self.emitWsEvent(job.id, "error", null, false, reason);
+                c.g_object_unref(@ptrCast(job.session));
+                self.allocator.destroy(job);
+                return;
+            }
+            job.conn = conn;
+            job.msg_handler = c.g_signal_connect_data(@ptrCast(conn), "message", @ptrCast(&wsOnMessage), job, null, 0);
+            job.closed_handler = c.g_signal_connect_data(@ptrCast(conn), "closed", @ptrCast(&wsOnClosed), job, null, 0);
+            job.error_handler = c.g_signal_connect_data(@ptrCast(conn), "error", @ptrCast(&wsOnError), job, null, 0);
+            self.ws_conns.put(self.allocator, job.id, job) catch {};
+            log.print("[ws] open id={d}", .{job.id});
+            self.emitWsEvent(job.id, "open", null, false, null);
+        }
+
+        fn wsOnMessage(_: ?*c.SoupWebsocketConnection, data_type: c.SoupWebsocketDataType, bytes: ?*c.GBytes, user_data: c.gpointer) callconv(.c) void {
+            const job: *WsConn = @ptrCast(@alignCast(user_data orelse return));
+            const self = job.backend;
+            if (bytes == null) return;
+            var size: c.gsize = 0;
+            const data_ptr = c.g_bytes_get_data(bytes, &size);
+            if (data_ptr == null) return;
+            const data: [*]const u8 = @ptrCast(data_ptr);
+            const raw = data[0..size];
+            const binary = data_type != c.SOUP_WEBSOCKET_DATA_TEXT;
+            if (!binary and std.unicode.utf8ValidateSlice(raw)) {
+                self.emitWsEvent(job.id, "message", raw, false, null);
+            } else {
+                // 二进制/非法 UTF-8 → base64 + binary 标记
+                const encoder = std.base64.standard.Encoder;
+                const encoded = self.allocator.alloc(u8, encoder.calcSize(raw.len)) catch return;
+                defer self.allocator.free(encoded);
+                _ = encoder.encode(encoded, raw);
+                self.emitWsEvent(job.id, "message", encoded, true, null);
+            }
+        }
+
+        fn wsOnClosed(_: ?*c.SoupWebsocketConnection, user_data: c.gpointer) callconv(.c) void {
+            const job: *WsConn = @ptrCast(@alignCast(user_data orelse return));
+            const self = job.backend;
+            log.print("[ws] close id={d}", .{job.id});
+            self.emitWsEvent(job.id, "close", null, false, null);
+            _ = self.ws_conns.remove(job.id);
+            self.freeWsConn(job);
+        }
+
+        fn wsOnError(_: ?*c.SoupWebsocketConnection, err: [*c]c.GError, user_data: c.gpointer) callconv(.c) void {
+            const job: *WsConn = @ptrCast(@alignCast(user_data orelse return));
+            const self = job.backend;
+            const reason = if (err != null) std.mem.span(err.*.message) else "error";
+            log.print("[ws] error id={d}: {s}", .{ job.id, reason });
+            self.emitWsEvent(job.id, "error", null, false, reason);
+        }
+
+        fn freeWsConn(self: *Self, job: *WsConn) void {
+            if (job.msg_handler != 0 and job.conn != null) c.g_signal_handler_disconnect(@ptrCast(job.conn), job.msg_handler);
+            if (job.closed_handler != 0 and job.conn != null) c.g_signal_handler_disconnect(@ptrCast(job.conn), job.closed_handler);
+            if (job.error_handler != 0 and job.conn != null) c.g_signal_handler_disconnect(@ptrCast(job.conn), job.error_handler);
+            if (job.conn) |conn| c.g_object_unref(@ptrCast(conn));
+            if (job.msg) |m| c.g_object_unref(@ptrCast(m)); // connect_async 引用期间由会话持有
+            c.g_object_unref(@ptrCast(job.session));
+            self.allocator.destroy(job);
+        }
+
+        fn emitWsEvent(self: *Self, id: i64, kind: []const u8, data: ?[]const u8, binary: bool, err: ?[]const u8) void {
+            const w = self.windowById(0) orelse return;
+            const kind_json = jsonStr(self.allocator, kind) orelse return;
+            defer self.allocator.free(kind_json);
+            const data_json = if (data) |d| (jsonStr(self.allocator, d) orelse return) else self.allocator.dupe(u8, "null") catch return;
+            defer self.allocator.free(data_json);
+            const err_json = if (err) |e| (jsonStr(self.allocator, e) orelse return) else self.allocator.dupe(u8, "null") catch return;
+            defer self.allocator.free(err_json);
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"kind\":{s},\"data\":{s},\"binary\":{},\"err\":{s}}}", .{ id, kind_json, data_json, binary, err_json }) catch return;
+            defer self.allocator.free(payload);
+            self.emitRawToWindow(w.id, "wsEvent", payload);
+        }
+
+        // ------------------------------------------------------------------
+        // 应用自定义协议 → 真 scheme（v0.2.3；每协议一个 scheme，URI 形态
+        // <name>://<rest>?<query>，对应 Windows 的 /__proto/<name>/<rest>）
+        // ------------------------------------------------------------------
+
+        fn registerProtocolSchemes(self: *Self, wc: [*c]c.WebKitWebContext) void {
+            for (config.protocols) |p| {
+                const name_z = dupeZ(self.allocator, p.name) catch continue;
+                defer self.allocator.free(name_z);
+                c.webkit_web_context_register_uri_scheme(wc, name_z.ptr, Self.onProtocolRequest, self, null);
+                log.print("[proto] scheme '{s}' registered", .{p.name});
+            }
+        }
+
+        fn onProtocolRequest(request: [*c]c.WebKitURISchemeRequest, user_data: c.gpointer) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return));
+            self.serveProtocol(request);
+        }
+
+        fn serveProtocol(self: *Self, request: [*c]c.WebKitURISchemeRequest) void {
+            const uri_ptr = c.webkit_uri_scheme_request_get_uri(request);
+            const uri = if (uri_ptr != null) std.mem.span(uri_ptr) else "";
+            const sep = std.mem.indexOf(u8, uri, "://") orelse return self.finishProtocolError(request, 400, "bad uri");
+            const name = uri[0..sep];
+            const p = protocol.find(config.protocols, name) orelse {
+                log.print("[proto] '{s}' 未注册 <- {s}", .{ name, uri });
+                return self.finishProtocolError(request, 404, "unknown protocol");
+            };
+
+            // rest：scheme:// 之后的部分，去掉前导 '/'；query = '?' 之后
+            var rest: []const u8 = uri[sep + 3 ..];
+            if (rest.len > 0 and rest[0] == '/') rest = rest[1..];
+            var path: []const u8 = rest;
+            var query: []const u8 = "";
+            if (std.mem.indexOfScalar(u8, rest, '?')) |q| {
+                path = rest[0..q];
+                query = rest[q + 1 ..];
+            }
+
+            var method: []const u8 = "GET";
+            var user_agent: ?[]const u8 = null;
+            const method_ptr = c.webkit_uri_scheme_request_get_http_method(request);
+            if (method_ptr != null) method = std.mem.span(method_ptr);
+            const headers: ?*c.SoupMessageHeaders = c.webkit_uri_scheme_request_get_http_headers(request);
+            if (headers != null) {
+                const ua = c.soup_message_headers_get_one(headers, "User-Agent");
+                if (ua != null) user_agent = std.mem.span(ua);
+            }
+
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const resp = p.handle(.{
+                .name = name,
+                .path = path,
+                .query = query,
+                .method = method,
+                .user_agent = user_agent,
+                .url = uri,
+            }, arena.allocator()) catch |err| {
+                log.print("[proto] {s} handler failed: {s}", .{ name, @errorName(err) });
+                return self.finishProtocolError(request, 500, "handler failed");
+            };
+            log.print("[proto] {s} {s}/{s} {d} bytes", .{ name, method, path, resp.body.len });
+            self.finishProtocol(request, resp);
+        }
+
+        fn finishProtocol(self: *Self, request: [*c]c.WebKitURISchemeRequest, resp: protocol.Response) void {
+            const bytes = c.g_bytes_new(resp.body.ptr, resp.body.len);
+            if (bytes == null) return;
+            defer c.g_bytes_unref(bytes);
+            const stream = c.g_memory_input_stream_new_from_bytes(bytes);
+            if (stream == null) return;
+            defer c.g_object_unref(@ptrCast(stream));
+
+            const response = c.webkit_uri_scheme_response_new(stream, @intCast(resp.body.len));
+            if (response == null) return;
+            defer c.g_object_unref(@ptrCast(response));
+
+            const ct_z = dupeZ(self.allocator, resp.content_type) catch return;
+            defer self.allocator.free(ct_z);
+            c.webkit_uri_scheme_response_set_content_type(response, ct_z.ptr);
+            if (resp.status != 200) {
+                c.webkit_uri_scheme_response_set_status(response, resp.status, protocol.reasonFor(resp.status).ptr);
+            }
+            // 应用头 + ACAO（自定义 scheme 的 fetch 需要 CORS 允许，Tauri 同款）。
+            // set_http_headers 转移所有权（transfer full）——**不能**再 unref。
+            const headers = c.soup_message_headers_new(c.SOUP_MESSAGE_HEADERS_RESPONSE);
+            if (headers != null) {
+                c.soup_message_headers_append(headers, "Access-Control-Allow-Origin", "*");
+                c.soup_message_headers_append(headers, "Access-Control-Expose-Headers", "*");
+                for (resp.headers) |h| {
+                    const name_z = dupeZ(self.allocator, h.name) catch continue;
+                    defer self.allocator.free(name_z);
+                    const value_z = dupeZ(self.allocator, h.value) catch continue;
+                    defer self.allocator.free(value_z);
+                    c.soup_message_headers_append(headers, name_z.ptr, value_z.ptr);
+                }
+                self.applySecurityHeadersRaw(headers);
+                c.webkit_uri_scheme_response_set_http_headers(response, headers);
+            }
+            c.webkit_uri_scheme_request_finish_with_response(request, response);
+        }
+
+        fn finishProtocolError(self: *Self, request: [*c]c.WebKitURISchemeRequest, status: u16, body: []const u8) void {
+            self.finishBytes(request, status, "text/plain; charset=utf-8", body);
+        }
+
+        /// applySecurityHeaders 的裸版（headers 已在调用方创建，协议响应复用）。
+        fn applySecurityHeadersRaw(self: *Self, headers: ?*c.SoupMessageHeaders) void {
+            if (config.security.csp) |csp| {
+                const value = dupeZ(self.allocator, csp) catch return;
+                defer self.allocator.free(value);
+                c.soup_message_headers_append(headers, "Content-Security-Policy", value.ptr);
+            }
+            for (config.security.headers) |header| {
+                const name = dupeZ(self.allocator, header.name) catch continue;
+                defer self.allocator.free(name);
+                const value = dupeZ(self.allocator, header.value) catch continue;
+                defer self.allocator.free(value);
+                c.soup_message_headers_append(headers, name.ptr, value.ptr);
+            }
+        }
+
         // ------------------------------------------------------------------
         // 消息处理
         // ------------------------------------------------------------------
@@ -3859,7 +5111,7 @@ fn Backend(comptime config: Config) type {
                         if (builtin_cmds.dispatch(ctx, inv.method, inv.args_json)) |maybe| {
                             if (maybe) |json| break :blk json;
                         } else |err| {
-                            log.print("[ipc] builtin {s} failed: {s}", .{ inv.method, @errorName(err) });
+                            log.print("[ipc] builtin {s} failed: {s} (args={s})", .{ inv.method, @errorName(err), inv.args_json[0..@min(inv.args_json.len, 200)] });
                             return self.reject(sink.view, inv.id, @errorName(err));
                         }
                         break :blk ipc.dispatch(config.commands, ctx, inv.method, inv.args_json) catch |err| {

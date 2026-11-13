@@ -110,15 +110,16 @@ pub fn isSafeRelative(rel: []const u8) bool {
 }
 
 /// 拼接 scope 根与相对路径；不安全路径返回 error.PathEscape。
+/// 分隔符随目标平台（Windows 用反斜杠，POSIX 用正斜杠；前端传哪种都能工作）。
 pub fn joinChecked(alloc: Allocator, root: []const u8, rel: []const u8) ![]u8 {
     if (!isSafeRelative(rel)) return error.PathEscape;
     const normalized = try alloc.dupe(u8, rel);
     defer alloc.free(normalized);
-    // 统一用反斜杠（Windows），前端传正斜杠也能工作
+    const sep: u8 = if (@import("builtin").os.tag == .windows) '\\' else '/';
     for (normalized) |*c| {
-        if (c.* == '/') c.* = '\\';
+        if (c.* == '\\' or c.* == '/') c.* = sep;
     }
-    return std.fmt.allocPrint(alloc, "{s}\\{s}", .{ root, normalized });
+    return std.fmt.allocPrint(alloc, "{s}{c}{s}", .{ root, sep, normalized });
 }
 
 /// 把 (scope, 相对路径) 规范化为 ACL 资源串：`documents/notes/a.txt`。
@@ -197,7 +198,12 @@ test "path safety rejects escapes" {
 test "join normalizes separators and rejects escape" {
     const joined = try joinChecked(testing.allocator, "C:\\root", "a/b/c.txt");
     defer testing.allocator.free(joined);
-    try testing.expectEqualStrings("C:\\root\\a\\b\\c.txt", joined);
+    // 分隔符随目标平台（v0.2.3）：Windows 反斜杠、POSIX 正斜杠
+    if (@import("builtin").os.tag == .windows) {
+        try testing.expectEqualStrings("C:\\root\\a\\b\\c.txt", joined);
+    } else {
+        try testing.expectEqualStrings("C:\\root/a/b/c.txt", joined);
+    }
 
     try testing.expectError(error.PathEscape, joinChecked(testing.allocator, "C:\\root", "..\\x"));
 }
