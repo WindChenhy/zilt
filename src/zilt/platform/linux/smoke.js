@@ -8,6 +8,10 @@
 // 可查字段（size/position/tracked 标志）与命令返回值。
 //
 // 刻意不测：剪贴板 / 通知 / 对话框 / 多窗口（v0.2.2–v0.2.3 才实现）。
+//
+// reload 刻意不做探测：报告 invoke 刚 post 就导航，消息会在导航中丢失
+// （实测导致「reload → 脚本重跑 → 再 reload」无限循环）；且 reload 与 stop
+// 是同一调用路径，风险极低。
 (async () => {
   const results = [];
   const check = (name, ok, note) => results.push({ name, ok: !!ok, note: String(note ?? '') });
@@ -150,6 +154,42 @@
     const rCursor = await W.setCursor('hand');
     check('win.unimpl', rCursor === false, `cursor=${rCursor}`);
   } catch (e) { check('win.state', false, String(e.message || e)); }
+
+  // ---- v0.2.1 切片 2：WebView 面（webview_request_fn / eval_async_fn）----
+  try {
+    const V = Z().webview;
+
+    // eval（__zilt.eval → __zilt.evalResult 事件）：数值往返 + JS 异常 reject
+    const ev = await Z().eval('1 + 41');
+    check('eval', ev === 42, JSON.stringify(ev));
+    let evalErr = '';
+    try { await Z().eval('throw new Error("boom")'); } catch (e) { evalErr = String(e.message || e); }
+    check('eval.err', evalErr === 'JavaScriptException', evalErr);
+
+    // zoom：设 1.5 → getZoom 1.5 → 恢复 1.0
+    await V.zoom(1.5);
+    let z = await V.getZoom();
+    const zoomOn = z && z.factor === 1.5;
+    await V.zoom(1);
+    z = await V.getZoom();
+    check('zoom', zoomOn && z.factor === 1, `on=${JSON.stringify(zoomOn)} off=${JSON.stringify(z)}`);
+
+    // history：首屏无后退/前进
+    const h = await V.history();
+    check('history', h && h.can_go_back === false && h.can_go_forward === false, JSON.stringify(h));
+
+    // stop / setUA / setUA 恢复：无返回值动作的响应是 JSON null（与 Windows 对齐），
+    // 断言「未拒绝且不为 false」
+    const rStop = await V.stop();
+    const rUa = await Z().invoke('__zilt.webview', { action: 'setUserAgent', user_agent: 'ZiltSmoke/0.2' });
+    const rUaReset = await Z().invoke('__zilt.webview', { action: 'setUserAgent', user_agent: '' });
+    check('webview.calls', rStop !== false && rUa !== false && rUaReset !== false, `stop=${rStop} ua=${rUa}/${rUaReset}`);
+
+    // 未实现项：print → NotSupported（错误名经 reject 稳定下发）
+    let printErr = '';
+    try { await V.print('browser'); } catch (e) { printErr = String(e.message || e); }
+    check('webview.unimpl', printErr === 'NotSupported', printErr);
+  } catch (e) { check('eval', false, String(e.message || e)); }
 
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {

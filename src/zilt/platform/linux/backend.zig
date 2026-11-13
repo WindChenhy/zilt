@@ -16,6 +16,10 @@
 //!     show / hide / focus / close / start_dragging / always_on_top(_bottom) /
 //!     skip_taskbar / focusable / enabled / theme(dark) / limits / fullscreen_monitor。
 //!     光标系列、ignore_cursor、content_protected、shadow、icon 留 false（后续切片）。
+//!   - v0.2.1 切片 2：WebView 面（`webview_request_fn` / `eval_async_fn`）已接通——
+//!     reload / stop / zoom / get_zoom / history / back / forward / devtools /
+//!     set_user_agent / eval（同步走嵌套 GMainLoop，对应 Windows 的 SyncWait 泵）。
+//!     print / cdp / cancel_download / cookies / clear_storage 返回 NotSupported。
 //!   - 尚未实现（钩子留 null → 前端拿到与 Windows 相同的固定降级错误名）：
 //!     剪贴板 / 通知 / 对话框 / 系统集成 / 多窗口 / 下载 / 托盘 / 菜单 / 快捷键。
 //!     这些属于 v0.2.1–v0.2.3，`platform/interface.zig` 的能力矩阵逐项打勾。
@@ -27,6 +31,7 @@ const std = @import("std");
 const c = @import("gtk");
 
 const ipc = @import("../../ipc.zig");
+const webview = @import("../../webview.zig");
 const asset_routes = @import("../../asset_routes.zig");
 const inflate = @import("../../inflate.zig");
 const security = @import("../../security.zig");
@@ -276,6 +281,8 @@ fn Backend(comptime config: Config) type {
                 .quit_fn = quitEntry,
                 .window_fn = windowEntry,
                 .window_query_fn = windowQueryEntry,
+                .webview_request_fn = webviewRequestEntry,
+                .eval_async_fn = evalAsyncEntry,
                 // 其余钩子留 null：调用方按 platform/interface.zig 的固定错误名降级
             };
         }
@@ -454,6 +461,162 @@ fn Backend(comptime config: Config) type {
                 self.max_width,
                 self.max_height,
             }) catch null;
+        }
+
+        // ---- WebView 面（v0.2.1 切片 2）----
+        //
+        // eval 双路径：
+        //   - eval_async_fn（__zilt.eval，Promise 语义）：发起后立即返回，结果在
+        //     后续主循环迭代经 completion 回调（builtin 的 EvalBox 负责转成事件）。
+        //   - webview_request_fn 的 .eval：调用方要同步拿到结果——对应 Windows 的
+        //     SyncWait + 局部消息泵，Linux 用嵌套 GMainLoop（WebKit 完成回调里
+        //     quit；嵌套泵在 GTK 是合法的，模态对话框就是这么做的）。
+        //   结果都是「值的 JSON 文本」（undefined → "null"），JS 异常 → JavaScriptException。
+
+        const EvalTask = struct {
+            backend: *Self,
+            /// null = 同步模式（嵌套泵等结果），非 null = 异步回调模式
+            completion: ?webview.Completion = null,
+            /// 同步模式专用：嵌套泵 + 结果落点（栈上，由调用方持有）
+            loop: ?*c.GMainLoop = null,
+            sync_err: ?anyerror = null,
+            sync_json: ?[]u8 = null,
+        };
+
+        /// JSCValue → 结果 JSON（undefined/不可序列化 → "null"）。self.allocator 分配。
+        fn evalResultJson(self: *Self, value: [*c]c.JSCValue) ?[]u8 {
+            if (value == null) return self.allocator.dupe(u8, "null") catch null;
+            if (c.jsc_value_is_undefined(value) != 0) return self.allocator.dupe(u8, "null") catch null;
+            const text = c.jsc_value_to_json(value, 0) orelse return self.allocator.dupe(u8, "null") catch null;
+            defer c.g_free(@ptrCast(text));
+            const span = std.mem.span(text);
+            if (span.len == 0) return self.allocator.dupe(u8, "null") catch null;
+            return self.allocator.dupe(u8, span) catch null;
+        }
+
+        fn evalFinished(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
+            const task: *EvalTask = @ptrCast(@alignCast(user_data orelse return));
+            const self = task.backend;
+            const view: [*c]c.WebKitWebView = @ptrCast(source);
+            var err: [*c]c.GError = null;
+            const value = c.webkit_web_view_evaluate_javascript_finish(view, res, &err);
+            if (err != null) {
+                const is_js = err.*.domain == c.webkit_javascript_error_quark();
+                c.g_error_free(err);
+                const failure: anyerror = if (is_js) error.JavaScriptException else error.WebViewCallFailed;
+                if (task.completion) |comp| {
+                    comp.callback(comp.context, failure);
+                    self.allocator.destroy(task);
+                } else {
+                    task.sync_err = failure;
+                    c.g_main_loop_quit(task.loop.?);
+                }
+                return;
+            }
+            const json = self.evalResultJson(value) orelse {
+                if (task.completion) |comp| {
+                    comp.callback(comp.context, error.WebViewCallFailed);
+                    self.allocator.destroy(task);
+                } else {
+                    task.sync_err = error.WebViewCallFailed;
+                    c.g_main_loop_quit(task.loop.?);
+                }
+                return;
+            };
+            if (task.completion) |comp| {
+                // JSON 只在回调期间借用：回调返回后立即释放
+                comp.callback(comp.context, json);
+                self.allocator.free(json);
+                self.allocator.destroy(task);
+            } else {
+                task.sync_json = json;
+                c.g_main_loop_quit(task.loop.?);
+            }
+        }
+
+        /// 发起异步 eval（__zilt.eval）。提交失败时不欠回调；提交成功回调恰一次。
+        fn evalAsyncEntry(backend_ptr: *anyopaque, window_id: u32, script: []const u8, completion: webview.Completion) anyerror!void {
+            _ = window_id;
+            const self: *Self = @ptrCast(@alignCast(backend_ptr));
+            const view = self.view orelse return error.WebViewNotAvailable;
+            const task = try self.allocator.create(EvalTask);
+            errdefer self.allocator.destroy(task);
+            task.* = .{ .backend = self, .completion = completion };
+            const src = try dupeZ(self.allocator, script);
+            defer self.allocator.free(src);
+            // WebKit 内部会复制脚本与入参，返回后即可释放 src/task 之外的东西
+            c.webkit_web_view_evaluate_javascript(view, src.ptr, @intCast(script.len), null, null, null, evalFinished, task);
+        }
+
+        /// 同步 eval：嵌套泵等待 WebKit 异步完成（对应 Windows 的 SyncWait）。
+        fn syncEval(self: *Self, alloc: std.mem.Allocator, script: []const u8) ![]u8 {
+            const view = self.view orelse return error.WebViewNotAvailable;
+            var task = EvalTask{ .backend = self };
+            task.loop = c.g_main_loop_new(null, 0) orelse return error.WebViewCallFailed;
+            defer c.g_main_loop_unref(task.loop);
+
+            const src = try dupeZ(self.allocator, script);
+            defer self.allocator.free(src);
+            c.webkit_web_view_evaluate_javascript(view, src.ptr, @intCast(script.len), null, null, null, evalFinished, &task);
+            c.g_main_loop_run(task.loop);
+
+            if (task.sync_err) |e| return e;
+            const json = task.sync_json orelse return try alloc.dupe(u8, "null");
+            defer self.allocator.free(json);
+            return try alloc.dupe(u8, json);
+        }
+
+        fn webviewRequestEntry(backend_ptr: *anyopaque, window_id: u32, alloc: std.mem.Allocator, request: webview.Request) anyerror![]u8 {
+            _ = window_id;
+            const self: *Self = @ptrCast(@alignCast(backend_ptr));
+            const view = self.view orelse return error.WebViewNotAvailable;
+
+            switch (request) {
+                .reload => c.webkit_web_view_reload(view),
+                .stop => c.webkit_web_view_stop_loading(view),
+                .back => c.webkit_web_view_go_back(view),
+                .forward => c.webkit_web_view_go_forward(view),
+                .zoom => |factor| {
+                    if (!std.math.isFinite(factor) or factor <= 0) return error.InvalidZoom;
+                    c.webkit_web_view_set_zoom_level(view, factor);
+                },
+                .get_zoom => {
+                    return try std.fmt.allocPrint(alloc, "{{\"factor\":{d}}}", .{c.webkit_web_view_get_zoom_level(view)});
+                },
+                .history => {
+                    // 与 Windows 对齐：{"can_go_back":b,"can_go_forward":b}
+                    const bfl = c.webkit_web_view_get_back_forward_list(view);
+                    const can_back = bfl != null and c.webkit_back_forward_list_get_back_item(bfl) != null;
+                    const can_fwd = bfl != null and c.webkit_back_forward_list_get_forward_item(bfl) != null;
+                    return try std.fmt.allocPrint(alloc, "{{\"can_go_back\":{s},\"can_go_forward\":{s}}}", .{
+                        boolStr(can_back),
+                        boolStr(can_fwd),
+                    });
+                },
+                .devtools => {
+                    if (!config.webview.settings.devtools) return error.DevToolsDisabled;
+                    const settings = c.webkit_web_view_get_settings(view);
+                    if (settings == null) return error.WebViewCallFailed;
+                    c.webkit_settings_set_enable_developer_extras(settings, 1);
+                    c.webkit_web_inspector_show(c.webkit_web_view_get_inspector(view));
+                },
+                .set_user_agent => |ua| {
+                    const settings = c.webkit_web_view_get_settings(view);
+                    if (settings == null) return error.WebViewCallFailed;
+                    if (ua.len == 0) {
+                        // 空串 = 恢复引擎默认（WebKit 文档：NULL/空 → 默认 UA）
+                        c.webkit_settings_set_user_agent(settings, null);
+                    } else {
+                        const z = try dupeZ(self.allocator, ua);
+                        defer self.allocator.free(z);
+                        c.webkit_settings_set_user_agent(settings, z.ptr);
+                    }
+                },
+                .eval => |e| return self.syncEval(alloc, e.script),
+                // 后续切片：print/cdp/下载/cookies/clear_storage
+                .print, .cdp, .cancel_download, .cookies, .clear_storage => return error.NotSupported,
+            }
+            return try alloc.dupe(u8, "null");
         }
 
         // ---- 消息处理 ----
