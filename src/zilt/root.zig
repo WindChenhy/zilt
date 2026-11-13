@@ -90,6 +90,7 @@ test {
     _ = @import("codesign.zig");
     _ = @import("wix_vendor.zig");
     _ = @import("msix.zig");
+    _ = @import("pack_formats.zig"); // v0.2.4：其单测此前从未被编译执行（断言与实现脱节）
     _ = @import("ws.zig");
     _ = @import("store.zig");
     _ = @import("fs_api.zig");

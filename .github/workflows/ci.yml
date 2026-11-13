@@ -100,6 +100,70 @@ jobs:
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
+  # v0.2.4：Linux（ubuntu-22.04 + Xvfb 冒烟 57 项 + 打包产物）
+  #   依赖与本地等价命令见 scripts/linux/bootstrap.sh / dev-smoke.sh
+  # ---------------------------------------------------------------------------
+  linux-test:
+    name: Build / Test / Smoke (Linux)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install GTK / WebKitGTK dev packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config xvfb \
+            libayatana-appindicator3-1 xdg-utils libsqlite3-0
+
+      - name: Build
+        run: zig build
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Smoke test (57 checks under Xvfb)
+        env:
+          ZILT_LINUX_SMOKE: "1"
+          ZILT_LINUX_SMOKE_DEEPLINK: "zilt://startup?demo=1"
+          GDK_BACKEND: x11
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: "1"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          python3 scripts/http_echo.py 8788 > /dev/null 2>&1 &
+          python3 scripts/ws_echo.py 8765 > /dev/null 2>&1 &
+          sleep 1
+          rm -f zilt.log
+          timeout 240 xvfb-run -a --server-args="-screen 0 1280x800x24" ./zig-out/bin/zilt-app
+          code=$?
+          grep -a "\[linux-smoke\]" zilt.log | tail -2
+          if [ $code -ne 0 ]; then echo "smoke failed with exit $code"; exit 1; fi
+
+      - name: Packaging (deb / AppDir / squashfs / flatpak / rpm spec)
+        run: |
+          zig build pack
+          dpkg-deb --info dist/*_amd64.deb | head -12
+          ls dist/
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zilt-linux-x64
+          path: |
+            dist/*_amd64.deb
+            dist/*.squashfs
+            dist/flatpak/*.json
+            dist/*.spec
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
   # 打包（NSIS setup.exe + zip；可选 MSI/MSIX 需要 WiX / Windows SDK）
   # ---------------------------------------------------------------------------
   package:

@@ -353,6 +353,9 @@ pub fn build(b: *std.Build) void {
         .name = "zilt-app",
         .root_module = exe_mod,
     });
+    // libgmodule 的 dlopen/dlerror 等符号由 libc 提供（glibc 2.34+ 并入）；
+    // ReleaseSafe 链接默认 --no-allow-shlib-undefined 会误报——显式允许
+    exe.linker_allow_shlib_undefined = true;
     if (is_windows) {
         // GUI 子系统：双击/安装后运行不弹出控制台窗口（日志仍写 zilt.log）
         exe.subsystem = .windows;
@@ -517,6 +520,7 @@ pub fn build(b: *std.Build) void {
         .name = "zilt-app",
         .root_module = rel_app_mod,
     });
+    rel_app.linker_allow_shlib_undefined = true; // 同上（libgmodule 的 dl* 在 libc）
     if (is_windows) {
         rel_app.subsystem = .windows; // 分发产物无控制台窗口
         linkWindowsLibs(rel_app_mod);
@@ -655,9 +659,22 @@ pub fn build(b: *std.Build) void {
         const init_step = b.step("init", "Create a new project from a template (ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=myapp zig build init)");
         init_step.dependOn(&init_run.step);
     } else {
-        // 这几个工具只做 Windows 产物（PEVERSIONINFO/NSIS/MSIX/Authenticode）；
-        // Linux 打包（deb/rpm/AppImage/Flatpak）是 v0.2.4，届时 pack.zig 会分平台实现。
-        _ = windowsOnlyStep(b, "pack", "cross-platform packaging", target_os);
+        // v0.2.4：Linux 打包（deb/AppDir/squashfs/Flatpak manifest/rpm spec）。
+        // zilt-pack-linux 需要 libc（std.c.getenv / Child）。
+        const pack_linux_mod = b.createModule(.{
+            .root_source_file = b.path("src/pack_linux.zig"),
+            .target = target,
+            .optimize = optimize,
+            // 直接路径引用 pack_formats/msix/app_meta（纯模块，不带 GTK 绑定）
+        });
+        pack_linux_mod.link_libc = true;
+        const pack_linux_exe = b.addExecutable(.{ .name = "zilt-pack", .root_module = pack_linux_mod });
+        b.installArtifact(pack_linux_exe);
+        const pack_linux_run = b.addRunArtifact(pack_linux_exe);
+        pack_linux_run.addArtifactArg(rel_app); // argv[1] = 应用 exe
+        const pack_linux_step = b.step("pack", "Linux packaging (deb / AppDir / squashfs / flatpak / rpm spec)");
+        pack_linux_step.dependOn(&pack_linux_run.step);
+
         _ = windowsOnlyStep(b, "init", "create a project from a template", target_os);
     }
 }

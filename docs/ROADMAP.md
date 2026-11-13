@@ -192,7 +192,19 @@
       真 scheme echo·json·bin fetch）；有/无 D-Bus 双环境 + 单实例转交 E2E 全过；
       Windows 冒烟 47/49（clip/clipmulti 因桌面剪贴板被外部进程占用——
       PowerShell Set-Clipboard 同样失败，环境问题非代码回归；Windows 代码零改动）。
-- [ ] **v0.2.4 打包与 CI**：deb/rpm/AppImage/Flatpak + Xvfb 冒烟 + WebKitWebDriver
+- [x] **v0.2.4 打包与 CI**（2026-11-14）：`zig build pack`（Linux 目标）→ **真实
+      .deb**（ar 包：Depends libgtk-3-0/libwebkit2gtk-4.1-0/libsqlite3-0 + postinst
+      xdg-mime 注册深链 + /usr/share/applications 桌面项 + hicolor 256 PNG 图标）
+      + **AppDir**（AppRun 可直接执行 + usr/bin + metainfo）+ **真实 squashfs**
+      （mksquashfs；单文件 AppImage 需官方 runtime，附 build-appimage.sh）+
+      Flatpak manifest（org.gnome.Platform）+ rpm spec。**打包 E2E 实测**
+      （scripts/linux/dev-pack-e2e.sh）：dpkg-deb --info/-x 提取运行 → 冒烟
+      57/57 exit 0；AppDir AppRun 冒烟 57/57 exit 0；squashfs 2.4MB。
+      GitHub Actions 增 **linux job**（ubuntu-22.04 + Xvfb 冒烟 + 打包产物上传）；
+      附带修复：**ReleaseSafe 链接误报 dl* 符号**（libgmodule 依赖 dlopen 系列，
+      glibc 2.34+ 并入 libc——`linker_allow_shlib_undefined = true`）；
+      pack_formats 单测此前从未被编译执行（root.zig 补引用 + 修正与实现脱节的
+      断言）。Flatpak manifest 为静态产物（flatpak-builder 实测留待有环境的 CI）。
 - [ ] **v0.2.5 GTK4 变体与稳定化**：`-Dgtk=gtk4`、Wayland/HiDPI、性能基线
 - [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）——v0.3+
 - [x] 平台差异收敛原则：平台无关层（ipc/security/fs_api/protocol/net/sql/store/patch/pack_formats）
