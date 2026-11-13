@@ -50,6 +50,7 @@ const icon_mod = @import("icon.zig");
 const deep_link = @import("deep_link.zig");
 const security = @import("../../security.zig");
 const asset_routes = @import("../../asset_routes.zig");
+const inflate = @import("../../inflate.zig");
 const protocol = @import("../../protocol.zig");
 const app_data = @import("app_data.zig");
 const builtin = @import("../../builtin.zig");
@@ -417,27 +418,8 @@ pub fn originOf(uri: []const u8) []const u8 {
     return uri[0 .. sep + 3 + end];
 }
 
-pub fn contentTypeOf(path: []const u8) []const u8 {
-    const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| path[i + 1 ..] else path;
-    const ext = if (std.mem.lastIndexOfScalar(u8, base, '.')) |i| base[i + 1 ..] else "";
-    const map = [_]struct { ext: []const u8, ct: []const u8 }{
-        .{ .ext = "html", .ct = "text/html; charset=utf-8" },
-        .{ .ext = "js", .ct = "text/javascript; charset=utf-8" },
-        .{ .ext = "mjs", .ct = "text/javascript; charset=utf-8" },
-        .{ .ext = "css", .ct = "text/css; charset=utf-8" },
-        .{ .ext = "json", .ct = "application/json" },
-        .{ .ext = "svg", .ct = "image/svg+xml" },
-        .{ .ext = "png", .ct = "image/png" },
-        .{ .ext = "jpg", .ct = "image/jpeg" },
-        .{ .ext = "ico", .ct = "image/x-icon" },
-        .{ .ext = "woff2", .ct = "font/woff2" },
-        .{ .ext = "ts", .ct = "text/plain; charset=utf-8" },
-    };
-    for (map) |m| {
-        if (std.ascii.eqlIgnoreCase(ext, m.ext)) return m.ct;
-    }
-    return "application/octet-stream";
-}
+/// v0.2.0：MIME 映射移到 asset_routes（Linux 后端共用），此处保留薄别名。
+pub const contentTypeOf = asset_routes.contentTypeOf;
 
 fn clampIconPx(metric: i32, fallback: u32) u32 {
     if (metric <= 0 or metric > 256) return fallback;
@@ -740,16 +722,8 @@ fn streamFromBytes(bytes: []const u8) ?*wv2.IStream {
 // 资产服务纯函数（Phase C；单测覆盖）
 // ---------------------------------------------------------------------------
 
-fn flateDecompress(alloc: std.mem.Allocator, gz: []const u8) ![]u8 {
-    var in: std.Io.Reader = .fixed(gz);
-    var dec = std.compress.flate.Decompress.init(&in, .gzip, &.{});
-    var aw: std.Io.Writer.Allocating = .init(alloc);
-    defer aw.deinit();
-    const n = try dec.reader.streamRemaining(&aw.writer);
-    const out = try alloc.dupe(u8, aw.written());
-    std.debug.assert(n == out.len);
-    return out;
-}
+/// v0.2.0：gzip 解压统一到 inflate.zig（Linux 后端共用，避免第三份实现）。
+const flateDecompress = inflate.gunzip;
 
 /// 实体标记字节缓冲：`"` + 16 hex + `"` = 18 字节。
 pub const EtagBytes = [18]u8;
@@ -4246,8 +4220,8 @@ fn Backend(comptime config: Config) type {
             @memcpy(dst[0..bytes_len], @as([*]const u8, @ptrCast(tw.ptr))[0..bytes_len]);
             _ = win32.GlobalUnlock(hg);
 
-            if (win32.OpenClipboard(w.hwnd) == 0) {
-                log.print("[clip] OpenClipboard failed", .{});
+            if (!openClipboardRetry(w.hwnd)) {
+                log.print("[clip] OpenClipboard failed after retries", .{});
                 return false;
             }
             defer _ = win32.CloseClipboard();
@@ -4261,10 +4235,23 @@ fn Backend(comptime config: Config) type {
             return true;
         }
 
+        /// OpenClipboard 会因**任何**进程正持有剪贴板而失败（Windows 的已知行为，
+        /// 不是错误码设计问题）。常见触发：剪贴板管理器、浏览器、远程桌面。
+        /// 早期实现一次失败就报 ClipboardWriteFailed，冒烟会被无关进程搞红——
+        /// 这里按 Win32 惯例做短重试（3 次 × 20ms 足够覆盖绝大多数瞬时占用）。
+        fn openClipboardRetry(hwnd: win32.HWND) bool {
+            var attempt: u8 = 0;
+            while (attempt < 3) : (attempt += 1) {
+                if (win32.OpenClipboard(hwnd) != 0) return true;
+                if (attempt < 2) @import("../../sys.zig").sleepMs(20);
+            }
+            return false;
+        }
+
         fn getClipboardText(self: *Self, w: *Window, alloc: std.mem.Allocator) ?[]u8 {
             _ = self;
-            if (win32.OpenClipboard(w.hwnd) == 0) {
-                log.print("[clip] OpenClipboard(read) failed", .{});
+            if (!openClipboardRetry(w.hwnd)) {
+                log.print("[clip] OpenClipboard(read) failed after retries", .{});
                 return null;
             }
             defer _ = win32.CloseClipboard();

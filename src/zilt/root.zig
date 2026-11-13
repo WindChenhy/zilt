@@ -48,6 +48,7 @@ pub const npm_pack = @import("npm_pack.zig");
 pub const mcp = @import("mcp.zig");
 pub const net = @import("net.zig");
 pub const protocol = @import("protocol.zig");
+pub const sys = @import("sys.zig");
 
 /// 平台模块（Windows 后端内部使用；用户一般无需直接接触）
 pub const platform_windows = @import("platform/windows/mod.zig");
@@ -63,8 +64,13 @@ pub fn run(comptime config: Config) !void {
 test {
     _ = @import("version.zig");
     _ = @import("protocol.zig");
+    _ = @import("inflate.zig");
+    _ = @import("sys.zig");
     _ = @import("platform/interface.zig");
     _ = @import("platform/mod.zig");
+    // Linux 后端的纯逻辑单测（entryPath/reasonFor）只在 linux 目标上编译：
+    // 它 @import("gtk")，而该模块由 build.zig 的 translate-c 在 linux 上生成。
+    if (builtin.os.tag == .linux) _ = @import("platform/linux/backend.zig");
     _ = @import("security.zig");
     _ = @import("asset_routes.zig");
     _ = @import("builtin.zig");

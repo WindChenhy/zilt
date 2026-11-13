@@ -28,22 +28,46 @@ pub const Options = struct {
     isolation: bool = false,
     /// v0.1.21：运行时冻结 window.zilt 与内建原型（防原型链篡改）。
     freeze_prototype: bool = false,
+    /// v0.2.0：应用自有 scheme 白名单（如 Linux 的 `zilt`）。
+    /// 只有列在这里的 scheme 才会被 `allowed()` 当作合法来源——`file:`/`data:` 等一律拒绝。
+    app_schemes: []const []const u8 = &.{},
 };
 pub const Direction = enum { command, event, receive_event };
 
 const Origin = struct { scheme: []const u8, host: []const u8, port: u16 };
-fn parseOrigin(url: []const u8) ?Origin {
+
+/// scheme 接受范围：
+///   .web_only —— 只有 http/https 算「来源」（对外部 URL 的默认立场）
+///   .any      —— 任意合法 scheme（用于同源比较；是否可信由 `allowed()` 另行把关）
+const SchemePolicy = enum { web_only, any };
+
+/// RFC 3986 scheme：字母开头，后续为字母/数字/+/-/.（小写比较）
+fn validScheme(scheme: []const u8) bool {
+    if (scheme.len == 0) return false;
+    if (!std.ascii.isAlphabetic(scheme[0])) return false;
+    for (scheme[1..]) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '+' or c == '-' or c == '.')) return false;
+    }
+    return true;
+}
+
+fn parseOriginPolicy(url: []const u8, policy: SchemePolicy) ?Origin {
     for (url) |c| if (c <= 0x20 or c == '\\' or c == 0x7f) return null;
     const sep = std.mem.indexOf(u8, url, "://") orelse return null;
     const scheme = url[0..sep];
     const secure = std.ascii.eqlIgnoreCase(scheme, "https");
-    if (!secure and !std.ascii.eqlIgnoreCase(scheme, "http")) return null;
+    const plain = std.ascii.eqlIgnoreCase(scheme, "http");
+    if (!secure and !plain) {
+        if (policy == .web_only) return null;
+        if (!validScheme(scheme)) return null;
+    }
     const rest = url[sep + 3 ..];
     const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
     const authority = rest[0..end];
     if (authority.len == 0 or std.mem.indexOfAny(u8, authority, "@%") != null) return null;
     var host = authority;
-    var port: u16 = if (secure) 443 else 80;
+    // 非 http(s) scheme 没有默认端口；0 表示「无端口」而不是非法
+    var port: u16 = if (secure) 443 else if (plain) 80 else 0;
     if (authority[0] == '[') {
         const close = std.mem.indexOfScalar(u8, authority, ']') orelse return null;
         host = authority[0 .. close + 1];
@@ -55,12 +79,19 @@ fn parseOrigin(url: []const u8) ?Origin {
         host = authority[0..colon];
         port = std.fmt.parseInt(u16, authority[colon + 1 ..], 10) catch return null;
     }
-    if (host.len == 0 or port == 0) return null;
+    if (host.len == 0) return null;
+    if ((secure or plain) and port == 0) return null;
     return .{ .scheme = scheme, .host = host, .port = port };
 }
+
+fn parseOrigin(url: []const u8) ?Origin {
+    return parseOriginPolicy(url, .web_only);
+}
 pub fn sameOrigin(a: []const u8, b: []const u8) bool {
-    const x = parseOrigin(a) orelse return false;
-    const y = parseOrigin(b) orelse return false;
+    // 比较用 .any：应用自有 scheme（zilt://app）也要能与自身同源。
+    // 这不放宽信任边界——来源是否可信由 `allowed()` 的 app_schemes 白名单把关。
+    const x = parseOriginPolicy(a, .any) orelse return false;
+    const y = parseOriginPolicy(b, .any) orelse return false;
     return std.ascii.eqlIgnoreCase(x.scheme, y.scheme) and std.ascii.eqlIgnoreCase(x.host, y.host) and x.port == y.port;
 }
 pub fn isWebUrl(url: []const u8) bool {
@@ -77,8 +108,19 @@ pub fn navigation(options: Options, app_url: []const u8, dev_url: ?[]const u8, u
     for (options.navigation_origins) |origin| if (sameOrigin(origin, url)) return .allow;
     return options.external_links;
 }
+/// 来源是否可信：http(s)，或显式登记在 `app_schemes` 里的应用自有 scheme。
+/// `file:` / `data:` / `blob:` 等一律不可信（它们没有真实 origin）。
+pub fn isTrustedSource(options: Options, url: []const u8) bool {
+    if (isWebUrl(url)) return true;
+    const origin = parseOriginPolicy(url, .any) orelse return false;
+    for (options.app_schemes) |scheme| {
+        if (std.ascii.eqlIgnoreCase(origin.scheme, scheme)) return true;
+    }
+    return false;
+}
+
 pub fn allowed(options: Options, app_url: []const u8, dev_url: ?[]const u8, source: []const u8, window: []const u8, direction: Direction, name: []const u8) bool {
-    if (!isWebUrl(source)) return false;
+    if (!isTrustedSource(options, source)) return false;
     if (matches(switch (direction) {
         .command => options.deny_commands,
         .event, .receive_event => options.deny_events,
@@ -249,4 +291,29 @@ test "v0.1.21: runtime grants extend capability scopes" {
     try std.testing.expect(scopeAllowedWith(empty, &.{}, "fs", "anything"));
     try std.testing.expect(!scopeAllowedWith(empty, &grants, "fs", "downloads/a.txt"));
     try std.testing.expect(scopeAllowedWith(empty, &grants, "fs", "documents/a.txt"));
+}
+
+test "v0.2.0: 应用自有 scheme 是一等来源（Linux zilt://）" {
+    const caps = [_]Capability{
+        .{ .name = "main", .commands = &.{"greet"}, .events = &.{"smokeResult"} },
+    };
+    const opts = Options{ .capabilities = &caps, .app_schemes = &.{"zilt"} };
+    const app = "zilt://app/index.html";
+
+    // 同源比较能识别自有 scheme
+    try std.testing.expect(sameOrigin(app, "zilt://app/second.html"));
+    try std.testing.expect(!sameOrigin(app, "zilt://other/index.html"));
+
+    // 登记过的 scheme + 同源 → 放行
+    try std.testing.expect(allowed(opts, app, null, app, "main", .command, "greet"));
+    try std.testing.expect(allowed(opts, app, null, app, "main", .event, "smokeResult"));
+    // 不在 capability 名单里的命令仍然拒绝
+    try std.testing.expect(!allowed(opts, app, null, app, "main", .command, "rm_rf"));
+
+    // 未登记的 scheme 一律不可信（file:/data: 不能借道）
+    const no_scheme = Options{ .capabilities = &caps };
+    try std.testing.expect(!allowed(no_scheme, app, null, app, "main", .command, "greet"));
+    try std.testing.expect(!isTrustedSource(opts, "file:///etc/passwd"));
+    try std.testing.expect(!isTrustedSource(opts, "data:text/html,<script>"));
+    try std.testing.expect(!isTrustedSource(opts, "zilt:x")); // 无 authority
 }

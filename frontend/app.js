@@ -153,8 +153,15 @@ async function runChecks() {
     setCheck('c-mode', m.applied === 'fast', JSON.stringify(m));
 
     // 7. 剪贴板往返（v0.1.6）
-    const cb = await window.zilt.invoke('clipboardRoundtrip', { text: 'zilt-clip-0.1.6' });
-    setCheck('c-clip', cb.ok === true, JSON.stringify(cb));
+    // 单独 try：剪贴板是**整机互斥**资源，别的进程占着时 OpenClipboard 会失败
+    // （远程会话/剪贴板管理器/截图工具都可能造成）。这种环境问题不该让后面
+    // 41 项检查全部瞎掉——失败仍然如实记在 c-clip 上。
+    try {
+      const cb = await window.zilt.invoke('clipboardRoundtrip', { text: 'zilt-clip-0.1.6' });
+      setCheck('c-clip', cb.ok === true, JSON.stringify(cb));
+    } catch (e) {
+      setCheck('c-clip', false, String(e.message || e));
+    }
 
     // 8. 窗口控制（标题设置 + 还原；v0.1.6）
     const w1 = await window.zilt.invoke('windowTitleDemo', { title: 'Zilt v0.1.7 — 冒烟' });

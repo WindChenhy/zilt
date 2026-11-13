@@ -46,7 +46,12 @@ pub const UpdateError = error{
     Sha256Mismatch,
     SignatureInvalid,
     KeyInvalid,
+    /// 当前平台没有 staging 实现（Linux 归 v0.2.4：AppImage/原子 rename）
+    UpdateUnsupported,
 } || bundler.ZipReadError || std.base64.Error || std.mem.Allocator.Error;
+
+/// 当前平台是否有 staging/回滚实现（v0.2.0：仅 Windows）。
+const is_windows = @import("builtin").os.tag == .windows;
 
 /// 解析 manifest（字符串指向调用方 allocator——建议传 arena）。
 pub fn parseManifest(arena: std.mem.Allocator, json_bytes: []const u8) UpdateError!Manifest {
@@ -164,6 +169,7 @@ pub fn stageUpdate(alloc: std.mem.Allocator, exe_path: []const u8, exe_name_in_z
 
 /// 将新 exe 字节原子替换当前运行中的 exe（写 .zilt-new → 旧改名 .zilt-old → new 接管原名）。
 pub fn stageBytes(alloc: std.mem.Allocator, exe_path: []const u8, new_exe: []const u8) UpdateError!void {
+    if (comptime !is_windows) return error.UpdateUnsupported;
     const win32 = @import("platform/windows/win32.zig");
 
     const new_path = try std.fmt.allocPrint(alloc, "{s}.zilt-new", .{exe_path});
@@ -199,6 +205,10 @@ pub fn isRestartHelperCall(argv: []const []const u8) ?[]const u8 {
 /// helper：延迟等待旧实例退出（互斥体释放）→ 拉起新 exe → 退出。
 /// 子进程退出码 5（单实例冲突）时重试——旧实例尚未完全退出。
 pub fn runRestartHelper(alloc: std.mem.Allocator, target: []const u8) void {
+    if (comptime !is_windows) {
+        @import("log.zig").print("[updater] restart helper 仅 Windows 实现（Linux 见 v0.2.4）", .{});
+        return;
+    }
     const win32 = @import("platform/windows/win32.zig");
     win32.Sleep(800);
     var attempt: u32 = 0;
@@ -236,6 +246,7 @@ pub fn runRestartHelper(alloc: std.mem.Allocator, target: []const u8) void {
 
 /// 用 `<exe>.zilt-old` 覆盖当前 exe（崩溃回滚）。返回是否成功。
 pub fn rollbackToBackup(alloc: std.mem.Allocator, exe_path: []const u8) bool {
+    if (comptime !is_windows) return false;
     const win32 = @import("platform/windows/win32.zig");
     const old_path = std.fmt.allocPrint(alloc, "{s}.zilt-old", .{exe_path}) catch return false;
     defer alloc.free(old_path);
@@ -249,6 +260,7 @@ pub fn rollbackToBackup(alloc: std.mem.Allocator, exe_path: []const u8) bool {
 /// 启动后确认健康：清理上次更新留下的备份（`<exe>.zilt-old`）。
 /// 调用时机很关键——必须在新版本已经跑起来一段时间之后，否则会毁掉回滚凭据。
 pub fn cleanupOld(alloc: std.mem.Allocator, exe_path: []const u8) void {
+    if (comptime !is_windows) return;
     const win32 = @import("platform/windows/win32.zig");
     const old_path = std.fmt.allocPrint(alloc, "{s}.zilt-old", .{exe_path}) catch return;
     defer alloc.free(old_path);

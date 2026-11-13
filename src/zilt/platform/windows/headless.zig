@@ -348,25 +348,12 @@ fn serveAsset(
     try respond(out, 404, "text/plain", "not found");
 }
 
-fn flateDecompressGzip(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
-    var in: std.Io.Reader = .fixed(data);
-    var dec = std.compress.flate.Decompress.init(&in, .gzip, &.{});
-    var aw: std.Io.Writer.Allocating = .init(alloc);
-    defer aw.deinit();
-    _ = try dec.reader.streamRemaining(&aw.writer);
-    return try alloc.dupe(u8, aw.written());
-}
+/// v0.2.0：gzip 解压统一到 inflate.zig。
+const flateDecompressGzip = @import("../../inflate.zig").gunzip;
 
-fn contentTypeOf(path: []const u8) []const u8 {
-    if (std.mem.endsWith(u8, path, ".html") or std.mem.endsWith(u8, path, ".htm")) return "text/html; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".js")) return "text/javascript; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".css")) return "text/css; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".json")) return "application/json";
-    if (std.mem.endsWith(u8, path, ".svg")) return "image/svg+xml";
-    if (std.mem.endsWith(u8, path, ".png")) return "image/png";
-    if (std.mem.endsWith(u8, path, ".ico")) return "image/x-icon";
-    return "application/octet-stream";
-}
+/// v0.2.0：MIME 映射统一到 asset_routes（此前这里是一份较短的重复实现，
+/// 缺少 .mjs/.woff2/.ts 且大小写敏感）。
+const contentTypeOf = asset_routes.contentTypeOf;
 
 fn respond(out: anytype, status: u16, content_type: []const u8, body: []const u8) !void {
     try respondWith(out, status, content_type, body);

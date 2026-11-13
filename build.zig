@@ -62,6 +62,113 @@ fn addAppIconResource(b: *std.Build, module: *std.Build.Module, icon_path: ?[]co
     module.addWin32ResourceFile(.{ .file = rc, .include_paths = include.items });
 }
 
+/// pkg-config 的 `-I` 目录（构建 translate-c 需要头文件路径）。
+///
+/// 只在 linux 目标上调用；宿主没有 pkg-config 或缺少开发包时给出可执行的报错，
+/// 而不是让 translate-c 抛一句 `'gtk/gtk.h' file not found`。
+fn pkgConfigIncludeDirs(b: *std.Build, packages: []const []const u8) []const []const u8 {
+    const alloc = b.allocator;
+    const argv = alloc.alloc([]const u8, packages.len + 2) catch @panic("OOM");
+    argv[0] = "pkg-config";
+    argv[1] = "--cflags-only-I";
+    @memcpy(argv[2..], packages);
+
+    const result = std.process.run(alloc, b.graph.io, .{
+        .argv = argv,
+        .cwd = .inherit,
+    }) catch {
+        @panic("需要 pkg-config 才能构建 Linux 后端：sudo apt install pkg-config " ++
+            "libgtk-3-dev libwebkit2gtk-4.1-dev");
+    };
+    defer {
+        alloc.free(result.stdout);
+        alloc.free(result.stderr);
+    }
+    if (result.term != .exited or result.term.exited != 0) {
+        std.log.err("pkg-config 查询失败（{s}）：{s}", .{
+            std.mem.join(alloc, " ", packages) catch "?",
+            std.mem.trim(u8, result.stderr, " \r\n"),
+        });
+        @panic("缺少 GTK/WebKitGTK 开发包：sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev");
+    }
+
+    var dirs: std.ArrayListUnmanaged([]const u8) = .empty;
+    var it = std.mem.tokenizeAny(u8, result.stdout, " \t\r\n");
+    while (it.next()) |tok| {
+        if (std.mem.startsWith(u8, tok, "-I") and tok.len > 2) {
+            dirs.append(alloc, alloc.dupe(u8, tok[2..]) catch @panic("OOM")) catch @panic("OOM");
+        }
+    }
+    return dirs.items;
+}
+
+/// Linux 的 WebView 依赖（GTK3 + WebKit2GTK 4.1）。
+///
+/// 注意：Zig 的 `linkSystemLibrary` 会通过 pkg-config 拿到 `-l` 与 `-I`，但
+/// **不会**补 `-L`（gtk 的 .pc 里也没有 `-L`，库都在发行版默认目录），链接器因此
+/// 报 `unable to find dynamic system library "gtk-3"`。这里显式把 pkg-config 的
+/// libdir 加进搜索路径。
+fn linkLinuxWebviewLibs(b: *std.Build, module: *std.Build.Module) void {
+    module.link_libc = true;
+    for (pkgConfigLibDirs(b, &.{ "gtk+-3.0", "webkit2gtk-4.1", "libsoup-3.0" })) |dir| {
+        module.addLibraryPath(.{ .cwd_relative = dir });
+    }
+    module.linkSystemLibrary("gtk-3", .{});
+    module.linkSystemLibrary("webkit2gtk-4.1", .{});
+    module.linkSystemLibrary("libsoup-3.0", .{}); // scheme 响应头（CSP/security.headers）
+}
+
+/// pkg-config 的库搜索目录：`--libs-only-L` 的 `-L` 加上 `--variable=libdir`。
+/// 发行版通常前者为空，靠 libdir 兜底。
+fn pkgConfigLibDirs(b: *std.Build, packages: []const []const u8) []const []const u8 {
+    const alloc = b.allocator;
+    var dirs: std.ArrayListUnmanaged([]const u8) = .empty;
+
+    const appendUnique = struct {
+        fn add(list: *std.ArrayListUnmanaged([]const u8), a: std.mem.Allocator, dir: []const u8) void {
+            for (list.items) |existing| {
+                if (std.mem.eql(u8, existing, dir)) return;
+            }
+            list.append(a, a.dupe(u8, dir) catch @panic("OOM")) catch @panic("OOM");
+        }
+    }.add;
+
+    const ldflags = runPkgConfig(alloc, b, "--libs-only-L", packages) orelse return dirs.items;
+    defer alloc.free(ldflags);
+    var it = std.mem.tokenizeAny(u8, ldflags, " \t\r\n");
+    while (it.next()) |tok| {
+        if (std.mem.startsWith(u8, tok, "-L") and tok.len > 2) appendUnique(&dirs, alloc, tok[2..]);
+    }
+
+    for (packages) |pkg| {
+        const argv = [_][]const u8{ "pkg-config", "--variable=libdir", pkg };
+        const result = std.process.run(alloc, b.graph.io, .{ .argv = &argv, .cwd = .inherit }) catch continue;
+        defer {
+            alloc.free(result.stdout);
+            alloc.free(result.stderr);
+        }
+        if (result.term != .exited or result.term.exited != 0) continue;
+        const dir = std.mem.trim(u8, result.stdout, " \t\r\n");
+        if (dir.len != 0) appendUnique(&dirs, alloc, dir);
+    }
+    return dirs.items;
+}
+
+/// 跑一次 pkg-config，返回 stdout（失败 null）。调用方负责 free。
+fn runPkgConfig(alloc: std.mem.Allocator, b: *std.Build, flag: []const u8, packages: []const []const u8) ?[]u8 {
+    const argv = alloc.alloc([]const u8, packages.len + 2) catch return null;
+    argv[0] = "pkg-config";
+    argv[1] = flag;
+    @memcpy(argv[2..], packages);
+    const result = std.process.run(alloc, b.graph.io, .{ .argv = argv, .cwd = .inherit }) catch return null;
+    alloc.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        alloc.free(result.stdout);
+        return null;
+    }
+    return result.stdout;
+}
+
 /// 非 Windows 上的 Windows 专用 step：请保留名字（避免 `no step named ...`），
 /// 但执行即失败并说明原因与后续计划——比悄悄不存在更有用。
 fn windowsOnlyStep(b: *std.Build, name: []const u8, desc: []const u8, target_os: std.Target.Os.Tag) *std.Build.Step {
@@ -100,12 +207,33 @@ pub fn build(b: *std.Build) void {
     // 默认 install，对应 step 保留名字但执行即给出原因（见 windowsOnlyStep）。
     const target_os = target.result.os.tag;
     const is_windows = target_os == .windows;
+    const is_linux = target_os == .linux;
+
+    // ---- Linux：GTK3 + WebKit2GTK 4.1 绑定（v0.2.0）----
+    // Zig 0.17 移除了 @cImport，改为构建期 translate-c：把 capi.h 翻成 Zig 模块。
+    // 只在 linux 目标上创建，Windows 构建完全不产生这项成本（约 8 万行、首次 ~1 分钟，
+    // 之后由构建缓存复用）。
+    const gtk_mod: ?*std.Build.Module = if (is_linux) blk: {
+        const tc = b.addTranslateC(.{
+            .root_source_file = b.path("src/zilt/platform/linux/capi.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        for (pkgConfigIncludeDirs(b, &.{ "gtk+-3.0", "webkit2gtk-4.1" })) |dir| {
+            tc.addSystemIncludePath(.{ .cwd_relative = dir });
+        }
+        break :blk tc.createModule();
+    } else null;
 
     // zilt 库模块
     const zilt_mod = b.addModule("zilt", .{
         .root_source_file = b.path("src/zilt/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = if (gtk_mod) |m|
+            &.{std.Build.Module.Import{ .name = "gtk", .module = m }}
+        else
+            &.{},
     });
 
     // ---- 前端资产 codegen：遍历 dist → 生成 zilt-assets 模块 ----
@@ -231,6 +359,8 @@ pub fn build(b: *std.Build) void {
         // Windows 系统库（Win32 extern 声明所需的导入库）
         linkWindowsLibs(exe_mod);
         addAppIconResource(b, exe_mod, project.icon);
+    } else if (is_linux) {
+        linkLinuxWebviewLibs(b, exe_mod);
     }
 
     b.installArtifact(exe);
@@ -391,6 +521,8 @@ pub fn build(b: *std.Build) void {
         rel_app.subsystem = .windows; // 分发产物无控制台窗口
         linkWindowsLibs(rel_app_mod);
         addAppIconResource(b, rel_app_mod, project.icon);
+    } else if (is_linux) {
+        linkLinuxWebviewLibs(b, rel_app_mod);
     }
 
     // ---- v0.1.17：zilt CLI（doctor / info / version）----

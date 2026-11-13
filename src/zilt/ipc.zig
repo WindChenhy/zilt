@@ -858,9 +858,17 @@ const runtime_js_head =
     \\    if (v instanceof Date) return { kind: 'text', text: v.toISOString() };
     \\    return v;
     \\  };
-    \\  const post = (m) => window.chrome.webview.postMessage(m);
-    \\  window.chrome.webview.addEventListener('message', (e) => {
-    \\    const m = e.data;
+    \\  // 传输层抽象（v0.2.0）：Windows/WebView2 与 Linux/WebKitGTK 两套，运行时择一。
+    \\  //   Windows: window.chrome.webview.postMessage + 'message' 事件
+    \\  //   Linux:   window.webkit.messageHandlers.zilt.postMessage；回程由后端
+    \\  //            evaluate_javascript 调 window.__ziltDeliver(json)
+    \\  const post = (m) => {
+    \\    if (window.chrome && window.chrome.webview) return window.chrome.webview.postMessage(m);
+    \\    const h = window.webkit && window.webkit.messageHandlers;
+    \\    if (h && h.zilt) return h.zilt.postMessage(m);
+    \\    throw new Error('zilt: no IPC transport available');
+    \\  };
+    \\  const deliver = (m) => {
     \\    if (!m || m.zilt !== 1) return;
     \\    if (m.kind === 'resolve') {
     \\      const r = resolvers.get(m.id);
@@ -872,7 +880,11 @@ const runtime_js_head =
     \\      const ls = listeners.get(m.name);
     \\      if (ls) for (const cb of ls) { try { cb(m.payload); } catch (err) { console.error('[zilt] listener error', err); } }
     \\    }
-    \\  });
+    \\  };
+    \\  if (window.chrome && window.chrome.webview) {
+    \\    window.chrome.webview.addEventListener('message', (e) => deliver(e.data));
+    \\  }
+    \\  window.__ziltDeliver = deliver;
     \\  const evalWaiters = new Map();
     \\  let evalId = 1;
     \\  const builtin = (method, args) => window.zilt.invoke(method, args ?? {});

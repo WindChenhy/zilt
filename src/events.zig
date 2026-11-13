@@ -133,9 +133,13 @@ pub fn smokeResult(ctx: Context, payload: struct {
         }
     }
 
-    const alloc = std.heap.page_allocator;
-    if (zilt.platform_windows.win32.getEnvUtf8(alloc, "ZILT_SMOKE_EXIT")) |v| {
-        defer alloc.free(v);
-        if (v.len > 0 and v[0] == '1') ctx.quit(if (ok) 0 else 1);
+    // ZILT_SMOKE_EXIT 是 Windows 自动化（CI/本地冒烟）用的一次性开关；
+    // 环境变量读取目前仍是 Win32 实现（Linux 侧 v0.2.2 随系统集成一起补）。
+    if (@import("builtin").os.tag == .windows) {
+        const alloc = std.heap.page_allocator;
+        if (zilt.platform_windows.win32.getEnvUtf8(alloc, "ZILT_SMOKE_EXIT")) |v| {
+            defer alloc.free(v);
+            if (v.len > 0 and v[0] == '1') ctx.quit(if (ok) 0 else 1);
+        }
     }
 }

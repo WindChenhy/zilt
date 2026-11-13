@@ -27,6 +27,29 @@ pub fn decodePath(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
+/// 扩展名 → Content-Type（两平台共用；未知类型按二进制流）。
+pub fn contentTypeOf(path: []const u8) []const u8 {
+    const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| path[i + 1 ..] else path;
+    const ext = if (std.mem.lastIndexOfScalar(u8, base, '.')) |i| base[i + 1 ..] else "";
+    const map = [_]struct { ext: []const u8, ct: []const u8 }{
+        .{ .ext = "html", .ct = "text/html; charset=utf-8" },
+        .{ .ext = "js", .ct = "text/javascript; charset=utf-8" },
+        .{ .ext = "mjs", .ct = "text/javascript; charset=utf-8" },
+        .{ .ext = "css", .ct = "text/css; charset=utf-8" },
+        .{ .ext = "json", .ct = "application/json" },
+        .{ .ext = "svg", .ct = "image/svg+xml" },
+        .{ .ext = "png", .ct = "image/png" },
+        .{ .ext = "jpg", .ct = "image/jpeg" },
+        .{ .ext = "ico", .ct = "image/x-icon" },
+        .{ .ext = "woff2", .ct = "font/woff2" },
+        .{ .ext = "ts", .ct = "text/plain; charset=utf-8" },
+    };
+    for (map) |m| {
+        if (std.ascii.eqlIgnoreCase(ext, m.ext)) return m.ct;
+    }
+    return "application/octet-stream";
+}
+
 pub const Candidates = struct {
     alloc: std.mem.Allocator,
     paths: [4]?[]u8 = @splat(null),

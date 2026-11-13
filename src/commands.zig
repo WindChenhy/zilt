@@ -21,7 +21,7 @@ pub fn startTicker(ctx: Context, args: struct { count: u32, interval_ms: u16 }) 
     // state 必须活得比本次 invoke 调用久 → 用长生命周期的 msg_allocator
     const state = try ctx.msg_allocator.create(TickerState);
     state.* = .{ .ctx = ctx, .count = args.count, .interval_ms = args.interval_ms };
-    _ = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, tickerMain, .{state}) catch |err| {
+    _ = std.Thread.spawn(.{ .stack_size = zilt.sys.threadStackSize(256 * 1024) }, tickerMain, .{state}) catch |err| {
         ticker_stop.store(true, .release);
         ctx.msg_allocator.destroy(state);
         return err;
@@ -34,10 +34,9 @@ pub fn stopTicker(_: Context, args: struct {}) !void {
 }
 
 fn tickerMain(state: *TickerState) void {
-    const win32 = zilt.platform_windows.win32;
     var n: u32 = 0;
     while (n < state.count and !ticker_stop.load(.acquire)) : (n += 1) {
-        win32.Sleep(state.interval_ms);
+        zilt.sys.sleepMs(state.interval_ms);
         state.ctx.emit("tick", .{ .n = n + 1 }); // emit 走 msg_allocator，跨线程安全
     }
     state.ctx.msg_allocator.destroy(state);
@@ -308,7 +307,7 @@ pub fn checkUpdate(ctx: Context, args: struct {}) !void {
     };
     const state = try ctx.msg_allocator.create(Ctx);
     state.* = .{ .ctx = ctx, .env = env };
-    _ = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, S.main, .{state}) catch {
+    _ = std.Thread.spawn(.{ .stack_size = zilt.sys.threadStackSize(512 * 1024) }, S.main, .{state}) catch {
         ctx.msg_allocator.destroy(state);
         return error.SpawnFailed;
     };
@@ -320,7 +319,7 @@ pub fn installUpdate(ctx: Context, args: struct {}) !void {
     const env = ctx.updater_env orelse return error.UpdateNotConfigured;
     const state = try ctx.msg_allocator.create(InstallCtx);
     state.* = .{ .ctx = ctx, .env = env };
-    _ = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, installMain, .{state}) catch {
+    _ = std.Thread.spawn(.{ .stack_size = zilt.sys.threadStackSize(512 * 1024) }, installMain, .{state}) catch {
         ctx.msg_allocator.destroy(state);
         return error.SpawnFailed;
     };
@@ -430,7 +429,7 @@ const StreamState = struct {
 pub fn streamDemo(ctx: Context, args: struct { id: u32, count: u32 = 5 }) !struct { ok: bool } {
     const st = try ctx.msg_allocator.create(StreamState);
     st.* = .{ .ctx = ctx, .id = args.id, .count = args.count };
-    _ = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, streamMain, .{st}) catch |err| {
+    _ = std.Thread.spawn(.{ .stack_size = zilt.sys.threadStackSize(256 * 1024) }, streamMain, .{st}) catch |err| {
         ctx.msg_allocator.destroy(st);
         return err;
     };
@@ -438,11 +437,10 @@ pub fn streamDemo(ctx: Context, args: struct { id: u32, count: u32 = 5 }) !struc
 }
 
 fn streamMain(st: *StreamState) void {
-    const win32 = zilt.platform_windows.win32;
     defer st.ctx.msg_allocator.destroy(st);
     var i: u32 = 0;
     while (i < st.count) : (i += 1) {
-        win32.Sleep(20);
+        zilt.sys.sleepMs(20);
         st.ctx.channelSend(st.id, i, .{ .n = i, .label = "chunk" });
     }
     st.ctx.channelClose(st.id, null);
