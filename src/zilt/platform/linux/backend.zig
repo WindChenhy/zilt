@@ -21,7 +21,23 @@
 //!   - v0.2.1 切片 2：WebView 面（`webview_request_fn` / `eval_async_fn`）已接通——
 //!     reload / stop / zoom / get_zoom / history / back / forward / devtools /
 //!     set_user_agent / eval（同步走嵌套 GMainLoop，对应 Windows 的 SyncWait 泵）。
-//!     print / cdp / cancel_download / cookies / clear_storage 返回 NotSupported。
+//!   - v0.2.1 切片 4：WebView 数据面补齐——
+//!     * **下载**：WebKitWebContext::download-started → 目标路径（save_directory >
+//!       show_dialog 原生保存框 > $HOME/Downloads；重名追加 " (n)"，不静默覆盖）
+//!       → received-data（32KB 节流）/finished/failed → `webview.download_*` 事件
+//!       （payload 对齐 Windows：started {id,url,path}；其余 {id,received,total,
+//!       interrupt_reason}）；`cancel_download` 未知 id 返回 UnknownDownload。
+//!     * **cookies**：WebKitCookieManager 的 get/set/delete/按域名清理
+//!       （异步 API 用嵌套 GMainLoop 同步化；返回 {"cookies":[…]} 与 Windows 同形）。
+//!     * **clear_storage**：WebKitWebsiteDataManager::clear（本版为全来源清理，
+//!       origin 参数不参与过滤——超集语义，已在 docs/v0.2-LINUX.md 标注）。
+//!     * **截图**：WebKit 无 CDP，仅支持 `Page.captureScreenshot`（PNG）——
+//!       webkit_web_view_get_snapshot + cairo PNG + base64 → `webviewCdp` 事件，
+//!       runtime 的 captureScreenshot 无需改动；其余 CDP 方法 NotSupported。
+//!     * **窗口状态持久化**：`window_state.zig`（与 Windows app_data 同格式/同
+//!       哈希文件名）→ state_key / persist_window_state 在创建时恢复、销毁时保存；
+//!       `window.zilt.windowState.get/save` 走 system_fn 的 `.window_state` op。
+//!     print 仍返回 NotSupported（P2，见能力清单）。
 //!   - v0.2.1 切片 3：**多窗口 + 子 WebView + 数据分区**已接通——
 //!     * 窗口注册表：每窗口独立 GtkWindow/WebView/UCM/脚本/状态跟踪，id 从 1 起
 //!       （主窗口固定 1）；`window_fn` / `window_query_fn` / `webview_request_fn` /
@@ -53,9 +69,9 @@
 //!       结果经 `webviewEval` 事件回传（对齐 Windows 的异步事件回传）；窗口销毁
 //!       时子 WebView 随控件树一并释放。
 //!   - 尚未实现（钩子留 null → 前端拿到与 Windows 相同的固定降级错误名）：
-//!     剪贴板 / 通知 / 对话框 / 下载 / 托盘 / 菜单 / 快捷键 / http/ws/fs/SQL。
+//!     剪贴板 / 通知 / 对话框 / 托盘 / 菜单 / 快捷键 / http/ws/fs/SQL。
 //!     这些属于 v0.2.2–v0.2.3，`platform/interface.zig` 的能力矩阵逐项打勾。
-//!   - 冒烟（ZILT_LINUX_SMOKE=1）：33 项检查。WSLg 环境必须 `GDK_BACKEND=x11`
+//!   - 冒烟（ZILT_LINUX_SMOKE=1）：40 项检查。WSLg 环境必须 `GDK_BACKEND=x11`
 //!     跑 xvfb-run——Wayland 路径实测在多窗口场景触发协议错误（Error 71）断连。
 //!
 //! 依赖（构建期）：pkg-config + libgtk-3-dev + libwebkit2gtk-4.1-dev。
@@ -72,6 +88,7 @@ const security = @import("../../security.zig");
 const builtin_cmds = @import("../../builtin.zig");
 const log = @import("../../log.zig");
 const system_api = @import("../../system_api.zig");
+const window_state = @import("window_state.zig");
 const Config = @import("../../config.zig").Config;
 
 pub const platform_name = "linux";
@@ -132,6 +149,29 @@ fn boolStr(b: bool) []const u8 {
     return if (b) "true" else "false";
 }
 
+/// JSON 字符串字面量（含引号）；调用方 free。
+fn jsonStr(alloc: std.mem.Allocator, s: []const u8) ?[]u8 {
+    return std.json.Stringify.valueAlloc(alloc, s, .{}) catch null;
+}
+
+/// URL 的 host 部分（"https://user@example.com:8443/x" → "example.com"）；
+/// 无 scheme/host 返回 null。cookie domain 推导用。
+fn hostOf(url: []const u8) ?[]const u8 {
+    const sep = std.mem.indexOf(u8, url, "://") orelse return null;
+    var rest = url[sep + 3 ..];
+    if (std.mem.indexOfScalar(u8, rest, '@')) |at| rest = rest[at + 1 ..];
+    const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    var host = rest[0..end];
+    if (std.mem.startsWith(u8, host, "[")) {
+        // IPv6 字面量：保留方括号（去掉 ":port"）
+        if (std.mem.indexOfScalar(u8, host, ']')) |close| host = host[0 .. close + 1];
+    } else if (std.mem.lastIndexOfScalar(u8, host, ':')) |colon| {
+        host = host[0..colon];
+    }
+    if (host.len == 0) return null;
+    return host;
+}
+
 /// 分区名规范化为可安全做目录名：保留字母/数字/-/_，其余转 '_'，最长 64；
 /// 全空 → "default"。与 Windows 后端同一份规则（对齐 `platform/windows/backend.zig`）。
 pub fn sanitizePartition(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -187,6 +227,8 @@ pub fn run(comptime config: Config) !void {
     const wc = c.webkit_web_context_get_default();
     if (wc == null) return error.WebKitContextUnavailable;
     c.webkit_web_context_register_uri_scheme(wc, scheme, Self.onSchemeRequest, self, null);
+    // v0.2.1：下载事件（分区 context 在 createPartitionContext 里同样注册）
+    _ = c.g_signal_connect_data(wc, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
 
     // 主窗口（id 固定 1）；spawn 的窗口走同一个创建函数（createWindowInternal）
     const main_opts = ipc.WindowOptions{
@@ -219,6 +261,8 @@ pub fn run(comptime config: Config) !void {
     });
 
     c.gtk_main();
+    // 主循环退出时窗口通常还没 destroy（ctx.quit 路径）→ 逐窗口落盘状态
+    for (self.windows.items) |st| self.saveWindowState(st);
     log.print("[linux] main loop exited", .{});
     // 冒烟模式：把结果变成进程退出码，便于 CI / 脚本判定
     if (self.smoke) std.process.exit(self.smoke_code);
@@ -266,6 +310,14 @@ fn Backend(comptime config: Config) type {
             scripts: std.ArrayListUnmanaged(?*c.WebKitUserScript) = .empty,
             /// 父窗口（parent/modal 映射 transient-for；父销毁级联关子窗口）
             parent_id: ?u32 = null,
+            /// 窗口状态持久化键（null = 不持久化；配置 persist_window_state 时 = label）
+            state_key: ?[]u8 = null,
+            /// 最近一次 configure 的几何（destroy 时 gtk_window_get_size 可能已失效，
+            /// 保存状态读这里；主循环退出前也用它）
+            geom_x: i32 = 0,
+            geom_y: i32 = 0,
+            geom_width: u32 = 0,
+            geom_height: u32 = 0,
             // ---- 窗口状态跟踪（v0.2.1 切片 1；Xvfb 无 WM，查询读跟踪值）----
             fullscreen: bool = false,
             always_on_top: bool = false,
@@ -302,6 +354,36 @@ fn Backend(comptime config: Config) type {
         const PartitionCtx = struct {
             name: []u8,
             ctx: [*c]c.WebKitWebContext,
+        };
+
+        /// 进行中的下载（v0.2.1）。WebKit 持有 WebKitDownload 的所有权，
+        /// 我们只记 id + 上次上报的进度（节流）。
+        const Download = struct {
+            backend: *Self,
+            id: u64,
+            dl: [*c]c.WebKitDownload,
+            total: i64 = -1,
+            last_progress: u64 = 0,
+            /// 三个信号的处理 id：终止事件到达后先断开再释放记录。
+            /// 实测 WebKit 失败时还会补一个 finished，不断开会二次进回调 → UAF。
+            received_handler: c.gulong = 0,
+            finished_handler: c.gulong = 0,
+            failed_handler: c.gulong = 0,
+        };
+
+        /// 异步等待任务（cookies / clear_storage 需要嵌套主循环同步取结果）。
+        const WaitTask = struct {
+            backend: *Self,
+            loop: ?*c.GMainLoop = null,
+            json: ?[]u8 = null,
+            failed: bool = false,
+        };
+
+        /// 截图任务：webkit_web_view_get_snapshot → PNG → base64 → webviewCdp 事件。
+        const SnapshotTask = struct {
+            backend: *Self,
+            win_id: u32,
+            rid: i64,
         };
 
         /// emit 的封送任务（worker 线程 → UI 线程，g_idle_add）。
@@ -344,6 +426,9 @@ fn Backend(comptime config: Config) type {
         smoke_code: u8 = 1,
         /// gzip 资产的解压缓存（UI 线程独占，无锁）
         asset_cache: std.StringHashMapUnmanaged([]u8) = .empty,
+        /// 进行中的下载（v0.2.1）
+        downloads: std.ArrayListUnmanaged(*Download) = .empty,
+        next_download_id: u64 = 1,
 
         fn deinit(self: *Self) void {
             // 主循环退出后可能仍有窗口未 destroy（ctx.quit 路径）→ 逐个释放记录
@@ -360,6 +445,8 @@ fn Backend(comptime config: Config) type {
                 self.allocator.free(entry.value_ptr.*);
             }
             self.asset_cache.deinit(self.allocator);
+            for (self.downloads.items) |d| self.allocator.destroy(d);
+            self.downloads.deinit(self.allocator);
         }
 
         // ------------------------------------------------------------------
@@ -403,6 +490,7 @@ fn Backend(comptime config: Config) type {
             self.allocator.destroy(st.sink);
             self.allocator.free(st.label);
             if (st.app_url.len != 0) self.allocator.free(st.app_url);
+            if (st.state_key) |key| self.allocator.free(key);
             self.allocator.destroy(st);
         }
 
@@ -514,6 +602,7 @@ fn Backend(comptime config: Config) type {
             const ctx = c.webkit_web_context_new_with_website_data_manager(mgr);
             if (ctx == null) return error.WebKitContextUnavailable;
             c.webkit_web_context_register_uri_scheme(ctx, scheme, Self.onSchemeRequest, self, null);
+            _ = c.g_signal_connect_data(ctx, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
             log.print("[webviews] partition '{s}' context created ({s})", .{ name, dir });
             return ctx;
         }
@@ -702,6 +791,16 @@ fn Backend(comptime config: Config) type {
                 if (opts.modal) c.gtk_window_set_modal(win_typed, 1);
             }
 
+            // 窗口状态键：显式 state_key 优先；persist_window_state 时按 label
+            //（与 Windows 的 createWindow 一致）
+            const state_key: ?[]u8 = if (opts.state_key) |key|
+                try self.allocator.dupe(u8, key)
+            else if (config.persist_window_state)
+                try self.allocator.dupe(u8, label)
+            else
+                null;
+            errdefer if (state_key) |key| self.allocator.free(key);
+
             const st = try self.allocator.create(WinState);
             errdefer self.allocator.destroy(st);
             st.* = .{
@@ -715,6 +814,11 @@ fn Backend(comptime config: Config) type {
                 .app_url = app_url,
                 .sink = undefined,
                 .parent_id = if (parent_state) |p| p.id else null,
+                .state_key = state_key,
+                .geom_x = opts.x orelse 0,
+                .geom_y = opts.y orelse 0,
+                .geom_width = opts.width,
+                .geom_height = opts.height,
                 .always_on_top = opts.always_on_top,
                 .min_width = opts.min_width orelse 0,
                 .min_height = opts.min_height orelse 0,
@@ -759,6 +863,9 @@ fn Backend(comptime config: Config) type {
             // geometry hints（min/max；Xvfb 无 WM 不执行，真实桌面生效）
             applyGeometryHints(st, win_typed);
 
+            // 窗口状态恢复（v0.2.1）：位置/尺寸/最大化/全屏覆盖 opts 默认值
+            self.restoreWindowState(st);
+
             const url_z = try dupeZ(self.allocator, app_url);
             defer self.allocator.free(url_z);
             c.webkit_web_view_load_uri(view, url_z.ptr);
@@ -769,6 +876,7 @@ fn Backend(comptime config: Config) type {
             // 注册成功后才接窗口级信号：destroy 处理器会解引用 st，
             // 之前的错误路径（errdefer destroy(st)）绝不能有 destroy 处理器存活。
             _ = c.g_signal_connect_data(win, "destroy", @ptrCast(&Self.onDestroy), st, null, 0);
+            _ = c.g_signal_connect_data(win, "configure-event", @ptrCast(&Self.onConfigureEvent), st, null, 0);
             _ = c.g_signal_connect_data(
                 overlay,
                 "get-child-position",
@@ -843,8 +951,17 @@ fn Backend(comptime config: Config) type {
                     if (on) c.gtk_window_fullscreen(win) else c.gtk_window_unfullscreen(win);
                     st.fullscreen = on;
                 },
-                .size => |s| c.gtk_window_resize(win, @intCast(s.width), @intCast(s.height)),
-                .position => |p| c.gtk_window_move(win, p.x, p.y),
+                .size => |s| {
+                    c.gtk_window_resize(win, @intCast(s.width), @intCast(s.height));
+                    // 跟踪值同步：窗口状态持久化在 destroy 期间查不到真实几何
+                    st.geom_width = s.width;
+                    st.geom_height = s.height;
+                },
+                .position => |p| {
+                    c.gtk_window_move(win, p.x, p.y);
+                    st.geom_x = p.x;
+                    st.geom_y = p.y;
+                },
                 .show => c.gtk_widget_show_all(widget),
                 .hide => c.gtk_widget_hide(widget),
                 .focus => c.gtk_window_present(win),
@@ -961,6 +1078,340 @@ fn Backend(comptime config: Config) type {
                 return null;
             };
             return st.id;
+        }
+
+        // ------------------------------------------------------------------
+        // 窗口状态持久化（v0.2.1；对齐 Windows 的 app_data 语义）
+        // ------------------------------------------------------------------
+
+        /// 当前窗口几何：**configure 跟踪值优先**。
+        /// 实测：destroy 信号里 gtk_window_get_size/get_position 会退化到创建时的
+        /// 默认值（0,0 / 初始 width×height），拿它保存会把用户调整后的几何丢掉；
+        /// 跟踪值由 configure-event + 程序化 resize/move 命令共同维护。
+        fn currentGeometry(self: *Self, st: *WinState) window_state.State {
+            _ = self;
+            var query_w: c.gint = 0;
+            var query_h: c.gint = 0;
+            c.gtk_window_get_size(st.win, &query_w, &query_h);
+            const width: u32 = if (st.geom_width > 0)
+                st.geom_width
+            else if (query_w > 0)
+                @intCast(query_w)
+            else
+                0;
+            const height: u32 = if (st.geom_height > 0)
+                st.geom_height
+            else if (query_h > 0)
+                @intCast(query_h)
+            else
+                0;
+            return .{
+                .x = st.geom_x,
+                .y = st.geom_y,
+                .width = width,
+                .height = height,
+                .maximized = c.gtk_window_is_maximized(st.win) != 0,
+                .fullscreen = st.fullscreen,
+            };
+        }
+
+        fn saveWindowState(self: *Self, st: *WinState) void {
+            const key = st.state_key orelse return;
+            const root = self.appDataRoot() orelse return;
+            defer self.allocator.free(root);
+            const state = self.currentGeometry(st);
+            if (state.width == 0 or state.height == 0) return;
+            window_state.save(self.allocator, root, key, state) catch |err| {
+                log.print("[state] save failed: {s}", .{@errorName(err)});
+                return;
+            };
+            log.print("[state] saved window #{d} ({s}) {d},{d} {d}x{d} max={} full={}", .{
+                st.id, key, state.x, state.y, state.width, state.height, state.maximized, state.fullscreen,
+            });
+        }
+
+        fn restoreWindowState(self: *Self, st: *WinState) void {
+            const key = st.state_key orelse return;
+            const root = self.appDataRoot() orelse return;
+            defer self.allocator.free(root);
+            const state = (window_state.load(self.allocator, root, key) catch |err| {
+                log.print("[state] load failed: {s}", .{@errorName(err)});
+                return;
+            }) orelse return;
+            if (state.width == 0 or state.height == 0) return;
+            c.gtk_window_resize(st.win, @intCast(state.width), @intCast(state.height));
+            c.gtk_window_move(st.win, state.x, state.y);
+            st.geom_x = state.x;
+            st.geom_y = state.y;
+            st.geom_width = state.width;
+            st.geom_height = state.height;
+            if (state.maximized) c.gtk_window_maximize(st.win);
+            if (state.fullscreen) {
+                c.gtk_window_fullscreen(st.win);
+                st.fullscreen = true;
+            }
+            log.print("[state] restored window #{d} ({s}) {d},{d} {d}x{d} max={} full={}", .{
+                st.id, key, state.x, state.y, state.width, state.height, state.maximized, state.fullscreen,
+            });
+        }
+
+        fn runWindowStateOp(self: *Self, w: *WinState, op: system_api.WindowStateOp, alloc: std.mem.Allocator) !system_api.Result {
+            switch (op) {
+                .save => {
+                    self.saveWindowState(w);
+                    log.print("[window-state] saved on demand", .{});
+                    return .{ .ok = true };
+                },
+                .get => {
+                    const s = self.currentGeometry(w);
+                    return .{ .json = try std.fmt.allocPrint(
+                        alloc,
+                        "{{\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d},\"maximized\":{}}}",
+                        .{ s.x, s.y, s.width, s.height, s.maximized },
+                    ) };
+                },
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // 下载（v0.2.1）：WebKitWebContext::download-started → 目标路径 →
+        // received-data / finished / failed → webview.download_* 事件
+        // ------------------------------------------------------------------
+
+        /// 下载目标目录：显式 save_directory > $HOME/Downloads。
+        fn defaultDownloadDir(self: *Self) ![]u8 {
+            if (config.webview.downloads.save_directory) |dir| return self.allocator.dupe(u8, dir);
+            const home = std.c.getenv("HOME") orelse return error.DownloadDirUnavailable;
+            const safe = std.mem.span(home);
+            if (safe.len == 0) return error.DownloadDirUnavailable;
+            return std.fmt.allocPrint(self.allocator, "{s}/Downloads", .{safe});
+        }
+
+        /// 取 suggested filename 的最后一段（防目录穿越；空 → download-<id>）。
+        fn downloadFilename(self: *Self, suggested: []const u8, id: u64) ![]u8 {
+            const trimmed = std.mem.trim(u8, suggested, " \t\r\n");
+            const base = if (std.mem.lastIndexOfScalar(u8, trimmed, '/')) |i| trimmed[i + 1 ..] else trimmed;
+            if (base.len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) {
+                return std.fmt.allocPrint(self.allocator, "download-{d}", .{id});
+            }
+            return self.allocator.dupe(u8, base);
+        }
+
+        /// 目标文件已存在时追加 " (n)"（不静默覆盖；对齐 Windows 的显式目标语义）。
+        fn uniqueDownloadPath(self: *Self, dir: []const u8, name: []const u8) ![]u8 {
+            const first = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, name });
+            if (!window_state.fileExists(first)) return first;
+            defer self.allocator.free(first);
+            const dot = std.mem.lastIndexOfScalar(u8, name, '.');
+            var n: u32 = 1;
+            while (n < 1000) : (n += 1) {
+                const candidate = if (dot) |i|
+                    try std.fmt.allocPrint(self.allocator, "{s}/{s} ({d}){s}", .{ dir, name[0..i], n, name[i..] })
+                else
+                    try std.fmt.allocPrint(self.allocator, "{s}/{s} ({d})", .{ dir, name, n });
+                if (!window_state.fileExists(candidate)) return candidate;
+                self.allocator.free(candidate);
+            }
+            return error.DownloadDestinationExists;
+        }
+
+        /// show_dialog=true 时的原生保存对话框；取消返回 null。
+        fn chooseSavePath(self: *Self, suggested: []const u8) !?[]u8 {
+            const title_z = try dupeZ(self.allocator, "Save File");
+            defer self.allocator.free(title_z);
+            const dlg = c.gtk_file_chooser_dialog_new(
+                title_z.ptr,
+                null,
+                c.GTK_FILE_CHOOSER_ACTION_SAVE,
+                "_Cancel",
+                c.GTK_RESPONSE_CANCEL,
+                "_Save",
+                c.GTK_RESPONSE_ACCEPT,
+                @as(?*anyopaque, null),
+            );
+            if (dlg == null) return error.DialogFailed;
+            defer c.gtk_widget_destroy(dlg);
+            const chooser: [*c]c.GtkFileChooser = @ptrCast(dlg);
+            const name_z = try dupeZ(self.allocator, suggested);
+            defer self.allocator.free(name_z);
+            c.gtk_file_chooser_set_current_name(chooser, name_z.ptr);
+            c.gtk_file_chooser_set_do_overwrite_confirmation(chooser, 1);
+            if (c.gtk_dialog_run(@ptrCast(dlg)) != c.GTK_RESPONSE_ACCEPT) return null;
+            const chosen = c.gtk_file_chooser_get_filename(chooser);
+            if (chosen == null) return null;
+            defer c.g_free(@ptrCast(chosen));
+            return try self.allocator.dupe(u8, std.mem.span(chosen));
+        }
+
+        fn onDownloadStarted(_: [*c]c.WebKitWebContext, download: [*c]c.WebKitDownload, user_data: c.gpointer) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return));
+            if (!config.webview.downloads.enabled or download == null) return;
+
+            const id = self.next_download_id;
+            self.next_download_id += 1;
+
+            const req = c.webkit_download_get_request(download);
+            const uri_ptr = if (req != null) c.webkit_uri_request_get_uri(req) else null;
+            const url = if (uri_ptr != null) std.mem.span(uri_ptr) else "";
+
+            const resp = c.webkit_download_get_response(download);
+            const suggested_ptr = if (resp != null) c.webkit_uri_response_get_suggested_filename(resp) else null;
+            const suggested = if (suggested_ptr != null) std.mem.span(suggested_ptr) else "";
+            const content_length: u64 = if (resp != null) c.webkit_uri_response_get_content_length(resp) else 0;
+            const total: i64 = if (content_length > 0 and content_length <= std.math.maxInt(i64)) @intCast(content_length) else -1;
+
+            const name = self.downloadFilename(suggested, id) catch return;
+            defer self.allocator.free(name);
+
+            var path: ?[]u8 = null;
+            if (config.webview.downloads.show_dialog and config.webview.downloads.save_directory == null) {
+                path = self.chooseSavePath(name) catch null;
+                if (path == null) {
+                    // 用户取消保存对话框：取消下载且不发事件（等价于没开始过）
+                    c.webkit_download_cancel(download);
+                    log.print("[download] cancelled by save dialog", .{});
+                    return;
+                }
+            } else {
+                const dir = self.defaultDownloadDir() catch |err| {
+                    log.print("[download] no destination dir: {s}", .{@errorName(err)});
+                    c.webkit_download_cancel(download);
+                    return;
+                };
+                defer self.allocator.free(dir);
+                makeDirPath(self.allocator, dir);
+                path = self.uniqueDownloadPath(dir, name) catch |err| {
+                    log.print("[download] destination failed: {s}", .{@errorName(err)});
+                    c.webkit_download_cancel(download);
+                    return;
+                };
+            }
+            defer if (path) |p| self.allocator.free(p);
+            const dest = path orelse return;
+
+            const dest_z = dupeZ(self.allocator, dest) catch return;
+            defer self.allocator.free(dest_z);
+            c.webkit_download_set_destination(download, dest_z.ptr);
+
+            const d = self.allocator.create(Download) catch return;
+            d.* = .{ .backend = self, .id = id, .dl = download, .total = total };
+            self.downloads.append(self.allocator, d) catch {
+                self.allocator.destroy(d);
+                c.webkit_download_cancel(download);
+                return;
+            };
+            d.received_handler = c.g_signal_connect_data(@ptrCast(download), "received-data", @ptrCast(&Self.onDownloadReceived), d, null, 0);
+            d.finished_handler = c.g_signal_connect_data(@ptrCast(download), "finished", @ptrCast(&Self.onDownloadFinished), d, null, 0);
+            d.failed_handler = c.g_signal_connect_data(@ptrCast(download), "failed", @ptrCast(&Self.onDownloadFailed), d, null, 0);
+
+            log.print("[download] #{d} started: {s} -> {s} (total={d})", .{ id, url, dest, total });
+            self.emitDownloadStarted(d, url, dest);
+        }
+
+        fn onDownloadReceived(_: [*c]c.WebKitDownload, _: c.guint64, user_data: c.gpointer) callconv(.c) void {
+            const d: *Download = @ptrCast(@alignCast(user_data orelse return));
+            const received = c.webkit_download_get_received_data_length(d.dl);
+            // 节流：WebKit 每个数据块都发信号，只按 32KB 步进上报
+            if (received < d.last_progress + 32 * 1024) return;
+            d.last_progress = received;
+            d.backend.emitDownloadProgress(d, "webview.download_progress", 0);
+        }
+
+        fn onDownloadFinished(_: [*c]c.WebKitDownload, user_data: c.gpointer) callconv(.c) void {
+            const d: *Download = @ptrCast(@alignCast(user_data orelse return));
+            const received = c.webkit_download_get_received_data_length(d.dl);
+            d.backend.disconnectDownloadSignals(d);
+            log.print("[download] #{d} completed ({d}/{d} bytes)", .{ d.id, received, d.total });
+            d.backend.emitDownloadProgress(d, "webview.download_completed", received);
+            d.backend.removeDownload(d);
+        }
+
+        fn onDownloadFailed(_: [*c]c.WebKitDownload, err: [*c]c.GError, user_data: c.gpointer) callconv(.c) void {
+            const d: *Download = @ptrCast(@alignCast(user_data orelse return));
+            const received = c.webkit_download_get_received_data_length(d.dl);
+            d.backend.disconnectDownloadSignals(d);
+            const reason = if (err != null) std.mem.span(err.*.message) else "unknown";
+            log.print("[download] #{d} failed: {s}", .{ d.id, reason });
+            d.backend.emitDownloadProgress(d, "webview.download_failed", received);
+            d.backend.removeDownload(d);
+        }
+
+        /// 终止事件后立刻断开三个信号（重复调用安全）。
+        fn disconnectDownloadSignals(self: *Self, d: *Download) void {
+            _ = self;
+            if (d.received_handler != 0) {
+                c.g_signal_handler_disconnect(@ptrCast(d.dl), d.received_handler);
+                d.received_handler = 0;
+            }
+            if (d.finished_handler != 0) {
+                c.g_signal_handler_disconnect(@ptrCast(d.dl), d.finished_handler);
+                d.finished_handler = 0;
+            }
+            if (d.failed_handler != 0) {
+                c.g_signal_handler_disconnect(@ptrCast(d.dl), d.failed_handler);
+                d.failed_handler = 0;
+            }
+        }
+
+        fn emitDownloadStarted(self: *Self, d: *Download, url: []const u8, path: []const u8) void {
+            const w = self.windowForView(c.webkit_download_get_web_view(d.dl)) orelse return;
+            const url_json = std.json.Stringify.valueAlloc(self.allocator, url, .{}) catch return;
+            defer self.allocator.free(url_json);
+            const path_json = std.json.Stringify.valueAlloc(self.allocator, path, .{}) catch return;
+            defer self.allocator.free(path_json);
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"url\":{s},\"path\":{s}}}", .{ d.id, url_json, path_json }) catch return;
+            defer self.allocator.free(payload);
+            const msg = ipc.encodeEvent(self.allocator, "webview.download_started", payload) catch return;
+            defer self.allocator.free(msg);
+            self.deliverAlloc(w.view, msg);
+        }
+
+        /// 进度/完成/失败三类事件（payload 与 Windows 对齐：
+        /// {id, received, total, interrupt_reason}；失败时 interrupt_reason=1）。
+        fn emitDownloadProgress(self: *Self, d: *Download, name: []const u8, received_override: u64) void {
+            const w = self.windowForView(c.webkit_download_get_web_view(d.dl)) orelse return;
+            const received = if (received_override != 0) received_override else c.webkit_download_get_received_data_length(d.dl);
+            const interrupt: u8 = if (std.mem.endsWith(u8, name, "failed")) 1 else 0;
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"received\":{d},\"total\":{d},\"interrupt_reason\":{d}}}", .{ d.id, received, d.total, interrupt }) catch return;
+            defer self.allocator.free(payload);
+            const msg = ipc.encodeEvent(self.allocator, name, payload) catch return;
+            defer self.allocator.free(msg);
+            self.deliverAlloc(w.view, msg);
+        }
+
+        fn removeDownload(self: *Self, d: *Download) void {
+            for (self.downloads.items, 0..) |item, i| {
+                if (item == d) {
+                    _ = self.downloads.swapRemove(i);
+                    break;
+                }
+            }
+            self.allocator.destroy(d);
+        }
+
+        fn cancelDownload(self: *Self, id: u64) !void {
+            for (self.downloads.items) |d| {
+                if (d.id != id) continue;
+                c.webkit_download_cancel(d.dl);
+                log.print("[download] #{d} cancel requested", .{id});
+                return;
+            }
+            return error.UnknownDownload;
+        }
+
+        /// 下载/子 WebView 事件的目标窗口：按发起下载的 WebView 反查注册表，
+        /// 找不到时退回主窗口（对齐 Windows 的「事件回发起窗口」语义）。
+        fn windowForView(self: *Self, view: [*c]c.WebKitWebView) ?*WinState {
+            if (view != null) {
+                for (self.windows.items) |st| {
+                    if (st.view == view) return st;
+                    for (st.child_webviews.items) |cv| {
+                        if (cv.view == view) return st;
+                    }
+                }
+            }
+            if (self.windows.items.len == 0) return null;
+            return self.windowById(0);
         }
 
         // ------------------------------------------------------------------
@@ -1129,10 +1580,372 @@ fn Backend(comptime config: Config) type {
                     }
                 },
                 .eval => |e| return self.syncEval(view, alloc, e.script),
-                // 后续切片：print/cdp/下载/cookies/clear_storage
-                .print, .cdp, .cancel_download, .cookies, .clear_storage => return error.NotSupported,
+                // v0.2.1：cookies / clear_storage / 截图 / 取消下载
+                .cookies => |op| return self.cookiesOp(w, op, alloc),
+                .clear_storage => |clear| return self.clearStorageOp(w, clear, alloc),
+                .cancel_download => |id| {
+                    try self.cancelDownload(id);
+                    return try alloc.dupe(u8, "null");
+                },
+                // CDP 逃生口：Linux 只支持截图（WebKit 无 CDP 通道）。
+                // 其余方法明确 NotSupported（能力矩阵里 Linux 也不含 cdp）。
+                .cdp => |cdp| {
+                    if (!std.mem.eql(u8, cdp.method, "Page.captureScreenshot")) return error.NotSupported;
+                    try self.startSnapshot(w, cdp.rid);
+                    return try alloc.dupe(u8, "{}");
+                },
+                .print => return error.NotSupported,
             }
             return try alloc.dupe(u8, "null");
+        }
+
+        // ------------------------------------------------------------------
+        // cookies / clear_storage（v0.2.1）
+        // ------------------------------------------------------------------
+
+        fn cookieManagerFor(w: *WinState) [*c]c.WebKitCookieManager {
+            const ctx = c.webkit_web_view_get_context(w.view);
+            if (ctx == null) return null;
+            return c.webkit_web_context_get_cookie_manager(ctx);
+        }
+
+        /// 请求未带 URL 时用窗口入口 URL；host 用于 domain 推导。
+        fn cookieUrl(self: *Self, w: *WinState, url: ?[]const u8, buf: *std.ArrayListUnmanaged(u8)) ![]const u8 {
+            const raw = url orelse w.app_url;
+            try buf.appendSlice(self.allocator, raw);
+            return buf.items;
+        }
+
+        fn cookiesOp(self: *Self, w: *WinState, op: webview.Cookies, alloc: std.mem.Allocator) ![]u8 {
+            const mgr = cookieManagerFor(w) orelse return error.WebViewCallFailed;
+            switch (op) {
+                .get => |g| {
+                    var url_buf: std.ArrayListUnmanaged(u8) = .empty;
+                    defer url_buf.deinit(self.allocator);
+                    const url = try self.cookieUrl(w, g.url, &url_buf);
+                    const url_z = try dupeZ(self.allocator, url);
+                    defer self.allocator.free(url_z);
+
+                    var task = WaitTask{ .backend = self };
+                    task.loop = c.g_main_loop_new(null, 0) orelse return error.WebViewCallFailed;
+                    defer c.g_main_loop_unref(task.loop);
+                    c.webkit_cookie_manager_get_cookies(mgr, url_z.ptr, null, cookiesGetDone, &task);
+                    c.g_main_loop_run(task.loop.?);
+
+                    const json = task.json orelse return error.WebViewCallFailed;
+                    defer self.allocator.free(json);
+                    return try alloc.dupe(u8, json);
+                },
+                .set => |cookie| {
+                    const built = try self.buildSoupCookie(w, cookie);
+                    defer c.soup_cookie_free(built);
+                    return self.runCookieWrite(mgr, built, alloc);
+                },
+                .delete => |del| {
+                    const built = try self.buildSoupCookie(w, .{
+                        .name = del.name,
+                        .value = "",
+                        .url = del.url,
+                        .domain = del.domain,
+                        .path = del.path orelse "/",
+                    });
+                    defer c.soup_cookie_free(built);
+                    // 删除走同一 add/delete 二选一完成回调
+                    return self.runCookieDelete(mgr, built, alloc);
+                },
+                .clear => |clear| {
+                    var url_buf: std.ArrayListUnmanaged(u8) = .empty;
+                    defer url_buf.deinit(self.allocator);
+                    const url = try self.cookieUrl(w, clear.origin, &url_buf);
+                    const host = hostOf(url) orelse return error.InvalidCookie;
+                    const host_z = try dupeZ(self.allocator, host);
+                    defer self.allocator.free(host_z);
+                    c.webkit_cookie_manager_delete_cookies_for_domain(mgr, host_z.ptr);
+                    log.print("[cookies] cleared domain '{s}'", .{host});
+                    return try alloc.dupe(u8, "null");
+                },
+            }
+        }
+
+        /// 构造 SoupCookie：domain/path 从 URL 与参数补齐（libsoup 要求 domain 非空）。
+        fn buildSoupCookie(self: *Self, w: *WinState, cookie: webview.Cookie) !*c.SoupCookie {
+            var url_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer url_buf.deinit(self.allocator);
+            const url = try self.cookieUrl(w, cookie.url, &url_buf);
+            const host = cookie.domain orelse hostOf(url) orelse return error.InvalidCookie;
+            const path = if (cookie.path.len > 0) cookie.path else "/";
+            const max_age: c_int = if (cookie.expires) |expires| blk: {
+                if (!std.math.isFinite(expires)) return error.InvalidCookie;
+                const now: f64 = @as(f64, @floatFromInt(c.g_get_real_time())) / 1_000_000.0;
+                const delta = @max(0, expires - now);
+                break :blk @intFromFloat(@min(delta, 2147483647.0));
+            } else -1;
+
+            const name_z = try dupeZ(self.allocator, cookie.name);
+            defer self.allocator.free(name_z);
+            const value_z = try dupeZ(self.allocator, cookie.value);
+            defer self.allocator.free(value_z);
+            const domain_z = try dupeZ(self.allocator, host);
+            defer self.allocator.free(domain_z);
+            const path_z = try dupeZ(self.allocator, path);
+            defer self.allocator.free(path_z);
+
+            const built = c.soup_cookie_new(name_z.ptr, value_z.ptr, domain_z.ptr, path_z.ptr, max_age) orelse
+                return error.InvalidCookie;
+            if (cookie.secure) c.soup_cookie_set_secure(built, 1);
+            if (cookie.http_only) c.soup_cookie_set_http_only(built, 1);
+            if (cookie.same_site) |same_site| {
+                c.soup_cookie_set_same_site_policy(built, switch (same_site) {
+                    .Strict => c.SOUP_SAME_SITE_POLICY_STRICT,
+                    .Lax => c.SOUP_SAME_SITE_POLICY_LAX,
+                    .None => c.SOUP_SAME_SITE_POLICY_NONE,
+                });
+            }
+            return built;
+        }
+
+        fn runCookieWrite(self: *Self, mgr: [*c]c.WebKitCookieManager, cookie: *c.SoupCookie, alloc: std.mem.Allocator) ![]u8 {
+            var task = WaitTask{ .backend = self };
+            task.loop = c.g_main_loop_new(null, 0) orelse return error.WebViewCallFailed;
+            defer c.g_main_loop_unref(task.loop);
+            c.webkit_cookie_manager_add_cookie(mgr, cookie, null, cookieWriteDone, &task);
+            c.g_main_loop_run(task.loop.?);
+            if (task.failed) return error.WebViewCallFailed;
+            return try alloc.dupe(u8, "null");
+        }
+
+        fn runCookieDelete(self: *Self, mgr: [*c]c.WebKitCookieManager, cookie: *c.SoupCookie, alloc: std.mem.Allocator) ![]u8 {
+            var task = WaitTask{ .backend = self };
+            task.loop = c.g_main_loop_new(null, 0) orelse return error.WebViewCallFailed;
+            defer c.g_main_loop_unref(task.loop);
+            c.webkit_cookie_manager_delete_cookie(mgr, cookie, null, cookieDeleteDone, &task);
+            c.g_main_loop_run(task.loop.?);
+            if (task.failed) return error.WebViewCallFailed;
+            return try alloc.dupe(u8, "null");
+        }
+
+        fn cookiesGetDone(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
+            const task: *WaitTask = @ptrCast(@alignCast(user_data orelse return));
+            const mgr: [*c]c.WebKitCookieManager = @ptrCast(source);
+            var err: [*c]c.GError = null;
+            const list = c.webkit_cookie_manager_get_cookies_finish(mgr, res, &err);
+            if (err != null) {
+                c.g_error_free(err);
+                task.failed = true;
+            } else {
+                task.json = cookiesJson(task.backend.allocator, list);
+                if (task.json == null) task.failed = true;
+            }
+            if (list != null) {
+                var it: ?*c.GList = list;
+                while (it) |node| : (it = node.*.next) {
+                    if (node.*.data) |data| c.soup_cookie_free(@ptrCast(data));
+                }
+                c.g_list_free(list);
+            }
+            if (task.loop) |loop| c.g_main_loop_quit(loop);
+        }
+
+        fn cookieWriteDone(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
+            const task: *WaitTask = @ptrCast(@alignCast(user_data orelse return));
+            const mgr: [*c]c.WebKitCookieManager = @ptrCast(source);
+            var err: [*c]c.GError = null;
+            if (c.webkit_cookie_manager_add_cookie_finish(mgr, res, &err) == 0) task.failed = true;
+            if (err != null) c.g_error_free(err);
+            if (task.loop) |loop| c.g_main_loop_quit(loop);
+        }
+
+        fn cookieDeleteDone(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
+            const task: *WaitTask = @ptrCast(@alignCast(user_data orelse return));
+            const mgr: [*c]c.WebKitCookieManager = @ptrCast(source);
+            var err: [*c]c.GError = null;
+            if (c.webkit_cookie_manager_delete_cookie_finish(mgr, res, &err) == 0) task.failed = true;
+            if (err != null) c.g_error_free(err);
+            if (task.loop) |loop| c.g_main_loop_quit(loop);
+        }
+
+        fn cookiesJson(alloc: std.mem.Allocator, list: ?*c.GList) ?[]u8 {
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer out.deinit(alloc);
+            out.appendSlice(alloc, "{\"cookies\":[") catch return null;
+            var it: ?*c.GList = list;
+            var first = true;
+            while (it) |node| : (it = node.*.next) {
+                const ck: *c.SoupCookie = @ptrCast(node.*.data orelse continue);
+                if (!first) out.append(alloc, ',') catch return null;
+                first = false;
+
+                const name = c.soup_cookie_get_name(ck);
+                const value = c.soup_cookie_get_value(ck);
+                const domain = c.soup_cookie_get_domain(ck);
+                const path = c.soup_cookie_get_path(ck);
+                const name_json = jsonStr(alloc, if (name != null) std.mem.span(name) else "") orelse return null;
+                defer alloc.free(name_json);
+                const value_json = jsonStr(alloc, if (value != null) std.mem.span(value) else "") orelse return null;
+                defer alloc.free(value_json);
+                const domain_json = jsonStr(alloc, if (domain != null) std.mem.span(domain) else "") orelse return null;
+                defer alloc.free(domain_json);
+                const path_json = jsonStr(alloc, if (path != null) std.mem.span(path) else "/") orelse return null;
+                defer alloc.free(path_json);
+
+                const same_site: []const u8 = switch (c.soup_cookie_get_same_site_policy(ck)) {
+                    c.SOUP_SAME_SITE_POLICY_STRICT => "Strict",
+                    c.SOUP_SAME_SITE_POLICY_LAX => "Lax",
+                    else => "None",
+                };
+                var expires_buf: [32]u8 = undefined;
+                var expires_json: []const u8 = "";
+                if (c.soup_cookie_get_expires(ck)) |dt| {
+                    defer c.g_date_time_unref(dt);
+                    expires_json = std.fmt.bufPrint(&expires_buf, ",\"expires\":{d}", .{c.g_date_time_to_unix(dt)}) catch "";
+                }
+
+                const item = std.fmt.allocPrint(
+                    alloc,
+                    "{{\"name\":{s},\"value\":{s},\"domain\":{s},\"path\":{s},\"secure\":{s},\"httpOnly\":{s},\"sameSite\":\"{s}\"{s}}}",
+                    .{
+                        name_json,
+                        value_json,
+                        domain_json,
+                        path_json,
+                        boolStr(c.soup_cookie_get_secure(ck) != 0),
+                        boolStr(c.soup_cookie_get_http_only(ck) != 0),
+                        same_site,
+                        expires_json,
+                    },
+                ) catch return null;
+                defer alloc.free(item);
+                out.appendSlice(alloc, item) catch return null;
+            }
+            out.appendSlice(alloc, "]}") catch return null;
+            return out.toOwnedSlice(alloc) catch null;
+        }
+
+        /// clear_storage：WebKit 的 clear 是「全部来源」，origin 参数仅作记录
+        ///（Windows 侧可按 origin 精确清理，Linux 为超集语义，已在文档标注）。
+        fn clearStorageOp(self: *Self, w: *WinState, clear: webview.ClearStorage, alloc: std.mem.Allocator) ![]u8 {
+            const ctx = c.webkit_web_view_get_context(w.view);
+            if (ctx == null) return error.WebViewCallFailed;
+            const mgr = c.webkit_web_context_get_website_data_manager(ctx);
+            if (mgr == null) return error.WebViewCallFailed;
+
+            var types: c.WebKitWebsiteDataTypes = 0;
+            if (clear.local_storage) types |= c.WEBKIT_WEBSITE_DATA_LOCAL_STORAGE | c.WEBKIT_WEBSITE_DATA_SESSION_STORAGE;
+            if (clear.indexed_db) types |= c.WEBKIT_WEBSITE_DATA_INDEXEDDB_DATABASES;
+            if (clear.cache) {
+                types |= c.WEBKIT_WEBSITE_DATA_MEMORY_CACHE |
+                    c.WEBKIT_WEBSITE_DATA_DISK_CACHE |
+                    c.WEBKIT_WEBSITE_DATA_SERVICE_WORKER_REGISTRATIONS |
+                    c.WEBKIT_WEBSITE_DATA_DOM_CACHE;
+            }
+            if (clear.cookies) types |= c.WEBKIT_WEBSITE_DATA_COOKIES;
+            if (types == 0) return try alloc.dupe(u8, "null");
+
+            var task = WaitTask{ .backend = self };
+            task.loop = c.g_main_loop_new(null, 0) orelse return error.WebViewCallFailed;
+            defer c.g_main_loop_unref(task.loop);
+            c.webkit_website_data_manager_clear(mgr, types, 0, null, clearStorageDone, &task);
+            c.g_main_loop_run(task.loop.?);
+            if (task.failed) return error.WebViewCallFailed;
+
+            const origin: []const u8 = clear.origin orelse "(all)";
+            log.print("[storage] cleared types=0x{x} origin={s}", .{ types, origin });
+            return try alloc.dupe(u8, "null");
+        }
+
+        fn clearStorageDone(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
+            const task: *WaitTask = @ptrCast(@alignCast(user_data orelse return));
+            const mgr: [*c]c.WebKitWebsiteDataManager = @ptrCast(source);
+            var err: [*c]c.GError = null;
+            if (c.webkit_website_data_manager_clear_finish(mgr, res, &err) == 0) task.failed = true;
+            if (err != null) c.g_error_free(err);
+            if (task.loop) |loop| c.g_main_loop_quit(loop);
+        }
+
+        // ------------------------------------------------------------------
+        // 截图（v0.2.1）：WebKit 无 CDP → 用 cairo 快照实现 Page.captureScreenshot
+        // ------------------------------------------------------------------
+
+        fn startSnapshot(self: *Self, w: *WinState, rid: i64) !void {
+            const task = try self.allocator.create(SnapshotTask);
+            errdefer self.allocator.destroy(task);
+            task.* = .{ .backend = self, .win_id = w.id, .rid = rid };
+            c.webkit_web_view_get_snapshot(
+                w.view,
+                c.WEBKIT_SNAPSHOT_REGION_VISIBLE,
+                c.WEBKIT_SNAPSHOT_OPTIONS_NONE,
+                null,
+                snapshotDone,
+                task,
+            );
+        }
+
+        fn snapshotDone(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
+            const task: *SnapshotTask = @ptrCast(@alignCast(user_data orelse return));
+            const self = task.backend;
+            defer self.allocator.destroy(task);
+            const view: [*c]c.WebKitWebView = @ptrCast(source);
+
+            var err: [*c]c.GError = null;
+            const surface = c.webkit_web_view_get_snapshot_finish(view, res, &err);
+            if (err != null or surface == null) {
+                const message = if (err != null) std.mem.span(err.*.message) else "snapshot failed";
+                if (err != null) c.g_error_free(err);
+                log.print("[snapshot] failed: {s}", .{message});
+                return self.emitCdpError(task.win_id, task.rid, message);
+            }
+            defer c.cairo_surface_destroy(surface);
+
+            const stream = c.g_memory_output_stream_new_resizable();
+            if (stream == null) return self.emitCdpError(task.win_id, task.rid, "snapshot stream failed");
+            defer c.g_object_unref(@ptrCast(stream));
+            const status = c.cairo_surface_write_to_png_stream(surface, pngWrite, stream);
+            if (status != c.CAIRO_STATUS_SUCCESS) return self.emitCdpError(task.win_id, task.rid, "png encode failed");
+
+            const raw: [*c]u8 = @ptrCast(c.g_memory_output_stream_get_data(@ptrCast(stream)));
+            const size: usize = @intCast(c.g_memory_output_stream_get_size(@ptrCast(stream)));
+            if (raw == null or size == 0) return self.emitCdpError(task.win_id, task.rid, "empty snapshot");
+
+            const encoder = std.base64.standard.Encoder;
+            const encoded = self.allocator.alloc(u8, encoder.calcSize(size)) catch return;
+            defer self.allocator.free(encoded);
+            _ = encoder.encode(encoded, raw[0..size]);
+            log.print("[snapshot] {d} bytes -> base64 {d} chars", .{ size, encoded.len });
+            self.emitCdpOk(task.win_id, task.rid, encoded);
+        }
+
+        /// cairo 的 PNG 写出回调（closure = GMemoryOutputStream）。
+        fn pngWrite(closure: ?*anyopaque, data: [*c]const u8, length: c_uint) callconv(.c) c.cairo_status_t {
+            const stream: [*c]c.GOutputStream = @ptrCast(@alignCast(closure orelse return c.CAIRO_STATUS_WRITE_ERROR));
+            var written: c.gsize = 0;
+            if (c.g_output_stream_write_all(stream, data, length, &written, null, null) == 0) return c.CAIRO_STATUS_WRITE_ERROR;
+            if (written != length) return c.CAIRO_STATUS_WRITE_ERROR;
+            return c.CAIRO_STATUS_SUCCESS;
+        }
+
+        fn emitCdpOk(self: *Self, win_id: u32, rid: i64, base64_data: []const u8) void {
+            const payload = std.fmt.allocPrint(
+                self.allocator,
+                "{{\"rid\":{d},\"ok\":true,\"result\":{{\"data\":\"{s}\"}}}}",
+                .{ rid, base64_data },
+            ) catch return;
+            defer self.allocator.free(payload);
+            self.emitRawToWindow(win_id, "webviewCdp", payload);
+        }
+
+        fn emitCdpError(self: *Self, win_id: u32, rid: i64, message: []const u8) void {
+            const msg_json = jsonStr(self.allocator, message) orelse return;
+            defer self.allocator.free(msg_json);
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"rid\":{d},\"ok\":false,\"error\":{s}}}", .{ rid, msg_json }) catch return;
+            defer self.allocator.free(payload);
+            self.emitRawToWindow(win_id, "webviewCdp", payload);
+        }
+
+        fn emitRawToWindow(self: *Self, win_id: u32, name: []const u8, payload: []const u8) void {
+            const w = self.windowById(win_id) orelse return;
+            const msg = ipc.encodeEvent(self.allocator, name, payload) catch return;
+            defer self.allocator.free(msg);
+            self.deliverAlloc(w.view, msg);
         }
 
         // ------------------------------------------------------------------
@@ -1149,6 +1962,7 @@ fn Backend(comptime config: Config) type {
             const w = self.windowById(window_id) orelse return error.WindowNotFound;
             switch (req) {
                 .webviews => |op| return self.runWebviewsOp(w, op, alloc),
+                .window_state => |op| return self.runWindowStateOp(w, op, alloc),
                 // 菜单/托盘/快捷键/http/ws/fs/... 属 v0.2.2–v0.2.3；NotSupported
                 // 与 Windows 的降级语义同构（platform/interface.zig 契约不受影响）
                 else => return error.NotSupported,
@@ -1650,6 +2464,8 @@ fn Backend(comptime config: Config) type {
                 st.label,
                 st.child_webviews.items.len,
             });
+            // 先落盘窗口状态（destroy 期间控件仍在，几何可查）
+            self.saveWindowState(st);
             self.freeWindowState(st);
             // 父销毁级联关子窗口（子窗口的 destroy 会重入本回调并自行摘除）
             while (self.findWindowByParent(closed_id)) |child| {
@@ -1661,6 +2477,22 @@ fn Backend(comptime config: Config) type {
                 log.print("[linux] all windows destroyed -> quit main loop", .{});
                 c.gtk_main_quit();
             }
+        }
+
+        /// configure-event：跟踪窗口几何（destroy 时保存窗口状态用）。
+        /// 返回 FALSE 表示继续传播给 GTK 默认处理。
+        /// 注意：translate-c 里 `GdkEvent` 是不透明 union，信号参数只能按
+        /// `?*anyopaque` 接、再转成具体的 GdkEventConfigure。
+        fn onConfigureEvent(_: [*c]c.GtkWidget, event: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
+            const st: *WinState = @ptrCast(@alignCast(user_data orelse return 0));
+            const cfg: [*c]c.GdkEventConfigure = @ptrCast(@alignCast(event orelse return 0));
+            if (cfg.*.width > 0 and cfg.*.height > 0) {
+                st.geom_x = cfg.*.x;
+                st.geom_y = cfg.*.y;
+                st.geom_width = @intCast(cfg.*.width);
+                st.geom_height = @intCast(cfg.*.height);
+            }
+            return 0;
         }
 
         /// GtkOverlay 的 get-child-position：子 WebView 按存储的布局矩形放置。
@@ -1726,6 +2558,15 @@ test "entryPath: 常见 config.url 形态" {
     // 没有 scheme 的畸形输入不应 panic：退回默认入口
     try testing.expectEqualStrings("/index.html", entryPath(""));
     try testing.expectEqualStrings("/index.html", entryPath("a.html"));
+}
+
+test "hostOf: URL host、端口与 IPv6 字面量" {
+    try testing.expectEqualStrings("example.com", hostOf("https://example.com/a?b=1").?);
+    try testing.expectEqualStrings("example.com", hostOf("https://user:pw@example.com:8443/x").?);
+    try testing.expectEqualStrings("[::1]", hostOf("http://[::1]:8080/x").?);
+    try testing.expectEqualStrings("app", hostOf("zilt://app/index.html").?);
+    try testing.expect(hostOf("about:blank") == null);
+    try testing.expect(hostOf("https:///x") == null);
 }
 
 test "reasonFor: 状态码有可读短语" {

@@ -11,7 +11,7 @@
 // keep-above 的实际置顶、geometry hint 的强制执行）不可断言——只断言客户端
 // 可查字段（size/position/tracked 标志）与命令返回值。
 //
-// 刻意不测：剪贴板 / 通知 / 对话框 / 下载（v0.2.2–v0.2.3 才实现）。
+// 刻意不测：剪贴板 / 通知 / 对话框（v0.2.2 才实现）。
 //
 // reload 刻意不做探测：报告 invoke 刚 post 就导航，消息会在导航中丢失
 // （实测导致「reload → 脚本重跑 → 再 reload」无限循环）；且 reload 与 stop
@@ -227,6 +227,18 @@ function runSecondWindowProbe() {
     let printErr = '';
     try { await V.print('browser'); } catch (e) { printErr = String(e.message || e); }
     check('webview.unimpl', printErr === 'NotSupported', printErr);
+
+    // 截图：runtime 的 captureScreenshot 走 cdp Page.captureScreenshot，
+    // Linux 用 webkit_web_view_get_snapshot + cairo PNG 实现（返回 data URL）
+    const shot = await V.captureScreenshot({ format: 'png' });
+    check('screenshot', typeof shot === 'string' && shot.startsWith('data:image/png;base64,') && shot.length > 2000,
+      typeof shot === 'string' ? shot.length : String(shot));
+
+    // cookies：URL 作用域的读取 + 按域名清理（示例 origin，无网络请求）
+    const ck = await V.getCookies('https://example.com/');
+    const clearedCookies = await V.clearCookies('https://example.com');
+    check('cookies', ck && Array.isArray(ck.cookies) && clearedCookies !== false,
+      `get=${JSON.stringify(ck).slice(0, 80)} clear=${clearedCookies}`);
   } catch (e) { check('eval', false, String(e.message || e)); }
 
   // ---- v0.2.1 切片 3：多窗口（spawn_window_fn + 窗口注册表）----
@@ -236,7 +248,9 @@ function runSecondWindowProbe() {
       title: 'Zilt Linux 多窗口冒烟',
       width: 420, height: 320,
       url: 'https://zilt.app/second.html',
-      label: 'smoke-second',
+      // 唯一 label：demo 配置 persist_window_state=true，固定 label 会把上一轮的
+      // 尺寸（如 setSize 后的 440x340）恢复进新窗口，污染本次断言。
+      label: 'smoke-second-' + Date.now(),
     });
     spawnedWinId = created && created.id;
     check('multiwin.create', typeof spawnedWinId === 'number' && spawnedWinId > 1, JSON.stringify(created));
@@ -267,6 +281,49 @@ function runSecondWindowProbe() {
     try { await W.state(spawnedWinId); } catch (e) { gone = String(e.message).includes('WindowNotAvailable'); }
     check('multiwin.close', gone, String(gone));
   } catch (e) { check('multiwin.state', false, String(e.message || e)); }
+
+  // ---- v0.2.1：窗口状态持久化（state_key → 关闭时保存 → 同 key 新窗口恢复）----
+  try {
+    const W = Z().window;
+    const key = 'smoke-window-state';
+    const first = await W.create({
+      title: 'Zilt Linux 状态持久化 A',
+      width: 300, height: 200,
+      url: 'about:blank',
+      label: 'smoke-state-a',
+      stateKey: key,
+    });
+    if (!first || !first.id) throw new Error('create A failed: ' + JSON.stringify(first));
+    // 窗口刚 show 时初始尺寸请求可能还在队列里 → 等一拍再做 resize/move（否则被初始
+    // configure 覆盖，实测保存下来的是创建尺寸）
+    await wait(250);
+    await W.setSize(360, 240, first.id);
+    await W.setPosition(70, 50, first.id);
+    await wait(250);
+    const before = await W.state(first.id);
+    await W.close(first.id);
+    await wait(250);
+
+    // 同 state_key 的新窗口：创建时应恢复上次关闭时的几何
+    const second = await W.create({
+      title: 'Zilt Linux 状态持久化 B',
+      width: 300, height: 200,
+      url: 'about:blank',
+      label: 'smoke-state-b',
+      stateKey: key,
+    });
+    const restored = second && second.id ? await W.state(second.id) : null;
+    const ok = !!restored && restored.width === 360 && restored.height === 240 && restored.x === 70 && restored.y === 50;
+    if (second && second.id) await W.close(second.id);
+    check('winstate.restore', ok,
+      `before=${JSON.stringify(before).slice(0, 90)} restored=${JSON.stringify(restored).slice(0, 90)}`);
+
+    // windowState.get / save：主窗口（persist_window_state=true → state_key=main）
+    const ws = await Z().windowState.get();
+    const saved = await Z().windowState.save();
+    check('winstate.api', !!ws && typeof ws.width === 'number' && ws.width > 0 && saved === true,
+      `${JSON.stringify(ws).slice(0, 100)} save=${saved}`);
+  } catch (e) { check('winstate.restore', false, String(e.message || e)); }
 
   // ---- v0.2.1 切片 3：子 WebView（system_fn 的 .webviews 通道）----
   try {
@@ -353,6 +410,50 @@ function runSecondWindowProbe() {
       ? 'partition ok (alpha/beta 隔离 + 同分区复用 + 共享 context 互通)'
       : `settle=${sA},${sB},${sS},${sA2} A=${writeA} B0=${readB} B=${writeB} A2=${readA2} dup=${readA2dup} S=${writeS} main=${readMain} back=${readBackInShared} parts=${JSON.stringify(parts)}`);
   } catch (e) { check('partition.isolation', false, String(e.message || e)); }
+
+  // ---- v0.2.1：下载（download-started → completed 事件 + 目标路径）----
+  try {
+    const events = await new Promise((resolve) => {
+      const seen = [];
+      const offs = [];
+      const finish = () => { for (const off of offs) off(); resolve(seen); };
+      offs.push(Z().on('webview.download_started', (p) => seen.push({ k: 'start', p })));
+      offs.push(Z().on('webview.download_progress', (p) => seen.push({ k: 'progress', p })));
+      offs.push(Z().on('webview.download_completed', (p) => { seen.push({ k: 'done', p }); finish(); }));
+      offs.push(Z().on('webview.download_failed', (p) => { seen.push({ k: 'fail', p }); finish(); }));
+      // data: URL + download 属性触发一次真实下载（demo 配置 show_dialog=false
+      // → 落到 $HOME/Downloads，无需人工交互）。
+      // 实测：zilt://（自定义 scheme）下载会被 WebKit 拒绝（"The URL can't be
+      // shown"），所以用 data: URL；它的 suggested filename 为空 → 走
+      // download-<id> 兜底命名。
+      const a = document.createElement('a');
+      a.href = 'data:text/plain;base64,' + btoa('zilt-linux-download');
+      a.download = 'zilt-smoke-download.txt';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(finish, 8000);
+    });
+    const start = events.find((e) => e.k === 'start');
+    const done = events.find((e) => e.k === 'done');
+    // data: URL 没有 suggested filename → 目标名走 download-<id> 兜底；
+    // 重复运行会命中重名策略（追加 " (n)"）。断言落在 Downloads 目录。
+    const started = !!start && typeof start.p.id === 'number' &&
+      /\/Downloads\/(zilt-smoke-download\.txt|download-\d+( \(\d+\))?)$/.test(start.p.path || '');
+    const completed = !!done && done.p.received > 0 && done.p.id === (start && start.p.id);
+    check('download', started && completed, JSON.stringify(events).slice(0, 240));
+
+    // 未知下载 id：稳定返回 UnknownDownload（不清空/不崩溃）
+    let cancelErr = '';
+    try { await Z().webview.cancelDownload(999999); } catch (e) { cancelErr = String(e.message || e); }
+    check('download.cancel', cancelErr === 'UnknownDownload', cancelErr);
+  } catch (e) { check('download', false, String(e.message || e)); }
+
+  // ---- v0.2.1：clearStorage（WebKitWebsiteDataManager::clear）----
+  try {
+    const st = await Z().webview.clearStorage();
+    check('storage.clear', st !== false, JSON.stringify(st));
+  } catch (e) { check('storage.clear', false, String(e.message || e)); }
 
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {

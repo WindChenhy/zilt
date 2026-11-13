@@ -110,7 +110,7 @@
       - [ ] Linux 后端实现（GTK3 + WebKit2GTK 4.1）：`g_application_run` + `WebKitWebView`
             + scheme 资产 + IPC 桥，再补窗口/系统集成
       - [ ] `zilt doctor` Linux 依赖检查（随 cli 移植）
-- [x] **v0.2.1 窗口/WebView 面**（2026-11-14；Linux 侧三切片，平台无关层零改动）：
+- [x] **v0.2.1 窗口/WebView 面**（2026-11-13；Linux 侧四切片，平台无关层零改动）：
       - [x] 切片 1 窗口 API（3c330b9）：`window_fn`/`window_query_fn` 全套基础动作；
             未实现项返回 false（错误语义对齐 Windows）；冒烟 9 → 20 项
       - [x] 切片 2 WebView 面（761d165）：`webview_request_fn`（reload/stop/zoom/
@@ -125,8 +125,24 @@
             冒烟 26 → 33 项（多窗口 E2E + alpha/beta 分区隔离 + 同分区复用 +
             共享 context 互通），逐项检查落 Zig 日志
             （踩坑与验证记录见 `docs/v0.2-LINUX.md` §v0.2.1 实施记录）
-      - [ ] 下载（WebKitDownload）/ clear_storage / cookies / print / 截图 /
-            窗口状态持久化——Linux 侧暂 NotSupported/false（v0.2.2+）
+      - [x] 切片 4（2026-11-13）WebView 数据面 + 窗口状态持久化：
+            **下载**（WebKitWebContext::download-started → save_directory >
+            show_dialog 原生保存框 > $HOME/Downloads；重名追加 " (n)"；received-data
+            32KB 节流 / finished / failed → `webview.download_*` 事件，payload 与
+            Windows 同形；cancel_download 未知 id → UnknownDownload；
+            **实测坑**：失败后 WebKit 还会补发 finished，必须在终止事件里
+            `g_signal_handler_disconnect` 三个处理，否则二次进回调 UAF）、
+            **cookies**（WebKitCookieManager get/set/delete/按域名清理，异步 API
+            用嵌套 GMainLoop 同步化，返回 `{"cookies":[…]}`）、
+            **clear_storage**（WebKitWebsiteDataManager::clear，本版为全来源超集）、
+            **截图**（无 CDP → 仅 `Page.captureScreenshot`，webkit_web_view_get_snapshot
+            + cairo PNG + base64 → `webviewCdp` 事件，runtime 的 captureScreenshot
+            零改动）、**窗口状态持久化**（`platform/linux/window_state.zig`，目录/格式/
+            SHA-256 文件名与 Windows app_data 一致；state_key / persist_window_state
+            创建时恢复、销毁时保存，`windowState.get/save` 经 system_fn）；
+            冒烟 33 → **40 项 exit 0**
+      - [ ] print（P2）：Linux 仍 NotSupported——WebKit 打印 UI 走 GTK PrintOperation，
+            规划随 v0.2.5 稳定化补齐（能力清单里本来就列为 P2）
 - [ ] **v0.2.2 系统集成**：单实例（GApplication）+ 深链、通知（GNotification）、剪贴板、对话框、菜单、托盘
 - [ ] **v0.2.3 安全与数据**：capability/scope 全链路、CSP、`Config.protocols` → 真 scheme、
       fs watch（inotify）/流式、SQL（libsqlite3）、http/ws（libsoup）

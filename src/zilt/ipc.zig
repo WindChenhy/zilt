@@ -915,6 +915,8 @@ const runtime_js_head =
     \\        const o = Object.assign({}, opts ?? {});
     \\        // v0.1.24: userAgent → user_agent（Zig 侧 snake_case）
     \\        if (o.userAgent !== undefined) o.user_agent = o.userAgent;
+    \\        // v0.2.1: stateKey → state_key（窗口状态持久化键）
+    \\        if (o.stateKey !== undefined) o.state_key = o.stateKey;
     \\        return winApi('create', o);
     \\      },
     \\      close: (id) => winApi('close', { window_id: id }),
