@@ -1,20 +1,58 @@
 // Linux 冒烟脚本（v0.2.1）——只覆盖**已实现**的能力。
 //
 // 由 platform/linux/backend.zig 在 ZILT_LINUX_SMOKE=1 时作为 document-start
-// 用户脚本注入；跑完通过 `__zilt.linuxSmoke` 把结果回传，后端据此决定退出码。
+// 用户脚本注入（**每个窗口/子 WebView 都注入**——因此按 location.pathname 分流：
+//   /index.html            → 完整检查套件（本文件主体）
+//   /second.html           → 第二窗口探针（invoke + 自身窗口状态 → 事件回传主窗口）
+//   其余（probe 页等）     → 不动作，避免误触发
+// ）。主套件跑完通过 `__zilt.linuxSmoke` 把结果回传，后端据此决定退出码。
 //
 // 窗口检查注意：xvfb-run 默认没有窗口管理器，WM 参与的状态（maximized/iconic、
 // keep-above 的实际置顶、geometry hint 的强制执行）不可断言——只断言客户端
 // 可查字段（size/position/tracked 标志）与命令返回值。
 //
-// 刻意不测：剪贴板 / 通知 / 对话框 / 多窗口（v0.2.2–v0.2.3 才实现）。
+// 刻意不测：剪贴板 / 通知 / 对话框 / 下载（v0.2.2–v0.2.3 才实现）。
 //
 // reload 刻意不做探测：报告 invoke 刚 post 就导航，消息会在导航中丢失
 // （实测导致「reload → 脚本重跑 → 再 reload」无限循环）；且 reload 与 stop
 // 是同一调用路径，风险极低。
+function runSecondWindowProbe() {
+  // 第二窗口探针：验证新窗口的 runtime 注入、invoke 通道与 ctx.window_id 路由。
+  // 结果以 JS→Zig 事件发出（events.zig 的 secondWindowProbe 处理器 emitTo(1)
+  // 转发回主窗口），主套件的 multiwin.report 检查负责断言。
+  (async () => {
+    try {
+      const g = await window.zilt.invoke('greet', { name: 'SecondWindow' });
+      const st = await window.zilt.window.state();
+      window.zilt.emit('secondWindowProbe', {
+        ok: g.message === 'Hello, SecondWindow!' && g.length === 20 && st.id > 1,
+        win_id: st.id,
+      });
+    } catch (e) {
+      window.zilt.emit('secondWindowProbe', { ok: false, err: String(e.message || e) });
+    }
+  })();
+}
+
 (async () => {
+  const path = location.pathname || '/';
+  if (path === '/second.html') return runSecondWindowProbe();
+  if (path !== '/index.html') return; // probe 等辅助页面不动作
+  // 防重入：本脚本在每个窗口都注入，而前端 app.js 的 c-windowapi 检查会再开一个
+  // 加载 index.html 的窗口——只有主窗口（id=1，state() 的 window_id 路由返回自身）
+  // 跑完整套件，避免双套件并发创建多窗口/分区的竞态。
+  try {
+    const me = await window.zilt.window.state();
+    if (!me || me.id !== 1) return;
+  } catch (_) { return; }
+
   const results = [];
-  const check = (name, ok, note) => results.push({ name, ok: !!ok, note: String(note ?? '') });
+  // 每项检查同步打一条 Zig 日志（frontendLog 事件）：CI/本地都能拿到
+  // 逐项结果与失败原因，而不只看最终 exit code。
+  const check = (name, ok, note) => {
+    results.push({ name, ok: !!ok, note: String(note ?? '') });
+    try { window.zilt.emit('frontendLog', { msg: `${name} ${ok ? 'PASS' : 'FAIL'} ${note ?? ''}` }); } catch (_) {}
+  };
   const Z = () => window.zilt;
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -190,6 +228,131 @@
     try { await V.print('browser'); } catch (e) { printErr = String(e.message || e); }
     check('webview.unimpl', printErr === 'NotSupported', printErr);
   } catch (e) { check('eval', false, String(e.message || e)); }
+
+  // ---- v0.2.1 切片 3：多窗口（spawn_window_fn + 窗口注册表）----
+  let spawnedWinId = 0;
+  try {
+    const created = await Z().window.create({
+      title: 'Zilt Linux 多窗口冒烟',
+      width: 420, height: 320,
+      url: 'https://zilt.app/second.html',
+      label: 'smoke-second',
+    });
+    spawnedWinId = created && created.id;
+    check('multiwin.create', typeof spawnedWinId === 'number' && spawnedWinId > 1, JSON.stringify(created));
+  } catch (e) { check('multiwin.create', false, String(e.message || e)); }
+
+  try {
+    // 第二窗口的 runtime/invoke/窗口 id 路由：探针事件经 Zig emitTo(1) 回到主窗口
+    const report = await new Promise((resolve) => {
+      const off = Z().on('secondWindowProbe', (p) => { off(); resolve(p); });
+      setTimeout(() => { off(); resolve(null); }, 10000);
+    });
+    check('multiwin.report', !!report && report.ok === true && report.win_id === spawnedWinId, JSON.stringify(report));
+  } catch (e) { check('multiwin.report', false, String(e.message || e)); }
+
+  try {
+    const W = Z().window;
+    // window_id 路由：从主窗口查询/控制第二个窗口
+    const st = await W.state(spawnedWinId);
+    check('multiwin.state', !!st && st.id === spawnedWinId && st.width === 420 && st.height === 320, JSON.stringify(st).slice(0, 140));
+    await W.setSize(440, 340, spawnedWinId);
+    await wait(150);
+    const st2 = await W.state(spawnedWinId);
+    check('multiwin.setSize', st2.width === 440 && st2.height === 340, `${st2.width}x${st2.height}`);
+    // close：关闭后查询应 reject（WindowNotAvailable），且主窗口不受影响（套件继续跑）
+    await W.close(spawnedWinId);
+    await wait(150);
+    let gone = false;
+    try { await W.state(spawnedWinId); } catch (e) { gone = String(e.message).includes('WindowNotAvailable'); }
+    check('multiwin.close', gone, String(gone));
+  } catch (e) { check('multiwin.state', false, String(e.message || e)); }
+
+  // ---- v0.2.1 切片 3：子 WebView（system_fn 的 .webviews 通道）----
+  try {
+    const WV = Z().webviews;
+    // 生命周期：create → list/ready → setBounds → navigate → remove；未知 id remove false
+    const created = await WV.create({ x: 8, y: 8, width: 200, height: 120, url: 'about:blank' });
+    const cid = created && created.id;
+    if (!cid) throw new Error('no id: ' + JSON.stringify(created));
+    const list1 = await WV.list();
+    const inList = (list1 || []).some((x) => x.id === cid && x.ready === true);
+    const sb = await WV.setBounds(cid, 16, 16, 260, 180);
+    const nav = await WV.navigate(cid, 'about:blank');
+    const removed = await WV.remove(cid);
+    const list2 = await WV.list();
+    const gone = !(list2 || []).some((x) => x.id === cid);
+    const unknown = await WV.remove(999999);
+    check('webviewchild.lifecycle', inList && sb && nav && removed && gone && unknown === false,
+      `inList=${inList} sb=${sb} nav=${nav} rm=${removed} gone=${gone} unknown=${unknown}`);
+  } catch (e) { check('webviewchild.lifecycle', false, String(e.message || e)); }
+
+  // ---- v0.2.1 切片 3：数据分区隔离（对齐 Windows 冒烟 c-partition 的思路）----
+  try {
+    const probeUrl = 'https://zilt.app/partition-probe.html';
+    const mk = async (partition) => {
+      const r = await Z().webviews.create({ x: 8, y: 8, width: 220, height: 160, url: probeUrl, partition });
+      return r && r.id;
+    };
+    const aId = await mk('alpha');
+    const bId = await mk('beta');
+    const sId = await mk(null);
+    if (!aId || !bId || !sId) throw new Error('create failed: ' + JSON.stringify([aId, bId, sId]));
+
+    // 等页面文档就绪（eval 断言的前置条件）。注意：create 后 child 还停在
+    // about:blank，其 readyState 立即就是 'complete'——必须同时等 pathname
+    // 到达 probe 页，否则 localStorage 在 opaque origin 上会抛 SecurityError。
+    const settle = async (id) => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < 10000) {
+        const v = await Z().webviews.eval(id, 'document.readyState + "|" + location.pathname');
+        if (v === 'complete|/partition-probe.html') return true;
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      return false;
+    };
+    const sA = await settle(aId), sB = await settle(bId), sS = await settle(sId);
+
+    // 分区数据会跨运行持久化（这正是分区该有的行为）→ 每次用唯一 key，
+    // 避免上一轮的残留把「隔离」断言污染成假失败
+    const probeKey = 'zilt_part_' + Date.now();
+    const writeA = await Z().webviews.eval(aId, `localStorage.setItem('${probeKey}','alpha'); localStorage.getItem('${probeKey}')`);
+    const readB = await Z().webviews.eval(bId, `localStorage.getItem('${probeKey}')`);
+    const writeB = await Z().webviews.eval(bId, `localStorage.setItem('${probeKey}','beta'); localStorage.getItem('${probeKey}')`);
+    const readA2 = await Z().webviews.eval(aId, `localStorage.getItem('${probeKey}')`);
+    // 同名分区复用：第三个 alpha 分区实例应读到 alpha 写入的数据（同一 context）
+    const a2Id = await mk('alpha');
+    const sA2 = a2Id ? await settle(a2Id) : false;
+    const readA2dup = sA2 ? await Z().webviews.eval(a2Id, `localStorage.getItem('${probeKey}')`) : 'not-settled';
+    // 共享（无分区）子 WebView 与主页面同一 context → 存储互通。
+    // 注意：子页面写入后，主页面的 localStorage 内存缓存需要等跨页面
+    // 更新传播（实测立即读会拿到旧缓存 → null），给 300ms 传播时间。
+    const writeS = await Z().webviews.eval(sId, `localStorage.setItem('${probeKey}','shared'); localStorage.getItem('${probeKey}')`);
+    await wait(300);
+    const readMain = localStorage.getItem(probeKey);
+    // 反向：主页面写 → 共享子读（诊断跨页面共享方向）
+    const mainKey2 = 'zilt_main_' + Date.now();
+    localStorage.setItem(mainKey2, 'from-main');
+    const readBackInShared = await Z().webviews.eval(sId, `localStorage.getItem('${mainKey2}')`);
+    localStorage.removeItem(mainKey2);
+
+    const listAll = await Z().webviews.list();
+    const parts = (listAll || []).map((x) => x.partition).filter((p) => p);
+    const hasParts = parts.includes('alpha') && parts.includes('beta');
+
+    await Z().webviews.remove(aId);
+    await Z().webviews.remove(bId);
+    await Z().webviews.remove(sId);
+    if (a2Id) await Z().webviews.remove(a2Id);
+    localStorage.removeItem(probeKey);
+
+    const ok = sA && sB && sS && sA2 &&
+      writeA === 'alpha' && readB === null && writeB === 'beta' && readA2 === 'alpha' &&
+      readA2dup === 'alpha' && writeS === 'shared' && readMain === 'shared' && hasParts;
+    check('partition.isolation', ok, ok
+      ? 'partition ok (alpha/beta 隔离 + 同分区复用 + 共享 context 互通)'
+      : `settle=${sA},${sB},${sS},${sA2} A=${writeA} B0=${readB} B=${writeB} A2=${readA2} dup=${readA2dup} S=${writeS} main=${readMain} back=${readBackInShared} parts=${JSON.stringify(parts)}`);
+  } catch (e) { check('partition.isolation', false, String(e.message || e)); }
 
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {

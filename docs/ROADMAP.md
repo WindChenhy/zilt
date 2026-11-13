@@ -110,7 +110,23 @@
       - [ ] Linux 后端实现（GTK3 + WebKit2GTK 4.1）：`g_application_run` + `WebKitWebView`
             + scheme 资产 + IPC 桥，再补窗口/系统集成
       - [ ] `zilt doctor` Linux 依赖检查（随 cli 移植）
-- [ ] **v0.2.1 窗口/WebView 面**：多窗口/模态/全屏、eval、devtools、下载、分区、截图、子 WebView
+- [x] **v0.2.1 窗口/WebView 面**（2026-11-14；Linux 侧三切片，平台无关层零改动）：
+      - [x] 切片 1 窗口 API（3c330b9）：`window_fn`/`window_query_fn` 全套基础动作；
+            未实现项返回 false（错误语义对齐 Windows）；冒烟 9 → 20 项
+      - [x] 切片 2 WebView 面（761d165）：`webview_request_fn`（reload/stop/zoom/
+            history/devtools/set_user_agent/eval）+ `eval_async_fn`；eval 同步走
+            嵌套 GMainLoop（对应 Windows SyncWait）；冒烟 20 → 26 项
+      - [x] 切片 3 多窗口 + 子 WebView + 数据分区：窗口注册表（id 从 1 起，全部
+            钩子/ACL 按 window_id 路由）；`spawn_window_fn`（GTK 属性映射 +
+            transient-for/modal + 父销毁级联）；**所有窗口销毁才 gtk_main_quit**；
+            `system_fn` 接通 `.webviews`（create/remove/navigate/setBounds/focus/
+            list/eval 异步回传），其余 op NotSupported；子 WebView GtkOverlay 布局 +
+            分区（独立 WebKitWebsiteDataManager，同名复用）+ IPC 按 sender 路由；
+            冒烟 26 → 33 项（多窗口 E2E + alpha/beta 分区隔离 + 同分区复用 +
+            共享 context 互通），逐项检查落 Zig 日志
+            （踩坑与验证记录见 `docs/v0.2-LINUX.md` §v0.2.1 实施记录）
+      - [ ] 下载（WebKitDownload）/ clear_storage / cookies / print / 截图 /
+            窗口状态持久化——Linux 侧暂 NotSupported/false（v0.2.2+）
 - [ ] **v0.2.2 系统集成**：单实例（GApplication）+ 深链、通知（GNotification）、剪贴板、对话框、菜单、托盘
 - [ ] **v0.2.3 安全与数据**：capability/scope 全链路、CSP、`Config.protocols` → 真 scheme、
       fs watch（inotify）/流式、SQL（libsqlite3）、http/ws（libsoup）

@@ -44,6 +44,14 @@ pub fn updateStaged(_: Context, payload: struct { version: []const u8 }) void {
     zilt.log.print("[updater] staged event: {s} (restart to apply)", .{payload.version});
 }
 
+/// v0.2.1：Linux 多窗口冒烟——第二个窗口的探针结果转发回主窗口（id 1）。
+/// 事件由冒烟脚本在第二窗口内 emit（验证新窗口的 runtime/invoke/ctx.window_id
+/// 路由），这里用 ctx.emitTo(1, ...) 验证 emitTo 的窗口路由链路。
+pub fn secondWindowProbe(ctx: Context, payload: struct { ok: bool = false, win_id: u32 = 0, err: []const u8 = "" }) void {
+    zilt.log.print("[smoke] secondWindowProbe ok={} win_id={d} err={s}", .{ payload.ok, payload.win_id, payload.err });
+    ctx.emitTo(1, "secondWindowProbe", payload);
+}
+
 pub fn updaterFailed(_: Context, payload: struct { stage: []const u8, err: []const u8 }) void {
     zilt.log.print("[updater] failed at '{s}': {s}", .{ payload.stage, payload.err });
 }
