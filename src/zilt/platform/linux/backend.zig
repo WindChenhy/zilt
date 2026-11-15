@@ -903,6 +903,14 @@ fn Backend(comptime config: Config) type {
             cursor_hidden: bool = false,
             /// 待拖出的文件（drag-data-get 时转 text/uri-list）
             drag_files: std.ArrayListUnmanaged([]u8) = .empty,
+            /// v0.3.0：创建期已恢复的几何（WM 下 map 前的 move 会被忽略，
+            /// map-event 时补一次；只补一次，避免盖掉用户后续拖动）
+            restored_geometry: bool = false,
+            restored_x: i32 = 0,
+            restored_y: i32 = 0,
+            /// v0.3.0：焦点轮询（X11 焦点直接落在 WebKit 子窗口时 GTK 不派发
+            /// focus-in/out，也不更新 has-toplevel-focus → 200ms 轮询兜底）
+            focus_timer: c.guint = 0,
         };
 
         /// 子 WebView（webviews.* op 管理的窗口内附加视图）。
@@ -1259,6 +1267,10 @@ fn Backend(comptime config: Config) type {
             st.menu_actions.deinit(self.allocator);
             for (st.child_webviews.items) |cv| self.freeChildView(cv);
             st.child_webviews.deinit(self.allocator);
+            if (st.focus_timer != 0) {
+                _ = c.g_source_remove(st.focus_timer);
+                st.focus_timer = 0;
+            }
             // v0.3.0：光标引用 / 待拖文件
             if (st.cursor) |cursor| c.g_object_unref(@ptrCast(cursor));
             for (st.drag_files.items) |f| self.allocator.free(f);
@@ -1783,7 +1795,15 @@ fn Backend(comptime config: Config) type {
             // 由前端确认后调 windowClose——对齐 Windows 的 WM_CLOSE opt-in 语义）
             _ = c.g_signal_connect_data(win, "focus-in-event", @ptrCast(&Self.onFocusChange), st, null, 0);
             _ = c.g_signal_connect_data(win, "focus-out-event", @ptrCast(&Self.onFocusChange), st, null, 0);
+            // v0.3.0：WebKit 的焦点落在子 GdkWindow 上，GtkWindow 的 focus-in/out
+            // 事件与 is-active 在 openbox 下都拿不到——补 has-toplevel-focus 通知
+            //（Wayland 等非 X11 后端的低延迟路径；X11 由 focusPollTick 兜底）。
+            _ = c.g_signal_connect_data(win, "notify::has-toplevel-focus", @ptrCast(&Self.onActiveNotify), st, null, 0);
             _ = c.g_signal_connect_data(win, "delete-event", @ptrCast(&Self.onDeleteEvent), st, null, 0);
+            // v0.3.0：恢复过几何的窗口在 map 后补一次 move（WM 会忽略 map 前的请求）
+            if (st.restored_geometry) {
+                _ = c.g_signal_connect_data(win, "map-event", @ptrCast(&Self.onMapRestore), st, null, 0);
+            }
             _ = c.g_signal_connect_data(
                 overlay,
                 "get-child-position",
@@ -1795,6 +1815,8 @@ fn Backend(comptime config: Config) type {
 
             c.gtk_widget_show_all(win);
             if (opts.visible) c.gtk_window_present(win_typed);
+            // v0.3.0：焦点轮询（见 WinState.focus_timer 注释）
+            st.focus_timer = c.g_timeout_add(200, Self.focusPollTick, st);
 
             log.print("[linux] window #{d} created: \"{s}\" ({s}) label={s} parent={s} modal={} visible={}", .{
                 id,
@@ -2192,7 +2214,7 @@ fn Backend(comptime config: Config) type {
                 height,
                 boolStr(c.gtk_widget_get_sensitive(widget) != 0),
                 boolStr(c.gtk_widget_get_visible(widget) != 0),
-                boolStr(c.gtk_window_is_active(win) != 0),
+                boolStr(windowFocused(st)),
                 boolStr(c.gtk_window_is_maximized(win) != 0),
                 boolStr(iconic),
                 boolStr(st.fullscreen),
@@ -2289,6 +2311,10 @@ fn Backend(comptime config: Config) type {
             st.geom_y = state.y;
             st.geom_width = state.width;
             st.geom_height = state.height;
+            // v0.3.0：WM 下创建期（未 map）的 move 会被忽略 → map 后补一次
+            st.restored_geometry = true;
+            st.restored_x = state.x;
+            st.restored_y = state.y;
             if (state.maximized) c.gtk_window_maximize(st.win);
             if (state.fullscreen) {
                 c.gtk_window_fullscreen(st.win);
@@ -7268,6 +7294,22 @@ fn Backend(comptime config: Config) type {
             }
         }
 
+        /// v0.3.0：map 后补一次恢复几何的 move（openbox 等 reparent 型 WM 实测
+        /// 会忽略窗口 map 之前的 gtk_window_move，恢复位置退化成 0,0）。
+        /// 只补一次：之后用户拖动/程序移动不再被覆盖。
+        fn onMapRestore(_: [*c]c.GtkWidget, _: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
+            const st: *WinState = @ptrCast(@alignCast(user_data orelse return 0));
+            if (!st.restored_geometry) return 0;
+            st.restored_geometry = false;
+            c.gtk_window_move(st.win, st.restored_x, st.restored_y);
+            st.geom_x = st.restored_x;
+            st.geom_y = st.restored_y;
+            log.print("[state] re-applied restored position {d},{d} after map (window #{d})", .{
+                st.restored_x, st.restored_y, st.id,
+            });
+            return 0;
+        }
+
         /// configure-event：跟踪窗口几何（destroy 时保存窗口状态用）。
         /// 返回 FALSE 表示继续传播给 GTK 默认处理。
         /// 注意：translate-c 里 `GdkEvent` 是不透明 union，信号参数只能按
@@ -7353,17 +7395,86 @@ fn Backend(comptime config: Config) type {
             return G_SOURCE_REMOVE;
         }
 
+        /// v0.3.0：X11 输入焦点是否落在本窗口（含 WebKit 子 GdkWindow）。
+        /// GTK 的 has-toplevel-focus 在「焦点直接落在子 GdkWindow」时不更新
+        ///（openbox + WebKit 实测：toplevel 从未收到 FocusIn，X 焦点是子窗口）；
+        /// 这里沿 X 焦点窗口向父链走，命中 toplevel XID 即视为窗口持有焦点。
+        /// 非 X11 后端（或 GTK4 变体）返回 null → 调用方回退 GTK 焦点属性。
+        const FocusProbe = if (@hasDecl(c, "gdk_x11_window_get_xid")) struct {
+            fn within(st: *WinState) ?bool {
+                const widget: [*c]c.GtkWidget = @ptrCast(st.win);
+                const gdk_win = c.gtk_widget_get_window(widget) orelse return null;
+                const top_xid = c.gdk_x11_window_get_xid(gdk_win);
+                if (top_xid == 0) return null;
+                const display = c.gdk_window_get_display(gdk_win) orelse return null;
+                const xdisplay = c.gdk_x11_display_get_xdisplay(display);
+                if (xdisplay == null) return null;
+                var focus: c.Window = 0;
+                var revert: c_int = 0;
+                _ = c.XGetInputFocus(xdisplay, &focus, &revert);
+                // None / PointerRoot：焦点不在任何具体窗口
+                if (focus == 0 or focus == 1) return false;
+                var cur = focus;
+                var depth: u32 = 0;
+                while (cur != 0 and depth < 32) : (depth += 1) {
+                    if (cur == top_xid) return true;
+                    var root: c.Window = 0;
+                    var parent: c.Window = 0;
+                    var children: [*c]c.Window = null;
+                    var nchildren: c_uint = 0;
+                    if (c.XQueryTree(xdisplay, cur, &root, &parent, &children, &nchildren) == 0) return null;
+                    if (children != null) _ = c.XFree(@ptrCast(children));
+                    if (parent == 0 or parent == cur) return false;
+                    cur = parent;
+                }
+                return false;
+            }
+        } else struct {
+            fn within(_: *WinState) ?bool {
+                return null;
+            }
+        };
+
+        /// 窗口当前是否持有焦点（X11 优先，回退 GTK 属性）。
+        fn windowFocused(st: *WinState) bool {
+            if (FocusProbe.within(st)) |focused| return focused;
+            return c.gtk_window_has_toplevel_focus(st.win) != 0;
+        }
+
+        /// 200ms 焦点轮询：X11 焦点直接落在 WebKit 子窗口时 GTK 不派发任何
+        /// focus 信号，属性也不更新——只有轮询能可靠触发 windowFocus/Blur。
+        fn focusPollTick(user_data: c.gpointer) callconv(.c) c.gboolean {
+            const st: *WinState = @ptrCast(@alignCast(user_data orelse return G_SOURCE_REMOVE));
+            notifyFocus(st, windowFocused(st));
+            return 1; // G_SOURCE_CONTINUE
+        }
+
         /// focus-in/out → windowFocus/windowBlur（去重）。
         fn onFocusChange(_: [*c]c.GtkWidget, event: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
             const st: *WinState = @ptrCast(@alignCast(user_data orelse return 0));
             const ev: [*c]c.GdkEventFocus = @ptrCast(@alignCast(event orelse return 0));
             const focused = ev.*.in != 0;
-            if (focused == st.reported_focus) return 0;
+            notifyFocus(st, focused);
+            return 0;
+        }
+
+        /// v0.3.0：`notify::has-toplevel-focus` → windowFocus/windowBlur。
+        /// GtkWindow 的 focus-in/out 事件依赖事件落在 toplevel GdkWindow 上；
+        /// WebKit 子窗口持有焦点时（openbox 实测）收不到。属性通知作为非 X11
+        /// 后端的低延迟路径；X11 由 focusPollTick 兜底。
+        fn onActiveNotify(_: [*c]c.GtkWidget, _: ?*anyopaque, user_data: c.gpointer) callconv(.c) void {
+            const st: *WinState = @ptrCast(@alignCast(user_data orelse return));
+            notifyFocus(st, windowFocused(st));
+        }
+
+        /// 焦点状态去重 + 事件发射（focus-in/out、属性通知与轮询共用）。
+        fn notifyFocus(st: *WinState, focused: bool) void {
+            if (focused == st.reported_focus) return;
             st.reported_focus = focused;
+            log.print("[window] focus changed #{d} focused={}", .{ st.id, focused });
             st.backend.emitWindowEvent(st, if (focused) "windowFocus" else "windowBlur", &.{
                 .{ .name = "id", .value = st.id },
             });
-            return 0;
         }
 
         /// delete-event → close_requested_event=true 时拦截（发 windowCloseRequested

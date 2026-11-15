@@ -12,6 +12,12 @@
 
 #include <gtk/gtk.h>
 #include <webkit2/webkit2.h>
+/* v0.3.0：X11 焦点判定（gdk_x11_window_get_xid / gdk_x11_display_get_xdisplay）。
+ * GTK4 的 X11 API 是 gdk_x11_surface_get_xid（v0.3.x 重做后端时再适配）——
+ * 这里对 GTK3 引入，GTK4 构建下由 @hasDecl 回退到 GTK 焦点属性。 */
+#if !defined(GTK_MAJOR_VERSION) || GTK_MAJOR_VERSION < 4
+#include <gdk/gdkx.h>
+#endif
 /* 响应头（CSP / security.headers）需要 SoupMessageHeaders，
  * webkit2.h 虽然会顺带引入，但显式声明依赖更稳。 */
 #include <libsoup/soup.h>

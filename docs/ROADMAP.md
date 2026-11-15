@@ -343,9 +343,17 @@
             `_NET_SUPPORTING_WM_CHECK` 探 WM（`__zilt.linuxSmokeWired` 探针），
             有 WM 时断言 windowMoved/Resized 载荷与 state 一致 +
             新窗口 blur → 回焦 focus 闭环；无 WM 明确 skip。
+            **焦点关键修复**：WebKit 的 X 焦点落在子 GdkWindow 时 GtkWindow 的
+            focus-in/out 与 has-toplevel-focus 都不更新（openbox 实测事件全灭）——
+            改为 200ms 轮询 `XGetInputFocus` + `XQueryTree` 父链匹配 toplevel XID
+            （`FocusProbe`，capi.h 对 GTK3 引入 gdkx.h，GTK4 回退属性）。
+            **窗口状态恢复修复**：WM 忽略 map 前的 move（openbox 恢复成 0,0）→
+            `map-event` 补一次 move。
             **验收**：Linux 冒烟 69 → **75 项 exit 0**（新增 win.polish /
             win.guards / win.overlay / win.background / win.dialog / drag.out /
-            wm.events）；Linux 单测 **197/198**（1 skip；+gdkCursorName/buildUriList）；
+            wm.events；无 WM 路径 skip 也 exit 0）；本地无 root 安装 openbox 实测
+            wm.events 全绿（blur/focus/probeActive/mainActive=true）。
+            Linux 单测 **197/198**（1 skip；+gdkCursorName/buildUriList）；
             Windows 单测 **279/279**、冒烟除桌面剪贴板占用（clip/clipmulti，
             环境问题）外全 PASS。
 - [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）——v0.3+

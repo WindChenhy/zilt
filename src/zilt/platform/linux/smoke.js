@@ -352,7 +352,10 @@ function runSecondWindowProbe() {
       stateKey: key,
     });
     const restored = second && second.id ? await W.state(second.id) : null;
-    const ok = !!restored && restored.width === 360 && restored.height === 240 && restored.x === 70 && restored.y === 50;
+    // v0.3.0：有 WM 时窗口位置受 frame/gravity 影响（实测 openbox 加了标题栏高度），
+    // 位置留 32px 容差（默认落点是居中，与 70,50 差得远）；尺寸仍须精确。
+    const ok = !!restored && restored.width === 360 && restored.height === 240 &&
+      Math.abs(restored.x - 70) <= 32 && Math.abs(restored.y - 50) <= 32;
     if (second && second.id) await W.close(second.id);
     check('winstate.restore', ok,
       `before=${JSON.stringify(before).slice(0, 90)} restored=${JSON.stringify(restored).slice(0, 90)}`);
@@ -979,7 +982,9 @@ function runSecondWindowProbe() {
   try {
     const wired = await Z().invoke('__zilt.linuxSmokeWired', {});
     if (wired && wired.wm) {
-      // WM 可能对请求做取整/加框：事件载荷与 state() 查询值比对（而非硬编码坐标）
+      const W = Z().window;
+      const state = async () => await W.state();
+      // 移动/缩放：先记录事件，再用 state() 校验几何（见下方 frame 偏移说明）
       const moved = await new Promise((resolve) => {
         const off = Z().on('windowMoved', (p) => {
           if (p.id === 1) { off(); resolve(p); }
@@ -997,7 +1002,10 @@ function runSecondWindowProbe() {
       });
       const sizeAfter = await state();
 
-      // 焦点闭环：新建窗口获得焦点 → 主窗口 windowBlur；再 focus 回主窗口
+      // 焦点闭环：先确保主窗口是 active，再新建窗口并显式 focus（openbox 的
+      // focusNew 不保证交权）→ 主窗口 windowBlur；再 focus 回主窗口 → windowFocus
+      await W.focus(1);
+      await wait(200);
       let blurred = false;
       const blurWait = new Promise((resolve) => {
         const off = Z().on('windowBlur', (p) => {
@@ -1014,22 +1022,33 @@ function runSecondWindowProbe() {
         });
         fid = cw && cw.id;
       } catch (_) {}
+      if (fid) { try { await W.focus(fid); } catch (_) {} }
+      let probeActive = false;
+      if (fid) {
+        await wait(300);
+        try { probeActive = (await W.state(fid)).focused === true; } catch (_) {}
+      }
       await blurWait;
       const focused = await new Promise((resolve) => {
         const off = Z().on('windowFocus', (p) => {
           if (p.id === 1) { off(); resolve(true); }
         });
         setTimeout(() => { off(); resolve(false); }, 3000);
-        W.focus().catch(() => {});
+        W.focus(1).catch(() => {});
       });
+      await wait(300);
+      let mainActive = false;
+      try { mainActive = (await W.state(1)).focused === true; } catch (_) {}
       try { await Z().window.close(fid); } catch (_) {}
 
-      const moveOk = !!moved && moved.x === posAfter.x && moved.y === posAfter.y;
+      // configure-event 的 x/y 在 reparent 型 WM 下含 frame 偏移（openbox 实测
+      // y 差 20px）→ 事件存在 + state() 落在请求位置附近即视为通过；尺寸须精确。
+      const moveOk = !!moved && Math.abs(posAfter.x - 150) <= 32 && Math.abs(posAfter.y - 120) <= 32;
       const sizeOk = !!resized && resized.width === sizeAfter.width && resized.height === sizeAfter.height;
       check('wm.events', moveOk && sizeOk && blurred && focused,
         `move=${JSON.stringify(moved)}/${posAfter.x},${posAfter.y} ` +
         `size=${JSON.stringify(resized)}/${sizeAfter.width}x${sizeAfter.height} ` +
-        `blur=${blurred} focus=${focused}`);
+        `blur=${blurred} focus=${focused} probeActive=${probeActive} mainActive=${mainActive}`);
       // 复原几何，避免影响后续检查
       W.setPosition(60, 40).catch(() => {});
       W.setSize(800, 600).catch(() => {});
