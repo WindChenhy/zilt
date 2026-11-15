@@ -39,7 +39,15 @@ mkdir -p .zilt-probe
   trap 'kill $echo_pid $ws_pid 2>/dev/null' EXIT
 
   set +e
-  timeout 240 xvfb-run -a --server-args="-screen 0 1280x800x24" ./zig-out/bin/zilt-app 2>&1 | tail -120
+  # v0.3.0：有 openbox 时在同一 Xvfb 会话里起 WM（windowMoved/Resized/Focus 才
+  # 会真实触发；没有 WM 时 smoke.js 自动 skip 该检查）；CI 会安装 openbox。
+  timeout 240 xvfb-run -a --server-args="-screen 0 1280x800x24" bash -c '
+    if command -v openbox >/dev/null 2>&1; then
+      openbox >/tmp/zilt-openbox.log 2>&1 &
+      sleep 0.5
+    fi
+    exec ./zig-out/bin/zilt-app
+  ' 2>&1 | tail -120
   code=${PIPESTATUS[0]}
   set -e
   echo "SMOKE_EXIT=$code"

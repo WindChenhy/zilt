@@ -6,12 +6,12 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.24（Windows 全栈）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.1.24（Windows 全栈）+ v0.3.0（Linux 桌面体验包）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
 | Windows | ✅ 0.1.x 全栈 | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
-| Linux | 🚧 v0.2（接口层就绪，GTK 实现待 CI） | GTK3 + WebKit2GTK 4.1；v0.2.5 增 GTK4 + WebKitGTK 6.0 变体 |
+| Linux | ✅ v0.2 全栈 + v0.3.0 桌面体验包 | GTK3 + WebKit2GTK 4.1；`-Dgtk=gtk4` 构建变体 |
 | macOS | ⏳ v0.3+ | WKWebView（zig-objc 路线） |
 
 Windows 能力面：窗口/多窗口/覆盖式标题栏、WebView2 事件面与 Settings、IPC + 事件 + 流式 channel、

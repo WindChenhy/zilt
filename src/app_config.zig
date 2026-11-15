@@ -27,6 +27,9 @@ pub const security: zilt.security.Options = .{    .capabilities = &.{.{
             "http:ws://127.0.0.1:*",
             "http:wss://127.0.0.1:*",
             "shell:cmd",
+            // v0.3.0：Linux 冒烟的子进程检查（/bin/echo；cmd 为 Windows 侧用）
+            "shell:echo",
+            "shell:sh",
         },
     }},
     // v0.1.21：冻结 window.zilt + 内建原型（防原型链篡改）

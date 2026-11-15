@@ -120,7 +120,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config xvfb \
+            libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config xvfb openbox \
             libayatana-appindicator3-1 xdg-utils libsqlite3-0 libx11-dev \
             webkit2gtk-driver
 
@@ -130,7 +130,7 @@ jobs:
       - name: Unit tests
         run: zig build test
 
-      - name: Smoke test (66 checks under Xvfb)
+      - name: Smoke test (75 checks under Xvfb + openbox)
         env:
           ZILT_LINUX_SMOKE: "1"
           ZILT_LINUX_SMOKE_DEEPLINK: "zilt://startup?demo=1"
@@ -142,7 +142,12 @@ jobs:
           python3 scripts/ws_echo.py 8765 > /dev/null 2>&1 &
           sleep 1
           rm -f zilt.log
-          timeout 240 xvfb-run -a --server-args="-screen 0 1280x800x24" ./zig-out/bin/zilt-app
+          # v0.3.0：openbox 提供真实 WM → windowMoved/Resized/Focus 断言生效
+          timeout 240 xvfb-run -a --server-args="-screen 0 1280x800x24" bash -c '
+            openbox >/dev/null 2>&1 &
+            sleep 0.5
+            exec ./zig-out/bin/zilt-app
+          '
           code=$?
           grep -a "\[linux-smoke\]" zilt.log | tail -2
           if [ $code -ne 0 ]; then echo "smoke failed with exit $code"; exit 1; fi

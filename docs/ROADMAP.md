@@ -291,6 +291,63 @@
       **验收**：冒烟 65 → **66 项**；Linux 单测 195/196（1 skip）/Windows 279/279；
       单实例转交/打包/headless/AppImage E2E 全 PASS；CI apt 补 webkit2gtk-driver
       + e2e 步骤。
+- [~] **v0.3.0 桌面体验包**（2026-11-15 进行中，逐项同步）：
+      - [x] **process 子进程 op**（Linux 接线，对齐 Windows v0.1.16）：runProcOp
+            （spawn/kill/list）+ procWorker（spawn → 两路管道读线程 → wait →
+            processEvent 事件：stdout/stderr 分块 + exit code）+ `shell:` scope
+            ACL（argv[0] basename 去 .exe，与 Windows 同规则）；事件经 g_idle_add
+            封送。**实测坑**：v0.2.7 的 SIGCHLD=SIG_IGN 让内核自动回收 → 子进程
+            wait 拿到 ECHILD → Threaded io 视为 errno bug panic——改为每个分离
+            子进程挂收割线程（waitpid 该 pid），全局信号方案废弃。
+            demo shell scope 补 `echo`/`sh`（Linux 侧检查用）。冒烟 66 → **68 项**
+            （proc stdout/exit 闭环 + proc.acl 拒绝）。
+      - [x] **通知交互**（Linux 接线，对齐 Windows v0.1.12 的可用子集）：按钮/正文
+            点击走 **GAction 索引机制**（`app.zilt-notify::<i>`——SimpleAction
+            参数 int32，激活回调查表 → `notification` 事件
+            `{tag,kind:activated,arguments}`，与 Windows toastEventJson 同形；
+            索引方案规避 GVariant 字符串转义）；launch → set_default_action。
+            input/progress 是 WinRT 独有 → 稳定 NotSupported
+            （`NotificationInputNotSupported`/`ProgressNotSupported`）；GNotification
+            无 dismissed 回调（文档化差异）。**坑**：`G_VARIANT_TYPE_INT32` 宏
+            translate-c 失败 → `g_variant_type_new("i")`；GSimpleAction 是
+            opaque → `?*c.T` 单指针（0.17 老规矩）。冒烟 68 → **69 项**
+            （notify.actions：按钮发送 + input 拒绝）。
+      - [x] **透明窗口 + background_color**（对齐 Windows v0.1.7）：RGBA visual +
+            app_paintable + `draw` 信号 cairo SOURCE 清屏（GTK3 无透明开关）+
+            `webkit_web_view_set_background_color`（alpha=0 / 0xRRGGBB 不透明）。
+            必须在 realize 前设置。`window.state()` 增 `transparent` /
+            `background_color` 字段（Windows 的 style/ex_style 之外的两平台通用查询项）。
+      - [x] **titlebar overlay / CSD**（对齐 Windows v0.1.23）：`titlebar_overlay`
+            → 无原生边框（`gtk_window_set_decorated(FALSE)`，客户区覆盖整窗），
+            `data-zilt-drag-region` 复用既有 `startDragging`（`gtk_window_begin_move_drag`）。
+            `window.create({titlebarOverlay, backgroundColor})` 两平台同接
+            （builtin Arg 补齐 + runtime camelCase 映射）。
+      - [x] **WebView 右键菜单 / 脚本对话框接管**：`context-menu` 信号 →
+            `settings.context_menus=false` 时阻止 WebKit 默认菜单（应用可经
+            `menu.popup` 自绘）；`script-dialog` 信号 → `settings.script_dialogs=false`
+            时阻止原生模态框（confirm/prompt 返回默认值），冒烟模式一律阻止（否则
+            模态框卡死主循环）。
+      - [x] **窗口精细控制包**（对齐 Windows v0.1.18）：14 种光标（GDK CSS 名 +
+            default 兜底）/ 光标隐藏（1×1 透明 pixbuf cursor）/ `gdk_seat_grab` 抓取 /
+            `gdk_device_warp` 定位 / 鼠标穿透（GdkWindow 空 input shape）/
+            运行时图标（`gtk_window_set_icon_from_file`，null 清空）/
+            阴影（GTK3 无窗口阴影 API → WM/compositor 负责，接受请求并记录）/
+            防截屏（Linux 无标准 API → 稳定 false，文档化）。
+      - [x] **拖出**（对齐 Windows v0.1.12）：`start_drag_fn` →
+            `gtk_drag_begin_with_coordinates`（text/uri-list, COPY），
+            `drag-data-get` 信号把待拖文件写成 CRLF 分隔 URI 列表
+            （`buildUriList` 纯函数 + 单测）。不做常驻 drag source（避免抢走页面
+            文本选择手势）。拖入既有 `dropFiles` 不变。
+      - [x] **CI openbox + 窗口事件断言**：CI apt 增 openbox；冒烟在 Xvfb 内先起
+            openbox（本地 dev-smoke.sh 同款，有则起、无则跳过）。后端启动用
+            `_NET_SUPPORTING_WM_CHECK` 探 WM（`__zilt.linuxSmokeWired` 探针），
+            有 WM 时断言 windowMoved/Resized 载荷与 state 一致 +
+            新窗口 blur → 回焦 focus 闭环；无 WM 明确 skip。
+            **验收**：Linux 冒烟 69 → **75 项 exit 0**（新增 win.polish /
+            win.guards / win.overlay / win.background / win.dialog / drag.out /
+            wm.events）；Linux 单测 **197/198**（1 skip；+gdkCursorName/buildUriList）；
+            Windows 单测 **279/279**、冒烟除桌面剪贴板占用（clip/clipmulti，
+            环境问题）外全 PASS。
 - [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）——v0.3+
 - [x] 平台差异收敛原则：平台无关层（ipc/security/fs_api/protocol/net/sql/store/patch/pack_formats）
       两平台共用，差异只出现在 `platform/<os>/`

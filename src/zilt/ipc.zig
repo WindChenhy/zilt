@@ -927,6 +927,9 @@ const runtime_js_head =
     \\        // v0.2.1: stateKey → state_key（窗口状态持久化键）
     \\        if (o.stateKey !== undefined) o.state_key = o.stateKey;
     \\        if (o.closeRequested !== undefined) o.close_requested_event = o.closeRequested;
+    \\        // v0.3.0: titlebarOverlay → titlebar_overlay / backgroundColor → background_color
+    \\        if (o.titlebarOverlay !== undefined) o.titlebar_overlay = o.titlebarOverlay;
+    \\        if (o.backgroundColor !== undefined) o.background_color = o.backgroundColor;
     \\        return winApi('create', o);
     \\      },
     \\      close: (id) => winApi('close', { window_id: id }),

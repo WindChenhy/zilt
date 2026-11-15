@@ -58,6 +58,11 @@ pub const Args = struct {
     state_key: ?[]const u8 = null,
     /// v0.2.6：per-window 关闭请求事件（window.create({closeRequested})）
     close_requested_event: ?bool = null,
+    /// v0.3.0：窗口创建选项（对齐 ipc.WindowOptions；两平台同接）
+    transparent: ?bool = null,
+    background_color: ?u32 = null,
+    titlebar_overlay: ?bool = null,
+    decorations: ?bool = null,
     zoom: ?f64 = null,
     download_id: ?u64 = null,
     /// v0.1.24：窗口/WebView 的 User-Agent
@@ -329,6 +334,11 @@ fn windowCmd(ctx: ipc.Context, a: Args) ![]u8 {
             .close_requested_event = a.close_requested_event,
             .proxy = a.proxy,
             .user_agent = a.user_agent,
+            // v0.3.0：桌面体验包（透明 / 背景色 / 覆盖式标题栏）
+            .transparent = a.transparent orelse false,
+            .background_color = a.background_color,
+            .titlebar_overlay = a.titlebar_overlay orelse false,
+            .decorations = a.decorations orelse true,
         };
         if (a.window_id) |_| opts.parent = a.window_id;
         const id = spawn(ctx.backend, opts);

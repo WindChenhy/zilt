@@ -204,14 +204,14 @@ fn reasonFor(status: u16) [:0]const u8 {
 }
 
 /// 分离拉起子进程（v0.2.7）：spawn 后不等待（对齐 Windows ShellExecuteW 的
-/// 立即返回语义——xdg-open 可能等浏览器退出，同步等待会冻结 UI）。子进程
-/// 僵尸问题靠 SIGCHLD=SIG_IGN 自动回收（set 一次，进程级）。
+/// 立即返回语义——xdg-open 可能等浏览器退出，同步等待会冻结 UI）。
+/// 僵尸回收：每个子进程挂一个收割线程（waitpid 该 pid 直到退出）——**不能**
+/// 用 SIGCHLD=SIG_IGN（内核自动回收会让子进程 op 的 wait 拿到 ECHILD，
+/// Threaded io 视为 errno bug 直接 panic，v0.3.0 实测踩到）。
 /// 返回 spawn 是否成功（子进程自身的成败是异步的，调用方拿不到）。
 fn spawnDetachedLinux(argv: []const []const u8) bool {
     if (argv.len == 0) return false;
-    // SIGCHLD → SIG_IGN：内核自动回收退出的子进程（不产生僵尸）
-    setSigChldIgnore();
-    _ = std.process.spawn(sharedIo(), .{
+    const child = std.process.spawn(sharedIo(), .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = .ignore,
@@ -220,7 +220,16 @@ fn spawnDetachedLinux(argv: []const []const u8) bool {
         log.print("[spawn] {s} failed: {s}", .{ argv[0], @errorName(err) });
         return false;
     };
+    if (child.id) |pid| {
+        const t = std.Thread.spawn(.{ .stack_size = sys.threadStackSize(256 * 1024) }, reapDetached, .{pid}) catch return true;
+        t.detach();
+    }
     return true;
+}
+
+/// 收割线程：waitpid 指定子进程直到退出（阻塞；shell 打开器通常很快退出）。
+fn reapDetached(pid: std.c.pid_t) void {
+    _ = std.c.waitpid(pid, null, 0);
 }
 
 /// updater.Fetcher 的取数实现（std.http.Client；与 Windows httpFetch 同构，
@@ -263,18 +272,6 @@ fn runRestartHelperLinux(target: []const u8) void {
     // replace 成功不返回；返回值即失败原因（bare error set，exec 语义）
     const fail: std.process.ReplaceError = std.process.replace(sharedIo(), .{ .argv = &.{target} });
     log.print("[updater] restart helper: replace failed: {s}", .{@errorName(fail)});
-}
-
-/// SIGCHLD 置 SIG_IGN（进程级一次）：内核自动回收退出的子进程，spawn 后
-/// 不 wait 也不会留僵尸。posix.sigaction 对 EINVAL/失败直接 unreachable——
-/// SIGCHLD 恒合法，无需错误分支。
-fn setSigChldIgnore() void {
-    const act = std.posix.Sigaction{
-        .handler = .{ .handler = std.posix.SIG.IGN },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.CHLD, &act, null);
 }
 
 /// 窗口事件的字段（v0.2.6：windowMoved/Resized/Focus/Blur/CloseRequested）。
@@ -533,6 +530,40 @@ pub fn parseAccelGtk(accel: []const u8) ?AccelGtk {
     return .{ .mods = mods, .keyval = keyval };
 }
 
+/// v0.3.0：CursorKind → GDK 标准光标名（CSS cursor 名）。
+/// `up-arrow` 在部分主题里缺失 → 调用方再回退 "default"。
+pub fn gdkCursorName(kind: ipc.CursorKind) [:0]const u8 {
+    return switch (kind) {
+        .default, .arrow => "default",
+        .ibeam => "text",
+        .crosshair => "crosshair",
+        .hand => "pointer",
+        .wait => "wait",
+        .help => "help",
+        .not_allowed => "not-allowed",
+        .size_ns => "ns-resize",
+        .size_ew => "ew-resize",
+        .size_nwse => "nwse-resize",
+        .size_nesw => "nesw-resize",
+        .move => "move",
+        .up_arrow => "up-arrow",
+    };
+}
+
+/// v0.3.0：拖出文件列表 → text/uri-list 内容（CRLF 分隔，空项跳过）。
+pub fn buildUriList(alloc: std.mem.Allocator, files: []const []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (files) |f| {
+        if (f.len == 0) continue;
+        const uri = try pathToFileUri(alloc, f);
+        defer alloc.free(uri);
+        try out.appendSlice(alloc, uri);
+        try out.appendSlice(alloc, "\r\n");
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 /// 键名 → GDK keysym：字母 GDK_KEY_A=0x41..，数字 GDK_KEY_0=0x30..，
 /// 功能键 GDK_KEY_F1=0xffbe 起。
 fn keyvalForGtk(part: []const u8) ?c.guint {
@@ -548,6 +579,41 @@ fn keyvalForGtk(part: []const u8) ?c.guint {
         if (n >= 1 and n <= 12) return 0xffbe + @as(c.guint, n - 1);
     }
     return null;
+}
+
+/// v0.3.0：会话是否有窗口管理器（X11 `_NET_SUPPORTING_WM_CHECK`）。
+/// Xvfb 裸跑无 WM → false（configure/focus 事件不会到达，冒烟按 skip 处理）；
+/// CI 装 openbox 后为 true → windowMoved/Resized/Focus 真实断言。
+fn detectWindowManager() bool {
+    const display = c.XOpenDisplay(null) orelse return false;
+    defer _ = c.XCloseDisplay(display);
+    const root = c.XDefaultRootWindow(display);
+    const atom = c.XInternAtom(display, "_NET_SUPPORTING_WM_CHECK", 0);
+    if (atom == 0) return false;
+    var actual_type: c.Atom = 0;
+    var actual_format: c_int = 0;
+    var nitems: c_ulong = 0;
+    var bytes_after: c_ulong = 0;
+    var prop: [*c]u8 = null;
+    const status = c.XGetWindowProperty(
+        display,
+        root,
+        atom,
+        0,
+        1,
+        0,
+        // XA_WINDOW = 33（X11 协议固定原子；translate-c 不导出该宏）
+        @as(c.Atom, 33),
+        &actual_type,
+        &actual_format,
+        &nitems,
+        &bytes_after,
+        &prop,
+    );
+    defer {
+        if (prop != null) _ = c.XFree(@ptrCast(prop));
+    }
+    return status == 0 and nitems == 1 and prop != null;
 }
 
 pub fn run(comptime config: Config) !void {
@@ -579,6 +645,10 @@ pub fn run(comptime config: Config) !void {
 
     // 无 DISPLAY 时 gtk_init 会直接 abort —— CI 必须用 xvfb-run（见 docs/v0.2-LINUX.md §7）
     gtk_compat.gtkInit();
+    // v0.3.0：WM 探测（Xvfb 裸跑无 WM → windowMoved/Resized/Focus 不会触发；
+    // CI 装 openbox 后这些事件真实生效，冒烟据此决定是否断言）
+    self.wm_present = detectWindowManager();
+    log.print("[linux] window manager: {s}", .{if (self.wm_present) "present" else "none (Xvfb)"});
 
     // scheme 必须在创建 WebView 之前注册（web process 首次启动后不再接受）
     const wc = c.webkit_web_context_get_default();
@@ -649,8 +719,11 @@ pub fn run(comptime config: Config) !void {
         .min_height = config.min_height,
         .max_width = config.max_width,
         .max_height = config.max_height,
-        // background_color / icon / proxy / user_agent / titlebar_overlay / transparent：
-        // Linux 侧暂无对应实现，主窗口与 spawn 窗口一致地忽略。
+        // v0.3.0：桌面体验面（透明 / 背景色 / 覆盖式标题栏）
+        .transparent = config.transparent,
+        .background_color = config.background_color,
+        .titlebar_overlay = config.titlebar_overlay,
+        // icon / proxy / user_agent：主窗口仍使用平台默认（运行时 setIcon 可改）
     };
     // 冒烟：主窗口 opt-in 关闭请求事件（windowCloseRequested 发给本窗口——
     // 冒烟在主窗口自测「拦截 → 存活」闭环；桌面应用走 config.close_requested_event）
@@ -815,6 +888,21 @@ fn Backend(comptime config: Config) type {
             reported_h: i64 = -1,
             reported_focus: bool = false,
             close_requested_event: bool = false,
+            // ---- v0.3.0：桌面体验面（透明 / 覆盖式标题栏 / 精细控制 / 拖出）----
+            /// 透明窗口（RGBA visual + 空白背景；desktop 透出）
+            transparent: bool = false,
+            /// WebView 背景色（0xRRGGBB；null = 引擎默认白底）
+            background_color: ?u32 = null,
+            /// 覆盖式标题栏（无原生边框；前端 data-zilt-drag-region 拖动）
+            titlebar_overlay: bool = false,
+            /// 鼠标穿透（GdkWindow input shape 置空）
+            ignore_cursor: bool = false,
+            /// 当前设置的光标（gdk_window_set_cursor 自己持有 ref；替换时 unref 旧值）
+            cursor: ?*c.GdkCursor = null,
+            /// 光标隐藏状态（1×1 透明 cursor 顶替）
+            cursor_hidden: bool = false,
+            /// 待拖出的文件（drag-data-get 时转 text/uri-list）
+            drag_files: std.ArrayListUnmanaged([]u8) = .empty,
         };
 
         /// 子 WebView（webviews.* op 管理的窗口内附加视图）。
@@ -1057,6 +1145,18 @@ fn Backend(comptime config: Config) type {
         terminate_check: bool = false,
         terminate_seen: bool = false,
         smoke_finished: bool = false,
+        /// ---- v0.3.0：桌面体验面 ----
+        /// WebView 右键菜单 / 脚本对话框信号已接线（冒烟探针断言用）
+        context_menu_wired: bool = false,
+        script_dialog_wired: bool = false,
+        /// 会话是否有窗口管理器（Xvfb 裸跑为 false；CI 装 openbox 后为 true）。
+        /// windowMoved/Resized/Focus 需要 WM 才会触发（configure/focus 信号）。
+        wm_present: bool = false,
+        /// 子进程槽表（v0.3.0；exit 事件后由 UI 线程摘除并 join）
+        procs: std.ArrayListUnmanaged(*ProcSlot) = .empty,
+        /// 通知按钮载荷表 + GAction 注册标记（v0.3.0）
+        notify_actions: std.ArrayListUnmanaged(NotifyActionEntry) = .empty,
+        notify_action_added: bool = false,
 
         fn deinit(self: *Self) void {
             // 主循环退出后可能仍有窗口未 destroy（ctx.quit 路径）→ 逐个释放记录
@@ -1159,6 +1259,10 @@ fn Backend(comptime config: Config) type {
             st.menu_actions.deinit(self.allocator);
             for (st.child_webviews.items) |cv| self.freeChildView(cv);
             st.child_webviews.deinit(self.allocator);
+            // v0.3.0：光标引用 / 待拖文件
+            if (st.cursor) |cursor| c.g_object_unref(@ptrCast(cursor));
+            for (st.drag_files.items) |f| self.allocator.free(f);
+            st.drag_files.deinit(self.allocator);
             self.allocator.destroy(st.sink);
             self.allocator.free(st.label);
             if (st.app_url.len != 0) self.allocator.free(st.app_url);
@@ -1385,6 +1489,7 @@ fn Backend(comptime config: Config) type {
                 .clipboard_read_data_fn = clipboardReadDataEntry,
                 .clipboard_write_data_fn = clipboardWriteDataEntry,
                 .dialog_fn = dialogEntry,
+                .start_drag_fn = startDragEntry,
                 .notify_fn = notifyEntry,
                 .notification_show_fn = notificationShowEntry,
                 .notification_update_fn = notificationUpdateEntry,
@@ -1499,7 +1604,10 @@ fn Backend(comptime config: Config) type {
             c.gtk_window_set_title(win_typed, title_z.ptr);
             c.gtk_window_set_default_size(win_typed, @intCast(opts.width), @intCast(opts.height));
             c.gtk_window_set_resizable(win_typed, if (opts.resizable) 1 else 0);
-            c.gtk_window_set_decorated(win_typed, if (opts.decorations) 1 else 0);
+            // v0.3.0：覆盖式标题栏 = 无原生边框（客户区覆盖整窗；前端自绘 +
+            // data-zilt-drag-region 拖动，语义对齐 Windows v0.1.23）
+            const overlay_title = opts.titlebar_overlay;
+            c.gtk_window_set_decorated(win_typed, if (opts.decorations and !overlay_title) 1 else 0);
             if (opts.always_on_top) c.gtk_window_set_keep_above(win_typed, 1);
             if (opts.skip_taskbar) c.gtk_window_set_skip_taskbar_hint(win_typed, 1);
             if (opts.x != null and opts.y != null) c.gtk_window_move(win_typed, opts.x.?, opts.y.?);
@@ -1542,6 +1650,9 @@ fn Backend(comptime config: Config) type {
                 .min_height = opts.min_height orelse 0,
                 .max_width = opts.max_width orelse 0,
                 .max_height = opts.max_height orelse 0,
+                .titlebar_overlay = overlay_title,
+                .transparent = opts.transparent,
+                .background_color = opts.background_color,
             };
 
             // 内容根：GtkBox（纵向）＝ 可选菜单栏 + GtkOverlay
@@ -1596,6 +1707,10 @@ fn Backend(comptime config: Config) type {
             // 主 WebView 作为 main child：随窗口内容区自动伸缩
             c.gtk_container_add(@ptrCast(overlay), view_widget);
 
+            // v0.3.0：透明窗口 / WebView 背景色（RGBA visual + app_paintable +
+            // webkit_web_view_set_background_color；必须在 realize 之前设置）
+            Self.applyWindowBackground(st);
+
             // IPC sink + load-changed（必须在 gtk_main 之前接好；页面脚本要等主循环）
             _ = c.g_signal_connect_data(
                 @ptrCast(view_widget),
@@ -1613,6 +1728,20 @@ fn Backend(comptime config: Config) type {
             _ = c.g_signal_connect_data(@ptrCast(view_widget), "permission-request", @ptrCast(&Self.onPermissionRequest), sink, null, 0);
             _ = c.g_signal_connect_data(@ptrCast(view_widget), "create", @ptrCast(&Self.onCreate), sink, null, 0);
             _ = c.g_signal_connect_data(@ptrCast(view_widget), "web-process-terminated", @ptrCast(&Self.onWebProcessTerminated), sink, null, 0);
+
+            // v0.3.0：WebView 右键菜单 / 脚本对话框接管（WebKit 原生信号）。
+            // 两者都按共享 `webview.Settings` 语义：context_menus=false → 阻止默认菜单
+            //（应用可经既有 menu.popup 自绘）；script_dialogs=false → 阻止原生模态框。
+            // 冒烟必须无交互：即使配置开启，脚本对话框也一律阻止（否则主循环被卡死）。
+            _ = c.g_signal_connect_data(@ptrCast(view_widget), "context-menu", @ptrCast(&Self.onContextMenu), sink, null, 0);
+            _ = c.g_signal_connect_data(@ptrCast(view_widget), "script-dialog", @ptrCast(&Self.onScriptDialog), sink, null, 0);
+            self.context_menu_wired = true;
+            self.script_dialog_wired = true;
+
+            // v0.3.0：拖出（window.zilt.drag.start → text/uri-list 文件拖放）。
+            // 只在 JS 主动请求时 begin（不做常驻 drag source——否则会抢走页面
+            // 文本选择/图片拖拽的默认手势）。
+            _ = c.g_signal_connect_data(@ptrCast(view_widget), "drag-data-get", @ptrCast(&Self.onDragDataGet), sink, null, 0);
 
             // v0.2.2：拖放（文件拖入）。dest 与信号挂主 WebView：drag-drop 里
             // gtk_drag_get_data 后返回 TRUE（user handler 先于 WebKit 的 class
@@ -1696,6 +1825,141 @@ fn Backend(comptime config: Config) type {
             }
             // geometry_widget 传 null = 约束相对窗口自身
             c.gtk_window_set_geometry_hints(win, null, &geom, flags);
+        }
+
+        // ------------------------------------------------------------------
+        // v0.3.0：透明窗口 / 背景色 / 光标 / 拖出
+        // ------------------------------------------------------------------
+
+        /// 透明窗口 + WebView 背景色。
+        /// 透明需要 RGBA visual + app_paintable + draw 清屏（GTK3 没有「透明窗口」
+        /// 开关，必须自己画 alpha=0）；WebView 侧用 set_background_color 让渲染
+        /// 结果透出。**必须在 realize（show_all/present）之前调用**。
+        fn applyWindowBackground(st: *WinState) void {
+            const widget: [*c]c.GtkWidget = @ptrCast(st.win);
+            if (st.transparent) {
+                const screen = c.gtk_widget_get_screen(widget);
+                var rgba_visual = false;
+                if (screen != null) {
+                    if (c.gdk_screen_get_rgba_visual(screen)) |visual| {
+                        c.gtk_widget_set_visual(widget, visual);
+                        rgba_visual = true;
+                    }
+                }
+                c.gtk_widget_set_app_paintable(widget, 1);
+                _ = c.g_signal_connect_data(widget, "draw", @ptrCast(&Self.onTransparentDraw), st, null, 0);
+                var clear = c.GdkRGBA{ .red = 0, .green = 0, .blue = 0, .alpha = 0 };
+                c.webkit_web_view_set_background_color(st.view, &clear);
+                log.print("[window] #{d} transparent (rgba visual={s})", .{ st.id, boolStr(rgba_visual) });
+                return;
+            }
+            if (st.background_color) |rgb| {
+                // 0xRRGGBB → GdkRGBA（alpha=1）
+                const r: f64 = @floatFromInt((rgb >> 16) & 0xff);
+                const g: f64 = @floatFromInt((rgb >> 8) & 0xff);
+                const b: f64 = @floatFromInt(rgb & 0xff);
+                var color = c.GdkRGBA{ .red = r / 255.0, .green = g / 255.0, .blue = b / 255.0, .alpha = 1 };
+                c.webkit_web_view_set_background_color(st.view, &color);
+                log.print("[window] #{d} background color #{x:0>6}", .{ st.id, rgb });
+            }
+        }
+
+        /// 透明窗口清屏：cairo 用 SOURCE 算子把整块区域涂成全透明
+        ///（app_paintable 下 GTK 不再画主题背景）。
+        fn onTransparentDraw(_: [*c]c.GtkWidget, cr: ?*c.cairo_t, user_data: c.gpointer) callconv(.c) c.gboolean {
+            _ = user_data;
+            const ctx = cr orelse return 0;
+            c.cairo_set_source_rgba(ctx, 0, 0, 0, 0);
+            c.cairo_set_operator(ctx, c.CAIRO_OPERATOR_SOURCE);
+            c.cairo_paint(ctx);
+            return 1;
+        }
+
+        /// 1×1 全透明光标（隐藏光标用；GDK3 没有 ShowCursor 式的全局开关）。
+        fn blankCursor(display: *c.GdkDisplay) ?*c.GdkCursor {
+            const pixbuf = c.gdk_pixbuf_new(c.GDK_COLORSPACE_RGB, 1, 8, 1, 1) orelse return null;
+            defer c.g_object_unref(@ptrCast(pixbuf));
+            c.gdk_pixbuf_fill(pixbuf, 0);
+            return c.gdk_cursor_new_from_pixbuf(display, pixbuf, 0, 0);
+        }
+
+        /// 把 st.cursor / cursor_hidden 的当前状态落到 GdkWindow。
+        fn applyWindowCursor(st: *WinState) bool {
+            const gdk_win = c.gtk_widget_get_window(@ptrCast(st.win)) orelse return false;
+            if (st.cursor_hidden) {
+                const display = c.gdk_window_get_display(gdk_win) orelse return false;
+                const blank = blankCursor(display) orelse return false;
+                c.gdk_window_set_cursor(gdk_win, blank);
+                c.g_object_unref(@ptrCast(blank));
+                return true;
+            }
+            c.gdk_window_set_cursor(gdk_win, st.cursor);
+            return true;
+        }
+
+        /// 释放拖出文件列表（替换/窗口销毁时）。
+        fn clearDragFiles(self: *Self, st: *WinState) void {
+            for (st.drag_files.items) |f| self.allocator.free(f);
+            st.drag_files.clearRetainingCapacity();
+        }
+
+        /// drag-data-get：把待拖文件列表写成 text/uri-list。
+        fn onDragDataGet(
+            _: [*c]c.GtkWidget,
+            _: ?*c.GdkDragContext,
+            data: ?*c.GtkSelectionData,
+            _: c.guint,
+            _: c.guint,
+            user_data: c.gpointer,
+        ) callconv(.c) void {
+            const sink: *IpcSink = @ptrCast(@alignCast(user_data orelse return));
+            const self = sink.backend;
+            const st = self.windowById(sink.win_id) orelse return;
+            const sel: *c.GtkSelectionData = @ptrCast(@alignCast(data orelse return));
+            var views: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer views.deinit(self.allocator);
+            for (st.drag_files.items) |f| views.append(self.allocator, f) catch return;
+            const uri_list = buildUriList(self.allocator, views.items) catch return;
+            defer self.allocator.free(uri_list);
+            const atom = c.gdk_atom_intern("text/uri-list", 0);
+            _ = c.gtk_selection_data_set(sel, atom, 8, uri_list.ptr, @intCast(uri_list.len));
+            log.print("[dnd] drag-data-get served {d} file(s) ({d} bytes)", .{
+                st.drag_files.items.len,
+                uri_list.len,
+            });
+        }
+
+        /// v0.3.0：`window.zilt.drag.start(files)` —— 记录待拖文件并立即开始
+        /// GTK 拖放（text/uri-list，COPY）。目标程序读取时经 drag-data-get 提供。
+        fn startDragEntry(backend: *anyopaque, window_id: u32, files: []const []const u8) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            const st = self.windowById(window_id) orelse return error.DragNotAvailable;
+            if (files.len == 0) return error.NoFiles;
+            self.clearDragFiles(st);
+            for (files) |f| {
+                if (f.len == 0) continue;
+                const copy = try self.allocator.dupe(u8, f);
+                errdefer self.allocator.free(copy);
+                try st.drag_files.append(self.allocator, copy);
+            }
+            if (st.drag_files.items.len == 0) return error.NoFiles;
+
+            const widget: [*c]c.GtkWidget = @ptrCast(st.view);
+            const gdk_win = c.gtk_widget_get_window(widget) orelse return error.DragNotAvailable;
+            const display = c.gdk_window_get_display(gdk_win) orelse return error.DragNotAvailable;
+            const seat = c.gdk_display_get_default_seat(display) orelse return error.DragNotAvailable;
+            var x: c.gint = 0;
+            var y: c.gint = 0;
+            c.gdk_device_get_position(c.gdk_seat_get_pointer(seat), null, &x, &y);
+
+            const targets = [_]c.GtkTargetEntry{
+                .{ .target = @constCast("text/uri-list"), .flags = 0, .info = 0 },
+            };
+            const list = c.gtk_target_list_new(&targets, targets.len);
+            if (list == null) return error.DragNotAvailable;
+            defer c.gtk_target_list_unref(list);
+            _ = c.gtk_drag_begin_with_coordinates(widget, list, c.GDK_ACTION_COPY, 1, null, x, y);
+            log.print("[dnd] drag-out started ({d} file(s), window #{d})", .{ st.drag_files.items.len, st.id });
         }
 
         // ------------------------------------------------------------------
@@ -1801,9 +2065,97 @@ fn Backend(comptime config: Config) type {
                     c.gtk_window_fullscreen_on_monitor(win, screen, @intCast(idx));
                     st.fullscreen = true;
                 },
-                // 光标系列 / 穿透 / 截图保护 / 阴影 / 图标：后续切片（false = 前端拿到明确失败）
-                .cursor, .cursor_visible, .cursor_grab, .cursor_position => return false,
-                .ignore_cursor, .content_protected, .shadow, .icon => return false,
+                // ---- v0.3.0：窗口精细控制 ----
+                .cursor => |kind| {
+                    const gdk_win = c.gtk_widget_get_window(widget) orelse return false;
+                    const display = c.gdk_window_get_display(gdk_win) orelse return false;
+                    const name = gdkCursorName(kind);
+                    var cursor = c.gdk_cursor_new_from_name(display, name.ptr);
+                    if (cursor == null and !std.mem.eql(u8, name, "default")) {
+                        cursor = c.gdk_cursor_new_from_name(display, "default");
+                    }
+                    if (cursor == null) return false;
+                    c.gdk_window_set_cursor(gdk_win, cursor);
+                    if (st.cursor) |old| c.g_object_unref(@ptrCast(old));
+                    st.cursor = cursor;
+                    st.cursor_hidden = false;
+                    return true;
+                },
+                .cursor_visible => |visible| {
+                    st.cursor_hidden = !visible;
+                    return applyWindowCursor(st);
+                },
+                .cursor_grab => |grab| {
+                    const gdk_win = c.gtk_widget_get_window(widget) orelse return false;
+                    const display = c.gdk_window_get_display(gdk_win) orelse return false;
+                    const seat = c.gdk_display_get_default_seat(display) orelse return false;
+                    if (grab) {
+                        const status = c.gdk_seat_grab(
+                            seat,
+                            gdk_win,
+                            c.GDK_SEAT_CAPABILITY_ALL,
+                            0,
+                            null,
+                            null,
+                            null,
+                            null,
+                        );
+                        if (status != c.GDK_GRAB_SUCCESS) {
+                            log.print("[window] cursor grab failed (status={d})", .{status});
+                        }
+                    } else {
+                        c.gdk_seat_ungrab(seat);
+                    }
+                    return true;
+                },
+                .cursor_position => |p| {
+                    const display = c.gdk_display_get_default() orelse return false;
+                    const seat = c.gdk_display_get_default_seat(display) orelse return false;
+                    const pointer = c.gdk_seat_get_pointer(seat) orelse return false;
+                    const screen = c.gdk_window_get_screen(c.gtk_widget_get_window(widget)) orelse return false;
+                    c.gdk_device_warp(pointer, screen, p.x, p.y);
+                    return true;
+                },
+                .ignore_cursor => |ignore| {
+                    const gdk_win = c.gtk_widget_get_window(widget) orelse return false;
+                    if (ignore) {
+                        // 空 input shape = 该窗口不接收指针事件（穿透到下层窗口）
+                        const region = c.cairo_region_create() orelse return false;
+                        defer c.cairo_region_destroy(region);
+                        c.gdk_window_input_shape_combine_region(gdk_win, region, 0, 0);
+                    } else {
+                        c.gdk_window_input_shape_combine_region(gdk_win, null, 0, 0);
+                    }
+                    st.ignore_cursor = ignore;
+                    return true;
+                },
+                .content_protected => {
+                    // Linux 无标准「禁止截屏」API（X11 无、Wayland 由 compositor 决定）
+                    log.print("[window] content protection not supported on Linux (window #{d})", .{st.id});
+                    return false;
+                },
+                .shadow => |on| {
+                    // GTK3 无窗口阴影 API：装饰窗口的阴影由 WM/compositor 提供；
+                    // 无边框窗口需要 CSD（GTK4 一等支持）。接受请求但不改变状态。
+                    log.print("[window] shadow={s} (WM/compositor-owned on Linux)", .{boolStr(on)});
+                    return true;
+                },
+                .icon => |maybe_path| {
+                    if (maybe_path) |path| {
+                        const z = dupeZ(self.allocator, path) catch return false;
+                        defer self.allocator.free(z);
+                        var err: ?*c.GError = null;
+                        const ok = c.gtk_window_set_icon_from_file(win, z.ptr, &err);
+                        if (err) |e| {
+                            log.print("[window] icon load failed ('{s}'): {s}", .{ path, std.mem.span(e.*.message) });
+                            c.g_error_free(e);
+                        }
+                        return ok != 0;
+                    }
+                    // null = 清空图标（GTK 回退到默认）
+                    c.gtk_window_set_icon(win, null);
+                    return true;
+                },
                 // builtin 的 state 动作在调用 window_fn 之前已走 window_query_fn
                 .state => return true,
             }
@@ -1831,7 +2183,7 @@ fn Backend(comptime config: Config) type {
             }
 
             return std.fmt.allocPrint(alloc,
-                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":0,"ex_style":0,"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":false,"focusable":{s},"content_protected":false,"overlay":false,"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d}}}
+                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":0,"ex_style":0,"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":false,"overlay":{s},"transparent":{s},"background_color":{d},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d}}}
             , .{
                 st.id,
                 x,
@@ -1846,7 +2198,11 @@ fn Backend(comptime config: Config) type {
                 boolStr(st.fullscreen),
                 boolStr(st.always_on_top),
                 boolStr(st.always_on_bottom),
+                boolStr(st.ignore_cursor),
                 boolStr(c.gtk_window_get_accept_focus(win) != 0),
+                boolStr(st.titlebar_overlay),
+                boolStr(st.transparent),
+                if (st.background_color) |bg| @as(i64, bg) else -1,
                 st.min_width,
                 st.min_height,
                 st.max_width,
@@ -2747,9 +3103,103 @@ fn Backend(comptime config: Config) type {
             log.print("[notify] sent title=\"{s}\" tag={s}", .{ title, tag orelse "-" });
         }
 
+        /// v0.3.0：完整通知（按钮/正文点击 → GAction 索引机制，避免 GVariant
+        /// 字符串转义）。input/progress 是 WinRT 独有 → 稳定 NotSupported。
         fn notificationShowEntry(backend: *anyopaque, _: u32, options: notification.Options) anyerror!void {
             const self: *Self = @ptrCast(@alignCast(backend));
-            try self.sendNotification(options.tag, options.title, options.body);
+            if (options.input != null) return error.NotificationInputNotSupported;
+            if (options.progress != null) return error.NotificationProgressNotSupported;
+            const app = self.gapp orelse return error.NotificationNotAvailable;
+            if (!self.gapp_registered) return error.NotificationNotAvailable;
+            self.initNotifyAction();
+
+            const title_z = try dupeZ(self.allocator, options.title);
+            defer self.allocator.free(title_z);
+            const body_z = try dupeZ(self.allocator, options.body);
+            defer self.allocator.free(body_z);
+            const n = c.g_notification_new(title_z.ptr) orelse return error.NotificationFailed;
+            defer c.g_object_unref(@ptrCast(n));
+            c.g_notification_set_body(n, body_z.ptr);
+
+            for (options.actions) |act| {
+                const idx = self.registerNotifyAction(if (act.arguments.len > 0) act.arguments else (act.launch orelse act.title), options.tag);
+                const detail = std.fmt.allocPrint(self.allocator, "app.zilt-notify::{d}", .{idx}) catch continue;
+                defer self.allocator.free(detail);
+                const label_z = dupeZ(self.allocator, act.title) catch continue;
+                defer self.allocator.free(label_z);
+                c.g_notification_add_button(n, label_z.ptr, detail.ptr);
+                log.print("[notify] button '{s}' -> action#{d}", .{ act.title, idx });
+            }
+            if (options.launch) |launch| {
+                const idx = self.registerNotifyAction(launch, options.tag);
+                const detail = std.fmt.allocPrint(self.allocator, "app.zilt-notify::{d}", .{idx}) catch return;
+                defer self.allocator.free(detail);
+                c.g_notification_set_default_action(n, detail.ptr);
+                log.print("[notify] default action -> action#{d} ({s})", .{ idx, launch });
+            }
+
+            var tag_z: ?[:0]u8 = null;
+            if (options.tag) |t| tag_z = dupeZ(self.allocator, t) catch null;
+            defer if (tag_z) |z| self.allocator.free(z);
+            c.g_application_send_notification(app, if (tag_z) |z| z.ptr else null, n);
+            log.print("[notify] sent title=\"{s}\" tag={s} buttons={d}", .{ options.title, options.tag orelse "-", options.actions.len });
+        }
+
+        /// 注册一次 GAction（app.zilt-notify，参数 int32 索引）——activate 信号
+        /// 挂在 SimpleAction 上（GApplication 无 per-action 信号）。
+        fn initNotifyAction(self: *Self) void {
+            if (self.notify_action_added) return;
+            const app = self.gapp orelse return;
+            // G_VARIANT_TYPE_INT32 宏 translate-c 失败——用 g_variant_type_new("i")
+            const vt = c.g_variant_type_new("i");
+            defer c.g_variant_type_free(vt);
+            const action = c.g_simple_action_new("zilt-notify", vt);
+            if (action == null) return;
+            _ = c.g_signal_connect_data(@ptrCast(action), "activate", @ptrCast(&Self.onNotifyActionActivated), self, null, 0);
+            c.g_action_map_add_action(@ptrCast(app), @ptrCast(action));
+            c.g_object_unref(@ptrCast(action)); // map 持有自己的引用
+            self.notify_action_added = true;
+            log.print("[notify] GAction 'zilt-notify' registered", .{});
+        }
+
+        /// 通知按钮载荷表（索引即槽位；进程生命周期内持有）。
+        const NotifyActionEntry = struct {
+            arguments: []u8,
+            tag: ?[]u8,
+        };
+
+        fn registerNotifyAction(self: *Self, arguments: []const u8, tag: ?[]const u8) u32 {
+            const args_copy = self.allocator.dupe(u8, arguments) catch return 0;
+            const tag_copy: ?[]u8 = if (tag) |t| (self.allocator.dupe(u8, t) catch null) else null;
+            self.notify_actions.append(self.allocator, .{ .arguments = args_copy, .tag = tag_copy }) catch {
+                self.allocator.free(args_copy);
+                if (tag_copy) |t2| self.allocator.free(t2);
+                return 0;
+            };
+            return @intCast(self.notify_actions.items.len - 1);
+        }
+
+        fn onNotifyActionActivated(
+            action: ?*c.GSimpleAction,
+            parameter: ?*c.GVariant,
+            user_data: c.gpointer,
+        ) callconv(.c) void {
+            _ = action;
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return));
+            if (parameter == null) return;
+            if (self.notify_actions.items.len == 0) return;
+            const idx: u32 = @intCast(@as(i64, c.g_variant_get_int32(parameter)));
+            if (idx >= self.notify_actions.items.len) return;
+            const entry = self.notify_actions.items[idx];
+            log.print("[notify] activated action#{d} args={s}", .{ idx, entry.arguments });
+            // notification 事件（对齐 Windows toastEventJson 的 activated 形状）
+            const args_json = jsonStr(self.allocator, entry.arguments) orelse return;
+            defer self.allocator.free(args_json);
+            const tag_json = if (entry.tag) |t| (jsonStr(self.allocator, t) orelse return) else self.allocator.dupe(u8, "null") catch return;
+            defer self.allocator.free(tag_json);
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"tag\":{s},\"kind\":\"activated\",\"arguments\":{s}}}", .{ tag_json, args_json }) catch return;
+            defer self.allocator.free(payload);
+            self.emitRawToWindow(0, "notification", payload);
         }
 
         fn notificationUpdateEntry(
@@ -3812,7 +4262,8 @@ fn Backend(comptime config: Config) type {
                 .hotkey => |op| return self.runHotkeyOp(op, alloc),
                 .http => |op| return self.runHttpOp(op, alloc),
                 .ws => |op| return self.runWsOp(op, alloc),
-                // v0.2.7：shell（opener）/ services / updater
+                // v0.2.7：shell（opener）/ services / updater；v0.3.0：子进程
+                .process => |op| return self.runProcOp(op, alloc),
                 .shell => |target| {
                     try openShellTarget(target);
                     return .{ .ok = true };
@@ -4696,7 +5147,6 @@ fn Backend(comptime config: Config) type {
                 return;
             };
             defer self.allocator.free(exe);
-            setSigChldIgnore();
             const ok = spawnDetachedLinux(&.{ exe, updater.restart_flag, exe });
             log.print("[updater] restart helper spawned ({})", .{ok});
         }
@@ -5619,6 +6069,273 @@ fn Backend(comptime config: Config) type {
         }
 
         // ------------------------------------------------------------------
+        // 子进程执行（v0.3.0，对齐 Windows v0.1.16 的 runProcOp/procWorker 面）
+        // ------------------------------------------------------------------
+
+        /// 一个子进程槽：worker 线程拥有 child/管道读循环；exit 事件后由
+        /// UI 线程 join 并释放（与 Windows 的 WM_ZILT_PROC 收尾同构）。
+        const ProcSlot = struct {
+            backend: *Self,
+            id: i64,
+            child: std.process.Child = undefined,
+            /// 共享 Threaded io（spawn/读管道/wait 都走它）
+            threaded: ?*std.Io.Threaded = null,
+            worker: std.Thread = undefined,
+        };
+
+        /// worker → UI 线程事件（g_idle_add 封送；page_allocator 持有，UI 线程 free）。
+        const ProcEventTask = struct {
+            backend: *Self,
+            ev: *ProcEvent,
+        };
+
+        const ProcWhich = enum { stdout, stderr };
+
+        const ProcEvent = struct {
+            const Kind = enum { out, exit };
+            id: i64,
+            kind: Kind,
+            which: ProcWhich = .stdout,
+            data: ?[]u8 = null,
+            code: i64 = 0,
+        };
+
+        fn procPostEvent(self: *Self, ev: *ProcEvent) void {
+            const task = self.allocator.create(ProcEventTask) catch {
+                const a = std.heap.page_allocator;
+                if (ev.data) |d| a.free(d);
+                a.destroy(ev);
+                return;
+            };
+            task.* = .{ .backend = self, .ev = ev };
+            if (c.g_idle_add(procEventIdle, task) == 0) {
+                const a = std.heap.page_allocator;
+                if (ev.data) |d| a.free(d);
+                a.destroy(ev);
+                self.allocator.destroy(task);
+            }
+        }
+
+        fn procEventIdle(data: c.gpointer) callconv(.c) c.gboolean {
+            const task: *ProcEventTask = @ptrCast(@alignCast(data orelse return G_SOURCE_REMOVE));
+            const self = task.backend;
+            const ev = task.ev;
+            defer {
+                const a = std.heap.page_allocator;
+                if (ev.data) |d| a.free(d);
+                a.destroy(ev);
+                self.allocator.destroy(task);
+            }
+            switch (ev.kind) {
+                .out => self.emitProcEvent(ev.id, if (ev.which == .stdout) "stdout" else "stderr", ev.data, 0),
+                .exit => {
+                    self.emitProcEvent(ev.id, "exit", null, ev.code);
+                    // exit 事件是槽的终点：join worker + 释放 io（与 Windows 同构）
+                    for (self.procs.items, 0..) |p, i| {
+                        if (p.id == ev.id) {
+                            _ = self.procs.swapRemove(i);
+                            p.worker.join();
+                            if (p.threaded) |t| {
+                                t.deinit();
+                                std.heap.page_allocator.destroy(t);
+                            }
+                            std.heap.page_allocator.destroy(p);
+                            break;
+                        }
+                    }
+                },
+            }
+            return G_SOURCE_REMOVE;
+        }
+
+        fn emitProcEvent(self: *Self, id: i64, kind: []const u8, data: ?[]const u8, code: i64) void {
+            const w = self.windowById(0) orelse return;
+            const kind_json = jsonStr(self.allocator, kind) orelse return;
+            defer self.allocator.free(kind_json);
+            const payload = if (data) |d| blk: {
+                const dj = jsonStr(self.allocator, d) orelse return;
+                defer self.allocator.free(dj);
+                break :blk std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"kind\":{s},\"data\":{s}}}", .{ id, kind_json, dj }) catch return;
+            } else std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"kind\":{s},\"code\":{d}}}", .{ id, kind_json, code }) catch return;
+            defer self.allocator.free(payload);
+            self.emitRawToWindow(w.id, "processEvent", payload);
+        }
+
+        /// 单路管道读循环：takeByte 填 4KB 缓冲，满/EOF 时发 out 事件（与 Windows 同构）。
+        fn procReadPipe(slot: *ProcSlot, file: std.Io.File, which: ProcWhich) void {
+            const a = std.heap.page_allocator;
+            const io = slot.threaded.?.io();
+            var buf: [8192]u8 = undefined;
+            var rd = file.reader(io, &buf);
+            var chunk: [4096]u8 = undefined;
+            var n: usize = 0;
+            while (true) {
+                const b = rd.interface.takeByte() catch break; // EOF / 错误
+                chunk[n] = b;
+                n += 1;
+                if (n == chunk.len) {
+                    const ev = a.create(ProcEvent) catch {
+                        n = 0;
+                        continue;
+                    };
+                    ev.* = .{ .id = slot.id, .kind = .out, .which = which, .data = a.dupe(u8, chunk[0..n]) catch null };
+                    slot.backend.procPostEvent(ev);
+                    n = 0;
+                }
+            }
+            if (n > 0) {
+                const ev = a.create(ProcEvent) catch return;
+                ev.* = .{ .id = slot.id, .kind = .out, .which = which, .data = a.dupe(u8, chunk[0..n]) catch null };
+                slot.backend.procPostEvent(ev);
+            }
+        }
+
+        /// 子进程 worker：spawn → 两路读线程 → join → wait → exit 事件。
+        /// spawn 失败也发 exit（code=-1），前端凭 id 收尾（与 Windows 同构）。
+        fn procWorker(slot: *ProcSlot, argv: [][]u8, cwd: ?[]u8) void {
+            const a = std.heap.page_allocator;
+            defer {
+                for (argv) |arg| a.free(arg);
+                a.free(argv);
+                if (cwd) |cw| a.free(cw);
+            }
+
+            const threaded = a.create(std.Io.Threaded) catch {
+                const ev = a.create(ProcEvent) catch return;
+                ev.* = .{ .id = slot.id, .kind = .exit, .code = -1 };
+                slot.backend.procPostEvent(ev);
+                return;
+            };
+            threaded.* = .init(a, .{});
+            slot.threaded = threaded;
+            const io = threaded.io();
+
+            const spawned = std.process.spawn(io, .{
+                .argv = argv,
+                .cwd = if (cwd) |cw| .{ .path = cw } else .inherit,
+                .stdout = .pipe,
+                .stderr = .pipe,
+            }) catch |e| {
+                log.print("[proc] spawn failed id={d}: {s}", .{ slot.id, @errorName(e) });
+                const ev = a.create(ProcEvent) catch return;
+                ev.* = .{ .id = slot.id, .kind = .exit, .code = -1 };
+                slot.backend.procPostEvent(ev);
+                return;
+            };
+            slot.child = spawned;
+            log.print("[proc] spawned id={d}", .{slot.id});
+
+            const t1: ?std.Thread = std.Thread.spawn(.{}, procReadPipe, .{ slot, slot.child.stdout.?, @as(ProcWhich, .stdout) }) catch null;
+            const t2: ?std.Thread = std.Thread.spawn(.{}, procReadPipe, .{ slot, slot.child.stderr.?, @as(ProcWhich, .stderr) }) catch null;
+            if (t1) |t| t.join();
+            if (t2) |t| t.join();
+
+            var code: i64 = -1;
+            if (slot.child.wait(io)) |term| {
+                code = switch (term) {
+                    .exited => |cc| @intCast(cc),
+                    else => -1,
+                };
+            } else |_| {}
+            const ev = a.create(ProcEvent) catch return;
+            ev.* = .{ .id = slot.id, .kind = .exit, .code = code };
+            slot.backend.procPostEvent(ev);
+            log.print("[proc] exited id={d} code={d}", .{ slot.id, code });
+        }
+
+        fn procById(self: *Self, id: i64) ?*ProcSlot {
+            for (self.procs.items) |p| {
+                if (p.id == id) return p;
+            }
+            return null;
+        }
+
+        /// spawn 受 `shell:` scope 管控（argv[0] basename 去 .exe——与 Windows 同规则）。
+        fn procBaseName(arg: []const u8) []const u8 {
+            const base = std.fs.path.basename(arg);
+            if (std.mem.endsWith(u8, base, ".exe") or std.mem.endsWith(u8, base, ".EXE")) return base[0 .. base.len - 4];
+            return base;
+        }
+
+        fn runProcOp(self: *Self, op: system_api.ProcessOp, alloc: std.mem.Allocator) !system_api.Result {
+            const a = std.heap.page_allocator;
+            switch (op) {
+                .spawn => |req| {
+                    if (req.argv.len == 0) return error.MissingCommand;
+                    const exe_name = procBaseName(req.argv[0]);
+                    if (!self.aclAllowed("shell", exe_name)) {
+                        log.print("[acl] shell denied: {s}", .{req.argv[0]});
+                        return error.PermissionDenied;
+                    }
+                    const slot = a.create(ProcSlot) catch return error.OutOfMemory;
+                    // argv/cwd 拷贝到 page_allocator（worker 生命周期内有效）
+                    const argv_copy = a.alloc([]u8, req.argv.len) catch {
+                        a.destroy(slot);
+                        return error.OutOfMemory;
+                    };
+                    var ok = true;
+                    for (req.argv, 0..) |arg, i| {
+                        argv_copy[i] = a.dupe(u8, arg) catch {
+                            ok = false;
+                            break;
+                        };
+                    }
+                    if (!ok) {
+                        for (argv_copy) |arg| a.free(arg);
+                        a.free(argv_copy);
+                        a.destroy(slot);
+                        return error.OutOfMemory;
+                    }
+                    const cwd_copy: ?[]u8 = if (req.cwd) |cw| a.dupe(u8, cw) catch null else null;
+                    slot.* = .{ .backend = self, .id = req.id };
+                    self.procs.append(self.allocator, slot) catch {
+                        for (argv_copy) |arg| a.free(arg);
+                        a.free(argv_copy);
+                        if (cwd_copy) |cw| a.free(cw);
+                        a.destroy(slot);
+                        return error.OutOfMemory;
+                    };
+                    const t = std.Thread.spawn(.{ .stack_size = sys.threadStackSize(512 * 1024) }, procWorker, .{ slot, argv_copy, cwd_copy }) catch {
+                        for (self.procs.items, 0..) |p, i| {
+                            if (p == slot) {
+                                _ = self.procs.swapRemove(i);
+                                break;
+                            }
+                        }
+                        for (argv_copy) |arg| a.free(arg);
+                        a.free(argv_copy);
+                        if (cwd_copy) |cw| a.free(cw);
+                        a.destroy(slot);
+                        log.print("[proc] spawn worker failed (id={d})", .{req.id});
+                        return error.ProcSpawnFailed;
+                    };
+                    slot.worker = t;
+                    log.print("[proc] spawn id={d} argv0={s} dispatched", .{ req.id, req.argv[0] });
+                    return .{ .ok = true };
+                },
+                .kill => |req| {
+                    const slot = self.procById(req.id) orelse return .{ .ok = false };
+                    const pid = slot.child.id orelse return .{ .ok = false };
+                    // Linux 无「以指定退出码终止」——SIGKILL 直达，exit 事件给实际码
+                    _ = std.c.kill(pid, .KILL);
+                    log.print("[proc] kill id={d} (SIGKILL; requested code={d} 不适用)", .{ req.id, req.exit_code });
+                    return .{ .ok = true };
+                },
+                .list => {
+                    var out: std.ArrayListUnmanaged(u8) = .empty;
+                    errdefer out.deinit(alloc);
+                    try out.append(alloc, '[');
+                    for (self.procs.items, 0..) |p, i| {
+                        if (i != 0) try out.append(alloc, ',');
+                        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{{\"id\":{d},\"alive\":true}}", .{p.id}));
+                    }
+                    try out.append(alloc, ']');
+                    return .{ .json = try out.toOwnedSlice(alloc) };
+                },
+            }
+        }
+
+        // ------------------------------------------------------------------
         // 应用自定义协议 → 真 scheme（v0.2.3；每协议一个 scheme，URI 形态
         // <name>://<rest>?<query>，对应 Windows 的 /__proto/<name>/<rest>）
         // ------------------------------------------------------------------
@@ -5774,6 +6491,20 @@ fn Backend(comptime config: Config) type {
                         log.print("[dnd] simulated drop (smoke, via invoke)", .{});
                         _ = c.g_idle_add(smokeDropIdle, self);
                         const resp = try ipc.encodeResolve(self.allocator, inv.id, "\"queued\"");
+                        defer self.allocator.free(resp);
+                        self.deliverAlloc(sink.view, resp);
+                        return;
+                    }
+                    // 框架内部：冒烟探针——v0.3.0 桌面体验面是否接线 + 会话有无 WM
+                    //（windowMoved/Resized/Focus 需要 WM；Xvfb 裸跑跳过断言）
+                    if (std.mem.eql(u8, inv.method, "__zilt.linuxSmokeWired")) {
+                        const body = try std.fmt.allocPrint(self.allocator, "{{\"context_menu\":{s},\"script_dialog\":{s},\"wm\":{s}}}", .{
+                            boolStr(self.context_menu_wired),
+                            boolStr(self.script_dialog_wired),
+                            boolStr(self.wm_present),
+                        });
+                        defer self.allocator.free(body);
+                        const resp = try ipc.encodeResolve(self.allocator, inv.id, body);
                         defer self.allocator.free(resp);
                         self.deliverAlloc(sink.view, resp);
                         return;
@@ -6185,6 +6916,43 @@ fn Backend(comptime config: Config) type {
         // ------------------------------------------------------------------
         // 拖放（v0.2.2）：文件拖入 → dropFiles {files}
         // ------------------------------------------------------------------
+
+        /// v0.3.0：WebView 右键菜单接管。返回 TRUE 阻止 WebKit 默认菜单
+        ///（context_menus=false；应用可经既有 menu.popup 自绘）。
+        fn onContextMenu(
+            _: [*c]c.WebKitWebView,
+            _: ?*anyopaque,
+            _: ?*anyopaque,
+            _: ?*anyopaque,
+            user_data: c.gpointer,
+        ) callconv(.c) c.gboolean {
+            const sink: *IpcSink = @ptrCast(@alignCast(user_data orelse return 0));
+            _ = sink;
+            return if (config.webview.settings.context_menus) 0 else 1;
+        }
+
+        /// v0.3.0：脚本对话框接管（alert/confirm/prompt/beforeunload）。
+        /// - `settings.script_dialogs=false` → 阻止原生模态框；
+        /// - 冒烟模式一律阻止（无交互环境，模态框会卡死主循环）→ 默认应答。
+        fn onScriptDialog(
+            _: [*c]c.WebKitWebView,
+            dialog: ?*anyopaque,
+            user_data: c.gpointer,
+        ) callconv(.c) c.gboolean {
+            const sink: *IpcSink = @ptrCast(@alignCast(user_data orelse return 0));
+            if (config.webview.settings.script_dialogs and !sink.backend.smoke) return 0;
+            if (dialog) |d| {
+                const sd: *c.WebKitScriptDialog = @ptrCast(@alignCast(d));
+                const kind = c.webkit_script_dialog_get_dialog_type(sd);
+                if (kind == c.WEBKIT_SCRIPT_DIALOG_CONFIRM or kind == c.WEBKIT_SCRIPT_DIALOG_BEFORE_UNLOAD_CONFIRM) {
+                    c.webkit_script_dialog_confirm_set_confirmed(sd, 0);
+                } else if (kind == c.WEBKIT_SCRIPT_DIALOG_PROMPT) {
+                    c.webkit_script_dialog_prompt_set_text(sd, "");
+                }
+            }
+            log.print("[webview] script dialog suppressed (window #{d})", .{sink.win_id});
+            return 1;
+        }
 
         /// drag-drop：取数据（uri-list 优先）后返回 TRUE，拦截 WebKit 默认导航。
         fn onDragDrop(
@@ -6702,6 +7470,35 @@ test "reasonFor: 状态码有可读短语" {
     try testing.expectEqualStrings("Not Found", reasonFor(404));
     try testing.expectEqualStrings("OK", reasonFor(200));
     try testing.expectEqualStrings("OK", reasonFor(599)); // 未知码不崩
+}
+
+test "gdkCursorName: 14 种 CursorKind 全部映射到 GDK 标准光标名" {
+    const kinds = [_]ipc.CursorKind{
+        .default, .arrow,     .ibeam,     .crosshair,
+        .hand,    .wait,      .help,      .not_allowed,
+        .size_ns, .size_ew,   .size_nwse, .size_nesw,
+        .move,    .up_arrow,
+    };
+    for (kinds) |kind| {
+        const name = gdkCursorName(kind);
+        try testing.expect(name.len > 0);
+    }
+    try testing.expectEqualStrings("pointer", gdkCursorName(.hand));
+    try testing.expectEqualStrings("text", gdkCursorName(.ibeam));
+    try testing.expectEqualStrings("not-allowed", gdkCursorName(.not_allowed));
+    try testing.expectEqualStrings("ns-resize", gdkCursorName(.size_ns));
+    try testing.expectEqualStrings("default", gdkCursorName(.arrow));
+}
+
+test "buildUriList: file:// 编码、CRLF 分隔与空项跳过" {
+    const alloc = testing.allocator;
+    const list = try buildUriList(alloc, &.{ "/tmp/a b.txt", "", "/tmp/c.txt" });
+    defer alloc.free(list);
+    try testing.expectEqualStrings("file:///tmp/a%20b.txt\r\nfile:///tmp/c.txt\r\n", list);
+
+    const empty = try buildUriList(alloc, &.{});
+    defer alloc.free(empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
 }
 
 test "sanitizePartition: 安全字符保留、其余替换、截断与空名兜底" {

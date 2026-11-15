@@ -201,9 +201,34 @@ function runSecondWindowProbe() {
     const rDrag = await W.startDragging();
     check('win.wmcalls', rMin === true && rMax === true && rDrag === true, `min=${rMin} max=${rMax} drag=${rDrag}`);
 
-    // 未实现项：明确返回 false（不抛异常），错误名对齐 Windows 语义
+    // v0.3.0：精细控制包——光标（抽样）/ 隐藏 / 抓取 / 位置 / 穿透 / 阴影
     const rCursor = await W.setCursor('hand');
-    check('win.unimpl', rCursor === false, `cursor=${rCursor}`);
+    const rCursor2 = await W.setCursor('ibeam');
+    const rCursorVis = await W.setCursorVisible(false);
+    const rCursorVis2 = await W.setCursorVisible(true);
+    const rGrab = await W.setCursorGrab(true);
+    const rUngrab = await W.setCursorGrab(false);
+    const rWarp = await W.setCursorPosition(20, 20);
+    const rShadow = await W.setShadow(true);
+    const rShadow2 = await W.setShadow(false);
+    const rIgnore = await W.setIgnoreCursorEvents(true);
+    await wait(80);
+    const ignored = (await state()).ignore_cursor === true;
+    await W.setIgnoreCursorEvents(false);
+    check('win.polish',
+      rCursor === true && rCursor2 === true && rCursorVis === true && rCursorVis2 === true &&
+      rGrab === true && rUngrab === true && rWarp === true && rShadow === true && rShadow2 === true &&
+      rIgnore === true && ignored,
+      `cursor=${rCursor}/${rCursor2} vis=${rCursorVis}/${rCursorVis2} grab=${rGrab}/${rUngrab} ` +
+      `warp=${rWarp} shadow=${rShadow}/${rShadow2} ignore=${rIgnore}/${ignored}`);
+
+    // v0.3.0：平台缺省项——防截屏无标准 API（稳定 false，不抛异常）；
+    // 运行时图标 null = 清空成功，不存在的路径 = 明确失败
+    const rProtect = await W.setContentProtected(true);
+    const rIconClear = await W.setIcon(null);
+    const rIconBogus = await W.setIcon('/nonexistent/zilt-smoke-icon.png');
+    check('win.guards', rProtect === false && rIconClear === true && rIconBogus === false,
+      `protect=${rProtect} iconClear=${rIconClear} iconBogus=${rIconBogus}`);
   } catch (e) { check('win.state', false, String(e.message || e)); }
 
   // ---- v0.2.1 切片 2：WebView 面（webview_request_fn / eval_async_fn）----
@@ -858,6 +883,172 @@ function runSecondWindowProbe() {
     const found = probe.length > 0 ? Z().webview.find(probe) : false;
     check('find', found === true, 'find(' + JSON.stringify(probe) + ') -> ' + found);
   } catch (e) { check('find', false, String(e.message || e)); }
+
+  // ---- v0.3.0：子进程（spawn → stdout 事件 → exit；ACL shell:echo 放行）----
+  try {
+    const pid = 900 + (Date.now() % 1000);
+    const events = await new Promise((resolve) => {
+      const seen = [];
+      const off = Z().on('processEvent', (p) => {
+        if (p && p.id === pid) {
+          seen.push(p);
+          if (p.kind === 'exit') { off(); resolve(seen); }
+        }
+      });
+      Z().process.spawn({ id: pid, argv: ['/bin/echo', 'zilt-proc-smoke'] });
+      setTimeout(() => { off(); resolve(seen); }, 6000);
+    });
+    const out = events.find((e2) => e2.kind === 'stdout');
+    const exit = events.find((e2) => e2.kind === 'exit');
+    check('proc', !!exit && exit.code === 0 && !!out && String(out.data || '').includes('zilt-proc-smoke'),
+      JSON.stringify(events).slice(0, 140));
+  } catch (e) { check('proc', false, String(e.message || e)); }
+
+  // ---- v0.3.0：子进程 ACL 拒绝（/bin/ls 不在 shell scope → PermissionDenied）----
+  try {
+    let denied = false;
+    try { await Z().process.spawn({ id: 99901, argv: ['/bin/ls', '/'] }); } catch (err) {
+      denied = String(err.message || err).includes('PermissionDenied');
+    }
+    check('proc.acl', denied, 'denied=' + denied);
+  } catch (e) { check('proc.acl', false, String(e.message || e)); }
+
+  // ---- v0.3.0：通知交互（按钮/launch 走 GAction 索引机制；无头环境断言
+  //      发送 + GAction 注册；input 为 WinRT 独有 → 稳定 NotSupported）----
+  try {
+    await Z().notification.show({
+      title: 'v0.3.0 notify', body: 'buttons smoke', tag: 'smoke-actions',
+      actions: [
+        { title: 'Open', arguments: 'action-args-1' },
+        { title: 'More', arguments: 'action-args-2' },
+      ],
+    });
+    let inputRejected = false;
+    try {
+      await Z().notification.show({ title: 'x', body: 'y', input: { id: 'note' } });
+    } catch (err) {
+      inputRejected = String(err.message || err).includes('NotificationInputNotSupported');
+    }
+    check('notify.actions', inputRejected, 'buttons sent + input rejected=' + inputRejected);
+  } catch (e) { check('notify.actions', false, String(e.message || e)); }
+
+  // ---- v0.3.0：覆盖式标题栏 / 透明窗口 / 背景色（创建期选项；Xvfb 无合成器
+  //      → 只断言后端接受并反映到 state；真实透明效果需桌面合成器）----
+  try {
+    const created = await Z().window.create({
+      title: 'overlay probe', width: 360, height: 240,
+      url: 'https://zilt.app/second.html',
+      label: 'smoke-overlay-' + Date.now(),
+      decorations: false,
+      titlebarOverlay: true,
+      transparent: true,
+    });
+    const oid = created && created.id;
+    await wait(300);
+    const st = oid ? await Z().window.state(oid) : null;
+    const ok = !!st && st.overlay === true && st.transparent === true && st.background_color === -1;
+    try { await Z().window.close(oid); } catch (_) {}
+    check('win.overlay', ok, JSON.stringify(st || {}).slice(0, 160));
+
+    const created2 = await Z().window.create({
+      title: 'bg probe', width: 320, height: 200,
+      url: 'https://zilt.app/second.html',
+      label: 'smoke-bg-' + Date.now(),
+      backgroundColor: 0x102030,
+    });
+    const bid = created2 && created2.id;
+    await wait(300);
+    const st2 = bid ? await Z().window.state(bid) : null;
+    const ok2 = !!st2 && st2.transparent === false && st2.background_color === 0x102030;
+    try { await Z().window.close(bid); } catch (_) {}
+    check('win.background', ok2, JSON.stringify(st2 || {}).slice(0, 160));
+  } catch (e) { check('win.overlay', false, String(e.message || e)); }
+
+  // ---- v0.3.0：脚本对话框接管（script-dialog 信号）——冒烟自动阻止，
+  //      alert 不弹模态框、eval 正常完成；探针同时确认右键菜单信号已接线 ----
+  try {
+    const wired = await Z().invoke('__zilt.linuxSmokeWired', {});
+    const ev = await Z().eval('alert("zilt-smoke"); 7');
+    check('win.dialog',
+      !!wired && wired.script_dialog === true && wired.context_menu === true && ev === 7,
+      `wired=${JSON.stringify(wired)} eval=${ev}`);
+  } catch (e) { check('win.dialog', false, String(e.message || e)); }
+
+  // ---- v0.3.0：WM 下的窗口事件（windowMoved / windowResized / Focus）----
+  //      Xvfb 裸跑无 WM（configure/focus 不触发）→ skip；CI 装 openbox 后真实断言。
+  try {
+    const wired = await Z().invoke('__zilt.linuxSmokeWired', {});
+    if (wired && wired.wm) {
+      // WM 可能对请求做取整/加框：事件载荷与 state() 查询值比对（而非硬编码坐标）
+      const moved = await new Promise((resolve) => {
+        const off = Z().on('windowMoved', (p) => {
+          if (p.id === 1) { off(); resolve(p); }
+        });
+        setTimeout(() => { off(); resolve(null); }, 3000);
+        W.setPosition(150, 120).catch(() => {});
+      });
+      const posAfter = await state();
+      const resized = await new Promise((resolve) => {
+        const off = Z().on('windowResized', (p) => {
+          if (p.id === 1) { off(); resolve(p); }
+        });
+        setTimeout(() => { off(); resolve(null); }, 3000);
+        W.setSize(820, 620).catch(() => {});
+      });
+      const sizeAfter = await state();
+
+      // 焦点闭环：新建窗口获得焦点 → 主窗口 windowBlur；再 focus 回主窗口
+      let blurred = false;
+      const blurWait = new Promise((resolve) => {
+        const off = Z().on('windowBlur', (p) => {
+          if (p.id === 1) { blurred = true; off(); resolve(true); }
+        });
+        setTimeout(() => { off(); resolve(false); }, 3000);
+      });
+      let fid = null;
+      try {
+        const cw = await Z().window.create({
+          title: 'focus probe', width: 240, height: 160,
+          url: 'https://zilt.app/second.html',
+          label: 'smoke-focus-' + Date.now(),
+        });
+        fid = cw && cw.id;
+      } catch (_) {}
+      await blurWait;
+      const focused = await new Promise((resolve) => {
+        const off = Z().on('windowFocus', (p) => {
+          if (p.id === 1) { off(); resolve(true); }
+        });
+        setTimeout(() => { off(); resolve(false); }, 3000);
+        W.focus().catch(() => {});
+      });
+      try { await Z().window.close(fid); } catch (_) {}
+
+      const moveOk = !!moved && moved.x === posAfter.x && moved.y === posAfter.y;
+      const sizeOk = !!resized && resized.width === sizeAfter.width && resized.height === sizeAfter.height;
+      check('wm.events', moveOk && sizeOk && blurred && focused,
+        `move=${JSON.stringify(moved)}/${posAfter.x},${posAfter.y} ` +
+        `size=${JSON.stringify(resized)}/${sizeAfter.width}x${sizeAfter.height} ` +
+        `blur=${blurred} focus=${focused}`);
+      // 复原几何，避免影响后续检查
+      W.setPosition(60, 40).catch(() => {});
+      W.setSize(800, 600).catch(() => {});
+      await wait(150);
+    } else {
+      check('wm.events', true, 'skipped (no WM; CI installs openbox)');
+    }
+  } catch (e) { check('wm.events', false, String(e.message || e)); }
+
+  // ---- v0.3.0：拖出（drag-data-get → text/uri-list）——真实投递需要目标程序；
+  //      冒烟断言 begin 被接受、主循环存活（drag-data-get 内容由后端日志佐证）。
+  //      放在最后：GTK 拖拽会持有指针 grab，避免影响上面的焦点类断言 ----
+  try {
+    const ok = await Z().drag.start(['/tmp/zilt-drag-out-a.txt', '/tmp/zilt drag b.txt']);
+    await wait(150);
+    const alive = (await Z().window.state()).id === 1;
+    // 无返回值动作的响应是 JSON null（与 Windows 一致）——断言「未被拒绝」
+    check('drag.out', ok !== false && alive, `start=${ok} alive=${alive}`);
+  } catch (e) { check('drag.out', false, String(e.message || e)); }
 
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {
