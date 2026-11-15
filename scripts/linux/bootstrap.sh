@@ -16,6 +16,8 @@ APT_PACKAGES=(
   build-essential pkg-config curl xz-utils
   libgtk-3-dev libwebkit2gtk-4.1-dev
   xvfb
+  # v0.2.6 全局快捷键（X11 头文件，capi.h 硬依赖）+ v0.2.7 shell（xdg-open）
+  libx11-dev xdg-utils
 )
 
 say() { printf '\n== %s ==\n' "$*"; }

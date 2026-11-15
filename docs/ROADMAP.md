@@ -232,6 +232,27 @@
       的「null 跟随 config / 显式值覆盖」两平台合并语义收敛为共享
       `ipc.resolveCloseRequested`（两后端同用 + 单测）。Linux 190/191、
       Windows 278/278 全绿。
+- [x] **v0.2.7 平台能力对称**（2026-11-15）：把「Windows 有、Linux 无」的能力面补齐——
+      **导航策略/新窗口策略/权限请求/渲染进程终止**（decide-policy（自有 zilt:// 与
+      data:/blob:/about: 内联 scheme 放行 + 其余走共享 security.navigation 三态）、
+      permission-request（GType 反查 → 共享 PermissionKind；ask 在冒烟模式自动拒绝、
+      桌面弹原生询问框（嵌套泵））、create（兜底阻断默认弹窗）、web-process-terminated
+      （process_failed 事件 + recover_renderer 自动 reload）——事件 payload 与 Windows
+      driver 面同形）；**shell（opener）**（url/path → xdg-open、reveal → 打开所在目录
+      （文档化语义差异），spawnDetachedLinux：spawn 不等待 + SIGCHLD=SIG_IGN 防僵尸）；
+      **windowThemeChanged**（notify::gtk-theme-name → 广播）；**per-window WebView 代理**
+      （独立 WebContext + 数据目录 + 全套 scheme 处理器，同 proxy 串复用）；
+      **updater Linux 接线**（stageBytes 的 POSIX 分支：libc 写 .zilt-new(0755) →
+      rename×2 原子替换；`--zilt-restart` helper = 等父进程消失 → std.process.replace
+      exec 新版；info/check op + 事件与 Windows 逐字对齐）；**services op**（共享
+      Registry + appendToJson 上移共享层）。**冒烟 59 → 65 项**（nav.deny / perm.geo /
+      shell.open / services.list / updater.info / proxy.window）+ **Zig 侧后置终止闭环**
+      （前端检查全过后主动 terminate web process → 断言信号 → 退出；smoke_finished
+      守卫防重载页重跑整套冒烟）。修正 `.desktop` 文件名重复拼接（app_id 已带
+      .desktop 后缀时）；CI apt 补 libx11-dev（v0.2.6 声称补了实际漏了——X11 头文件
+      是 capi.h 硬依赖）。**验收**：Linux 冒烟 65/65 exit 0（+ post terminate PASS）、
+      单实例转交 E2E PASS、打包 E2E PASS、Linux 单测 191/192（1 skip）、
+      Windows 单测/构建全绿。
 - [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）——v0.3+
 - [x] 平台差异收敛原则：平台无关层（ipc/security/fs_api/protocol/net/sql/store/patch/pack_formats）
       两平台共用，差异只出现在 `platform/<os>/`

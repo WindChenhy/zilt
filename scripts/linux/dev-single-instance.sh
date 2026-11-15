@@ -42,7 +42,7 @@ ok=1
 grep -aq "\[single-instance\] args forwarded to primary -> exit 5" zilt.log || ok=0
 grep -aq "\[deep-link\] launch (url=zilt://second-instance" zilt.log || ok=0
 grep -aq "deeplink-event.*second-instance" zilt.log || ok=0
-grep -aq "ALL 59 CHECKS PASSED" zilt.log || ok=0
+grep -aqE "ALL [0-9]+ CHECKS PASSED" zilt.log || ok=0
 
 {
   echo "SECOND_EXIT=$second_code"

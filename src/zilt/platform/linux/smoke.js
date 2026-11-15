@@ -772,6 +772,84 @@ function runSecondWindowProbe() {
       `reg=${reg} list=${JSON.stringify(list1).slice(0, 80)} un=${un}`);
   } catch (e) { check('hotkey.x11', false, String(e.message || e)); }
 
+  // ---- v0.2.7：导航策略（decide-policy）——外部导航命中 security.navigation
+  //      的 external_links（demo 配置 = system_browser）→ 拦截 + 事件
+  //      policy=system_browser，页面留在应用 origin（mapAppUrl 后是 zilt://app）----
+  try {
+    const ev = await new Promise((resolve) => {
+      const off = Z().on('webview.navigation_starting', (p) => { off(); resolve(p); });
+      setTimeout(() => { off(); resolve(null); }, 4000);
+      location.href = 'https://example.com/zilt-nav-deny-probe';
+    });
+    let stillHome = false;
+    try {
+      const o = location.origin;
+      stillHome = o === 'zilt://app' || o === 'https://zilt.app';
+    } catch (_) {}
+    check('nav.deny', !!ev && ev.policy === 'system_browser' && stillHome,
+      `policy=${ev && ev.policy} home=${stillHome}`);
+  } catch (e) { check('nav.deny', false, String(e.message || e)); }
+
+  // ---- v0.2.7：权限请求（permission-request 信号）——geolocation 的默认策略是
+  //      ask → 冒烟模式自动拒绝；事件 {kind:location, policy:ask} 与 Windows 同形 ----
+  try {
+    const ev = await new Promise((resolve) => {
+      const off = Z().on('webview.permission', (p) => { off(); resolve(p); });
+      setTimeout(() => { off(); resolve(null); }, 4000);
+      try {
+        navigator.geolocation.getCurrentPosition(() => {}, () => {}, { timeout: 2000 });
+      } catch (_) {}
+    });
+    check('perm.geo', !!ev && ev.kind === 'location' && ev.policy === 'ask',
+      JSON.stringify(ev));
+  } catch (e) { check('perm.geo', false, String(e.message || e)); }
+
+  // ---- v0.2.7：shell（opener）——xdg-open 分离拉起。op 返回 ok=true（spawn 成功）
+  //      或稳定错误 ShellExecuteFailed（本环境无 xdg-utils；CI apt 装 xdg-utils 走
+  //      真实成功路径）——两条路径都证明 op 链路可达且错误语义稳定 ----
+  try {
+    let outcome = '';
+    try {
+      const r = await Z().shell.openUrl('https://example.com/zilt-smoke-open');
+      outcome = 'ok=' + JSON.stringify(r);
+    } catch (err) {
+      outcome = 'err=' + String(err.message || err);
+    }
+    check('shell.open', outcome === 'ok={"ok":true}' || outcome === 'err=ShellExecuteFailed', outcome);
+  } catch (e) { check('shell.open', false, String(e.message || e)); }
+
+  // ---- v0.2.7：services（Config.services → Registry → JS list/status）----
+  try {
+    const list = await Z().services.list();
+    const demo = Array.isArray(list) && list.find((s) => s && s.name === 'demo');
+    const st = await Z().services.status('demo');
+    check('services.list', !!demo && demo.started === true && st && st.started === true,
+      JSON.stringify(list));
+  } catch (e) { check('services.list', false, String(e.message || e)); }
+
+  // ---- v0.2.7：updater.info（config.update 已配置；不触发网络）----
+  try {
+    const info = await Z().updater.info();
+    check('updater.info', !!info && info.configured === true && info.restart_required === false,
+      JSON.stringify(info).slice(0, 120));
+  } catch (e) { check('updater.info', false, String(e.message || e)); }
+
+  // ---- v0.2.7：per-window WebView 代理（独立 WebContext；死代理只影响加载，
+  //      窗口本身要能创建/关闭）----
+  try {
+    const created = await Z().window.create({
+      title: 'proxy probe',
+      width: 320, height: 200,
+      url: 'https://zilt.app/index.html',
+      proxy: 'http://127.0.0.1:9',
+      label: 'smoke-proxy-' + Date.now(),
+    });
+    const pid = created && created.id;
+    await new Promise((r) => setTimeout(r, 600));
+    try { await Z().window.close(pid); } catch (_) {}
+    check('proxy.window', typeof pid === 'number' && pid > 1, 'id=' + pid);
+  } catch (e) { check('proxy.window', false, String(e.message || e)); }
+
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {
     await Z().invoke('__zilt.linuxSmoke', {

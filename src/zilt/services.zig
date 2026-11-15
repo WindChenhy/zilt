@@ -136,6 +136,46 @@ pub const Registry = struct {
     }
 };
 
+/// 服务条目的 JSON 序列化（v0.2.7：Windows/Linux 的 services.list/status 共用；
+/// name/scope 是开发者声明串，仍做转义防意外字符破坏 JSON）。
+pub fn appendToJson(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    name: []const u8,
+    scope: []const u8,
+    started: bool,
+) !void {
+    try out.appendSlice(alloc, "{\"name\":\"");
+    try appendJsonEscaped(alloc, out, name);
+    try out.appendSlice(alloc, "\",\"scope\":\"");
+    try appendJsonEscaped(alloc, out, scope);
+    try out.appendSlice(alloc, "\",\"started\":");
+    try out.appendSlice(alloc, if (started) "true" else "false");
+    try out.append(alloc, '}');
+}
+
+fn appendJsonEscaped(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try out.appendSlice(alloc, "\\\""),
+            '\\' => try out.appendSlice(alloc, "\\\\"),
+            '\n' => try out.appendSlice(alloc, "\\n"),
+            '\r' => try out.appendSlice(alloc, "\\r"),
+            '\t' => try out.appendSlice(alloc, "\\t"),
+            else => {
+                if (ch < 0x20) {
+                    try out.appendSlice(alloc, "\\u");
+                    var buf: [4]u8 = undefined;
+                    _ = std.fmt.bufPrint(&buf, "{x:0>4}", .{ch}) catch unreachable;
+                    try out.appendSlice(alloc, &buf);
+                } else {
+                    try out.append(alloc, ch);
+                }
+            },
+        }
+    }
+}
+
 const testing = std.testing;
 
 const Counter = struct {
@@ -224,4 +264,14 @@ test "start and stop single service" {
         try reg.register(.{ .name = "nostate", .init_fn = initOk });
         break :blk reg.start("nostate");
     });
+}
+
+test "appendToJson: 转义与 started 布尔" {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try appendToJson(testing.allocator, &out, "de\"mo", "scope\nA", true);
+    try testing.expectEqualStrings(
+        "{\"name\":\"de\\\"mo\",\"scope\":\"scope\\nA\",\"started\":true}",
+        out.items,
+    );
 }

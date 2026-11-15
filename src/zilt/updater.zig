@@ -169,25 +169,53 @@ pub fn stageUpdate(alloc: std.mem.Allocator, exe_path: []const u8, exe_name_in_z
 
 /// 将新 exe 字节原子替换当前运行中的 exe（写 .zilt-new → 旧改名 .zilt-old → new 接管原名）。
 pub fn stageBytes(alloc: std.mem.Allocator, exe_path: []const u8, new_exe: []const u8) UpdateError!void {
-    if (comptime !is_windows) return error.UpdateUnsupported;
-    const win32 = @import("platform/windows/win32.zig");
-
     const new_path = try std.fmt.allocPrint(alloc, "{s}.zilt-new", .{exe_path});
     defer alloc.free(new_path);
     const old_path = try std.fmt.allocPrint(alloc, "{s}.zilt-old", .{exe_path});
     defer alloc.free(old_path);
 
-    if (!win32.writeFileAlloc(alloc, new_path, new_exe)) return error.ManifestInvalid;
+    if (comptime is_windows) {
+        const win32 = @import("platform/windows/win32.zig");
 
-    const exe_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, exe_path) catch return error.ManifestInvalid;
-    defer alloc.free(exe_w);
-    const old_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, old_path) catch return error.ManifestInvalid;
-    defer alloc.free(old_w);
-    const new_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, new_path) catch return error.ManifestInvalid;
-    defer alloc.free(new_w);
+        if (!win32.writeFileAlloc(alloc, new_path, new_exe)) return error.ManifestInvalid;
 
-    if (win32.MoveFileExW(exe_w.ptr, old_w.ptr, win32.MOVEFILE_REPLACE_EXISTING) == 0) return error.ManifestInvalid;
-    if (win32.MoveFileExW(new_w.ptr, exe_w.ptr, win32.MOVEFILE_REPLACE_EXISTING) == 0) return error.ManifestInvalid;
+        const exe_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, exe_path) catch return error.ManifestInvalid;
+        defer alloc.free(exe_w);
+        const old_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, old_path) catch return error.ManifestInvalid;
+        defer alloc.free(old_w);
+        const new_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, new_path) catch return error.ManifestInvalid;
+        defer alloc.free(new_w);
+
+        if (win32.MoveFileExW(exe_w.ptr, old_w.ptr, win32.MOVEFILE_REPLACE_EXISTING) == 0) return error.ManifestInvalid;
+        if (win32.MoveFileExW(new_w.ptr, exe_w.ptr, win32.MOVEFILE_REPLACE_EXISTING) == 0) return error.ManifestInvalid;
+        return;
+    }
+
+    // Linux：POSIX rename 是原子的，且运行中的 exe 允许被改名/替换（旧 inode
+    // 由运行中的进程继续持有）——Windows 的「运行中不能覆盖」问题天然不存在。
+    // 写 .zilt-new（0755）→ rename exe→.zilt-old → rename .zilt-new→exe。
+    const new_z = alloc.allocSentinel(u8, new_path.len, 0) catch return error.ManifestInvalid;
+    defer alloc.free(new_z);
+    @memcpy(new_z, new_path);
+    const old_z = alloc.allocSentinel(u8, old_path.len, 0) catch return error.ManifestInvalid;
+    defer alloc.free(old_z);
+    @memcpy(old_z, old_path);
+    const exe_z = alloc.allocSentinel(u8, exe_path.len, 0) catch return error.ManifestInvalid;
+    defer alloc.free(exe_z);
+    @memcpy(exe_z, exe_path);
+
+    const f = std.c.fopen(new_z.ptr, "wb") orelse return error.ManifestInvalid;
+    const written = std.c.fwrite(new_exe.ptr, 1, new_exe.len, f);
+    _ = std.c.fclose(f);
+    if (written != new_exe.len) return error.ManifestInvalid;
+    if (std.c.chmod(new_z.ptr, 0o755) != 0) return error.ManifestInvalid;
+
+    if (std.c.rename(exe_z.ptr, old_z.ptr) != 0) return error.ManifestInvalid;
+    if (std.c.rename(new_z.ptr, exe_z.ptr) != 0) {
+        // 回滚：至少恢复旧 exe 到原名，避免应用「消失」
+        _ = std.c.rename(old_z.ptr, exe_z.ptr);
+        return error.ManifestInvalid;
+    }
 }
 
 /// 重启触发标志：`<exe> --zilt-restart <target>`（helper 进程：等旧实例退出并释放

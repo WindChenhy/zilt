@@ -99,7 +99,10 @@ fn appendField(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), key: []const 
 }
 
 /// 自启动条目文件名：`<app_id>.desktop`（多应用互不覆盖）。
+/// app_id 已以 .desktop 结尾时不重复拼接（v0.2.7 修正：`app.zilt.desktop`
+/// 这类反域名 app_id 此前会生成 `app.zilt.desktop.desktop`）。
 pub fn entryFileName(alloc: Allocator, app_id: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, app_id, ".desktop")) return alloc.dupe(u8, app_id);
     return std.fmt.allocPrint(alloc, "{s}.desktop", .{app_id});
 }
 
@@ -220,7 +223,7 @@ test "autostartState: enabled / disabled / exe 不匹配" {
 
 test "xdgMimeDefaultArgs: argv 形状" {
     const a = testing.allocator;
-    const argv = try xdgMimeDefaultArgs(a, "app.zilt.desktop.desktop", "x-scheme-handler/zilt");
+    const argv = try xdgMimeDefaultArgs(a, "app.zilt.desktop", "x-scheme-handler/zilt");
     defer {
         for (argv) |part| a.free(part);
         a.free(argv);
@@ -228,8 +231,22 @@ test "xdgMimeDefaultArgs: argv 形状" {
     try testing.expectEqual(@as(usize, 4), argv.len);
     try testing.expectEqualStrings("xdg-mime", argv[0]);
     try testing.expectEqualStrings("default", argv[1]);
-    try testing.expectEqualStrings("app.zilt.desktop.desktop", argv[2]);
+    try testing.expectEqualStrings("app.zilt.desktop", argv[2]);
     try testing.expectEqualStrings("x-scheme-handler/zilt", argv[3]);
+}
+
+test "entryFileName: 已带 .desktop 后缀不重复拼接" {
+    const a = testing.allocator;
+    {
+        const n = try entryFileName(a, "com.example.app");
+        defer a.free(n);
+        try testing.expectEqualStrings("com.example.app.desktop", n);
+    }
+    {
+        const n = try entryFileName(a, "app.zilt.desktop");
+        defer a.free(n);
+        try testing.expectEqualStrings("app.zilt.desktop", n);
+    }
 }
 
 test "entryFileName" {

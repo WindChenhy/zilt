@@ -100,10 +100,20 @@ fn exeBaseName(alloc: Allocator, meta: PackMeta) ![]const u8 {
     return meta.exe_name;
 }
 
+/// 桌面项文件名：`<pkg>.desktop`；pkg 已以 .desktop 结尾时不重复拼接
+/// （v0.2.7 修正：app_id `app.zilt.desktop` 此前会生成
+/// `app.zilt.desktop.desktop`——与运行时 desktop_entry.entryFileName 同规则）。
+fn desktopFileName(alloc: Allocator, pkg: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, pkg, ".desktop")) return alloc.dupe(u8, pkg);
+    return std.fmt.allocPrint(alloc, "{s}.desktop", .{pkg});
+}
+
 /// Flatpak manifest（app id 反转为反域名；runtime 用 GNOME 45 平台）。
 fn generateFlatpakManifest(alloc: Allocator, meta: PackMeta) ![]u8 {
     const pkg = try pack_formats.debianName(alloc, meta.app_id);
     defer alloc.free(pkg);
+    const desktop_name = try desktopFileName(alloc, pkg);
+    defer alloc.free(desktop_name);
     const exe_base = try exeBaseName(alloc, meta);
     // app.zilt.desktop → desktop.zilt.app（反域名）
     var app_id: std.ArrayListUnmanaged(u8) = .empty;
@@ -139,13 +149,13 @@ fn generateFlatpakManifest(alloc: Allocator, meta: PackMeta) ![]u8 {
         \\      "buildsystem": "simple",
         \\      "build-commands": [
         \\        "install -Dm755 {s} /app/bin/{s}",
-        \\        "install -Dm644 {s}.desktop /app/share/applications/{s}.desktop"
+        \\        "install -Dm644 {s} /app/share/applications/{s}"
         \\      ],
         \\      "sources": [ {{ "type": "dir", "path": "." }} ]
         \\    }}
         \\  ]
         \\}}
-    , .{ app_id.items, exe_base, pkg, exe_base, exe_base, pkg, pkg });
+    , .{ app_id.items, exe_base, pkg, exe_base, exe_base, desktop_name, desktop_name });
 }
 
 pub fn main() !void {
@@ -177,6 +187,7 @@ pub fn main() !void {
         .description = app_meta.app_name,
     };
     const pkg = try pack_formats.debianName(alloc, meta.app_id);
+    const desktop_name = try desktopFileName(alloc, pkg);
     const exe_base = try exeBaseName(alloc, meta);
 
     // 图标：project.icon 或内置 zilt.ico（帧即 PNG）
@@ -204,7 +215,7 @@ pub fn main() !void {
         const v = getEnv(alloc, "ZILT_DEB_SCHEME") orelse break :blk "zilt";
         break :blk v;
     };
-    const mime_line = try std.fmt.allocPrint(alloc, "xdg-mime default {s}.desktop x-scheme-handler/{s} || true", .{ pkg, scheme });
+    const mime_line = try std.fmt.allocPrint(alloc, "xdg-mime default {s} x-scheme-handler/{s} || true", .{ desktop_name, scheme });
     const deb = try pack_formats.buildDebOpt(alloc, meta, exe_bytes.?, .{
         .depends = &.{ "libgtk-3-0", "libwebkit2gtk-4.1-0", "libsqlite3-0" },
         .postinst_lines = &.{mime_line},
@@ -235,7 +246,7 @@ pub fn main() !void {
         .mime_types = &.{try std.fmt.allocPrint(alloc, "x-scheme-handler/{s}", .{scheme})},
         .wmclass = meta.app_id,
     });
-    const desktop_out = try pathJoin(alloc, app_dir, try std.fmt.allocPrint(alloc, "usr/share/applications/{s}.desktop", .{pkg}));
+    const desktop_out = try pathJoin(alloc, app_dir, try std.fmt.allocPrint(alloc, "usr/share/applications/{s}", .{desktop_name}));
     if (!writeFile(alloc, desktop_out, desktop_text, 0o644)) return error.WriteFailed;
 
     // AppDir 元数据（AppStream 可选文件）

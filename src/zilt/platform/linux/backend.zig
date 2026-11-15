@@ -117,6 +117,9 @@ const security = @import("../../security.zig");
 const builtin_cmds = @import("../../builtin.zig");
 const log = @import("../../log.zig");
 const system_api = @import("../../system_api.zig");
+const shared_services = @import("../../services.zig");
+const updater = @import("../../updater.zig");
+const shell_mod = @import("../../shell.zig");
 const clipboard = @import("../../clipboard.zig");
 const notification = @import("../../notification.zig");
 const window_state = @import("window_state.zig");
@@ -197,6 +200,80 @@ fn reasonFor(status: u16) [:0]const u8 {
         500 => "Internal Server Error",
         else => "OK",
     };
+}
+
+/// 分离拉起子进程（v0.2.7）：spawn 后不等待（对齐 Windows ShellExecuteW 的
+/// 立即返回语义——xdg-open 可能等浏览器退出，同步等待会冻结 UI）。子进程
+/// 僵尸问题靠 SIGCHLD=SIG_IGN 自动回收（set 一次，进程级）。
+/// 返回 spawn 是否成功（子进程自身的成败是异步的，调用方拿不到）。
+fn spawnDetachedLinux(argv: []const []const u8) bool {
+    if (argv.len == 0) return false;
+    // SIGCHLD → SIG_IGN：内核自动回收退出的子进程（不产生僵尸）
+    setSigChldIgnore();
+    _ = std.process.spawn(sharedIo(), .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch |err| {
+        log.print("[spawn] {s} failed: {s}", .{ argv[0], @errorName(err) });
+        return false;
+    };
+    return true;
+}
+
+/// updater.Fetcher 的取数实现（std.http.Client；与 Windows httpFetch 同构，
+/// 两平台共享同一套 updater 决策/验签逻辑）。
+fn updaterFetchLinux(backend_ptr: *anyopaque, alloc: std.mem.Allocator, url: []const u8) anyerror![]u8 {
+    _ = backend_ptr;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    var client: std.http.Client = .{ .allocator = alloc, .io = threaded.io() };
+    defer client.deinit();
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const result = try client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &aw.writer,
+    });
+    if (result.status != .ok) {
+        log.print("[updater] http {s} -> status {d}", .{ url, @intFromEnum(result.status) });
+        return error.HttpRequestFailed;
+    }
+    return aw.toOwnedSlice();
+}
+
+/// 重启 helper（Linux）：等旧实例（父进程）退出 → replace 成新版。
+/// 与 Windows 的互斥体等待对应——Linux 的「旧实例已退出」信号就是父进程消失
+/// （getppid 变为 1/init）。轮询间隔 200ms，上限 30s 防挂死。
+fn runRestartHelperLinux(target: []const u8) void {
+    log.print("[updater] restart helper: waiting for old instance to exit", .{});
+    var waited_ms: u32 = 0;
+    while (waited_ms < 30_000) : (waited_ms += 200) {
+        if (std.c.getppid() == 1) break; // 父进程已退出（被 init 收养）
+        _ = c.g_usleep(200_000);
+    }
+    if (waited_ms >= 30_000) {
+        log.print("[updater] restart helper: timeout waiting for old instance", .{});
+        return;
+    }
+    log.print("[updater] restart helper: exec {s}", .{target});
+    // replace 成功不返回；返回值即失败原因（bare error set，exec 语义）
+    const fail: std.process.ReplaceError = std.process.replace(sharedIo(), .{ .argv = &.{target} });
+    log.print("[updater] restart helper: replace failed: {s}", .{@errorName(fail)});
+}
+
+/// SIGCHLD 置 SIG_IGN（进程级一次）：内核自动回收退出的子进程，spawn 后
+/// 不 wait 也不会留僵尸。posix.sigaction 对 EINVAL/失败直接 unreachable——
+/// SIGCHLD 恒合法，无需错误分支。
+fn setSigChldIgnore() void {
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.CHLD, &act, null);
 }
 
 /// 窗口事件的字段（v0.2.6：windowMoved/Resized/Focus/Blur/CloseRequested）。
@@ -505,6 +582,21 @@ pub fn run(comptime config: Config) !void {
     // 不注入脚本）。命令行参数（char**）进程生命周期内持有；冒烟模式会把
     // ZILT_LINUX_SMOKE_DEEPLINK 追加为伪参数，覆盖「启动深链」链路。
     const argv = try collectArgv(alloc);
+
+    // v0.2.7：重启接力拦截（对齐 Windows v0.1.5）——`<exe> --zilt-restart <target>`
+    // 等旧实例退出（父进程消失）后 replace 成新版，不进主流程。
+    {
+        var argv_strs: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer argv_strs.deinit(alloc);
+        for (argv) |a| {
+            if (a != null) argv_strs.append(alloc, std.mem.span(a)) catch break;
+        }
+        if (updater.isRestartHelperCall(argv_strs.items)) |target| {
+            runRestartHelperLinux(target);
+            std.process.exit(0);
+        }
+    }
+
     const app_mode = self.initApplication();
 
     switch (app_mode) {
@@ -560,6 +652,31 @@ pub fn run(comptime config: Config) !void {
 
     // v0.2.3：本地存储（store.json / acl.json，与 windowState 同根）
     self.initStorage();
+
+    // v0.2.7：服务注册表（Config.services → init/start，逆序 deinit）
+    self.initServices();
+
+    // v0.2.7：自动更新器（config.update + ZILT_UPDATE_URL/ZILT_UPDATE_PK 覆盖；
+    // ZILT_UPDATE_AUTO=1 启动即检查——与 Windows 同语义）
+    if (config.update) |uc| {
+        if (self.buildUpdaterEnv(uc)) |env| {
+            self.updater_env = env;
+            log.print("[updater] configured (manifest={s}, current={s})", .{ env.manifest_url, uc.current_version });
+            if (std.c.getenv("ZILT_UPDATE_AUTO")) |a| {
+                if (std.mem.span(a).len > 0 and std.mem.span(a)[0] == '1') {
+                    if (std.Thread.spawn(.{ .stack_size = sys.threadStackSize(512 * 1024) }, Self.updaterFlow, .{self})) |t| {
+                        t.detach();
+                        log.print("[updater] auto check started", .{});
+                    } else |_| {}
+                }
+            }
+        } else |err| {
+            log.print("[updater] env build failed: {s} (updater disabled)", .{@errorName(err)});
+        }
+    }
+
+    // v0.2.7：主题变化事件（GTK settings 全局 → 广播所有窗口）
+    self.watchThemeChanges();
 
     // v0.2.6：X11 全局快捷键（config.hotkeys 声明式注册 + hotkey.* 运行时 op）
     self.initHotkeys();
@@ -704,6 +821,13 @@ fn Backend(comptime config: Config) type {
         /// 同名分区复用同一 context → 同分区多个子 WebView 共享存储。
         const PartitionCtx = struct {
             name: []u8,
+            ctx: [*c]c.WebKitWebContext,
+        };
+
+        /// per-window WebView 代理（v0.2.7，对齐 Windows v0.1.23）：同 proxy 串
+        /// 复用同一 WebContext（独立数据目录，cookie/缓存不与主窗口共享）。
+        const ProxyEntry = struct {
+            proxy: []u8,
             ctx: [*c]c.WebKitWebContext,
         };
 
@@ -901,6 +1025,21 @@ fn Backend(comptime config: Config) type {
         /// WebSocket 连接表（SoupWebsocketConnection 所有权在此）
         ws_conns: std.AutoHashMapUnmanaged(i64, *WsConn) = .empty,
         next_ws_id_seq: i64 = 1,
+        /// ---- v0.2.7：services / updater / per-window 代理 ----
+        /// 服务注册表（Config.services 声明 → init/start，对齐 Windows v0.1.16）
+        services: ?shared_services.Registry = null,
+        /// 自动更新器（共享 updater.zig；Linux 侧 stageBytes 走 POSIX 原子替换）
+        updater_env: ?updater.Env = null,
+        update_cfg: ?Config.Update = config.update,
+        /// per-window WebView 代理（对齐 Windows v0.1.23）：同 proxy 串复用独立
+        /// WebContext（独立数据目录 + scheme 处理器），cookie/缓存与主窗口隔离
+        proxy_ctxs: std.ArrayListUnmanaged(ProxyEntry) = .empty,
+        /// ZILT_UPDATE_URL 覆盖的清单 URL（进程生命周期持有）
+        updater_url_override: ?[]u8 = null,
+        /// 冒烟后置闭环（v0.2.7）：终止检查进行中 / 信号已见 / 首轮结果已定
+        terminate_check: bool = false,
+        terminate_seen: bool = false,
+        smoke_finished: bool = false,
 
         fn deinit(self: *Self) void {
             // 主循环退出后可能仍有窗口未 destroy（ctx.quit 路径）→ 逐个释放记录
@@ -911,6 +1050,14 @@ fn Backend(comptime config: Config) type {
                 self.allocator.free(pe.name);
             }
             self.partitions.deinit(self.allocator);
+            // v0.2.7：per-window 代理 context（生命周期同 partitions）
+            for (self.proxy_ctxs.items) |pe| {
+                c.g_object_unref(@ptrCast(pe.ctx));
+                self.allocator.free(pe.proxy);
+            }
+            self.proxy_ctxs.deinit(self.allocator);
+            // v0.2.7：服务注册表（stopAll + 逆序 deinit）
+            if (self.services) |*r| r.deinit();
             var it = self.asset_cache.iterator();
             while (it.next()) |entry| {
                 self.allocator.free(entry.key_ptr.*);
@@ -948,6 +1095,7 @@ fn Backend(comptime config: Config) type {
             }
             if (self.store) |*st| st.deinit();
             if (self.storage_root) |r| self.allocator.free(r);
+            if (self.updater_url_override) |u| self.allocator.free(u);
         }
 
         // ------------------------------------------------------------------
@@ -1407,7 +1555,23 @@ fn Backend(comptime config: Config) type {
             sink.* = .{ .backend = self, .win_id = id, .view = null };
             st.sink = sink;
 
-            const view_widget = c.webkit_web_view_new_with_user_content_manager(ucm);
+            // v0.2.7：per-window WebView 代理（opts.proxy）→ 独立 WebContext +
+            // 独立数据目录（scheme 处理器齐全）；WebView 用 context 构造，UCM 取
+            // view 自带的（同分区子 WebView 的既有手法）。失败降级共享 context。
+            var view_widget: [*c]c.GtkWidget = null;
+            if (opts.proxy) |proxy| {
+                if (self.proxyContext(proxy)) |vctx| {
+                    view_widget = @ptrCast(c.webkit_web_view_new_with_context(vctx));
+                    if (view_widget != null) {
+                        st.ucm = c.webkit_web_view_get_user_content_manager(@ptrCast(view_widget));
+                    }
+                } else {
+                    log.print("[proxy] context unavailable for '{s}' -> shared context", .{proxy});
+                }
+            }
+            if (view_widget == null) {
+                view_widget = c.webkit_web_view_new_with_user_content_manager(ucm);
+            }
             if (view_widget == null) return error.WebViewCreateFailed;
             const view: [*c]c.WebKitWebView = @ptrCast(view_widget);
             st.view = view;
@@ -1425,6 +1589,13 @@ fn Backend(comptime config: Config) type {
                 0,
             );
             self.attachIpc(sink, ucm, &st.scripts);
+
+            // v0.2.7：导航策略 / 新窗口策略 / 权限请求 / 渲染进程终止——只挂主
+            // WebView（与 Windows「child webview 不挂 driver」的边界一致）。
+            _ = c.g_signal_connect_data(@ptrCast(view_widget), "decide-policy", @ptrCast(&Self.onDecidePolicy), sink, null, 0);
+            _ = c.g_signal_connect_data(@ptrCast(view_widget), "permission-request", @ptrCast(&Self.onPermissionRequest), sink, null, 0);
+            _ = c.g_signal_connect_data(@ptrCast(view_widget), "create", @ptrCast(&Self.onCreate), sink, null, 0);
+            _ = c.g_signal_connect_data(@ptrCast(view_widget), "web-process-terminated", @ptrCast(&Self.onWebProcessTerminated), sink, null, 0);
 
             // v0.2.2：拖放（文件拖入）。dest 与信号挂主 WebView：drag-drop 里
             // gtk_drag_get_data 后返回 TRUE（user handler 先于 WebKit 的 class
@@ -3624,7 +3795,14 @@ fn Backend(comptime config: Config) type {
                 .hotkey => |op| return self.runHotkeyOp(op, alloc),
                 .http => |op| return self.runHttpOp(op, alloc),
                 .ws => |op| return self.runWsOp(op, alloc),
-                // 托盘运行时 op/快捷键/process/... 属后续版本；NotSupported
+                // v0.2.7：shell（opener）/ services / updater
+                .shell => |target| {
+                    try openShellTarget(target);
+                    return .{ .ok = true };
+                },
+                .services => |op| return self.runServicesOp(op, alloc),
+                .updater => |op| return self.runUpdaterOp(op, alloc),
+                // 托盘运行时 op/process/appearance/... 属后续版本；NotSupported
                 // 与 Windows 的降级语义同构（platform/interface.zig 契约不受影响）
                 else => return error.NotSupported,
             }
@@ -4179,6 +4357,331 @@ fn Backend(comptime config: Config) type {
                     return .{ .ok = removed > 0 };
                 },
             }
+        }
+
+        // ------------------------------------------------------------------
+        // v0.2.7：shell（opener）/ services / updater（对齐 Windows v0.1.14/16/5）
+        // ------------------------------------------------------------------
+
+        /// shell op：url/path → xdg-open；reveal → 打开所在目录（Linux 无
+        /// explorer「定位并选中」的通用等价物——xdg-open 目录是最大公约数，
+        /// 文档化语义差异）。分离拉起，不等待 xdg-open 退出。
+        fn openShellTarget(target: shell_mod.Target) !void {
+            switch (target) {
+                .url => |u| {
+                    if (!spawnDetachedLinux(&.{ "xdg-open", u })) return error.ShellExecuteFailed;
+                    log.print("[shell] openUrl -> xdg-open ({s})", .{u});
+                },
+                .path => |p| {
+                    if (!spawnDetachedLinux(&.{ "xdg-open", p })) return error.ShellExecuteFailed;
+                    log.print("[shell] openPath -> xdg-open ({s})", .{p});
+                },
+                .reveal => |p| {
+                    const dir = std.fs.path.dirname(p) orelse "/";
+                    if (!spawnDetachedLinux(&.{ "xdg-open", dir })) return error.ShellExecuteFailed;
+                    log.print("[shell] reveal -> xdg-open {s} (dir of {s})", .{ dir, p });
+                },
+            }
+        }
+
+        fn appendServiceJson(
+            alloc: std.mem.Allocator,
+            out: *std.ArrayListUnmanaged(u8),
+            name: []const u8,
+            scope: []const u8,
+            started: bool,
+        ) !void {
+            try shared_services.appendToJson(alloc, out, name, scope, started);
+        }
+
+        /// 按 Config 声明的顺序注册并启动（对齐 Windows initServices：单个失败
+        /// 只记录，不阻断启动）。
+        fn initServices(self: *Self) void {
+            const declared = config.services;
+            self.services = shared_services.Registry.init(self.allocator);
+            for (declared) |svc| {
+                self.services.?.register(svc) catch |err| {
+                    log.print("[services] register '{s}' failed: {s}", .{ svc.name, @errorName(err) });
+                };
+            }
+            if (declared.len > 0) {
+                self.services.?.startAll() catch |err| {
+                    log.print("[services] startAll failed: {s}", .{@errorName(err)});
+                };
+                var started: usize = 0;
+                for (self.services.?.slots.items) |slot| {
+                    if (slot.started) started += 1;
+                }
+                log.print("[services] {d} registered, {d} started", .{ self.services.?.count(), started });
+            }
+        }
+
+        /// 主题变化监听（v0.2.7）：GTK settings 是全局的 → 变化时广播所有窗口
+        /// （Windows 是每窗口 WM_THEMECHANGED，payload 同形 {id, theme}）。
+        fn watchThemeChanges(self: *Self) void {
+            const settings = c.gtk_settings_get_default() orelse return;
+            _ = c.g_signal_connect_data(
+                @ptrCast(settings),
+                "notify::gtk-theme-name",
+                @ptrCast(&Self.onThemeChanged),
+                self,
+                null,
+                0,
+            );
+        }
+
+        fn onThemeChanged(_: [*c]c.GObject, _: c.guint, user_data: c.gpointer) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return));
+            const dark = currentThemeIsDark();
+            const theme: []const u8 = if (dark) "dark" else "light";
+            for (self.windows.items) |w| {
+                // theme 是字符串字段：payload 直接拼（emitWindowEvent 只支持数值字段）
+                const payload = std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"theme\":\"{s}\"}}", .{ w.id, theme }) catch continue;
+                defer self.allocator.free(payload);
+                self.emitRawToWindow(w.id, "windowThemeChanged", payload);
+            }
+            log.print("[theme] changed -> {s}", .{theme});
+        }
+
+        fn currentThemeIsDark() bool {
+            const settings = c.gtk_settings_get_default() orelse return false;
+            var name_ptr: ?[*:0]const u8 = null;
+            c.g_object_get(@ptrCast(settings), "gtk-theme-name", &name_ptr, @as(?*anyopaque, null));
+            defer if (name_ptr) |p| c.g_free(@constCast(p));
+            return sysinfo_linux.isDarkThemeName(if (name_ptr) |p| std.mem.span(p) else null);
+        }
+
+        /// per-window WebView 代理 context（对齐 Windows v0.1.23）：同 proxy 串
+        /// 复用；独立数据目录（<应用数据>/webview-windows/<sanitized>）+ 全套
+        /// scheme 处理器（资产/协议/下载）。失败返回 null（降级共享 context）。
+        fn proxyContext(self: *Self, proxy: []const u8) ?[*c]c.WebKitWebContext {
+            for (self.proxy_ctxs.items) |pe| {
+                if (std.mem.eql(u8, pe.proxy, proxy)) return pe.ctx;
+            }
+            const dir = self.proxyDirectory(proxy) catch return null;
+            defer self.allocator.free(dir);
+            makeDirPath(self.allocator, dir);
+            const dir_z = dupeZ(self.allocator, dir) catch return null;
+            defer self.allocator.free(dir_z);
+            const proxy_z = dupeZ(self.allocator, proxy) catch return null;
+            defer self.allocator.free(proxy_z);
+
+            const mgr = c.webkit_website_data_manager_new(
+                "base-data-directory",
+                @as(?*const anyopaque, dir_z.ptr),
+                @as(?*anyopaque, null),
+            );
+            if (mgr == null) return null;
+            defer c.g_object_unref(@ptrCast(mgr));
+            const ctx = c.webkit_web_context_new_with_website_data_manager(mgr);
+            if (ctx == null) return null;
+
+            // 代理：custom 模式 + 单一代理 URI（等价 Windows per-window env 代理）
+            const settings = c.webkit_network_proxy_settings_new(proxy_z.ptr, null);
+            if (settings != null) {
+                defer c.webkit_network_proxy_settings_free(@ptrCast(settings));
+                c.webkit_web_context_set_network_proxy_settings(ctx, c.WEBKIT_NETWORK_PROXY_MODE_CUSTOM, @ptrCast(settings));
+            }
+            c.webkit_web_context_register_uri_scheme(ctx, scheme, Self.onSchemeRequest, self, null);
+            _ = c.g_signal_connect_data(ctx, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
+            self.registerProtocolSchemes(ctx);
+
+            const copy = self.allocator.dupe(u8, proxy) catch {
+                c.g_object_unref(@ptrCast(ctx));
+                return null;
+            };
+            self.proxy_ctxs.append(self.allocator, .{ .proxy = copy, .ctx = ctx }) catch {
+                self.allocator.free(copy);
+                c.g_object_unref(@ptrCast(ctx));
+                return null;
+            };
+            log.print("[proxy] webview context ready ({s}, dir={s})", .{ proxy, dir });
+            return ctx;
+        }
+
+        /// 代理 → 数据目录名：非 [A-Za-z0-9._-] 全替换 '_'（防注入/超长）。
+        fn proxyDirectory(self: *Self, proxy: []const u8) ![]u8 {
+            var sanitized = try self.allocator.alloc(u8, proxy.len);
+            defer self.allocator.free(sanitized);
+            for (proxy, 0..) |ch, i| {
+                sanitized[i] = switch (ch) {
+                    'A'...'Z', 'a'...'z', '0'...'9', '.', '_', '-' => ch,
+                    else => '_',
+                };
+            }
+            const root = self.storage_root orelse return error.StorageNotReady;
+            return std.fmt.allocPrint(self.allocator, "{s}/webview-windows/{s}", .{ root, sanitized });
+        }
+
+        fn runServicesOp(self: *Self, op: system_api.ServicesOp, alloc: std.mem.Allocator) !system_api.Result {
+            const reg = if (self.services) |*r| r else return error.ServicesNotAvailable;
+            switch (op) {
+                .list => {
+                    var out: std.ArrayListUnmanaged(u8) = .empty;
+                    errdefer out.deinit(alloc);
+                    try out.append(alloc, '[');
+                    for (reg.slots.items, 0..) |slot, i| {
+                        if (i != 0) try out.append(alloc, ',');
+                        try appendServiceJson(alloc, &out, slot.service.name, slot.service.scope, slot.started);
+                    }
+                    try out.append(alloc, ']');
+                    return .{ .json = try out.toOwnedSlice(alloc) };
+                },
+                .status => |name| {
+                    const svc = reg.get(name) orelse return .{ .json = try alloc.dupe(u8, "null") };
+                    var out: std.ArrayListUnmanaged(u8) = .empty;
+                    errdefer out.deinit(alloc);
+                    try appendServiceJson(alloc, &out, svc.name, svc.scope, reg.isStarted(name));
+                    return .{ .json = try out.toOwnedSlice(alloc) };
+                },
+                .start => |name| {
+                    reg.start(name) catch |err| {
+                        log.print("[services] start '{s}' failed: {s}", .{ name, @errorName(err) });
+                        return .{ .ok = false };
+                    };
+                    log.print("[services] started '{s}'", .{name});
+                    return .{ .ok = true };
+                },
+                .stop => |name| {
+                    const known = reg.get(name) != null;
+                    reg.stop(name);
+                    log.print("[services] stopped '{s}' (known={})", .{ name, known });
+                    return .{ .ok = known };
+                },
+            }
+        }
+
+        /// updater.info：状态查询（不触发网络）。restart_required 看 .zilt-old
+        /// 是否存在（stageBytes 的改名痕迹，与 Windows 同语义）。
+        fn runUpdaterOp(self: *Self, op: system_api.UpdaterOp, alloc: std.mem.Allocator) !system_api.Result {
+            switch (op) {
+                .info => {
+                    const env = self.updater_env orelse {
+                        return .{ .json = try alloc.dupe(u8, "{\"configured\":false}") };
+                    };
+                    const exe_path = try currentExePathLinux(alloc);
+                    defer alloc.free(exe_path);
+                    const old_path = try std.fmt.allocPrint(alloc, "{s}.zilt-old", .{exe_path});
+                    defer alloc.free(old_path);
+                    const restart_required = blk: {
+                        _ = std.Io.Dir.cwd().statFile(sharedIo(), old_path, .{}) catch break :blk false;
+                        break :blk true;
+                    };
+                    const url_json = try std.json.Stringify.valueAlloc(alloc, env.manifest_url, .{});
+                    defer alloc.free(url_json);
+                    const ver_json = try std.json.Stringify.valueAlloc(alloc, env.current_version, .{});
+                    defer alloc.free(ver_json);
+                    return .{ .json = try std.fmt.allocPrint(alloc,
+                        "{{\"configured\":true,\"manifest_url\":{s},\"current_version\":{s},\"channel\":\"{s}\",\"restart_required\":{s}}}",
+                        .{ url_json, ver_json, @tagName(env.channel), if (restart_required) "true" else "false" },
+                    ) };
+                },
+                .check => {
+                    if (self.updater_env == null) return .{ .ok = false };
+                    const t = std.Thread.spawn(.{ .stack_size = sys.threadStackSize(512 * 1024) }, updaterFlow, .{self}) catch |err| {
+                        log.print("[updater] manual check spawn failed: {s}", .{@errorName(err)});
+                        return .{ .ok = false };
+                    };
+                    t.detach();
+                    log.print("[updater] manual check started (from JS)", .{});
+                    return .{ .ok = true };
+                },
+            }
+        }
+
+        /// 当前 exe 路径（updater 用；0.17 的 executablePathAlloc 走 Io）。
+        fn currentExePathLinux(alloc: std.mem.Allocator) ![]u8 {
+            return std.process.executablePathAlloc(sharedIo(), alloc);
+        }
+
+        /// 构建 updater.Env（config.update + 环境变量覆盖，与 Windows 同语义：
+        /// ZILT_UPDATE_URL 覆盖清单 URL、ZILT_UPDATE_PK 覆盖公钥 hex）。
+        fn buildUpdaterEnv(self: *Self, uc: Config.Update) !updater.Env {
+            var pk: [32]u8 = undefined;
+            var pk_from_env = false;
+            if (std.c.getenv("ZILT_UPDATE_PK")) |hex| {
+                const h = std.mem.span(hex);
+                if (h.len == 64) {
+                    _ = std.fmt.hexToBytes(&pk, h) catch return error.InvalidPublicKey;
+                    pk_from_env = true;
+                }
+            }
+            if (!pk_from_env) {
+                if (uc.public_key_hex.len != 64) return error.InvalidPublicKey;
+                _ = std.fmt.hexToBytes(&pk, uc.public_key_hex) catch return error.InvalidPublicKey;
+            }
+
+            var manifest_url: []const u8 = uc.manifest_url;
+            if (std.c.getenv("ZILT_UPDATE_URL")) |u| {
+                if (self.allocator.dupe(u8, std.mem.span(u))) |owned| {
+                    self.updater_url_override = owned;
+                    manifest_url = owned;
+                } else |_| {}
+            }
+
+            const channel: updater.UpdateChannel = if (std.mem.eql(u8, uc.channel, "beta")) .beta else .stable;
+
+            return .{
+                .channel = channel,
+                .manifest_url = manifest_url,
+                .public_key = pk,
+                .current_version = uc.current_version,
+                .exe_path = try currentExePathLinux(self.allocator),
+                .exe_name = uc.exe_name,
+                .fetcher = .{ .ctx = @ptrCast(self), .fetchFn = updaterFetchLinux },
+            };
+        }
+
+        /// 更新流程（后台线程）：检查 → 下载 → 验签 → 暂存替换 → 事件 + 日志。
+        /// 与 Windows updaterFlow 同构（事件名/payload 逐字对齐）。
+        fn updaterFlow(self: *Self) void {
+            const env = self.updater_env orelse return;
+            const ctx = self.context(self.allocator, 0); // emit 用 msg_allocator，线程安全
+
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+
+            const m = updater.checkForUpdate(arena.allocator(), env.fetcher, env.manifest_url, env.current_version, env.channel) catch |err| {
+                log.print("[updater] check failed: {s}", .{@errorName(err)});
+                ctx.emit("updaterFailed", .{ .stage = "check", .err = @errorName(err) });
+                return;
+            } orelse {
+                log.print("[updater] up to date ({s})", .{env.current_version});
+                return;
+            };
+            log.print("[updater] update available: {s} (current {s})", .{ m.version, env.current_version });
+            ctx.emit("updateInfo", .{ .version = m.version, .notes = m.notes });
+
+            const artifact = updater.downloadAndVerify(self.allocator, env.fetcher, m, env.public_key) catch |err| {
+                log.print("[updater] download/verify failed: {s}", .{@errorName(err)});
+                ctx.emit("updaterFailed", .{ .stage = "download", .err = @errorName(err) });
+                return;
+            };
+            defer self.allocator.free(artifact);
+            log.print("[updater] artifact verified ({d} bytes, sha256+ed25519)", .{artifact.len});
+            updater.stageUpdate(self.allocator, env.exe_path, env.exe_name, artifact) catch |err| {
+                log.print("[updater] stage failed: {s}", .{@errorName(err)});
+                ctx.emit("updaterFailed", .{ .stage = "stage", .err = @errorName(err) });
+                return;
+            };
+            log.print("[updater] staged ✓ {s} — restart to apply", .{m.version});
+            ctx.emit("updateStaged", .{ .version = m.version });
+            if (self.update_cfg != null and self.update_cfg.?.auto_restart) {
+                self.restartToApply();
+            }
+        }
+
+        /// 重启以应用已暂存的更新：分离拉起 `<exe> --zilt-restart <target>`，
+        /// helper 进程在 run() 最早期拦截（等旧实例退出后 replace 成新版）。
+        fn restartToApply(self: *Self) void {
+            const exe = currentExePathLinux(self.allocator) catch {
+                log.print("[updater] restart: exe path failed", .{});
+                return;
+            };
+            defer self.allocator.free(exe);
+            setSigChldIgnore();
+            const ok = spawnDetachedLinux(&.{ exe, updater.restart_flag, exe });
+            log.print("[updater] restart helper spawned ({})", .{ok});
         }
 
         // ------------------------------------------------------------------
@@ -5365,6 +5868,304 @@ fn Backend(comptime config: Config) type {
         }
 
         // ------------------------------------------------------------------
+        // v0.2.7：导航策略 / 新窗口策略 / 权限请求 / 渲染进程终止
+        // （对齐 Windows v0.1.9 的 driver 面；只挂主 WebView——子 WebView 不挂
+        // driver，与 Windows 的「child webview 不挂 driver」边界一致）
+        // ------------------------------------------------------------------
+
+        /// webview.* 事件的载荷拼装（url 等字符串经 jsonStr 转义）。
+        fn emitWebViewJson(self: *Self, win_id: u32, name: []const u8, payload: []const u8) void {
+            self.emitRawToWindow(win_id, name, payload);
+        }
+
+        /// 外部 URL（system_browser 策略）→ xdg-open（分离拉起）。
+        fn openExternalUrl(url: []const u8) void {
+            if (!security.isWebUrl(url)) return;
+            const ok = spawnDetachedLinux(&.{ "xdg-open", url });
+            log.print("[webview] external url -> xdg-open ({s})", .{boolStr(ok)});
+        }
+
+        /// 导航策略判定（v0.2.7）：应用自有 scheme（zilt://，mapAppUrl 后的加载
+        /// 形态）与内联 scheme（data:/blob:/about:）一律放行——security.navigation
+        /// 只认 http(s)，不判它们会把应用初始加载拦死、把 `<a download>` 的
+        /// data: 下载拦掉（两者均实测）；其余走共享 security.navigation
+        /// （config.url 为应用 origin，与 Windows driverNavigation 同参）。
+        fn navigationPolicyFor(url: []const u8) security.ExternalLinks {
+            if (std.mem.startsWith(u8, url, scheme ++ "://")) return .allow;
+            inline for (.{ "data:", "blob:", "about:" }) |pfx| {
+                if (std.mem.startsWith(u8, url, pfx)) return .allow;
+            }
+            return security.navigation(config.security, config.url, null, url);
+        }
+
+        /// decide-policy：导航动作走 navigationPolicyFor 三态；新窗口动作走
+        /// config.webview.new_window 三态；响应放行（下载走 download-started）。
+        /// translate-c 把 WebKitPolicyDecisionType 变成 c_uint → 用 if 链比较。
+        fn onDecidePolicy(
+            _: [*c]c.WebKitWebView,
+            decision: ?*c.WebKitPolicyDecision,
+            dtype: c.WebKitPolicyDecisionType,
+            user_data: c.gpointer,
+        ) callconv(.c) c.gboolean {
+            const sink: *IpcSink = @ptrCast(@alignCast(user_data orelse return 0));
+            const self = sink.backend;
+            const d = decision orelse return 0;
+            if (dtype == c.WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION) {
+                const npd: *c.WebKitNavigationPolicyDecision = @ptrCast(@alignCast(d));
+                const action = c.webkit_navigation_policy_decision_get_navigation_action(npd);
+                const req = if (action != null) c.webkit_navigation_action_get_request(action) else null;
+                const uri_raw = if (req != null) c.webkit_uri_request_get_uri(req) else null;
+                if (uri_raw == null) return 0;
+                const url = std.mem.span(uri_raw);
+                const policy = navigationPolicyFor(url);
+                const redirected = c.webkit_navigation_action_is_redirect(action) != 0;
+                if (jsonStr(self.allocator, url)) |uj| {
+                    defer self.allocator.free(uj);
+                    const payload = std.fmt.allocPrint(self.allocator,
+                        "{{\"url\":{s},\"id\":0,\"redirected\":{},\"policy\":\"{s}\"}}",
+                        .{ uj, redirected, @tagName(policy) },
+                    ) catch null;
+                    if (payload) |p| {
+                        defer self.allocator.free(p);
+                        self.emitWebViewJson(sink.win_id, webview.Event.navigation_starting, p);
+                    }
+                }
+                log.print("[nav] {s} -> {s}", .{ url, @tagName(policy) });
+                switch (policy) {
+                    .allow => c.webkit_policy_decision_use(d),
+                    // system_browser/deny 都拦截导航；前者另行交给系统处理程序
+                    .system_browser => {
+                        c.webkit_policy_decision_ignore(d);
+                        openExternalUrl(url);
+                    },
+                    .deny => c.webkit_policy_decision_ignore(d),
+                }
+                return 1;
+            }
+            if (dtype == c.WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION) {
+                const npd: *c.WebKitNavigationPolicyDecision = @ptrCast(@alignCast(d));
+                const action = c.webkit_navigation_policy_decision_get_navigation_action(npd);
+                const req = if (action != null) c.webkit_navigation_action_get_request(action) else null;
+                const uri_raw = if (req != null) c.webkit_uri_request_get_uri(req) else null;
+                const url = if (uri_raw != null) std.mem.span(uri_raw) else "";
+                const policy = config.webview.new_window;
+                if (jsonStr(self.allocator, url)) |uj| {
+                    defer self.allocator.free(uj);
+                    const payload = std.fmt.allocPrint(self.allocator,
+                        "{{\"url\":{s},\"policy\":\"{s}\"}}",
+                        .{ uj, @tagName(policy) },
+                    ) catch null;
+                    if (payload) |p| {
+                        defer self.allocator.free(p);
+                        self.emitWebViewJson(sink.win_id, webview.Event.new_window, p);
+                    }
+                }
+                log.print("[new-window] {s} -> {s}", .{ url, @tagName(policy) });
+                switch (policy) {
+                    .deny => c.webkit_policy_decision_ignore(d),
+                    .external => {
+                        c.webkit_policy_decision_ignore(d);
+                        if (url.len != 0) openExternalUrl(url);
+                    },
+                    .new_window => {
+                        c.webkit_policy_decision_ignore(d);
+                        if (url.len != 0) self.spawnPolicyWindow(url);
+                    },
+                }
+                return 1;
+            }
+            // RESPONSE：放行（下载走 download-started 通道，v0.2.1）
+            c.webkit_policy_decision_use(d);
+            return 0;
+        }
+
+        /// new_window 策略命中 → 建新 Zilt 窗口（对齐 Windows driverNewWindow：
+        /// 独立 label，复用 createWindowInternal 的全部接线）。
+        fn spawnPolicyWindow(self: *Self, url: []const u8) void {
+            const label = std.fmt.allocPrint(self.allocator, "webview-{d}", .{self.next_window_id}) catch return;
+            defer self.allocator.free(label);
+            const id = self.createWindowInternal(.{
+                .label = label,
+                .title = "Zilt Window",
+                .url = url,
+                .width = config.width,
+                .height = config.height,
+            }) catch |err| {
+                log.print("[new-window] spawn failed: {s}", .{@errorName(err)});
+                return;
+            };
+            log.print("[new-window] window #{d} -> {s}", .{ id.id, url });
+        }
+
+        /// `create` 信号：默认弹窗一律不建（策略已在 decide-policy 处理——
+        /// ignore 后不会走到这里；兜底返回 NULL 阻断 WebKit 自建窗口）。
+        fn onCreate(
+            _: [*c]c.WebKitWebView,
+            _: ?*c.WebKitNavigationAction,
+            _: c.gpointer,
+        ) callconv(.c) [*c]c.WebKitWebView {
+            return null;
+        }
+
+        /// permission-request：GType 反查 → 共享 PermissionKind → config 策略。
+        /// ask 在冒烟模式直接拒绝（无交互；桌面弹原生询问框），事件 payload
+        /// {url,kind,policy} 与 Windows 同形（WebKitGTK 拿不到发起 URL → 空串）。
+        fn onPermissionRequest(
+            _: [*c]c.WebKitWebView,
+            request: ?*c.WebKitPermissionRequest,
+            user_data: c.gpointer,
+        ) callconv(.c) c.gboolean {
+            const sink: *IpcSink = @ptrCast(@alignCast(user_data orelse return 0));
+            const self = sink.backend;
+            const req = request orelse return 0;
+            const kind = permissionKindOf(req);
+            const policy = config.webview.permissions.policy(kind);
+            var resolved = policy;
+            if (policy == .ask) {
+                resolved = if (self.smoke) .deny else permissionAskDialog(self, sink.win_id, kind);
+            }
+            switch (resolved) {
+                .allow => c.webkit_permission_request_allow(req),
+                else => c.webkit_permission_request_deny(req),
+            }
+            const payload = std.fmt.allocPrint(self.allocator,
+                "{{\"url\":\"\",\"kind\":\"{s}\",\"policy\":\"{s}\"}}",
+                .{ @tagName(kind), @tagName(policy) },
+            ) catch return 1;
+            defer self.allocator.free(payload);
+            self.emitWebViewJson(sink.win_id, webview.Event.permission, payload);
+            log.print("[permission] {s} -> {s}", .{ @tagName(kind), @tagName(policy) });
+            return 1;
+        }
+
+        /// GType 反查 WebKitGTK 权限类型 → 共享 PermissionKind（未知 → .unknown，
+        /// 共享默认策略是 deny）。
+        fn permissionKindOf(req: *c.WebKitPermissionRequest) webview.PermissionKind {
+            const obj: *c.GObject = @ptrCast(@alignCast(req));
+            if (c.g_type_check_instance_is_a(@ptrCast(obj), c.webkit_user_media_permission_request_get_type()) != 0) {
+                const um: *c.WebKitUserMediaPermissionRequest = @ptrCast(@alignCast(req));
+                if (c.webkit_user_media_permission_is_for_video_device(um) != 0) return .camera;
+                if (c.webkit_user_media_permission_is_for_audio_device(um) != 0) return .microphone;
+                return .unknown;
+            }
+            if (c.g_type_check_instance_is_a(@ptrCast(obj), c.webkit_geolocation_permission_request_get_type()) != 0) return .location;
+            if (c.g_type_check_instance_is_a(@ptrCast(obj), c.webkit_notification_permission_request_get_type()) != 0) return .notifications;
+            if (c.g_type_check_instance_is_a(@ptrCast(obj), c.webkit_clipboard_permission_request_get_type()) != 0) return .clipboard;
+            return .unknown;
+        }
+
+        /// ask 策略的原生询问框（模态；嵌套泵与 cookies/eval 同手法）。
+        /// 返回 allow/deny；窗口缺失（子页面场景）直接 deny。
+        fn permissionAskDialog(self: *Self, win_id: u32, kind: webview.PermissionKind) webview.PermissionPolicy {
+            const w = self.windowById(win_id) orelse return .deny;
+            const phrase: []const u8 = switch (kind) {
+                .camera => "use the camera",
+                .microphone => "use the microphone",
+                .location => "access your location",
+                .clipboard => "read the clipboard",
+                .notifications => "show notifications",
+                .unknown => "access a device capability",
+            };
+            const parent: [*c]c.GtkWindow = @ptrCast(w.win);
+            const text = std.fmt.allocPrintSentinel(self.allocator, "Allow this page to {s}?", .{phrase}, 0) catch return .deny;
+            defer self.allocator.free(text);
+            const dialog = c.gtk_message_dialog_new(
+                parent,
+                c.GTK_DIALOG_MODAL,
+                c.GTK_MESSAGE_QUESTION,
+                c.GTK_BUTTONS_YES_NO,
+                "%s",
+                text.ptr,
+            );
+            if (dialog == null) return .deny;
+            var st = PermissionDialogState{ .loop = c.g_main_loop_new(null, 0), .allowed = false };
+            defer if (st.loop) |l| c.g_main_loop_unref(l);
+            _ = c.g_signal_connect_data(
+                dialog,
+                "response",
+                @ptrCast(&Self.permissionDialogResponse),
+                @ptrCast(&st),
+                null,
+                0,
+            );
+            c.gtk_widget_show(dialog);
+            c.g_main_loop_run(st.loop.?);
+            c.gtk_widget_destroy(dialog);
+            return if (st.allowed) .allow else .deny;
+        }
+
+        /// 权限询问框的会话状态（对话框/嵌套泵/结果）；栈上分配——嵌套泵
+        /// 运行期间本栈帧存活，信号回调直接借用。
+        const PermissionDialogState = struct {
+            loop: ?*c.GMainLoop,
+            allowed: bool,
+        };
+
+        fn permissionDialogResponse(
+            _: [*c]c.GtkDialog,
+            response_id: c.gint,
+            user_data: c.gpointer,
+        ) callconv(.c) void {
+            const st: *PermissionDialogState = @ptrCast(@alignCast(user_data orelse return));
+            st.allowed = response_id == c.GTK_RESPONSE_YES;
+            if (st.loop) |l| c.g_main_loop_quit(l);
+        }
+
+        /// web-process-terminated：发 process_failed（kind = WebKit reason 0/1/2）
+        /// + 自动恢复（对齐 Windows recover_renderer：crashed/exceeded_memory →
+        /// reload；terminated_by_api 是主动调用 → 不恢复）。
+        fn onWebProcessTerminated(
+            view: [*c]c.WebKitWebView,
+            reason: c.WebKitWebProcessTerminationReason,
+            user_data: c.gpointer,
+        ) callconv(.c) void {
+            const sink: *IpcSink = @ptrCast(@alignCast(user_data orelse return));
+            const self = sink.backend;
+            // translate-c 把 WebKitWebProcessTerminationReason 变成 c_uint
+            const kind: i64 = @intCast(reason);
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"kind\":{d}}}", .{kind}) catch return;
+            defer self.allocator.free(payload);
+            self.emitWebViewJson(sink.win_id, webview.Event.process_failed, payload);
+            log.print("[webview] web process terminated (reason={d})", .{kind});
+            // 冒烟后置闭环：终止信号到达即 PASS → 退出（不 reload——重载页面会把
+            // 整套冒烟再跑一遍，与 1.5s 退出窗口竞态，实测踩到）
+            if (self.terminate_check and !self.terminate_seen) {
+                self.terminate_seen = true;
+                log.print("[linux-smoke] post terminate-check PASS (reason={d})", .{kind});
+                self.requestQuit();
+                return;
+            }
+            if (reason != c.WEBKIT_WEB_PROCESS_TERMINATED_BY_API and config.webview.recover_renderer) {
+                // 进程刚终止：reload 放到 idle 下一拍（避免与终止处理竞态）
+                const task = self.allocator.create(CrashReloadTask) catch return;
+                task.* = .{ .backend = self, .view = view };
+                if (c.g_idle_add(crashReloadIdle, task) == 0) self.allocator.destroy(task);
+            }
+        }
+
+        const CrashReloadTask = struct {
+            backend: *Self,
+            view: [*c]c.WebKitWebView,
+        };
+
+        fn crashReloadIdle(data: c.gpointer) callconv(.c) c.gboolean {
+            const task: *CrashReloadTask = @ptrCast(@alignCast(data orelse return G_SOURCE_REMOVE));
+            defer task.backend.allocator.destroy(task);
+            const w = task.backend.windowByView(task.view) orelse return G_SOURCE_REMOVE;
+            log.print("[webview] auto reload after process termination (window #{d})", .{w.id});
+            c.webkit_web_view_reload(w.view);
+            return G_SOURCE_REMOVE;
+        }
+
+        /// 由 WebView 指针反查窗口状态（崩溃恢复 idle 回调用）。
+        fn windowByView(self: *Self, view: [*c]c.WebKitWebView) ?*WinState {
+            for (self.windows.items) |w| {
+                if (w.view == view) return w;
+            }
+            return null;
+        }
+
+        // ------------------------------------------------------------------
         // 拖放（v0.2.2）：文件拖入 → dropFiles {files}
         // ------------------------------------------------------------------
 
@@ -5442,6 +6243,9 @@ fn Backend(comptime config: Config) type {
 
         /// 冒烟结果：`{passed,total,failed:[...]}` → 日志 + 退出码。
         fn finishSmoke(self: *Self, args_json: []const u8) void {
+            // 终止后重载页面会把整套冒烟重跑一遍（实测）——只认首轮结果
+            if (self.smoke_finished) return;
+            self.smoke_finished = true;
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
 
@@ -5492,7 +6296,29 @@ fn Backend(comptime config: Config) type {
                 _ = c.g_timeout_add_seconds(self.smoke_stay, stayQuit, self);
                 return;
             }
+            // v0.2.7 后置闭环：前端检查全过后，Zig 侧主动终止 web process →
+            // 断言 web-process-terminated 信号 + process_failed 事件链路 → reload
+            // 恢复 → 退出（渲染进程死亡无法被前端断言——JS 上下文随进程一起没了）
+            if (ok) {
+                log.print("[linux-smoke] post: web process terminate check", .{});
+                self.terminate_check = true;
+                _ = c.g_timeout_add_seconds(6, smokeTerminateTimeout, self);
+                if (self.windowById(1)) |w| {
+                    c.webkit_web_view_terminate_web_process(w.view);
+                }
+                return; // 退出由 onWebProcessTerminated / 超时承担
+            }
             self.requestQuit();
+        }
+
+        /// 后置闭环的失败兜底：6 秒内未见终止信号 → FAIL + 退出。
+        fn smokeTerminateTimeout(user_data: c.gpointer) callconv(.c) c.gboolean {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return G_SOURCE_REMOVE));
+            if (self.terminate_seen) return G_SOURCE_REMOVE;
+            log.print("[linux-smoke] post terminate-check FAIL (no web-process-terminated signal)", .{});
+            self.smoke_code = 1;
+            self.requestQuit();
+            return G_SOURCE_REMOVE;
         }
 
         fn stayQuit(user_data: c.gpointer) callconv(.c) c.gboolean {
