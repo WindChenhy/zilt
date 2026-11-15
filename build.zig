@@ -624,8 +624,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // ---- 更新签名工具：keygen / sign ----
-    // gen_keys 用 bcrypt（BCryptGenRandom）；sign_update 通过 win_env 读环境变量
-    // （GetEnvironmentVariableW）——两者都是 Win32。
+    // v0.3.1：三件套跨平台（env 走 Init.environ_map、文件走 std.Io、熵源 std.Io.random）
     const keygen = b.addExecutable(.{
         .name = "zilt-keygen",
         .root_module = b.createModule(.{
@@ -678,7 +677,6 @@ pub fn build(b: *std.Build) void {
     });
 
     if (is_windows) {
-        keygen.root_module.linkSystemLibrary("bcrypt", .{});
         b.installArtifact(keygen);
         b.installArtifact(sign);
 
@@ -696,6 +694,11 @@ pub fn build(b: *std.Build) void {
         const init_step = b.step("init", "Create a new project from a template (ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=myapp zig build init)");
         init_step.dependOn(&init_run.step);
     } else {
+        // v0.3.1：更新签名/差分工具跨平台——Linux 发布流水线可生成补丁与清单
+        b.installArtifact(keygen);
+        b.installArtifact(sign);
+        b.installArtifact(diff_exe);
+
         // v0.2.4：Linux 打包（deb/AppDir/squashfs/Flatpak manifest/rpm spec）。
         // zilt-pack-linux 需要 libc（std.c.getenv / Child）。
         const pack_linux_mod = b.createModule(.{

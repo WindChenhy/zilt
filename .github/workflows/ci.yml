@@ -155,6 +155,9 @@ jobs:
       - name: Headless / MCP E2E
         run: bash scripts/linux/dev-headless.sh
 
+      - name: Differential update E2E (patch + rollback/health)
+        run: bash scripts/linux/dev-update-e2e.sh
+
       - name: WebDriver E2E (WebKitWebDriver)
         run: zig build e2e
 

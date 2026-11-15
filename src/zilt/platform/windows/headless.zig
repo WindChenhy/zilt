@@ -95,22 +95,6 @@ pub fn run(comptime config: zilt.Config, alloc: std.mem.Allocator) !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const port: u16 = if (envUtf8(alloc, "ZILT_HEADLESS_PORT")) |p| blk: {
-        defer alloc.free(p);
-        break :blk std.fmt.parseInt(u16, p, 10) catch DEFAULT_PORT;
-    } else DEFAULT_PORT;
-
-    const addr = std.Io.net.IpAddress.resolve(io, "127.0.0.1", port) catch |e| {
-        log.print("[headless] resolve failed: {s}", .{@errorName(e)});
-        return error.HeadlessListenFailed;
-    };
-    var server = addr.listen(io, .{ .reuse_address = true }) catch |e| {
-        log.print("[headless] listen failed: {s}", .{@errorName(e)});
-        return error.HeadlessListenFailed;
-    };
-    defer server.deinit(io);
-    log.print("[headless] serving http://127.0.0.1:{d}/ (app={s})", .{ port, config.app_id });
-
     // 服务注册表：与 GUI 模式同一生命周期（init → startAll → 逆序 deinit）
     var registry = services_mod.Registry.init(alloc);
     defer registry.deinit();
@@ -127,17 +111,107 @@ pub fn run(comptime config: zilt.Config, alloc: std.mem.Allocator) !void {
     };
     log.print("[headless] {d} service(s) started", .{service_count});
 
+    const mcp_opts = buildMcpOptions(config, alloc);
+
+    // v0.3.1：MCP stdio 传输（`zilt mcp` 直连 / Claude Desktop 本地进程）
+    if (mcpStdioEnabled(alloc)) {
+        log.print("[headless] MCP stdio mode (no HTTP listener)", .{});
+        return runMcpStdio(config, alloc, io, mcp_opts);
+    }
+
+    const port: u16 = if (envUtf8(alloc, "ZILT_HEADLESS_PORT")) |p| blk: {
+        defer alloc.free(p);
+        break :blk std.fmt.parseInt(u16, p, 10) catch DEFAULT_PORT;
+    } else DEFAULT_PORT;
+
+    const addr = std.Io.net.IpAddress.resolve(io, "127.0.0.1", port) catch |e| {
+        log.print("[headless] resolve failed: {s}", .{@errorName(e)});
+        return error.HeadlessListenFailed;
+    };
+    var server = addr.listen(io, .{ .reuse_address = true }) catch |e| {
+        log.print("[headless] listen failed: {s}", .{@errorName(e)});
+        return error.HeadlessListenFailed;
+    };
+    defer server.deinit(io);
+    log.print("[headless] serving http://127.0.0.1:{d}/ (app={s})", .{ port, config.app_id });
+
     log.print("[headless] ready — Ctrl+C 终止（或父进程 Job 清理）", .{});
     while (true) {
         var stream = server.accept(io) catch |e| {
             log.print("[headless] accept failed: {s}", .{@errorName(e)});
             continue;
         };
-        handleConnection(config, alloc, io, &stream) catch |e| {
+        handleConnection(config, alloc, io, &stream, mcp_opts) catch |e| {
             log.print("[headless] connection error: {s}", .{@errorName(e)});
         };
         stream.close(io);
     }
+}
+
+/// MCP 运行选项：`ZILT_MCP_TOOLS=greet,add` 白名单（逗号分隔）。
+/// 切片指向 env 原始字符串——headless 进程生命周期内不释放。
+fn buildMcpOptions(comptime config: zilt.Config, alloc: std.mem.Allocator) mcp.Options {
+    var opts = mcp.Options{ .app_id = config.app_id };
+    if (envUtf8(alloc, "ZILT_MCP_TOOLS")) |raw| {
+        var list: std.ArrayListUnmanaged([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, raw, ',');
+        while (it.next()) |part| {
+            const t = std.mem.trim(u8, part, " \t");
+            if (t.len == 0) continue;
+            list.append(alloc, t) catch continue;
+        }
+        opts.tools_allowlist = list.toOwnedSlice(alloc) catch null;
+    }
+    return opts;
+}
+
+fn mcpStdioEnabled(alloc: std.mem.Allocator) bool {
+    const raw = envUtf8(alloc, "ZILT_MCP_STDIO") orelse return false;
+    defer alloc.free(raw);
+    return std.mem.eql(u8, raw, "1");
+}
+
+/// MCP stdio：一行一条 JSON-RPC（MCP 标准传输）。
+/// stdout 只写响应；日志走 stderr / zilt.log，保证客户端读到干净流。
+fn runMcpStdio(
+    comptime config: zilt.Config,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    opts: mcp.Options,
+) !void {
+    var rbuf: [64 * 1024]u8 = undefined;
+    var wbuf: [64 * 1024]u8 = undefined;
+    var rd = std.Io.File.stdin().reader(io, &rbuf);
+    var wr = std.Io.File.stdout().writer(io, &wbuf);
+
+    var dummy: u8 = 0;
+    const ctx = ipc.Context{
+        .allocator = alloc,
+        .msg_allocator = alloc,
+        .backend = @ptrCast(&dummy),
+        .window_id = 0,
+        .emit_fn = headlessEmit,
+        .quit_fn = headlessQuit,
+        .system_fn = headlessSystem,
+    };
+
+    while (true) {
+        const line = rd.interface.takeDelimiter('\n') catch |e| {
+            log.print("[mcp:stdio] read failed: {s}", .{@errorName(e)});
+            return;
+        } orelse break;
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        const resp = mcp.handle(alloc, trimmed, ctx, config.commands, opts) catch |e| {
+            log.print("[mcp:stdio] {s}", .{@errorName(e)});
+            continue;
+        } orelse continue; // 通知不回包
+        defer alloc.free(resp);
+        wr.interface.writeAll(resp) catch return;
+        wr.interface.writeAll("\n") catch return;
+        wr.interface.flush() catch return;
+    }
+    log.print("[mcp:stdio] stdin closed -> exit", .{});
 }
 
 fn handleConnection(
@@ -145,6 +219,7 @@ fn handleConnection(
     alloc: std.mem.Allocator,
     io: std.Io,
     stream: *std.Io.net.Stream,
+    mcp_opts: mcp.Options,
 ) !void {
     var rbuf: [16 * 1024]u8 = undefined;
     var wbuf: [16 * 1024]u8 = undefined;
@@ -204,12 +279,15 @@ fn handleConnection(
         try handleIpc(config, alloc, out, body);
         return;
     }
-    // v0.1.19：MCP（JSON-RPC 2.0，tools = 应用命令）
+    // v0.1.19：MCP（JSON-RPC 2.0，tools = 应用命令）；v0.3.1：resources/prompts + 白名单
     if (std.mem.eql(u8, path_only, "/mcp")) {
         if (std.mem.eql(u8, method, "POST")) {
-            try handleMcp(config, alloc, out, body);
+            try handleMcp(config, alloc, out, body, mcp_opts);
         } else {
-            const info = try std.fmt.allocPrint(alloc, "{{\"server\":\"zilt\",\"protocolVersion\":\"{s}\",\"tools\":{d}}}", .{ mcp.PROTOCOL_VERSION, comptime ipc.commandMetas(config.commands).len });
+            const info = try std.fmt.allocPrint(alloc, "{{\"server\":\"zilt\",\"protocolVersion\":\"{s}\",\"tools\":{d},\"resources\":3,\"prompts\":2}}", .{
+                mcp.PROTOCOL_VERSION,
+                comptime ipc.commandMetas(config.commands).len,
+            });
             defer alloc.free(info);
             try respond(out, 200, "application/json", info);
         }
@@ -295,12 +373,13 @@ fn handleIpc(
     alloc.free(result);
 }
 
-/// POST /mcp：MCP JSON-RPC（initialize / tools/list / tools/call / ping）。
+/// POST /mcp：MCP JSON-RPC（initialize / ping / tools / resources / prompts）。
 fn handleMcp(
     comptime config: zilt.Config,
     alloc: std.mem.Allocator,
     out: anytype,
     body: []const u8,
+    opts: mcp.Options,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -314,11 +393,17 @@ fn handleMcp(
         .quit_fn = headlessQuit,
         .system_fn = headlessSystem,
     };
-    const resp = mcp.handle(alloc, body, ctx, config.commands) catch |e| {
+    const maybe_resp = mcp.handle(alloc, body, ctx, config.commands, opts) catch |e| {
         log.print("[headless:mcp] {s}", .{@errorName(e)});
         const msg = std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":-32603,\"message\":\"{s}\"}}}}", .{@errorName(e)}) catch "{}";
         defer alloc.free(msg);
         try respond(out, 200, "application/json", msg);
+        return;
+    };
+    const resp = maybe_resp orelse {
+        // 通知（无 id）：HTTP 语义用 202 + 空体
+        log.print("[headless:mcp] notification accepted", .{});
+        try respondWith(out, 202, "application/json", "");
         return;
     };
     defer alloc.free(resp);
@@ -379,6 +464,7 @@ fn respond(out: anytype, status: u16, content_type: []const u8, body: []const u8
 fn respondWith(out: anytype, status: u16, content_type: []const u8, body: []const u8) !void {
     const reason: []const u8 = switch (status) {
         200 => "OK",
+        202 => "Accepted",
         400 => "Bad Request",
         404 => "Not Found",
         413 => "Payload Too Large",

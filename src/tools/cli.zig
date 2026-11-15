@@ -60,6 +60,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (eql(u8, cmd, "doctor")) return runDoctor(alloc);
     if (eql(u8, cmd, "info")) return runInfo();
+    if (eql(u8, cmd, "mcp")) return runMcp(init, alloc, args.items[1..]);
     if (eql(u8, cmd, "icon")) return runIcon(alloc, args.items[1..]);
     if (eql(u8, cmd, "npm-pack")) return runNpmPack(alloc, args.items[1..]);
     if (eql(u8, cmd, "new")) return runNew(alloc, args.items[1..]);
@@ -85,6 +86,7 @@ fn printHelp() void {
         \\用法:
         \\  zilt doctor    检查构建环境（Zig / WebView2 / makensis / frontend dist / 图标）
         \\  zilt info      打印当前项目配置摘要
+        \\  zilt mcp [app] 以 MCP stdio 直连应用（默认取同目录 zilt-app / ZILT_MCP_APP）
         \\  zilt version   打印版本
         \\  zilt icon <in.png> [-o out.ico] [--sizes 16,32,48,256]
         \\                 PNG → 多尺寸 .ico（Windows 发布图标）
@@ -99,6 +101,95 @@ fn printHelp() void {
         \\  zig build pack      多平台包（deb/rpm/wxs/appimage）
         \\
     , .{});
+}
+
+/// v0.3.1：`zilt mcp [app]` —— 用 MCP stdio 直连应用。
+/// 实现方式：把 `ZILT_HEADLESS=1 ZILT_MCP_STDIO=1` 注入环境后原地 spawn 应用，
+/// stdin/stdout/stderr 全部继承——不额外占端口、不需要桥接进程。
+fn runMcp(init: std.process.Init, alloc: std.mem.Allocator, rest: []const []const u8) !u8 {
+    var explicit: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (eqlStr(a, "--help") or eqlStr(a, "-h")) {
+            print(
+                \\用法: zilt mcp [app-path]
+                \\  默认取同目录 zilt-app（Windows: zilt-app.exe），可用 ZILT_MCP_APP 覆盖。
+                \\  走的传输是 MCP stdio（一行一条 JSON-RPC），stdout 只输出响应。
+                \\
+            , .{});
+            return 0;
+        }
+        if (eqlStr(a, "--app")) {
+            if (i + 1 >= rest.len) {
+                print("zilt mcp: --app 缺少路径\n", .{});
+                return 2;
+            }
+            explicit = rest[i + 1];
+            i += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "-")) {
+            print("zilt mcp: 未知选项 '{s}'\n", .{a});
+            return 2;
+        }
+        explicit = a;
+    }
+
+    var owned: ?[]u8 = null;
+    defer if (owned) |p| alloc.free(p);
+
+    const app_path: []const u8 = explicit orelse blk: {
+        if (init.environ_map.get("ZILT_MCP_APP")) |p| break :blk p;
+        const exe = std.process.executablePathAlloc(init.io, alloc) catch {
+            print("zilt mcp: 无法定位 zilt 可执行文件\n", .{});
+            return 1;
+        };
+        defer alloc.free(exe);
+        const dir = std.fs.path.dirname(exe) orelse ".";
+        const name = if (builtin.os.tag == .windows) "zilt-app.exe" else "zilt-app";
+        owned = std.fs.path.join(alloc, &.{ dir, name }) catch {
+            print("zilt mcp: 路径分配失败\n", .{});
+            return 1;
+        };
+        break :blk owned.?;
+    };
+
+    _ = std.Io.Dir.cwd().statFile(init.io, app_path, .{}) catch {
+        print(
+            "zilt mcp: 找不到应用 '{s}'\n  用法: zilt mcp <path/to/zilt-app>（或设置 ZILT_MCP_APP）\n",
+            .{app_path},
+        );
+        return 2;
+    };
+
+    var env = init.environ_map.clone(alloc) catch {
+        print("zilt mcp: 环境变量克隆失败\n", .{});
+        return 1;
+    };
+    defer env.deinit();
+    env.put("ZILT_HEADLESS", "1") catch return 1;
+    env.put("ZILT_MCP_STDIO", "1") catch return 1;
+
+    var child = std.process.spawn(init.io, .{
+        .argv = &.{app_path},
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .environ_map = &env,
+    }) catch |e| {
+        print("zilt mcp: 启动失败: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    const term = child.wait(init.io) catch return 1;
+    return switch (term) {
+        .exited => |code| @intCast(code),
+        else => 1,
+    };
+}
+
+fn eqlStr(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
 }
 
 fn runDoctor(alloc: std.mem.Allocator) !u8 {

@@ -356,6 +356,32 @@
             Linux 单测 **197/198**（1 skip；+gdkCursorName/buildUriList）；
             Windows 单测 **279/279**、冒烟除桌面剪贴板占用（clip/clipmulti，
             环境问题）外全 PASS。
+- [x] **v0.3.1 MCP 深化 + Linux 差分更新**（2026-11-15）：
+      - **MCP 深化**：`POST /mcp` 之外新增 **stdio transport**
+            （`ZILT_HEADLESS=1 ZILT_MCP_STDIO=1`，一行一条 JSON-RPC，stdout 只出响应）；
+            `resources/list|read`（app info / zilt.log 尾部 / tools）、
+            `prompts/list|get`（app_overview / call_command）、通知（无 id）不回包
+            （HTTP 202 / stdio 静默）、工具级 ACL `ZILT_MCP_TOOLS=greet,add`
+            （tools/list 过滤 + call 返回 `ToolNotAllowed`）。
+      - **`zilt mcp [app]`**：CLI 注入 `ZILT_HEADLESS`/`ZILT_MCP_STDIO` 后 spawn 应用
+            （stdin/stdout 继承，无桥接进程/端口）；默认取同目录 zilt-app，
+            `ZILT_MCP_APP` 可覆盖。Claude Desktop 可直接以命令方式接入。
+      - **Linux 差分更新**：`updaterFlow` 优先 `manifest.patch`——
+            基线 sha256 校验 → 补丁下载/sha256/ed25519 → `applyPatch` →
+            结果全量 sha256+签名复核 → `stageBytes`；任一步失败回退全量。
+      - **Linux 崩溃回滚 + 健康确认**：restart helper 由 exec 改为
+            「拉起新版 → 观察 3s，提前退出则 `.zilt-old` 回滚并重拉」；
+            启动 10s 后 `cleanupOld` 删除备份（g_timeout，对齐 Windows WM_TIMER）。
+      - **工具链跨平台**：`zilt-keygen` / `zilt-sign` / `zilt-diff` 全部改
+            `std.process.Init`（env/environ_map + std.Io 文件 + Io.random），
+            Linux `zig build` 直接产出三件套（补丁/清单可在 Linux 发布流水线生成）。
+      - **验收**：Linux 单测 **200/201**（1 skip；+MCP resources/prompts/ACL、
+            POSIX rollback/cleanup）；headless/MCP E2E **PASS**
+            （HTTP resources/read + 202 + stdio 3 行 + `zilt mcp` 42 + ACL 拒绝）；
+            **差分更新 E2E PASS**（61MB exe + 30 字节扰动 → 补丁 107 字节，
+            exe 替换/备份 sha 匹配/10s 健康清理全绿）；
+            Linux GUI 冒烟 **75/75 exit 0**（openbox）；Windows 单测 **281/282**
+            （1 skip = POSIX 用例）、构建通过、冒烟 **49/49 ALL PASSED**。
 - [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）——v0.3+
 - [x] 平台差异收敛原则：平台无关层（ipc/security/fs_api/protocol/net/sql/store/patch/pack_formats）
       两平台共用，差异只出现在 `platform/<os>/`

@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.24（Windows 全栈）+ v0.3.0（Linux 桌面体验包）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.1.24（Windows 全栈）+ v0.3.1（Linux 桌面体验包 + MCP stdio + 差分更新）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -172,6 +172,7 @@ CLI 自检：
 ```sh
 zig build                       # 产出 zig-out/bin/zilt.exe
 ./zig-out/bin/zilt.exe doctor   # Zig / WebView2 / makensis / dist / 图标 全链路检查
+./zig-out/bin/zilt.exe mcp      # MCP stdio 直连同目录 zilt-app（AI 客户端可接入）
 ./zig-out/bin/zilt.exe info     # 项目配置摘要
 zig build doctor                # 等价快捷 step
 ```

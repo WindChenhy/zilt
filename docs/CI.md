@@ -7,7 +7,7 @@
 | job | 触发 | 内容 |
 |---|---|---|
 | `test` | push / PR / 手动 | Zig 构建（Debug + ReleaseFast）→ `zig build test` → GUI 冒烟 31 项 → WebDriver E2E（可选）|
-| `linux-test` | push / PR / 手动 | Ubuntu 22.04：GTK3/WebKitGTK 构建 + 单测 → Xvfb + **openbox** 冒烟 75 项 → headless/MCP → WebKitWebDriver → init 模板 → 打包 |
+| `linux-test` | push / PR / 手动 | Ubuntu 22.04：GTK3/WebKitGTK 构建 + 单测 → Xvfb + **openbox** 冒烟 75 项 → headless/MCP → **差分更新 E2E** → WebKitWebDriver → init 模板 → 打包 |
 | `package` | 依赖 `test` | 前端构建 → NSIS 打包 → 上传 `zilt-windows-x64`（setup.exe / zip）|
 | `release` | tag `v*` | 下载产物 → signtool 签名（RFC3161 时间戳）→ 创建 GitHub Release |
 

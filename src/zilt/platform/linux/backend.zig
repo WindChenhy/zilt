@@ -119,6 +119,7 @@ const log = @import("../../log.zig");
 const system_api = @import("../../system_api.zig");
 const shared_services = @import("../../services.zig");
 const updater = @import("../../updater.zig");
+const patch_mod = @import("../../patch.zig");
 const shell_mod = @import("../../shell.zig");
 const headless = @import("../windows/headless.zig");
 const clipboard = @import("../../clipboard.zig");
@@ -254,9 +255,9 @@ fn updaterFetchLinux(backend_ptr: *anyopaque, alloc: std.mem.Allocator, url: []c
     return aw.toOwnedSlice();
 }
 
-/// 重启 helper（Linux）：等旧实例（父进程）退出 → replace 成新版。
-/// 与 Windows 的互斥体等待对应——Linux 的「旧实例已退出」信号就是父进程消失
-/// （getppid 变为 1/init）。轮询间隔 200ms，上限 30s 防挂死。
+/// 重启 helper（Linux）：等旧实例（父进程）退出 → 拉起新版并观察 3 秒。
+/// 3 秒内退出视为更新失败 → 用 `.zilt-old` 回滚并重拉旧版（对齐 Windows v0.1.15）；
+/// 仍在运行视为健康，helper 退出（子进程被 init 收养）。
 fn runRestartHelperLinux(target: []const u8) void {
     log.print("[updater] restart helper: waiting for old instance to exit", .{});
     var waited_ms: u32 = 0;
@@ -268,10 +269,38 @@ fn runRestartHelperLinux(target: []const u8) void {
         log.print("[updater] restart helper: timeout waiting for old instance", .{});
         return;
     }
-    log.print("[updater] restart helper: exec {s}", .{target});
-    // replace 成功不返回；返回值即失败原因（bare error set，exec 语义）
-    const fail: std.process.ReplaceError = std.process.replace(sharedIo(), .{ .argv = &.{target} });
-    log.print("[updater] restart helper: replace failed: {s}", .{@errorName(fail)});
+
+    const alloc = std.heap.page_allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    log.print("[updater] restart helper: spawn {s}", .{target});
+    const child = std.process.spawn(io, .{ .argv = &.{target} }) catch |e| {
+        log.print("[updater] restart helper: spawn failed: {s}", .{@errorName(e)});
+        return;
+    };
+    const id = child.id orelse return;
+    const pid: std.c.pid_t = @intCast(id);
+
+    var observe_ms: u32 = 0;
+    while (observe_ms < 3000) : (observe_ms += 100) {
+        var status: c_int = 0;
+        const r = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+        if (r == pid) {
+            // 提前退出（任何原因）→ 回滚到备份并重拉旧版
+            if (updater.rollbackToBackup(alloc, target)) {
+                log.print("[updater] target exited within 3s -> rolled back to backup", .{});
+                const old_child = std.process.spawn(io, .{ .argv = &.{target} }) catch return;
+                _ = old_child; // 健康观察由 init 接管；这里只负责拉起
+            } else {
+                log.print("[updater] target exited within 3s, no backup available", .{});
+            }
+            return;
+        }
+        _ = c.g_usleep(100_000);
+    }
+    log.print("[updater] target healthy after 3s", .{});
 }
 
 /// 窗口事件的字段（v0.2.6：windowMoved/Resized/Focus/Blur/CloseRequested）。
@@ -781,6 +810,13 @@ pub fn run(comptime config: Config) !void {
             _ = c.g_signal_connect_data(cb, "owner-change", @ptrCast(&Self.onClipboardOwnerChange), self, null, 0);
             log.print("[clip] change listener attached", .{});
         }
+    }
+
+    // v0.3.1：更新健康确认（对齐 Windows v0.1.15）——新版本跑满 10s 才删除
+    // .zilt-old 备份，避免「刚启动就删掉回滚凭据」。
+    if (config.update != null) {
+        _ = c.g_timeout_add_seconds(10, Self.healthConfirmIdle, self);
+        log.print("[updater] health timer armed (10s)", .{});
     }
 
     if (app_mode == .primary) {
@@ -5126,8 +5162,70 @@ fn Backend(comptime config: Config) type {
             };
         }
 
-        /// 更新流程（后台线程）：检查 → 下载 → 验签 → 暂存替换 → 事件 + 日志。
-        /// 与 Windows updaterFlow 同构（事件名/payload 逐字对齐）。
+        /// 差分更新路径（v0.3.1，对齐 Windows v0.1.5）：校验基线 → 下载/验签补丁 →
+        /// 应用 → 复核全量 sha256+签名 → 暂存。任一步失败返回 false（回退全量）。
+        fn tryPatchUpdateLinux(self: *Self, p: *const updater.PatchInfo, m: *const updater.Manifest, env: *const updater.Env) bool {
+            const alloc = self.allocator;
+            log.print("[updater] patch path: {s} -> {s}", .{ p.from, m.version });
+
+            const current = self.fsReadFile(env.exe_path, 512 * 1024 * 1024) catch |e| {
+                log.print("[updater] patch: read current exe failed: {s}", .{@errorName(e)});
+                return false;
+            };
+            defer alloc.free(current);
+            log.print("[updater] patch: current exe {d} bytes", .{current.len});
+
+            const cur_hex = updater.sha256Hex(alloc, current) catch return false;
+            defer alloc.free(cur_hex);
+            log.print("[updater] patch: current sha256={s}", .{cur_hex});
+            if (!std.ascii.eqlIgnoreCase(cur_hex, p.from_sha256)) {
+                log.print("[updater] patch base mismatch (current {s} != from {s}) -> full download", .{ cur_hex, p.from_sha256 });
+                return false;
+            }
+
+            const patch_bytes = env.fetcher.fetchFn(env.fetcher.ctx, alloc, p.url) catch |e| {
+                log.print("[updater] patch fetch failed ({s}): {s}", .{ p.url, @errorName(e) });
+                return false;
+            };
+            defer alloc.free(patch_bytes);
+            log.print("[updater] patch: downloaded {d} bytes", .{patch_bytes.len});
+            const patch_hex = updater.sha256Hex(alloc, patch_bytes) catch return false;
+            defer alloc.free(patch_hex);
+            if (!std.ascii.eqlIgnoreCase(patch_hex, p.sha256)) {
+                log.print("[updater] patch sha256 mismatch ({s} != {s})", .{ patch_hex, p.sha256 });
+                return false;
+            }
+            updater.verifyArtifact(patch_bytes, p.signature, env.public_key) catch {
+                log.print("[updater] patch signature invalid", .{});
+                return false;
+            };
+
+            const new_bytes = patch_mod.applyPatch(alloc, current, patch_bytes) catch |e| {
+                log.print("[updater] patch apply failed: {s}", .{@errorName(e)});
+                return false;
+            };
+            defer alloc.free(new_bytes);
+
+            const new_hex = updater.sha256Hex(alloc, new_bytes) catch return false;
+            defer alloc.free(new_hex);
+            if (!std.ascii.eqlIgnoreCase(new_hex, m.sha256)) {
+                log.print("[updater] patched result sha256 != manifest -> full download", .{});
+                return false;
+            }
+            updater.verifyArtifact(new_bytes, m.signature, env.public_key) catch {
+                log.print("[updater] patched result signature invalid", .{});
+                return false;
+            };
+
+            updater.stageBytes(alloc, env.exe_path, new_bytes) catch |e| {
+                log.print("[updater] patch stage failed: {s}", .{@errorName(e)});
+                return false;
+            };
+            log.print("[updater] patched & staged ok ({d} -> {d} bytes)", .{ current.len, new_bytes.len });
+            return true;
+        }
+
+        /// 更新流程（后台线程）：检查 → 差分优先/全量回退 → 验签 → 替换 → 事件。
         fn updaterFlow(self: *Self) void {
             const env = self.updater_env orelse return;
             const ctx = self.context(self.allocator, 0); // emit 用 msg_allocator，线程安全
@@ -5146,18 +5244,31 @@ fn Backend(comptime config: Config) type {
             log.print("[updater] update available: {s} (current {s})", .{ m.version, env.current_version });
             ctx.emit("updateInfo", .{ .version = m.version, .notes = m.notes });
 
-            const artifact = updater.downloadAndVerify(self.allocator, env.fetcher, m, env.public_key) catch |err| {
-                log.print("[updater] download/verify failed: {s}", .{@errorName(err)});
-                ctx.emit("updaterFailed", .{ .stage = "download", .err = @errorName(err) });
-                return;
-            };
-            defer self.allocator.free(artifact);
-            log.print("[updater] artifact verified ({d} bytes, sha256+ed25519)", .{artifact.len});
-            updater.stageUpdate(self.allocator, env.exe_path, env.exe_name, artifact) catch |err| {
-                log.print("[updater] stage failed: {s}", .{@errorName(err)});
-                ctx.emit("updaterFailed", .{ .stage = "stage", .err = @errorName(err) });
-                return;
-            };
+            var staged_by_patch = false;
+            if (m.patch) |*p| {
+                if (std.mem.eql(u8, p.from, env.current_version)) {
+                    staged_by_patch = self.tryPatchUpdateLinux(p, &m, &env);
+                    if (!staged_by_patch) {
+                        log.print("[updater] patch path failed -> full download fallback", .{});
+                    }
+                } else {
+                    log.print("[updater] patch base {s} != current {s} -> full download", .{ p.from, env.current_version });
+                }
+            }
+            if (!staged_by_patch) {
+                const artifact = updater.downloadAndVerify(self.allocator, env.fetcher, m, env.public_key) catch |err| {
+                    log.print("[updater] download/verify failed: {s}", .{@errorName(err)});
+                    ctx.emit("updaterFailed", .{ .stage = "download", .err = @errorName(err) });
+                    return;
+                };
+                defer self.allocator.free(artifact);
+                log.print("[updater] artifact verified ({d} bytes, sha256+ed25519)", .{artifact.len});
+                updater.stageUpdate(self.allocator, env.exe_path, env.exe_name, artifact) catch |err| {
+                    log.print("[updater] stage failed: {s}", .{@errorName(err)});
+                    ctx.emit("updaterFailed", .{ .stage = "stage", .err = @errorName(err) });
+                    return;
+                };
+            }
             log.print("[updater] staged ✓ {s} — restart to apply", .{m.version});
             ctx.emit("updateStaged", .{ .version = m.version });
             if (self.update_cfg != null and self.update_cfg.?.auto_restart) {
@@ -7292,6 +7403,16 @@ fn Backend(comptime config: Config) type {
                 log.print("[linux] all windows destroyed -> quit main loop", .{});
                 self.requestQuit();
             }
+        }
+
+        /// v0.3.1：启动 10s 后清理 `.zilt-old`（健康确认；与 Windows WM_TIMER id=3 同语义）。
+        fn healthConfirmIdle(user_data: c.gpointer) callconv(.c) c.gboolean {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return G_SOURCE_REMOVE));
+            const exe = currentExePathLinux(self.allocator) catch return G_SOURCE_REMOVE;
+            defer self.allocator.free(exe);
+            updater.cleanupOld(self.allocator, exe);
+            log.print("[updater] health confirmed, backup cleaned", .{});
+            return G_SOURCE_REMOVE;
         }
 
         /// v0.3.0：map 后补一次恢复几何的 move（openbox 等 reparent 型 WM 实测

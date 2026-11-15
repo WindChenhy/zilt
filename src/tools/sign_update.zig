@@ -1,45 +1,9 @@
 //! 更新包签名：`ZILT_SIGN_FILE=<安装包路径> ZILT_SIGN_KEY=<64hex种子> zig-out/bin/zilt-sign`
 //! 输出可直接使用的 manifest JSON（url/version 字段需手动填）。
+//!
+//! v0.3.1：跨平台（Windows/Linux 共用）——env 走 Init.environ_map，文件走 std.Io。
 
 const std = @import("std");
-
-// 自带最小 Win32 助手（独立工具，不依赖 zilt 模块）
-const DWORD = u32;
-const BOOL = i32;
-const HANDLE = *anyopaque;
-const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
-
-pub extern "kernel32" fn GetEnvironmentVariableW(lpName: [*:0]const u16, lpBuffer: ?[*]u16, nSize: DWORD) callconv(.c) DWORD;
-pub extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?*anyopaque) callconv(.c) HANDLE;
-pub extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: DWORD, lpNumberOfBytesRead: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.c) BOOL;
-pub extern "kernel32" fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *i64) callconv(.c) BOOL;
-pub extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.c) BOOL;
-
-/// v0.1.23：三份拷贝合一（实现见 win_env.zig）。
-const getEnv = @import("win_env.zig").get;
-
-fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ?[]u8 {
-    const pw = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return null;
-    defer alloc.free(pw);
-    const GENERIC_READ: DWORD = 0x80000000;
-    const OPEN_EXISTING: DWORD = 3;
-    const f = CreateFileW(pw.ptr, GENERIC_READ, 1, null, OPEN_EXISTING, 0x80, null);
-    if (f == INVALID_HANDLE_VALUE) return null;
-    defer _ = CloseHandle(f);
-    var size: i64 = 0;
-    if (GetFileSizeEx(f, &size) == 0 or size < 0 or size > 256 * 1024 * 1024) return null;
-    const buf = alloc.alloc(u8, @intCast(size)) catch return null;
-    var total: DWORD = 0;
-    while (total < buf.len) {
-        var got: DWORD = 0;
-        if (ReadFile(f, buf.ptr + total, @intCast(buf.len - total), &got, null) == 0 or got == 0) {
-            alloc.free(buf);
-            return null;
-        }
-        total += got;
-    }
-    return buf;
-}
 
 fn hexLower(out: *[64]u8, bytes: []const u8) void {
     const hex = "0123456789abcdef";
@@ -49,20 +13,19 @@ fn hexLower(out: *[64]u8, bytes: []const u8) void {
     }
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var gpa_state = std.heap.DebugAllocator(.{}){};
     const alloc = gpa_state.allocator();
+    const io = init.io;
 
-    const file_path = getEnv(alloc, "ZILT_SIGN_FILE") orelse {
+    const file_path = init.environ_map.get("ZILT_SIGN_FILE") orelse {
         std.debug.print("error: set ZILT_SIGN_FILE\n", .{});
         return error.MissingArgs;
     };
-    defer alloc.free(file_path);
-    const key_hex = getEnv(alloc, "ZILT_SIGN_KEY") orelse {
+    const key_hex = init.environ_map.get("ZILT_SIGN_KEY") orelse {
         std.debug.print("error: set ZILT_SIGN_KEY (64 hex chars)\n", .{});
         return error.MissingArgs;
     };
-    defer alloc.free(key_hex);
     if (key_hex.len != 64) {
         std.debug.print("error: ZILT_SIGN_KEY must be 64 hex chars\n", .{});
         return error.BadKey;
@@ -75,7 +38,7 @@ pub fn main() !void {
     };
     const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
 
-    const artifact = readFileAlloc(alloc, file_path) orelse {
+    const artifact = std.Io.Dir.cwd().readFileAlloc(io, file_path, alloc, .limited(256 * 1024 * 1024)) catch {
         std.debug.print("error: cannot read {s}\n", .{file_path});
         return error.ReadFileFailed;
     };

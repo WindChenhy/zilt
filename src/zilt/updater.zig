@@ -274,27 +274,45 @@ pub fn runRestartHelper(alloc: std.mem.Allocator, target: []const u8) void {
 
 /// 用 `<exe>.zilt-old` 覆盖当前 exe（崩溃回滚）。返回是否成功。
 pub fn rollbackToBackup(alloc: std.mem.Allocator, exe_path: []const u8) bool {
-    if (comptime !is_windows) return false;
-    const win32 = @import("platform/windows/win32.zig");
     const old_path = std.fmt.allocPrint(alloc, "{s}.zilt-old", .{exe_path}) catch return false;
     defer alloc.free(old_path);
-    const old_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, old_path) catch return false;
-    defer alloc.free(old_w);
-    const exe_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, exe_path) catch return false;
-    defer alloc.free(exe_w);
-    return win32.MoveFileExW(old_w.ptr, exe_w.ptr, win32.MOVEFILE_REPLACE_EXISTING) != 0;
+
+    if (comptime is_windows) {
+        const win32 = @import("platform/windows/win32.zig");
+        const old_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, old_path) catch return false;
+        defer alloc.free(old_w);
+        const exe_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, exe_path) catch return false;
+        defer alloc.free(exe_w);
+        return win32.MoveFileExW(old_w.ptr, exe_w.ptr, win32.MOVEFILE_REPLACE_EXISTING) != 0;
+    }
+
+    // POSIX：rename 原子覆盖（运行中的旧 inode 不受影响）
+    const old_z = alloc.allocSentinel(u8, old_path.len, 0) catch return false;
+    defer alloc.free(old_z);
+    @memcpy(old_z, old_path);
+    const exe_z = alloc.allocSentinel(u8, exe_path.len, 0) catch return false;
+    defer alloc.free(exe_z);
+    @memcpy(exe_z, exe_path);
+    return std.c.rename(old_z.ptr, exe_z.ptr) == 0;
 }
 
 /// 启动后确认健康：清理上次更新留下的备份（`<exe>.zilt-old`）。
 /// 调用时机很关键——必须在新版本已经跑起来一段时间之后，否则会毁掉回滚凭据。
 pub fn cleanupOld(alloc: std.mem.Allocator, exe_path: []const u8) void {
-    if (comptime !is_windows) return;
-    const win32 = @import("platform/windows/win32.zig");
     const old_path = std.fmt.allocPrint(alloc, "{s}.zilt-old", .{exe_path}) catch return;
     defer alloc.free(old_path);
-    const old_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, old_path) catch return;
-    defer alloc.free(old_w);
-    _ = win32.DeleteFileW(old_w.ptr);
+
+    if (comptime is_windows) {
+        const win32 = @import("platform/windows/win32.zig");
+        const old_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, old_path) catch return;
+        defer alloc.free(old_w);
+        _ = win32.DeleteFileW(old_w.ptr);
+        return;
+    }
+    const old_z = alloc.allocSentinel(u8, old_path.len, 0) catch return;
+    defer alloc.free(old_z);
+    @memcpy(old_z, old_path);
+    _ = std.c.unlink(old_z.ptr);
 }
 
 /// 更新器运行环境（backend 组装后挂到 Context.updater_env）。
@@ -625,3 +643,32 @@ test "rollbackToBackup replaces exe with .zilt-old" {
     defer alloc.free(still);
     try testing.expectEqualStrings("OLD-BUILD", still);
 }
+
+test "v0.3.1: POSIX rollbackToBackup / cleanupOld" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const exe = "/tmp/zilt-rollback-posix-test";
+    const old = exe ++ ".zilt-old";
+    defer _ = std.Io.Dir.cwd().deleteFile(io, exe) catch {};
+    defer _ = std.Io.Dir.cwd().deleteFile(io, old) catch {};
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = exe, .data = "NEW-BUILD" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = old, .data = "OLD-BUILD" });
+
+    try testing.expect(rollbackToBackup(alloc, exe));
+    const back = try std.Io.Dir.cwd().readFileAlloc(io, exe, alloc, .limited(64));
+    defer alloc.free(back);
+    try testing.expectEqualStrings("OLD-BUILD", back);
+    // 备份已被 rename 走
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(io, old, alloc, .limited(64)));
+
+    // cleanupOld：备份被删除（不存在时静默）
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = old, .data = "OLD-BUILD" });
+    cleanupOld(alloc, exe);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(io, old, alloc, .limited(64)));
+}
+
