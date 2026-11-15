@@ -199,6 +199,31 @@ fn reasonFor(status: u16) [:0]const u8 {
     };
 }
 
+/// 窗口事件的字段（v0.2.6：windowMoved/Resized/Focus/Blur/CloseRequested）。
+/// 数值直出、无字符串转义——payload 都是小而固定的形状。
+pub const WindowEventField = struct { name: []const u8, value: i64 };
+
+/// 窗口事件 payload JSON 拼装（纯函数）。单测锁定「字段名必须带引号」——
+/// v0.2.6 实测漏引号时 `{id":1}` 是非法 JSON，evaluate_javascript 静默丢弃。
+fn windowEventPayloadJson(alloc: std.mem.Allocator, fields: []const WindowEventField) ![]u8 {
+    var payload: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer payload.deinit(alloc);
+    try payload.append(alloc, '{');
+    for (fields, 0..) |f, i| {
+        if (i != 0) try payload.append(alloc, ',');
+        try payload.append(alloc, '"');
+        try payload.appendSlice(alloc, f.name);
+        try payload.appendSlice(alloc, "\":");
+        var buf: [24]u8 = undefined;
+        const printed = std.fmt.bufPrint(&buf, "{d}", .{f.value}) catch continue;
+        try payload.appendSlice(alloc, printed);
+    }
+    try payload.append(alloc, '}');
+    // toOwnedSlice：free 必须拿整块分配（items 的 len < capacity 时 free(items)
+    // 与分配元数据不符——0.17 SafeAllocator 实测直接 panic）
+    return try payload.toOwnedSlice(alloc);
+}
+
 fn boolStr(b: bool) []const u8 {
     return if (b) "true" else "false";
 }
@@ -1347,7 +1372,7 @@ fn Backend(comptime config: Config) type {
                 .geom_width = opts.width,
                 .geom_height = opts.height,
                 .always_on_top = opts.always_on_top,
-                .close_requested_event = opts.close_requested_event orelse config.close_requested_event,
+                .close_requested_event = ipc.resolveCloseRequested(opts.close_requested_event, config.close_requested_event),
                 .min_width = opts.min_width orelse 0,
                 .min_height = opts.min_height orelse 0,
                 .max_width = opts.max_width orelse 0,
@@ -5670,34 +5695,18 @@ fn Backend(comptime config: Config) type {
         }
 
         /// 窗口事件的字段发射器（小而固定的 payload；数值直出、无字符串转义）。
-        const WinEventField = struct { name: []const u8, value: i64 };
+        const WinEventField = WindowEventField;
 
         fn emitWindowEvent(self: *Self, st: *WinState, name: []const u8, fields: []const WinEventField) void {
-            // 经 idle 封送：本函数常在 script-message 回调（invoke 处理）内触发，
+            // 经 idle 封送：本函数在 script-message 回调（invoke 处理）内触发，
             // 回调里直接 evaluate_javascript 实测会被丢弃（与 emitEntry 同理）
             const task = self.allocator.create(WindowEventTask) catch return;
             const name_copy = self.allocator.dupe(u8, name) catch {
                 self.allocator.destroy(task);
                 return;
             };
-            var payload: std.ArrayListUnmanaged(u8) = .empty;
-            payload.append(self.allocator, '{') catch {
+            const payload = windowEventPayloadJson(self.allocator, fields) catch {
                 self.allocator.free(name_copy);
-                self.allocator.destroy(task);
-                return;
-            };
-            for (fields, 0..) |f, i| {
-                if (i != 0) payload.append(self.allocator, ',') catch break;
-                payload.append(self.allocator, '"') catch break;
-                payload.appendSlice(self.allocator, f.name) catch break;
-                payload.appendSlice(self.allocator, "\":") catch break;
-                var buf: [24]u8 = undefined;
-                const printed = std.fmt.bufPrint(&buf, "{d}", .{f.value}) catch continue;
-                payload.appendSlice(self.allocator, printed) catch break;
-            }
-            payload.append(self.allocator, '}') catch {
-                self.allocator.free(name_copy);
-                payload.deinit(self.allocator);
                 self.allocator.destroy(task);
                 return;
             };
@@ -5705,11 +5714,11 @@ fn Backend(comptime config: Config) type {
                 .backend = self,
                 .win_id = st.id,
                 .name = name_copy,
-                .payload = payload.items,
+                .payload = payload,
             };
             if (c.g_idle_add(windowEventIdle, task) == 0) {
                 self.allocator.free(name_copy);
-                self.allocator.free(payload.items);
+                self.allocator.free(payload);
                 self.allocator.destroy(task);
             }
         }
@@ -5925,4 +5934,29 @@ test "parseAccelGtk: 修饰符组合 / 键位 / 非法输入" {
     try testing.expect(parseAccelGtk("Ctrl+Foo") == null);
     try testing.expect(parseAccelGtk("Ctrl+Alt") == null);
     try testing.expect(parseAccelGtk("Ctrl+A+B") == null);
+}
+
+test "windowEventPayloadJson: 字段名带引号、多字段与空字段" {
+    const alloc = testing.allocator;
+    {
+        const json = try windowEventPayloadJson(alloc, &.{
+            .{ .name = "id", .value = 1 },
+            .{ .name = "x", .value = -12 },
+        });
+        defer alloc.free(json);
+        try testing.expectEqualStrings("{\"id\":1,\"x\":-12}", json);
+    }
+    {
+        const json = try windowEventPayloadJson(alloc, &.{});
+        defer alloc.free(json);
+        try testing.expectEqualStrings("{}", json);
+    }
+    // 负数与 i64 大值直出
+    {
+        const json = try windowEventPayloadJson(alloc, &.{
+            .{ .name = "width", .value = 9007199254740993 },
+        });
+        defer alloc.free(json);
+        try testing.expectEqualStrings("{\"width\":9007199254740993}", json);
+    }
 }

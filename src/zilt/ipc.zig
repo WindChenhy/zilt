@@ -159,6 +159,13 @@ pub const WindowOptions = struct {
     user_agent: ?[]const u8 = null,
 };
 
+/// v0.2.6：per-window `close_requested_event` 的两平台合并语义——
+/// 显式 true/false 覆盖、null 跟随应用级 `config.close_requested_event`。
+/// Windows（WM_CLOSE 分支）与 Linux（delete-event 分支）共用，单测锁定。
+pub fn resolveCloseRequested(opt: ?bool, config_default: bool) bool {
+    return opt orelse config_default;
+}
+
 /// v0.1.18：窗口光标形状（对齐 Tauri `CursorIcon` 的 Windows 子集）。
 pub const CursorKind = enum {
     default,
@@ -1555,4 +1562,13 @@ test "v0.1.18: cursor kind names" {
     try testing.expectEqual(CursorKind.size_ew, CursorKind.fromName("ew-resize").?);
     try testing.expectEqual(CursorKind.move, CursorKind.fromName("grabbing").?);
     try testing.expect(CursorKind.fromName("nope") == null);
+}
+
+test "v0.2.6: resolveCloseRequested — null 跟随 config，显式值覆盖" {
+    // null = 跟随应用级配置
+    try testing.expectEqual(false, resolveCloseRequested(null, false));
+    try testing.expectEqual(true, resolveCloseRequested(null, true));
+    // 显式值覆盖配置
+    try testing.expectEqual(true, resolveCloseRequested(true, false));
+    try testing.expectEqual(false, resolveCloseRequested(false, true));
 }

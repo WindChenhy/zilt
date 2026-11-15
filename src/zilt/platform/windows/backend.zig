@@ -1318,7 +1318,7 @@ fn Backend(comptime config: Config) type {
                 .max_height = opts.max_height,
                 .background_color = opts.background_color,
                 .transparent = opts.transparent,
-                .close_requested_events = opts.close_requested_event orelse config.close_requested_event,
+                .close_requested_events = ipc.resolveCloseRequested(opts.close_requested_event, config.close_requested_event),
                 .proxy = proxy,
                 .overlay = opts.titlebar_overlay,
                 .user_agent = user_agent,

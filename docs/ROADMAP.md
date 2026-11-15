@@ -226,6 +226,12 @@
       未做（如实记录）：headless 服务 / WebKitWebDriver E2E（Linux）——留待
       后续；windowMoved/Resized/Focus/Blur 的冒烟断言需 WM（Xvfb 无 WM 不触发
       configure/focus，实现与桌面同代码路径）。
+      **测试补齐（2026-11-15）**：payload JSON 拼装抽为纯函数
+      `windowEventPayloadJson`（单测锁定 v0.2.6 修过的「字段名缺引号被
+      evaluate 静默丢弃」缺陷 + toOwnedSlice 所有权）；`close_requested_event`
+      的「null 跟随 config / 显式值覆盖」两平台合并语义收敛为共享
+      `ipc.resolveCloseRequested`（两后端同用 + 单测）。Linux 190/191、
+      Windows 278/278 全绿。
 - [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）——v0.3+
 - [x] 平台差异收敛原则：平台无关层（ipc/security/fs_api/protocol/net/sql/store/patch/pack_formats）
       两平台共用，差异只出现在 `platform/<os>/`
