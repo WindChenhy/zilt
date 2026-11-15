@@ -850,6 +850,15 @@ function runSecondWindowProbe() {
     check('proxy.window', typeof pid === 'number' && pid > 1, 'id=' + pid);
   } catch (e) { check('proxy.window', false, String(e.message || e)); }
 
+  // ---- v0.2.9：页内查找（runtime 纯 JS window.find，两平台同实现——
+  //      后端零参与，冒烟锁定该 API 面在 Linux 同样可用）----
+  try {
+    const body = (document.body.innerText || '').trim();
+    const probe = (body.split(/\s+/)[0] || '').slice(0, 12);
+    const found = probe.length > 0 ? Z().webview.find(probe) : false;
+    check('find', found === true, 'find(' + JSON.stringify(probe) + ') -> ' + found);
+  } catch (e) { check('find', false, String(e.message || e)); }
+
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {
     await Z().invoke('__zilt.linuxSmoke', {

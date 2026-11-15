@@ -102,13 +102,13 @@ pub const windows_capabilities = [_]Capability{
     .msix,
 };
 
-/// Linux 目标能力（v0.2.0–v0.2.5 的验收清单；见 docs/v0.2-LINUX.md §5）。
+/// Linux 目标能力（v0.2.0–v0.2.9 的验收清单；见 docs/v0.2-LINUX.md §5）。
 /// 平台独占项（taskbar / mica / PE 资源 / Authenticode / MSIX）刻意不在列表内。
 pub const linux_target_capabilities = [_]Capability{
     .window,                .multi_window,   .window_state,      .window_transparency,
-    .titlebar_overlay,      .per_window_user_agent,
+    .titlebar_overlay,      .per_window_user_agent, .per_window_proxy,
     .webview_eval,          .devtools,       .downloads,         .data_partition,
-    .child_webview,         .screenshot,
+    .child_webview,         .screenshot,     .find_in_page,
     .asset_server,          .custom_protocol, .csp,
     .ipc_events,            .ipc_stream,
     .capability_acl,        .fs_scopes,      .fs_watch,          .sql,
@@ -117,7 +117,7 @@ pub const linux_target_capabilities = [_]Capability{
     .drag_drop,             .dialog,         .autostart,         .deep_link,
     .single_instance,       .global_hotkey,  .shell,             .sysinfo,
     .theme,
-    .updater,               .headless,       .mcp,
+    .updater,               .headless,       .mcp,               .webdriver,
     .packaging,
 };
 

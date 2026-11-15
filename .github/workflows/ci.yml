@@ -121,7 +121,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config xvfb \
-            libayatana-appindicator3-1 xdg-utils libsqlite3-0 libx11-dev
+            libayatana-appindicator3-1 xdg-utils libsqlite3-0 libx11-dev \
+            webkit2gtk-driver
 
       - name: Build
         run: zig build
@@ -129,7 +130,7 @@ jobs:
       - name: Unit tests
         run: zig build test
 
-      - name: Smoke test (65 checks under Xvfb)
+      - name: Smoke test (66 checks under Xvfb)
         env:
           ZILT_LINUX_SMOKE: "1"
           ZILT_LINUX_SMOKE_DEEPLINK: "zilt://startup?demo=1"
@@ -148,6 +149,9 @@ jobs:
 
       - name: Headless / MCP E2E
         run: bash scripts/linux/dev-headless.sh
+
+      - name: WebDriver E2E (WebKitWebDriver)
+        run: zig build e2e
 
       - name: Template scaffold E2E (init vanilla → build)
         run: |

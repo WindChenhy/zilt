@@ -275,6 +275,22 @@
       mcp 33 tools / tools/call 42 / 资产 200）；dev 编排实测（TCP 等待 +
       ZILT_DEV_URL 注入 + 应用拉起）；CI Linux job 增 headless E2E 与模板
       init→build E2E。gen_bindings 顺带跨平台化（dev/gen 依赖它）。
+- [x] **v0.2.9 分发与测试收尾**（2026-11-15）：v0.2 画句号——
+      **WebKitWebDriver E2E**（driver.zig 跨平台化：argv 走 Args.Iterator、文件/env/
+      进程/睡眠助手两平台分派、W3C HTTP 层本就 std.Io；Linux 流程 = 注入
+      `ZILT_AUTOMATION=1`（app 侧 `webkit_web_context_set_automation_allowed`）→
+      spawn WebKitWebDriver → POST /session（`webkitgtk:browserOptions.binary` =
+      应用 exe，WebKitWebDriver 自己拉起应用）→ 同一套 execute/sync 断言 →
+      DELETE /session；缺驱动 SKIP(3) 与 Windows 同语义）；**find_in_page 打勾**
+      （runtime 纯 JS `window.find` 两平台同实现——冒烟补 find 检查项锁定）；
+      **per_window_proxy/webdriver 能力清单打勾**；**单文件 AppImage E2E 实测**
+      （dev-appimage-e2e.sh：AppImageKit runtime-x86_64（gh-proxy mirror——
+      GitHub release-assets 在本地网络 TLS 被干扰，直连 302 后解码失败）+
+      squashfs 拼接 → 无 FUSE 环境降级 `--appimage-extract` + 提取版 AppRun
+      冒烟 **66/66 exit 0**；CI runner 可装 libfuse2 直跑）。
+      **验收**：冒烟 65 → **66 项**；Linux 单测 195/196（1 skip）/Windows 279/279；
+      单实例转交/打包/headless/AppImage E2E 全 PASS；CI apt 补 webkit2gtk-driver
+      + e2e 步骤。
 - [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）——v0.3+
 - [x] 平台差异收敛原则：平台无关层（ipc/security/fs_api/protocol/net/sql/store/patch/pack_formats）
       两平台共用，差异只出现在 `platform/<os>/`

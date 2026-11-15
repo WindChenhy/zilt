@@ -443,11 +443,13 @@ pub fn build(b: *std.Build) void {
     // 它会编译同一份 zilt_mod，从而遮蔽真正的「后端未实现」报错。
     if (is_windows) b.getInstallStep().dependOn(&cap_run.step);
 
-    // ---- v0.1.17：WebDriver 自动化驱动（msedgedriver W3C 协议） ----
+    // ---- v0.1.17：WebDriver 自动化驱动（msedgedriver / WebKitWebDriver W3C 协议） ----
     const driver_mod = b.createModule(.{
         .root_source_file = b.path("src/tools/driver.zig"),
         .target = target,
         .optimize = optimize,
+        // Linux 侧 std.c.getenv / extern "c"（setenv/kill）需要 libc
+        .link_libc = !is_windows,
     });
     const driver_exe = b.addExecutable(.{
         .name = "zilt-driver",
@@ -464,8 +466,16 @@ pub fn build(b: *std.Build) void {
         e2e_run.step.dependOn(b.getInstallStep());
         const e2e_step = b.step("e2e", "Run WebDriver E2E against the built app (SKIP without msedgedriver)");
         e2e_step.dependOn(&e2e_run.step);
+    } else if (is_linux) {
+        // v0.2.9：WebKitWebDriver 后端（webkit2gtk-driver 包；缺失 SKIP(3)）
+        const driver_install = b.addInstallArtifact(driver_exe, .{});
+        b.getInstallStep().dependOn(&driver_install.step);
+        const e2e_run = b.addRunArtifact(driver_exe);
+        e2e_run.addArg(b.fmt("zig-out/bin/{s}", .{exe.name}));
+        e2e_run.step.dependOn(b.getInstallStep());
+        const e2e_step = b.step("e2e", "Run WebDriver E2E against the built app (SKIP without WebKitWebDriver)");
+        e2e_step.dependOn(&e2e_run.step);
     } else {
-        // v0.2 计划：同一 driver 加 WebKitWebDriver 后端（docs/v0.2-LINUX.md §7）
         _ = windowsOnlyStep(b, "e2e", "WebDriver E2E", target_os);
     }
 

@@ -1,21 +1,30 @@
 //! v0.1.17：WebDriver 自动化（`zilt-driver`）。
 //!
-//! 对齐 Tauri 的 WebDriver 测试能力：不注入 JS，而是通过 **msedgedriver**
-//! （W3C WebDriver 协议）真实驱动 WebView2。
+//! 对齐 Tauri 的 WebDriver 测试能力：不注入 JS，而是通过 W3C WebDriver 协议
+//! 真实驱动系统 WebView。
 //!
-//! 链路：
+//! Windows（msedgedriver）链路：
 //!   1. 启动应用（附加 ZILT_WEBVIEW2_ARGS=--remote-debugging-port=<debug_port>）
 //!   2. 启动 msedgedriver --port=<driver_port>
 //!   3. POST /session（ms:edgeOptions.debuggerAddress 指向上面的调试端口）
 //!   4. POST /session/{id}/execute/sync 逐条执行断言脚本
 //!   5. DELETE /session，杀应用与驱动
 //!
-//! 找不到 msedgedriver 时打印 SKIP 并以退出码 3 结束（CI 里可区分「没环境」和
-//! 「真失败」）。取得 msedgedriver：
+//! Linux（WebKitWebDriver，v0.2.9）链路：
+//!   1. 注入 ZILT_AUTOMATION=1（app 侧 webkit_web_context_set_automation_allowed）
+//!   2. 启动 WebKitWebDriver -p <driver_port>（webkit2gtk-driver 包）
+//!   3. POST /session（webkitgtk:browserOptions.binary = 应用 exe——WebKitWebDriver
+//!      自己拉起应用，断言脚本同 W3C execute/sync）
+//!   4. DELETE /session（WebKitWebDriver 终止它拉起的应用）
+//!
+//! 找不到驱动时打印 SKIP 并以退出码 3 结束（CI 里可区分「没环境」和「真失败」）。
+//! 取得 msedgedriver：
 //!   https://developer.microsoft.com/microsoft-edge/tools/webdriver/
-//!   或 `npx --yes @puppeteer/browsers install chromedriver` 同类工具。
+//! Linux：sudo apt install webkit2gtk-driver
 
 const std = @import("std");
+const builtin = @import("builtin");
+const Io = std.Io;
 
 const DWORD = u32;
 const BOOL = i32;
@@ -97,69 +106,122 @@ const default_checks = [_]Check{
     .{ .name = "title", .script = "return document.title.length > 0;" },
 };
 
-pub fn main() !void {
+/// 工具进程的 Io（Threaded 惰性创建；HTTP 客户端/文件/进程 API 都走它）。
+var g_threaded: Io.Threaded = undefined;
+var g_threaded_ready = false;
+fn toolIo() Io {
+    if (!g_threaded_ready) {
+        g_threaded = .init(std.heap.page_allocator, .{});
+        g_threaded_ready = true;
+    }
+    return g_threaded.io();
+}
+
+pub fn main(init: std.process.Init) !void {
     const alloc = std.heap.page_allocator;
-    const opts = parseArgs(alloc) catch |e| {
+    const opts = parseArgs(alloc, init) catch |e| {
         std.debug.print("usage: zilt-driver <app.exe> [--driver msedgedriver.exe] [--script file.js] [--port 9516] [--debug-port 9223]\n", .{});
         std.debug.print("error: {s}\n", .{@errorName(e)});
         std.process.exit(2);
     };
 
     const driver_path = findDriver(alloc, opts) orelse {
-        log.info("SKIP — 未找到 msedgedriver（WebDriver 不可用）", .{});
-        log.info("  获取: https://developer.microsoft.com/microsoft-edge/tools/webdriver/", .{});
-        log.info("  然后: set ZILT_EDGEDRIVER_PATH=<path>\\msedgedriver.exe", .{});
+        log.info("SKIP — 未找到 WebDriver 实现（WebDriver 不可用）", .{});
+        if (builtin.os.tag == .windows) {
+            log.info("  获取: https://developer.microsoft.com/microsoft-edge/tools/webdriver/", .{});
+            log.info("  然后: set ZILT_EDGEDRIVER_PATH=<path>\\msedgedriver.exe", .{});
+        } else {
+            log.info("  Linux: sudo apt install webkit2gtk-driver", .{});
+            log.info("  或: ZILT_WEBKITDRIVER_PATH=/path/WebKitWebDriver zilt-driver ...", .{});
+        }
         std.process.exit(3);
     };
-    log.info("msedgedriver: {s}", .{driver_path});
+    log.info("driver: {s}", .{driver_path});
 
-    // 关键：让 WebView2 打开 DevTools 调试端口（backend 读取该 env）
-    {
-        const args = std.fmt.allocPrint(alloc, "--remote-debugging-port={d}", .{opts.debug_port}) catch return error.OutOfMemory;
-        defer alloc.free(args);
-        setEnv("ZILT_WEBVIEW2_ARGS", args);
-    }
-    // 冒烟安全网不应干扰 driver（driver 自己负责退出）
+    // 冒烟安全网不应干扰 driver（driver 自己负责退出；两平台 env 名都清）
     setEnv("ZILT_SMOKE_TEST_MS", "");
-
-    var app = spawnProcess(alloc, opts.app_exe, ".") orelse {
-        log.fail("spawn app failed GLE={d}", .{GetLastError()});
-        std.process.exit(1);
-    };
-    log.info("app pid={d}", .{app.dwProcessId});
-
-    var driver: ?PROCESS_INFORMATION = null;
-    {
-        const cmd = std.fmt.allocPrint(alloc, "{s} --port={d}", .{ driver_path, opts.driver_port }) catch {
-            killProcess(&app);
-            std.process.exit(1);
-        };
-        defer alloc.free(cmd);
-        driver = spawnProcess(alloc, cmd, ".") orelse {
-            log.fail("spawn msedgedriver failed GLE={d}", .{GetLastError()});
-            killProcess(&app);
-            std.process.exit(1);
-        };
-        log.info("msedgedriver pid={d} port={d}", .{ driver.?.dwProcessId, opts.driver_port });
-    }
+    setEnv("ZILT_LINUX_SMOKE", "");
 
     var io_ctx = IoCtx.init(alloc);
     defer io_ctx.deinit();
 
-    const session_id = createSession(alloc, &io_ctx, opts) catch |e| {
-        log.fail("create session: {s}（调试端口是否就绪？）", .{@errorName(e)});
+    if (builtin.os.tag == .windows) {
+        // WebView2 需要打开 DevTools 调试端口（backend 读取该 env）
+        {
+            const args = std.fmt.allocPrint(alloc, "--remote-debugging-port={d}", .{opts.debug_port}) catch return error.OutOfMemory;
+            defer alloc.free(args);
+            setEnv("ZILT_WEBVIEW2_ARGS", args);
+        }
+
+        var app = spawnProcess(alloc, opts.app_exe, ".") orelse {
+            log.fail("spawn app failed GLE={d}", .{GetLastError()});
+            std.process.exit(1);
+        };
+        log.info("app pid={d}", .{app.dwProcessId});
+
+        var driver: ?PROCESS_INFORMATION = null;
+        {
+            const cmd = std.fmt.allocPrint(alloc, "{s} --port={d}", .{ driver_path, opts.driver_port }) catch {
+                killProcess(&app);
+                std.process.exit(1);
+            };
+            defer alloc.free(cmd);
+            driver = spawnProcess(alloc, cmd, ".") orelse {
+                log.fail("spawn msedgedriver failed GLE={d}", .{GetLastError()});
+                killProcess(&app);
+                std.process.exit(1);
+            };
+            log.info("msedgedriver pid={d} port={d}", .{ driver.?.dwProcessId, opts.driver_port });
+        }
+
+        const session_id = createSession(alloc, &io_ctx, opts) catch |e| {
+            log.fail("create session: {s}（调试端口是否就绪？）", .{@errorName(e)});
+            killProcess(&app);
+            if (driver) |*d| killProcess(d);
+            std.process.exit(1);
+        };
+        defer destroySession(alloc, &io_ctx, opts, session_id);
+        log.info("session {s} ready", .{session_id});
+
+        const result = runAllChecks(alloc, &io_ctx, opts, session_id);
+        log.info("done: {d}/{d} passed", .{ result.total - result.failed, result.total });
         killProcess(&app);
         if (driver) |*d| killProcess(d);
+        if (result.failed > 0) std.process.exit(1);
+        return;
+    }
+
+    // ---- Linux：WebKitWebDriver 自己拉起应用（browserOptions.binary）----
+    // ZILT_AUTOMATION=1 经 env 继承传给应用 → webkit_web_context_set_automation_allowed
+    setEnv("ZILT_AUTOMATION", "1");
+
+    var driver_child = spawnProcessLinux(alloc, &.{ driver_path, "--port", std.fmt.allocPrint(alloc, "{d}", .{opts.driver_port}) catch return error.OutOfMemory }, ".") orelse {
+        log.fail("spawn WebKitWebDriver failed", .{});
+        std.process.exit(1);
+    };
+    log.info("WebKitWebDriver pid={d} port={d}", .{ driver_child.id orelse 0, opts.driver_port });
+
+    const session_id = createSessionLinux(alloc, &io_ctx, opts) catch |e| {
+        log.fail("create session: {s}", .{@errorName(e)});
+        killChild(&driver_child);
         std.process.exit(1);
     };
     defer destroySession(alloc, &io_ctx, opts, session_id);
     log.info("session {s} ready", .{session_id});
 
+    const result = runAllChecks(alloc, &io_ctx, opts, session_id);
+    log.info("done: {d}/{d} passed", .{ result.total - result.failed, result.total });
+    killChild(&driver_child);
+    if (result.failed > 0) std.process.exit(1);
+}
+
+/// 断言循环（默认 4 条 + 可选 --script 文件）；返回 {failed, total} 供收尾判定。
+fn runAllChecks(alloc: std.mem.Allocator, io_ctx: *IoCtx, opts: Options, session_id: []const u8) struct { failed: usize, total: usize } {
     var failed: usize = 0;
     var total: usize = 0;
     for (default_checks) |c| {
         total += 1;
-        if (runCheck(alloc, &io_ctx, opts, session_id, c)) {
+        if (runCheck(alloc, io_ctx, opts, session_id, c)) {
             log.info("PASS {s}", .{c.name});
         } else {
             failed += 1;
@@ -169,132 +231,138 @@ pub fn main() !void {
     if (opts.script_file) |sf| {
         total += 1;
         const script = readFileAlloc(alloc, sf, 1 << 20) catch |e| {
+            failed += 1;
             log.fail("read script {s}: {s}", .{ sf, @errorName(e) });
-            killProcess(&app);
-            if (driver) |*d| killProcess(d);
-            std.process.exit(1);
+            return .{ .failed = failed, .total = total };
         };
         defer alloc.free(script);
-        if (runCheck(alloc, &io_ctx, opts, session_id, .{ .name = sf, .script = script })) {
+        if (runCheck(alloc, io_ctx, opts, session_id, .{ .name = sf, .script = script })) {
             log.info("PASS {s}", .{sf});
         } else {
             failed += 1;
             log.fail("{s}", .{sf});
         }
     }
-
-    log.info("done: {d}/{d} passed", .{ total - failed, total });
-    killProcess(&app);
-    if (driver) |*d| killProcess(d);
-    if (failed > 0) std.process.exit(1);
+    return .{ .failed = failed, .total = total };
 }
 
-fn parseArgs(alloc: std.mem.Allocator) !Options {
-    var argc: i32 = 0;
-    const argv_w = CommandLineToArgvW(GetCommandLineW(), &argc) orelse return error.ArgsFailed;
-    defer _ = LocalFree(@ptrCast(argv_w));
-    if (argc < 2) return error.MissingAppPath;
+fn parseArgs(alloc: std.mem.Allocator, init: std.process.Init) !Options {
+    // v0.2.9：argv 跨平台（Args.Iterator 两平台同用；替代 CommandLineToArgvW）
+    var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
+    defer it.deinit();
+    _ = it.skip(); // argv[0]
 
-    var opts = Options{ .app_exe = try utf8Arg(alloc, argv_w[1]) };
-    var i: usize = 2;
-    while (i < argc) : (i += 1) {
-        const a = try utf8Arg(alloc, argv_w[i]);
+    const app = it.next() orelse return error.MissingAppPath;
+    var opts = Options{ .app_exe = try alloc.dupe(u8, app) };
+    while (it.next()) |raw| {
+        const a: []const u8 = raw;
         if (std.mem.eql(u8, a, "--driver")) {
-            i += 1;
-            if (i < argc) opts.driver_exe = try utf8Arg(alloc, argv_w[i]);
+            if (it.next()) |v| opts.driver_exe = try alloc.dupe(u8, v);
         } else if (std.mem.eql(u8, a, "--script")) {
-            i += 1;
-            if (i < argc) opts.script_file = try utf8Arg(alloc, argv_w[i]);
+            if (it.next()) |v| opts.script_file = try alloc.dupe(u8, v);
         } else if (std.mem.eql(u8, a, "--port")) {
-            i += 1;
-            if (i < argc) {
-                const p = try utf8Arg(alloc, argv_w[i]);
-                opts.driver_port = std.fmt.parseInt(u16, p, 10) catch opts.driver_port;
-            }
+            if (it.next()) |v| opts.driver_port = std.fmt.parseInt(u16, v, 10) catch opts.driver_port;
         } else if (std.mem.eql(u8, a, "--debug-port")) {
-            i += 1;
-            if (i < argc) {
-                const p = try utf8Arg(alloc, argv_w[i]);
-                opts.debug_port = std.fmt.parseInt(u16, p, 10) catch opts.debug_port;
-            }
+            if (it.next()) |v| opts.debug_port = std.fmt.parseInt(u16, v, 10) catch opts.debug_port;
         } else if (std.mem.eql(u8, a, "--timeout")) {
-            i += 1;
-            if (i < argc) {
-                const p = try utf8Arg(alloc, argv_w[i]);
-                opts.startup_timeout_ms = (std.fmt.parseInt(u32, p, 10) catch 20) * 1000;
-            }
+            if (it.next()) |v| opts.startup_timeout_ms = (std.fmt.parseInt(u32, v, 10) catch 20) * 1000;
         }
     }
     return opts;
 }
 
-fn utf8Arg(alloc: std.mem.Allocator, w: [*:0]const u16) ![]u8 {
-    return std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(w)) catch error.InvalidArg;
-}
-
 fn findDriver(alloc: std.mem.Allocator, opts: Options) ?[]const u8 {
+    if (builtin.os.tag == .windows) {
+        if (opts.driver_exe) |d| {
+            if (fileExists(alloc, d)) return d;
+        }
+        if (getEnv(alloc, "ZILT_EDGEDRIVER_PATH")) |p| {
+            if (fileExists(alloc, p)) return p;
+        }
+        // app exe 同目录
+        if (std.fs.path.dirname(opts.app_exe)) |dir| {
+            const p = std.fmt.allocPrint(alloc, "{s}\\msedgedriver.exe", .{dir}) catch return null;
+            if (fileExists(alloc, p)) return p;
+        }
+        // PATH 搜索：用 cmd 的 where 太绕，直接试 cwd / 系统盘常见位置
+        if (fileExists(alloc, "msedgedriver.exe")) return "msedgedriver.exe";
+        return null;
+    }
+    // Linux：WebKitWebDriver（webkit2gtk-driver 包）——显式路径 / env / PATH 扫描
     if (opts.driver_exe) |d| {
         if (fileExists(alloc, d)) return d;
     }
-    if (getEnv(alloc, "ZILT_EDGEDRIVER_PATH")) |p| {
+    if (getEnv(alloc, "ZILT_WEBKITDRIVER_PATH")) |p| {
         if (fileExists(alloc, p)) return p;
     }
-    // app exe 同目录
-    if (std.fs.path.dirname(opts.app_exe)) |dir| {
-        const p = std.fmt.allocPrint(alloc, "{s}\\msedgedriver.exe", .{dir}) catch return null;
-        if (fileExists(alloc, p)) return p;
+    if (findInPath(alloc, "WebKitWebDriver")) |p| return p;
+    return null;
+}
+
+/// PATH 扫描（WebKitWebDriver 用；与 cli.zig 的 findInPath 同规则）。
+fn findInPath(alloc: std.mem.Allocator, name: []const u8) ?[]u8 {
+    const path_env = std.c.getenv("PATH") orelse return null;
+    var dirs = std.mem.splitScalar(u8, std.mem.span(path_env), ':');
+    while (dirs.next()) |dir| {
+        if (dir.len == 0) continue;
+        const cand = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, name }) catch return null;
+        defer alloc.free(cand);
+        if (fileExists(alloc, cand)) return alloc.dupe(u8, cand) catch null;
     }
-    // PATH 搜索：用 cmd 的 where 太绕，直接试 cwd / 系统盘常见位置
-    if (fileExists(alloc, "msedgedriver.exe")) return "msedgedriver.exe";
     return null;
 }
 
 fn fileExists(alloc: std.mem.Allocator, path: []const u8) bool {
-    const w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return false;
-    defer alloc.free(w);
-    return GetFileAttributesW(w.ptr) != INVALID_FILE_ATTRIBUTES;
+    _ = alloc;
+    _ = Io.Dir.cwd().statFile(toolIo(), path, .{}) catch return false;
+    return true;
 }
 
-/// 读文件（0.17 无 std.fs.cwd：用 CreateFileW + ReadFile 直读）。
+/// 读文件（v0.2.9：std.Io 化，两平台同用）。
 fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8, max: usize) ![]u8 {
-    const w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
-    defer alloc.free(w);
-    const GENERIC_READ: DWORD = 0x80000000;
-    const FILE_SHARE_READ: DWORD = 0x1;
-    const OPEN_EXISTING: DWORD = 3;
-    const f = CreateFileW(w.ptr, GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, 0, null);
-    if (f == INVALID_HANDLE_VALUE) return error.OpenFailed;
-    defer _ = CloseHandle(f);
-    const buf = try alloc.alloc(u8, max);
-    errdefer alloc.free(buf);
-    var read: DWORD = 0;
-    if (ReadFile(f, buf.ptr, @intCast(max), &read, null) == 0) return error.ReadFailed;
-    return try alloc.realloc(buf, read);
+    return Io.Dir.cwd().readFileAlloc(toolIo(), path, alloc, .limited(max));
 }
-
-extern "kernel32" fn CreateFileW(lpFileName: LPCWSTR, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?*anyopaque) callconv(.c) HANDLE;
-extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: DWORD, lpNumberOfBytesRead: *DWORD, lpOverlapped: ?*anyopaque) callconv(.c) BOOL;
 
 fn getEnv(alloc: std.mem.Allocator, name: [:0]const u8) ?[]u8 {
-    const nw = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch return null;
-    defer alloc.free(nw);
-    var buf: [1024]u16 = undefined;
-    const got = GetEnvironmentVariableW(nw.ptr, &buf, buf.len);
-    if (got == 0 or got >= buf.len) return null;
-    return std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..got]) catch null;
+    if (builtin.os.tag == .windows) {
+        const nw = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch return null;
+        defer alloc.free(nw);
+        var buf: [1024]u16 = undefined;
+        const got = GetEnvironmentVariableW(nw.ptr, &buf, buf.len);
+        if (got == 0 or got >= buf.len) return null;
+        return std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..got]) catch null;
+    }
+    const v = std.c.getenv(name.ptr) orelse return null;
+    return alloc.dupe(u8, std.mem.span(v)) catch null;
 }
 
 extern "kernel32" fn GetEnvironmentVariableW(lpName: LPCWSTR, lpBuffer: [*]u16, nSize: DWORD) callconv(.c) DWORD;
 
+/// libc setenv（0.17 的 std.c 无绑定；extern 名即 C 符号名）。
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
 fn setEnv(name: [:0]const u8, value: []const u8) void {
-    const alloc = std.heap.page_allocator;
-    const nw = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch return;
-    defer alloc.free(nw);
-    const vw = std.unicode.utf8ToUtf16LeAllocZ(alloc, value) catch return;
-    defer alloc.free(vw);
-    _ = SetEnvironmentVariableW(nw.ptr, vw.ptr);
+    if (builtin.os.tag == .windows) {
+        const alloc = std.heap.page_allocator;
+        const nw = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch return;
+        defer alloc.free(nw);
+        const vw = std.unicode.utf8ToUtf16LeAllocZ(alloc, value) catch return;
+        defer alloc.free(vw);
+        _ = SetEnvironmentVariableW(nw.ptr, vw.ptr);
+        return;
+    }
+    // libc setenv（0.17 的 std.c 无绑定——直接 extern；driver 是工具进程，
+    // 环境变量进程生命周期内有效）
+    const name_z = std.heap.page_allocator.allocSentinel(u8, name.len, 0) catch return;
+    defer std.heap.page_allocator.free(name_z);
+    @memcpy(name_z, name);
+    const value_z = std.heap.page_allocator.allocSentinel(u8, value.len, 0) catch return;
+    defer std.heap.page_allocator.free(value_z);
+    @memcpy(value_z, value);
+    _ = setenv(name_z.ptr, value_z.ptr, 1);
 }
 
+/// Windows：CreateProcessW 命令行串；Linux：argv 数组。
 fn spawnProcess(alloc: std.mem.Allocator, cmd: []const u8, cwd: []const u8) ?PROCESS_INFORMATION {
     const cl_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, cmd) catch return null;
     defer alloc.free(cl_w);
@@ -305,6 +373,34 @@ fn spawnProcess(alloc: std.mem.Allocator, cmd: []const u8, cwd: []const u8) ?PRO
     var pi = std.mem.zeroes(PROCESS_INFORMATION);
     if (CreateProcessW(null, cl_w.ptr, null, null, 0, 0, null, cwd_w.ptr, &si, &pi) == 0) return null;
     return pi;
+}
+
+/// Linux：std.process.spawn（argv 形式；stdio ignore——driver 的输出就够）。
+fn spawnProcessLinux(alloc: std.mem.Allocator, argv: []const []const u8, cwd: []const u8) ?std.process.Child {
+    _ = cwd; // 继承当前目录（仓库根）
+    _ = alloc;
+    return std.process.spawn(toolIo(), .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch null;
+}
+
+/// Linux：杀子进程（WebKitWebDriver；SIGKILL 直达）。
+fn killChild(child: *std.process.Child) void {
+    child.kill(toolIo()); // 0.17 的 Child.kill 返回 void（内部已兜底）
+    _ = child.wait(toolIo()) catch {};
+}
+
+/// 跨平台毫秒睡眠（Clock.Duration；Windows 的 Sleep 与 createSession 轮询共用）。
+fn sleepMs(ms: u64) void {
+    if (builtin.os.tag == .windows) {
+        Sleep(@intCast(ms));
+        return;
+    }
+    const d: Io.Clock.Duration = .{ .raw = .{ .nanoseconds = @intCast(ms * 1_000_000) }, .clock = .real };
+    d.sleep(toolIo()) catch {};
 }
 
 fn killProcess(p: *PROCESS_INFORMATION) void {
@@ -393,7 +489,7 @@ fn createSession(alloc: std.mem.Allocator, io_ctx: *IoCtx, opts: Options) ![]u8 
     var waited: u32 = 0;
     while (waited < opts.startup_timeout_ms) : (waited += 500) {
         _ = httpRequest(alloc, io_ctx, opts.driver_port, "GET", "/status", null) catch {
-            Sleep(500);
+            sleepMs(500);
             continue;
         };
         break;
@@ -401,6 +497,32 @@ fn createSession(alloc: std.mem.Allocator, io_ctx: *IoCtx, opts: Options) ![]u8 
     const body = try std.fmt.allocPrint(alloc,
         \\{{"capabilities":{{"alwaysMatch":{{"browserName":"webview2","ms:edgeOptions":{{"debuggerAddress":"127.0.0.1:{d}","args":["--remote-debugging-port={d}"]}}}}}}}}
     , .{ opts.debug_port, opts.debug_port });
+    defer alloc.free(body);
+    const resp = try httpRequest(alloc, io_ctx, opts.driver_port, "POST", "/session", body);
+    defer alloc.free(resp);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, resp, .{});
+    defer parsed.deinit();
+    const val = parsed.value.object.get("value") orelse return error.BadResponse;
+    const sid = val.object.get("sessionId") orelse return error.NoSessionId;
+    return alloc.dupe(u8, sid.string);
+}
+
+/// Linux 会话：WebKitWebDriver 自己拉起 browserOptions.binary 指向的应用。
+/// （W3C 端点与 Windows 同形——差异只在 capabilities 的方言。）
+fn createSessionLinux(alloc: std.mem.Allocator, io_ctx: *IoCtx, opts: Options) ![]u8 {
+    var waited: u32 = 0;
+    while (waited < opts.startup_timeout_ms) : (waited += 500) {
+        _ = httpRequest(alloc, io_ctx, opts.driver_port, "GET", "/status", null) catch {
+            sleepMs(500);
+            continue;
+        };
+        break;
+    }
+    const binary_json = try jsonEscape(alloc, opts.app_exe);
+    defer alloc.free(binary_json);
+    const body = try std.fmt.allocPrint(alloc,
+        \\{{"capabilities":{{"alwaysMatch":{{"browserName":"webkitgtk","webkitgtk:browserOptions":{{"binary":"{s}","args":[]}}}}}}}}
+    , .{binary_json});
     defer alloc.free(body);
     const resp = try httpRequest(alloc, io_ctx, opts.driver_port, "POST", "/session", body);
     defer alloc.free(resp);

@@ -584,6 +584,13 @@ pub fn run(comptime config: Config) !void {
     const wc = c.webkit_web_context_get_default();
     if (wc == null) return error.WebKitContextUnavailable;
     c.webkit_web_context_register_uri_scheme(wc, scheme, Self.onSchemeRequest, self, null);
+    // v0.2.9：WebDriver 自动化（zilt-driver 经 WebKitWebDriver 拉起时注入该 env）
+    if (std.c.getenv("ZILT_AUTOMATION")) |a| {
+        if (std.mem.eql(u8, std.mem.span(a), "1")) {
+            c.webkit_web_context_set_automation_allowed(wc, 1);
+            log.print("[linux] automation allowed (ZILT_AUTOMATION=1)", .{});
+        }
+    }
     // v0.2.1：下载事件（分区 context 在 createPartitionContext 里同样注册）
     _ = c.g_signal_connect_data(wc, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
 

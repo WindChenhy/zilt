@@ -17,7 +17,8 @@ APT_PACKAGES=(
   libgtk-3-dev libwebkit2gtk-4.1-dev
   xvfb
   # v0.2.6 全局快捷键（X11 头文件，capi.h 硬依赖）+ v0.2.7 shell（xdg-open）
-  libx11-dev xdg-utils
+  # v0.2.9 WebDriver E2E（WebKitWebDriver）
+  libx11-dev xdg-utils webkit2gtk-driver
 )
 
 say() { printf '\n== %s ==\n' "$*"; }
