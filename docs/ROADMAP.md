@@ -106,10 +106,10 @@
             **结果**：Linux `zig build` 只走 `install → zilt-app` 一条链，报错即
             `platform/linux/backend.zig` 的「Linux 后端尚未实现」；`zig build test` 仍全绿；
             `zig build doctor` 打印依赖 Win32 的原因与 v0.2 计划。Windows 侧产物与之前完全一致。
-      - [ ] `init.zig` 移植到 std.Io（模板脚手架），之后放开 Linux 的工具测试
-      - [ ] Linux 后端实现（GTK3 + WebKit2GTK 4.1）：`g_application_run` + `WebKitWebView`
-            + scheme 资产 + IPC 桥，再补窗口/系统集成
-      - [ ] `zilt doctor` Linux 依赖检查（随 cli 移植）
+      - [x] `init.zig` 移植到 std.Io（v0.2.8：模板脚手架跨平台；Linux 工具测试同步放开）
+      - [x] Linux 后端实现（GTK3 + WebKit2GTK 4.1）：v0.2.1–v0.2.7 全链路
+      - [x] `zilt doctor` Linux 依赖检查（v0.2.8：pkg-config gtk+-3.0/webkit2gtk-4.1 +
+            xvfb-run/xdg-open/mksquashfs；Windows 检查项平台分派保留）
 - [x] **v0.2.1 窗口/WebView 面**（2026-11-13；Linux 侧四切片，平台无关层零改动）：
       - [x] 切片 1 窗口 API（3c330b9）：`window_fn`/`window_query_fn` 全套基础动作；
             未实现项返回 false（错误语义对齐 Windows）；冒烟 9 → 20 项
@@ -253,6 +253,28 @@
       是 capi.h 硬依赖）。**验收**：Linux 冒烟 65/65 exit 0（+ post terminate PASS）、
       单实例转交 E2E PASS、打包 E2E PASS、Linux 单测 191/192（1 skip）、
       Windows 单测/构建全绿。
+- [x] **v0.2.8 工具链与 headless**（2026-11-15）：对齐 Wails `wails3 dev`/doctor 的
+      开发体验 + 补齐 headless/MCP 的 Linux 半边——
+      **init 跨平台**（kernel32 手写 extern → std.Io.Dir + Args.Iterator + Io.random；
+      `zig build init` Linux 可用，脚手架项目在 Linux `zig build` + 冒烟 exit 0 实测）；
+      **模板漂移修复**（v0.2.x 期间 templates/_common 的 build.zig.tmpl /
+      app_meta.zig.tmpl 与仓库脱节——两平台都产不出可构建项目，本轮实测踩到后
+      全量同步；VERSION 占位符改为读 src/zilt/version.zig（此前硬编码 0.1.0 →
+      版本一致性编译断言必炸）；src/pack_linux.zig 纳入 vendored 集合）；
+      **cli 跨平台**（doctor/info Linux 化：文件检查走 std.Io、PATH 扫描两平台分派、
+      doctor 增 Linux 检查组 pkg-config gtk+-3.0/webkit2gtk-4.1 + xvfb-run/
+      xdg-open/mksquashfs；icon/npm-pack/new 的 IO 同步跨平台）；
+      **`zig build dev`（Linux）**（scripts/linux/dev.sh，与 dev.zig 同编排语义：
+      spawn dev 命令 → TCP 直连等待 → 注入 ZILT_DEV_URL/反代 → 拉起；
+      ZILT_DEV_WATCH=1 热重启——杀应用 → 等 `zig build --watch` 写新 exe → 重拉）；
+      **headless + MCP**（Windows v0.1.17 的 headless.zig 跨平台化——全 std.Io 实现，
+      仅 env/SQL 两处平台点 comptime 分派；Linux sqlite.zig 的 run/migrate 与
+      Windows 逐字同构；`ZILT_HEADLESS=1` 在 Linux 跳过 GTK 直起 HTTP 服务）。
+      **验收**：Linux 单测 195/196（1 skip）/Windows 279/279；冒烟 65/65 +
+      post terminate PASS；headless E2E 四端点 PASS（health / ipc greet /
+      mcp 33 tools / tools/call 42 / 资产 200）；dev 编排实测（TCP 等待 +
+      ZILT_DEV_URL 注入 + 应用拉起）；CI Linux job 增 headless E2E 与模板
+      init→build E2E。gen_bindings 顺带跨平台化（dev/gen 依赖它）。
 - [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）——v0.3+
 - [x] 平台差异收敛原则：平台无关层（ipc/security/fs_api/protocol/net/sql/store/patch/pack_formats）
       两平台共用，差异只出现在 `platform/<os>/`

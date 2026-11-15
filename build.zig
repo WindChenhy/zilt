@@ -498,7 +498,8 @@ pub fn build(b: *std.Build) void {
         dev_run.step.dependOn(b.getInstallStep());
         const dev_step = b.step("dev", "Run frontend dev server + app (HMR)");
         dev_step.dependOn(&dev_run.step);
-    } else {
+    } else if (!is_linux) {
+        // Linux 的 dev 在下方 rel_app 声明后注册（scripts/linux/dev.sh）
         _ = windowsOnlyStep(b, "dev", "frontend dev server + app (HMR)", target_os);
     }
 
@@ -575,10 +576,18 @@ pub fn build(b: *std.Build) void {
         const info_step = b.step("info", "Run `zilt info` (project config summary)");
         info_step.dependOn(&info_run.step);
     } else {
-        // cli.zig 目前深绑 Win32 文件/控制台 API；Linux 化是 v0.2.0 的一项
-        // （先抽 tools/fsio.zig 的 posix 实现，再加 pkg-config 依赖检查）
-        _ = windowsOnlyStep(b, "doctor", "build environment check", target_os);
-        _ = windowsOnlyStep(b, "info", "project config summary", target_os);
+        // v0.2.8：cli.zig 跨平台化（argv/文件检查走 Args.Iterator + std.Io；
+        // doctor 平台分派：Windows 查 WebView2/makensis，Linux 查 pkg-config 链）
+        b.installArtifact(cli_exe);
+        const doctor_run = b.addRunArtifact(cli_exe);
+        doctor_run.addArg("doctor");
+        const doctor_step = b.step("doctor", "Run `zilt doctor` (build environment check)");
+        doctor_step.dependOn(&doctor_run.step);
+
+        const info_run = b.addRunArtifact(cli_exe);
+        info_run.addArg("info");
+        const info_step = b.step("info", "Run `zilt info` (project config summary)");
+        info_step.dependOn(&info_run.step);
     }
 
     const bundle_mod = b.createModule(.{
@@ -693,6 +702,25 @@ pub fn build(b: *std.Build) void {
         const pack_linux_step = b.step("pack", "Linux packaging (deb / AppDir / squashfs / flatpak / rpm spec)");
         pack_linux_step.dependOn(&pack_linux_run.step);
 
-        _ = windowsOnlyStep(b, "init", "create a project from a template", target_os);
+        // v0.2.8：init 移植 std.Io 后 Linux 同样可建项目（模板脚手架跨平台）
+        const init_run_linux = b.addRunArtifact(init_exe);
+        const init_step_linux = b.step("init", "Create a new project from a template (ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=myapp zig build init)");
+        init_step_linux.dependOn(&init_run_linux.step);
+        b.installArtifact(init_exe);
+
+        // v0.2.8：`zig build dev`（scripts/linux/dev.sh——与 dev.zig 同编排语义：
+        // spawn dev 命令 → TCP 等待 → 注入 ZILT_DEV_URL → 拉起；ZILT_DEV_WATCH=1 热重启）
+        const dev_sh = b.addSystemCommand(&.{"bash"});
+        dev_sh.addFileArg(b.path("scripts/linux/dev.sh"));
+        dev_sh.addArtifactArg(rel_app); // argv[1] = 应用 exe（zig-out/bin 稳定产物）
+        dev_sh.addArg(frontend.dev_command orelse "-");
+        dev_sh.addArg(frontend.dev_url orelse "-");
+        dev_sh.addArg(b.fmt("{d}", .{frontend.wait_timeout_secs}));
+        dev_sh.addArg(frontend.dir);
+        dev_sh.addArg(if (frontend.dev_proxy) "1" else "-");
+        dev_sh.step.dependOn(&gen_run.step);
+        dev_sh.step.dependOn(b.getInstallStep());
+        const dev_step_linux = b.step("dev", "Run frontend dev server + app (HMR) — Linux 实现（scripts/linux/dev.sh）");
+        dev_step_linux.dependOn(&dev_sh.step);
     }
 }

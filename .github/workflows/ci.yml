@@ -146,6 +146,17 @@ jobs:
           grep -a "\[linux-smoke\]" zilt.log | tail -2
           if [ $code -ne 0 ]; then echo "smoke failed with exit $code"; exit 1; fi
 
+      - name: Headless / MCP E2E
+        run: bash scripts/linux/dev-headless.sh
+
+      - name: Template scaffold E2E (init vanilla → build)
+        run: |
+          rm -rf /tmp/zilt-init-e2e
+          ZILT_INIT_TEMPLATE=vanilla ZILT_INIT_NAME=ci-probe ZILT_INIT_DEST=/tmp/zilt-init-e2e zig build init
+          cd /tmp/zilt-init-e2e
+          zig build
+          test -x zig-out/bin/zilt-app
+
       - name: Packaging (deb / AppDir / squashfs / flatpak / rpm spec)
         run: |
           zig build pack

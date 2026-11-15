@@ -95,15 +95,27 @@ const EventMeta = struct {
 };
 
 fn eventMetas(comptime Events: type) []const EventMeta {
+    @setEvalBranchQuota(10000);
     const decl_names = @typeInfo(Events).@"struct".decl_names;
-    var metas: [decl_names.len]EventMeta = undefined;
-    for (decl_names, 0..) |name, i| {
-        const info = @typeInfo(@TypeOf(@field(Events, name))).@"fn";
-        const has_payload = info.param_types.len == 2;
-        metas[i] = .{
-            .name = name,
-            .payload = if (has_payload) info.param_types[1].? else null,
-        };
+    // 先数 fn 型 decl（events.zig 里允许 pub var 计数器等非命令 decl——实测
+    // `pub var builtin_hits` 混进 decl_names 会把 @typeInfo 打到 struct 分支）
+    comptime var n: usize = 0;
+    inline for (decl_names) |name| {
+        if (@typeInfo(@TypeOf(@field(Events, name))) == .@"fn") n += 1;
+    }
+    var metas: [n]EventMeta = undefined;
+    comptime var i: usize = 0;
+    inline for (decl_names) |name| {
+        const Fn = @TypeOf(@field(Events, name));
+        if (@typeInfo(Fn) == .@"fn") {
+            const info = @typeInfo(Fn).@"fn";
+            const has_payload = info.param_types.len == 2;
+            metas[i] = .{
+                .name = name,
+                .payload = if (has_payload) info.param_types[1].? else null,
+            };
+            i += 1;
+        }
     }
     const frozen = metas;
     return &frozen;
@@ -192,6 +204,10 @@ const SampleCommands = struct {
 };
 
 const SampleEvents = struct {
+    // v0.2.8：非 fn 的 pub decl（计数器等）必须被 eventMetas 跳过——
+    // 实测 events.zig 的 `pub var builtin_hits` 曾把 @typeInfo 打到 struct 分支
+    pub var hits: u32 = 0;
+
     pub fn tick(_: ipc.Context, payload: struct { n: u32 }) void {
         _ = payload;
     }

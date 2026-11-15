@@ -5,42 +5,50 @@
 //!  - `info`   打印 project.zig 的配置摘要（版本、app_id、前端工程、图标、安装器范围）
 //!
 //! 输出走 stderr（与 zig build 日志一致，便于 CI 收集）；退出码非 0 表示有检查失败。
+//!
+//! v0.2.8：跨平台——argv 走 Args.Iterator、文件检查走 std.Io（Windows/Linux 同一
+//! 份实现）；doctor 平台分派：Windows 查 WebView2/makensis/signtool/WiX，
+//! Linux 查 pkg-config（gtk+-3.0 / webkit2gtk-4.1）+ xvfb-run/xdg-open/mksquashfs。
 const std = @import("std");
 const builtin = @import("builtin");
+const Io = std.Io;
 const zilt = @import("zilt");
 const meta = @import("app_meta");
 const signtool_locator = @import("signtool_locate.zig");
 const wix_tool = @import("wix_tool.zig");
 
-const win32 = zilt.platform_windows.win32;
+const win32 = if (builtin.os.tag == .windows) zilt.platform_windows.win32 else {};
 const print = std.debug.print;
 
-extern "kernel32" fn SearchPathW(
-    lpPath: ?win32.LPCWSTR,
-    lpFileName: win32.LPCWSTR,
-    lpExtension: ?win32.LPCWSTR,
-    nBufferLength: u32,
-    lpBuffer: [*]u16,
-    lpFilePart: ?*?[*:0]u16,
-) callconv(.c) u32;
+/// 工具进程的 Io（Threaded 惰性创建；doctor 的文件存在性检查用）。
+var g_threaded: Io.Threaded = undefined;
+var g_threaded_ready = false;
+fn toolIo() Io {
+    if (!g_threaded_ready) {
+        g_threaded = .init(std.heap.page_allocator, .{});
+        g_threaded_ready = true;
+    }
+    return g_threaded.io();
+}
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF;
 
-pub fn main() !u8 {
+pub fn main(init: std.process.Init) !u8 {
     const alloc = std.heap.page_allocator;
-    var argc: i32 = 0;
-    const argv_w = win32.CommandLineToArgvW(win32.GetCommandLineW(), &argc) orelse return error.ArgsFailed;
-    defer _ = win32.LocalFree(@ptrCast(argv_w));
+
+    // v0.2.8：argv 读取跨平台化（Args.Iterator 两平台同用；替代 CommandLineToArgvW）
+    var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
+    defer it.deinit();
+    _ = it.skip(); // argv[0]
 
     var args: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (args.items) |a| alloc.free(a);
         args.deinit(alloc);
     }
-    var i: usize = 1;
-    while (i < @as(usize, @intCast(argc))) : (i += 1) {
-        try args.append(alloc, try std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(argv_w[i])));
+    while (it.next()) |raw| {
+        try args.append(alloc, try alloc.dupe(u8, raw));
     }
 
     const cmd = if (args.items.len > 0) args.items[0] else "help";
@@ -99,35 +107,67 @@ fn runDoctor(alloc: std.mem.Allocator) !u8 {
     const v = builtin.zig_version;
     print("[ok]   Zig {d}.{d}.{d}\n", .{ v.major, v.minor, v.patch });
 
-    // WebView2 运行时（Evergreen）
-    if (webviewVersion(alloc)) |wv| {
-        defer alloc.free(wv);
-        print("[ok]   WebView2 runtime {s}\n", .{wv});
-    } else {
-        print("[warn] WebView2 runtime not found (Evergreen) — 应用启动会失败\n", .{});
-        issues += 1;
-    }
+    if (builtin.os.tag == .windows) {
+        // WebView2 运行时（Evergreen）
+        if (webviewVersion(alloc)) |wv| {
+            defer alloc.free(wv);
+            print("[ok]   WebView2 runtime {s}\n", .{wv});
+        } else {
+            print("[warn] WebView2 runtime not found (Evergreen) — 应用启动会失败\n", .{});
+            issues += 1;
+        }
 
-    // makensis（安装器）
-    if (findInPath(alloc, "makensis.exe")) |p| {
-        defer alloc.free(p);
-        print("[ok]   makensis: {s}\n", .{p});
-    } else {
-        print("[warn] makensis not in PATH — `zig build bundle` 只能生成 .nsi\n", .{});
-    }
+        // makensis（安装器）
+        if (findInPath(alloc, "makensis.exe")) |p| {
+            defer alloc.free(p);
+            print("[ok]   makensis: {s}\n", .{p});
+        } else {
+            print("[warn] makensis not in PATH — `zig build bundle` 只能生成 .nsi\n", .{});
+        }
 
-    // 可选工具链：代码签名 / MSI
-    if (signtool_locator.locate(alloc)) |p| {
-        defer alloc.free(p);
-        print("[ok]   signtool: {s}\n", .{p});
+        // 可选工具链：代码签名 / MSI
+        if (signtool_locator.locate(alloc)) |p| {
+            defer alloc.free(p);
+            print("[ok]   signtool: {s}\n", .{p});
+        } else {
+            print("[warn] signtool not found — code signing needs Windows SDK (bundle prints the command)\n", .{});
+        }
+        if (wix_tool.detect(alloc)) |p| {
+            defer alloc.free(p);
+            print("[ok]   WiX 3.14: {s}\n", .{p});
+        } else {
+            print("[info] WiX 3 not cached — fetched automatically on first `zig build pack` (MSI)\n", .{});
+        }
     } else {
-        print("[warn] signtool not found — code signing needs Windows SDK (bundle prints the command)\n", .{});
-    }
-    if (wix_tool.detect(alloc)) |p| {
-        defer alloc.free(p);
-        print("[ok]   WiX 3.14: {s}\n", .{p});
-    } else {
-        print("[info] WiX 3 not cached — fetched automatically on first `zig build pack` (MSI)\n", .{});
+        // v0.2.8：Linux 构建链检查（pkg-config 包 + 运行时工具）
+        for ([_][]const u8{ "gtk+-3.0", "webkit2gtk-4.1" }) |pkg| {
+            if (pkgConfigExists(alloc, pkg)) {
+                print("[ok]   pkg-config: {s}\n", .{pkg});
+            } else {
+                print("[fail] pkg-config: {s} 缺失 — Ubuntu/Debian: sudo apt install {s}\n", .{
+                    pkg, if (std.mem.eql(u8, pkg, "gtk+-3.0")) "libgtk-3-dev" else "libwebkit2gtk-4.1-dev",
+                });
+                issues += 1;
+            }
+        }
+        if (findInPath(alloc, "xvfb-run")) |p| {
+            defer alloc.free(p);
+            print("[ok]   xvfb-run: {s}\n", .{p});
+        } else {
+            print("[info] xvfb-run not in PATH — 冒烟/E2E 需要（sudo apt install xvfb）\n", .{});
+        }
+        if (findInPath(alloc, "xdg-open")) |p| {
+            defer alloc.free(p);
+            print("[ok]   xdg-open: {s}\n", .{p});
+        } else {
+            print("[info] xdg-open not in PATH — shell/openUrl 与深链注册需要（sudo apt install xdg-utils）\n", .{});
+        }
+        if (findInPath(alloc, "mksquashfs")) |p| {
+            defer alloc.free(p);
+            print("[ok]   mksquashfs: {s}\n", .{p});
+        } else {
+            print("[info] mksquashfs not in PATH — `zig build pack` 跳过 squashfs（sudo apt install squashfs-tools）\n", .{});
+        }
     }
 
     // 前端 dist
@@ -208,30 +248,67 @@ fn webviewVersion(alloc: std.mem.Allocator) ?[]u8 {
     return null;
 }
 
-/// PATH 中查找可执行文件（SearchPathW 自带 .exe 补全）。
+/// Windows 的 PATH 查找（SearchPathW 自带 .exe 补全）。extern 声明惰性分析：
+/// Linux 构建不引用即不参与编译。
+extern "kernel32" fn SearchPathW(
+    lpPath: ?[*:0]const u16,
+    lpFileName: [*:0]const u16,
+    lpExtension: ?[*:0]const u16,
+    nBufferLength: u32,
+    lpBuffer: [*]u16,
+    lpFilePart: ?*?[*:0]u16,
+) u32;
+
+/// pkg-config --exists（Linux 构建链检查）。子进程退出码 0 = 存在。
+fn pkgConfigExists(alloc: std.mem.Allocator, pkg: []const u8) bool {
+    if (findInPath(alloc, "pkg-config") == null) return false;
+    var child = std.process.spawn(toolIo(), .{
+        .argv = &.{ "pkg-config", "--exists", pkg },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return false;
+    const term = child.wait(toolIo()) catch return false;
+    return term.success();
+}
+
+/// PATH 中查找可执行文件（Windows 走 SearchPathW；其他平台扫 PATH）。
 fn findInPath(alloc: std.mem.Allocator, name: []const u8) ?[]u8 {
-    const name_z = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch return null;
-    defer alloc.free(name_z);
-    var buf: [1024]u16 = undefined;
-    const n = SearchPathW(null, name_z.ptr, null, buf.len, &buf, null);
-    if (n == 0 or n >= buf.len) return null;
-    return std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..n]) catch null;
+    if (builtin.os.tag == .windows) {
+        const name_z = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch return null;
+        defer alloc.free(name_z);
+        var buf: [1024]u16 = undefined;
+        const n = SearchPathW(null, name_z.ptr, null, buf.len, &buf, null);
+        if (n == 0 or n >= buf.len) return null;
+        return std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..n]) catch null;
+    }
+    // Linux：扫 PATH（zilt doctor 检查 xdg-open / xvfb-run / pkg-config 用）
+    const path_env = std.c.getenv("PATH") orelse return null;
+    var dirs = std.mem.splitScalar(u8, std.mem.span(path_env), ':');
+    while (dirs.next()) |dir| {
+        if (dir.len == 0) continue;
+        const cand = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, name }) catch return null;
+        defer alloc.free(cand);
+        if (fileExists(alloc, cand)) return alloc.dupe(u8, cand) catch null;
+    }
+    return null;
+}
+
+/// v0.2.8：文件存在性检查走 std.Io（两平台同用；statFile 对目录/文件均返回）。
+fn statExists(path: []const u8) ?bool {
+    const st = Io.Dir.cwd().statFile(toolIo(), path, .{}) catch return null;
+    return st.kind == .directory;
 }
 
 fn dirExists(alloc: std.mem.Allocator, path: []const u8) bool {
-    const path_z = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return false;
-    defer alloc.free(path_z);
-    const attrs = win32.GetFileAttributesW(path_z.ptr);
-    if (attrs == INVALID_FILE_ATTRIBUTES) return false;
-    return attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
+    _ = alloc;
+    return (statExists(path) orelse false);
 }
 
 fn fileExists(alloc: std.mem.Allocator, path: []const u8) bool {
-    const path_z = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return false;
-    defer alloc.free(path_z);
-    const attrs = win32.GetFileAttributesW(path_z.ptr);
-    if (attrs == INVALID_FILE_ATTRIBUTES) return false;
-    return attrs & FILE_ATTRIBUTE_DIRECTORY == 0;
+    _ = alloc;
+    const st = Io.Dir.cwd().statFile(toolIo(), path, .{}) catch return false;
+    return st.kind != .directory;
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +365,7 @@ fn runIcon(alloc: std.mem.Allocator, args: []const []u8) !u8 {
         return 2;
     };
 
-    const png_bytes = win32.readFileAlloc(alloc, in_path) orelse {
+    const png_bytes = Io.Dir.cwd().readFileAlloc(toolIo(), in_path, alloc, .limited(64 * 1024 * 1024)) catch {
         print("zilt icon: cannot read '{s}'\n", .{in_path});
         return 1;
     };
@@ -307,10 +384,10 @@ fn runIcon(alloc: std.mem.Allocator, args: []const []u8) !u8 {
     };
     defer alloc.free(ico_bytes);
 
-    if (!win32.writeFileAlloc(alloc, output, ico_bytes)) {
+    Io.Dir.cwd().writeFile(toolIo(), .{ .sub_path = output, .data = ico_bytes }) catch {
         print("zilt icon: cannot write '{s}'\n", .{output});
         return 1;
-    }
+    };
     print("zilt icon: wrote {s} ({d} bytes, sizes ", .{ output, ico_bytes.len });
     for (sizes.items, 0..) |s, k| print("{s}{d}", .{ if (k == 0) "" else ",", s });
     print(")\n", .{});
@@ -374,19 +451,15 @@ fn runNpmPack(alloc: std.mem.Allocator, args: []const []u8) !u8 {
         .{ .name = "README.md", .data = files.readme_md },
     };
 
-    // 目录不存在则创建（CreateDirectoryW，已存在视为成功）
-    {
-        const dir_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, out_dir) catch return 1;
-        defer alloc.free(dir_w);
-        _ = win32.CreateDirectoryW(dir_w.ptr, null);
-    }
+    // 目录不存在则创建（std.Io，已存在视为成功）
+    _ = Io.Dir.cwd().createDirPathStatus(toolIo(), out_dir, .default_dir) catch return 1;
     for (targets) |t| {
-        const path = std.fmt.allocPrint(alloc, "{s}\\{s}", .{ out_dir, t.name }) catch return 1;
+        const path = std.fmt.allocPrint(alloc, "{s}/{s}", .{ out_dir, t.name }) catch return 1;
         defer alloc.free(path);
-        if (!win32.writeFileAlloc(alloc, path, t.data)) {
+        Io.Dir.cwd().writeFile(toolIo(), .{ .sub_path = path, .data = t.data }) catch {
             print("zilt npm-pack: cannot write '{s}'\n", .{path});
             return 1;
-        }
+        };
         print("zilt npm-pack: wrote {s} ({d} bytes)\n", .{ path, t.data.len });
     }
     print("zilt npm-pack: package ready -> cd {s} && npm pack\n", .{out_dir});
@@ -451,24 +524,34 @@ fn runNew(alloc: std.mem.Allocator, args: []const []u8) !u8 {
 
 /// 把 cwd 切到框架仓库根。优先 ZILT_ROOT，其次 exe 的 ../../（zig-out/bin 布局）。
 /// 找不到时保持原 cwd（scaffold 会以 SourceMissing 报错）。
+/// v0.2.8：跨平台——env 走 std.c.getenv/Win32 分派，exe 路径走 executablePathAlloc，
+/// chdir 走 Win32/libc（0.17 的 std 无 chdir）。
 fn chdirToFrameworkRoot(alloc: std.mem.Allocator) void {
-    if (win32.getEnvUtf8(alloc, "ZILT_ROOT")) |root| {
-        defer alloc.free(root);
-        const w = std.unicode.utf8ToUtf16LeAllocZ(alloc, root) catch return;
+    var root: ?[]u8 = null;
+    defer if (root) |r| alloc.free(r);
+    if (builtin.os.tag == .windows) {
+        root = win32.getEnvUtf8(alloc, "ZILT_ROOT");
+    } else if (std.c.getenv("ZILT_ROOT")) |v| {
+        root = alloc.dupe(u8, std.mem.span(v)) catch null;
+    }
+    if (root == null) {
+        const exe = std.process.executablePathAlloc(toolIo(), alloc) catch return;
+        defer alloc.free(exe);
+        // <root>/zig-out/bin/zilt(.exe) → <root>（三层 dirname）
+        var dir = std.fs.path.dirname(exe) orelse return; // <root>/zig-out/bin
+        dir = std.fs.path.dirname(dir) orelse return; // <root>/zig-out
+        const parent = std.fs.path.dirname(dir) orelse return; // <root>
+        root = alloc.dupe(u8, parent) catch return;
+    }
+    const r = root.?;
+    if (builtin.os.tag == .windows) {
+        const w = std.unicode.utf8ToUtf16LeAllocZ(alloc, r) catch return;
         defer alloc.free(w);
         _ = win32.SetCurrentDirectoryW(w.ptr);
-        return;
+    } else {
+        const rz = alloc.allocSentinel(u8, r.len, 0) catch return;
+        defer alloc.free(rz);
+        @memcpy(rz, r);
+        _ = std.c.chdir(rz.ptr); // 失败保持原 cwd（scaffold 报 SourceMissing）
     }
-    var buf: [win32.MAX_PATH_W]u16 = undefined;
-    const n = win32.GetModuleFileNameW(null, &buf, buf.len);
-    if (n == 0 or n >= buf.len) return;
-    const exe = std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..n]) catch return;
-    defer alloc.free(exe);
-    // <root>\zig-out\bin\zilt.exe → <root>
-    var dir = std.fs.path.dirname(exe) orelse return; // ...\zig-out\bin
-    dir = std.fs.path.dirname(dir) orelse return; // ...\zig-out
-    const root = std.fs.path.dirname(dir) orelse return; // <root>
-    const w = std.unicode.utf8ToUtf16LeAllocZ(alloc, root) catch return;
-    defer alloc.free(w);
-    _ = win32.SetCurrentDirectoryW(w.ptr);
 }

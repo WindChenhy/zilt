@@ -5,70 +5,33 @@
 //!   - 共享壳（templates/_common：build.zig/main.zig/commands 等，.tmpl 占位符替换）
 //!   - 模板前端（templates/<t>/frontend/**）
 //!   - 模板专属 project.zig（frontend 段按模板差异生成）
+//!
+//! v0.2.8：IO 层从 kernel32 手写 extern 改为 `std.Io.Dir`（frontend_codegen 的
+//! v0.2.0 移植同款）——Windows / Linux 同一份实现，路径分隔符统一 '/'。
 
 const std = @import("std");
-
-const DWORD = u32;
-const BOOL = i32;
-const HANDLE = *anyopaque;
-const LPCWSTR = [*:0]const u16;
-const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
-
-pub extern "kernel32" fn FindFirstFileW(lpFileName: LPCWSTR, lpFindFileData: *FindData) callconv(.c) HANDLE;
-pub extern "kernel32" fn FindNextFileW(hFindFile: HANDLE, lpFindFileData: *FindData) callconv(.c) BOOL;
-pub extern "kernel32" fn FindClose(hFindFile: HANDLE) callconv(.c) BOOL;
-pub extern "kernel32" fn CreateDirectoryW(lpPathName: LPCWSTR, lpSecurityAttributes: ?*anyopaque) callconv(.c) BOOL;
-pub extern "kernel32" fn CreateFileW(lpFileName: LPCWSTR, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?*anyopaque) callconv(.c) HANDLE;
-pub extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: DWORD, lpNumberOfBytesRead: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.c) BOOL;
-pub extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: [*]const u8, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.c) BOOL;
-pub extern "kernel32" fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *i64) callconv(.c) BOOL;
-pub extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.c) BOOL;
-pub extern "kernel32" fn GetEnvironmentVariableW(lpName: LPCWSTR, lpBuffer: ?[*]u16, nSize: DWORD) callconv(.c) DWORD;
-pub extern "bcrypt" fn BCryptGenRandom(hAlgorithm: ?*anyopaque, pBuffer: [*]u8, cbBuffer: u32, dwFlags: u32) callconv(.c) i32;
-pub extern "kernel32" fn GetTickCount64() callconv(.c) u64;
-
-pub const FILETIME = extern struct { dwLowDateTime: DWORD, dwHighDateTime: DWORD };
-pub const FindData = extern struct {
-    dwFileAttributes: DWORD,
-    ftCreationTime: FILETIME,
-    ftLastAccessTime: FILETIME,
-    ftLastWriteTime: FILETIME,
-    nFileSizeHigh: DWORD,
-    nFileSizeLow: DWORD,
-    dwReserved0: DWORD,
-    dwReserved1: DWORD,
-    cFileName: [260]u16,
-    cAlternateFileName: [14]u16,
-};
-
-const FILE_ATTRIBUTE_DIRECTORY: DWORD = 0x10;
-const GENERIC_READ: DWORD = 0x80000000;
-const GENERIC_WRITE: DWORD = 0x40000000;
-const OPEN_EXISTING: DWORD = 3;
-const CREATE_ALWAYS: DWORD = 2;
+const Io = std.Io;
 
 const alloc = std.heap.page_allocator;
-const BS = "\\"; // 单个反斜杠
 
 pub const templates_available = [_][]const u8{ "vanilla", "vue", "react", "svelte", "solid", "preact", "htmx", "angular" };
 
-fn getEnv(alloc2: std.mem.Allocator, name: [:0]const u8) ?[]u8 {
-    const nw = std.unicode.utf8ToUtf16LeAllocZ(alloc2, name) catch return null;
-    defer alloc2.free(nw);
-    const need = GetEnvironmentVariableW(nw.ptr, null, 0);
-    if (need == 0) return null;
-    const buf = alloc2.alloc(u16, need + 1) catch return null;
-    defer alloc2.free(buf);
-    const got = GetEnvironmentVariableW(nw.ptr, buf.ptr, @intCast(need + 1));
-    if (got == 0 or got > need) return null;
-    return std.unicode.utf16LeToUtf8Alloc(alloc2, buf[0..got]) catch null;
+/// 工具进程的 Io（Threaded 惰性创建；本工具只做同步目录/文件操作）。
+var g_threaded: Io.Threaded = undefined;
+var g_threaded_ready = false;
+fn toolIo() Io {
+    if (!g_threaded_ready) {
+        g_threaded = .init(alloc, .{});
+        g_threaded_ready = true;
+    }
+    return g_threaded.io();
 }
 
-pub fn main() !void {
-    // 0.17 build 无 b.args——参数经环境变量：ZILT_INIT_TEMPLATE / ZILT_INIT_NAME / ZILT_INIT_DEST
-    const template: []const u8 = getEnv(alloc, "ZILT_INIT_TEMPLATE") orelse "vanilla";
-    const name: []const u8 = getEnv(alloc, "ZILT_INIT_NAME") orelse "my-zilt-app";
-    const dest: ?[]const u8 = getEnv(alloc, "ZILT_INIT_DEST");
+pub fn main(init: std.process.Init) !void {
+    // 参数经环境变量（0.17 build 无 b.args）：ZILT_INIT_TEMPLATE / ZILT_INIT_NAME / ZILT_INIT_DEST
+    const template = init.environ_map.get("ZILT_INIT_TEMPLATE") orelse "vanilla";
+    const name = init.environ_map.get("ZILT_INIT_NAME") orelse "my-zilt-app";
+    const dest: ?[]const u8 = init.environ_map.get("ZILT_INIT_DEST");
 
     return scaffold(template, name, dest);
 }
@@ -97,15 +60,33 @@ pub fn scaffold(template: []const u8, name: []const u8, dest: ?[]const u8) !void
     // "My Zilt App"/"app.myziltapp"——v0.1.17 修复）
     app_name_value = try displayNameAlloc(alloc, name);
     app_id_value = try appIdAlloc(alloc, name);
+    // v0.2.8：VERSION 占位符取框架当前版本（vendored src/zilt/version.zig 与
+    // project.zig 的编译期一致性断言要求两者相同——此前硬编码 "0.1.0" 会直接
+    // 编译失败，实测踩到）
+    if (readFile("src/zilt/version.zig")) |vz| {
+        defer alloc.free(vz);
+        if (std.mem.indexOf(u8, vz, "pub const version = \"")) |i| {
+            const start = i + "pub const version = \"".len;
+            if (std.mem.indexOfScalarPos(u8, vz, start, '"')) |j| {
+                if (j > start) version_value = try alloc.dupe(u8, vz[start..j]);
+            }
+        }
+    } else |_| {}
     zon_name_value = try zonNameAlloc(alloc, name);
 
     const dest_dir = dest orelse try alloc.dupe(u8, name);
-    const dest_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, dest_dir);
-    _ = CreateDirectoryW(dest_w.ptr, null); // 已存在则报错由后续目录创建兜底
+    mkDir(dest_dir); // 已存在不算错误
 
     // 1) vendored 框架源码与工具（项目完全自包含）
     try copyTree("src/zilt", try join3(dest_dir, "src", "zilt"), false);
     try copyTree("src/tools", try join3(dest_dir, "src", "tools"), false);
+    // v0.2.8：src/pack_linux.zig（vendored build.zig 的 Linux pack 步骤引用它；
+    // 它只依赖 src/zilt/pack_formats.zig 等已 vendor 的路径，单文件拷贝即可）
+    {
+        const pl = try readFile("src/pack_linux.zig");
+        defer alloc.free(pl);
+        try writeFile(try join3(dest_dir, "src", "pack_linux.zig"), pl);
+    }
 
     // 2) 共享壳（.tmpl 占位符替换）
     try copyTree("templates/_common", dest_dir, true);
@@ -132,10 +113,6 @@ pub fn scaffold(template: []const u8, name: []const u8, dest: ?[]const u8) !void
         \\  zig build dev          （开发：spawn dev server → 直连 HMR）
         \\
     , .{ dest_dir, template, dest_dir });
-}
-
-fn utf8(w: [*:0]u16) []u8 {
-    return std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(w)) catch "";
 }
 
 pub fn validName(name: []const u8) bool {
@@ -212,45 +189,37 @@ pub fn zonName(name: []const u8) [64]u8 {    var out: [64]u8 = undefined;
 /// 递归复制。replace=true 时：.tmpl 文件做占位符替换并去掉后缀。
 fn copyTree(src: []const u8, dst: []const u8, replace: bool) !void {
     mkDir(dst);
-    const pattern = try join2(src, "*");
-    const pattern_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, pattern);
-    defer alloc.free(pattern_w);
+    const io = toolIo();
+    var dir = Io.Dir.cwd().openDir(io, src, .{ .iterate = true }) catch return error.SourceMissing;
+    defer dir.close(io);
 
-    var fd: FindData = undefined;
-    const h = FindFirstFileW(pattern_w.ptr, &fd);
-    if (h == INVALID_HANDLE_VALUE) return error.SourceMissing;
-    defer _ = FindClose(h);
-
-    while (true) {
-        const name_len = std.mem.indexOfScalar(u16, &fd.cFileName, 0) orelse fd.cFileName.len;
-        const is_dot = name_len == 1 and fd.cFileName[0] == '.';
-        const is_dotdot = name_len == 2 and fd.cFileName[0] == '.' and fd.cFileName[1] == '.';
-        if (name_len > 0 and !is_dot and !is_dotdot) {
-            const name = utf8(@ptrCast(&fd.cFileName));
-            defer alloc.free(name);
-            const is_dir = (fd.dwFileAttributes & 0x10) != 0;
-
-            const src_path = try join2(src, name);
-            const dst_path = try join2(dst, name);
-            if (is_dir) {
-                try copyTree(src_path, dst_path, replace);
-            } else if (replace and isTextPlaceholderFile(name)) {
-                // 文本文件同样做占位符替换（此前只处理 .tmpl，frontend/index.html
-                // 里的 {{APP_NAME}} 会原样留在产出页面——实测缺陷，v0.1.17 修复）
-                const out_name = if (std.mem.endsWith(u8, name, ".tmpl")) name[0 .. name.len - 5] else name;
-                const out_path = try join2(dst, out_name);
-                const data = try readFile(src_path);
-                defer alloc.free(data);
-                const replaced = try replacePlaceholders(alloc, data);
-                defer alloc.free(replaced);
-                try writeFile(out_path, replaced);
-            } else {
-                const data = try readFile(src_path);
-                defer alloc.free(data);
-                try writeFile(dst_path, data);
-            }
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        const name = try alloc.dupe(u8, entry.name);
+        defer alloc.free(name);
+        const src_path = try join2(src, name);
+        const dst_path = try join2(dst, name);
+        switch (entry.kind) {
+            .directory => try copyTree(src_path, dst_path, replace),
+            .file => {
+                if (replace and isTextPlaceholderFile(name)) {
+                    // 文本文件同样做占位符替换（此前只处理 .tmpl，frontend/index.html
+                    // 里的 {{APP_NAME}} 会原样留在产出页面——实测缺陷，v0.1.17 修复）
+                    const out_name = if (std.mem.endsWith(u8, name, ".tmpl")) name[0 .. name.len - 5] else name;
+                    const out_path = try join2(dst, out_name);
+                    const data = try readFile(src_path);
+                    defer alloc.free(data);
+                    const replaced = try replacePlaceholders(alloc, data);
+                    defer alloc.free(replaced);
+                    try writeFile(out_path, replaced);
+                } else {
+                    const data = try readFile(src_path);
+                    defer alloc.free(data);
+                    try writeFile(dst_path, data);
+                }
+            },
+            else => {}, // symlink 等跳过（模板仓库不含）
         }
-        if (FindNextFileW(h, &fd) == 0) break;
     }
 }
 
@@ -287,12 +256,9 @@ pub fn replacePlaceholders(alloc2: std.mem.Allocator, data: []const u8) ![]u8 {
                 try out.appendSlice(alloc2, zn[0..std.mem.indexOfScalar(u8, &zn, 0) orelse zn.len]);
             } else if (std.mem.eql(u8, key, "FINGERPRINT")) {
                 // Zig 包指纹：高 32 位随机 id（1..0xfffffffe），低 32 位 = crc32(zon name)
-                var fp: [8]u8 = undefined;
-                if (BCryptGenRandom(null, fp[0..4], 4, 2) != 0) {
-                    const tick = GetTickCount64();
-                    @memcpy(fp[0..4], @as(*const [4]u8, @ptrCast(&tick)));
-                }
-                var id = std.mem.readInt(u32, fp[0..4], .little);
+                var fp: [4]u8 = undefined;
+                Io.random(toolIo(), &fp); // 跨平台熵源（BCryptGenRandom 的替代）
+                var id = std.mem.readInt(u32, &fp, .little);
                 if (id == 0 or id == 0xffffffff) id = 0x12345678;
                 const checksum = std.hash.Crc32.hash(zon_name_value);
                 const fingerprint = (@as(u64, checksum) << 32) | id;
@@ -350,68 +316,27 @@ test "replacePlaceholders" {
 // ---- 文件助手 ----
 
 fn join2(base: []const u8, a: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}" ++ BS ++ "{s}", .{ base, a });
+    return std.fmt.allocPrint(alloc, "{s}/{s}", .{ base, a });
 }
 
 fn join3(base: []const u8, a: []const u8, b: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}" ++ BS ++ "{s}" ++ BS ++ "{s}", .{ base, a, b });
+    return std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ base, a, b });
 }
 
 /// 递归创建目录（逐段创建，CreateDirectoryW 不建父目录）。
 fn mkDir(path: []const u8) void {
-    var i: usize = 0;
-    while (i < path.len) {
-        // 跳过盘符段（如 "D:"）
-        if (i + 1 < path.len and path[i + 1] == ':') {
-            i += 3; // "X:" + 分隔符
-            continue;
-        }
-        if (path[i] == 92 or path[i] == 47) { // backslash or slash
-            i += 1;
-            continue;
-        }
-        const end = std.mem.indexOfAnyPos(u8, path, i, "\x5c/") orelse path.len;
-        const seg_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path[0..end]) catch return;
-        defer alloc.free(seg_w);
-        _ = CreateDirectoryW(seg_w.ptr, null); // 已存在则失败，忽略
-        i = end;
-    }
+    _ = Io.Dir.cwd().createDirPathStatus(toolIo(), path, .default_dir) catch {};
 }
 
 fn readFile(path: []const u8) ![]u8 {
-    const w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
-    defer alloc.free(w);
-    const f = CreateFileW(w.ptr, GENERIC_READ, 1, null, OPEN_EXISTING, 0x80, null);
-    if (f == INVALID_HANDLE_VALUE) return error.OpenFailed;
-    defer _ = CloseHandle(f);
-    var size: i64 = 0;
-    if (GetFileSizeEx(f, &size) != 0 and size > 0) {
-        const buf = try alloc.alloc(u8, @intCast(size));
-        var total: DWORD = 0;
-        while (total < buf.len) {
-            var got: DWORD = 0;
-            if (ReadFile(f, buf.ptr + total, @intCast(buf.len - total), &got, null) == 0 or got == 0) {
-                alloc.free(buf);
-                return error.ReadFailed;
-            }
-            total += got;
-        }
-        return buf;
-    }
-    return alloc.alloc(u8, 0);
+    return Io.Dir.cwd().readFileAlloc(toolIo(), path, alloc, .limited(64 * 1024 * 1024));
 }
 
 fn writeFile(path: []const u8, data: []const u8) !void {
-    const w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
-    defer alloc.free(w);
-    const f = CreateFileW(w.ptr, GENERIC_WRITE, 0, null, CREATE_ALWAYS, 0x80, null);
-    if (f == INVALID_HANDLE_VALUE) {
-        std.debug.print("[init] writeFile OpenFailed: {s}\n", .{path});
-        return error.OpenFailed;
-    }
-    defer _ = CloseHandle(f);
-    var written: DWORD = 0;
-    if (WriteFile(f, data.ptr, @intCast(data.len), &written, null) == 0) return error.WriteFailed;
+    Io.Dir.cwd().writeFile(toolIo(), .{ .sub_path = path, .data = data }) catch {
+        std.debug.print("[init] writeFile failed: {s}\n", .{path});
+        return error.WriteFailed;
+    };
 }
 
 test "displayNameAlloc / appIdAlloc 派生" {

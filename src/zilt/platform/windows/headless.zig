@@ -9,10 +9,14 @@
 //!
 //! 端口：ZILT_HEADLESS_PORT（默认 8790）；仅绑定 127.0.0.1。
 //! 事件：headless 下 emit 打到日志（无前端可收）。
+//!
+//! v0.2.8：跨平台（Linux 接线）——全 std.Io 实现，仅两处平台点：
+//! env 读取（Win32 / std.c.getenv）与 SQL 后端（winsqlite3.dll / libsqlite3 dlopen），
+//! 都经 comptime 按 os.tag 分派；两平台的 sqlite run/migrate 签名逐字同构。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zilt = @import("../../root.zig");
-const win32 = @import("win32.zig");
 const asset_routes = @import("../../asset_routes.zig");
 const services_mod = @import("../../services.zig");
 
@@ -21,7 +25,20 @@ const ipc = zilt.ipc;
 const mcp = zilt.mcp;
 const builtin_commands = zilt.builtin_commands;
 const shared_system = zilt.system_api;
-const win_sqlite = @import("sqlite.zig");
+const win32 = if (builtin.os.tag == .windows) @import("win32.zig") else {};
+const sqlite_backend = if (builtin.os.tag == .windows)
+    @import("sqlite.zig")
+else
+    @import("../linux/sqlite.zig");
+
+/// 可移植 env 读取（返回堆拷贝）。
+fn envUtf8(alloc: std.mem.Allocator, name: [:0]const u8) ?[]u8 {
+    if (builtin.os.tag == .windows) {
+        return win32.getEnvUtf8(alloc, name);
+    }
+    const raw = std.c.getenv(name.ptr) orelse return null;
+    return alloc.dupe(u8, std.mem.span(raw)) catch null;
+}
 
 /// headless 的系统能力：SQL 直接本地执行（无窗口可依赖）；其余一律 Unsupported。
 /// 前端在 GUI 模式拿到的系统 API 面不变，headless 只是最小可用子集。
@@ -32,7 +49,7 @@ fn headlessSystem(backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator,
         .sql => |op| {
             if (op == .migrate) {
                 const m = op.migrate;
-                win_sqlite.migrate(alloc, m.db, m.statements, m.version) catch |e| {
+                sqlite_backend.migrate(alloc, m.db, m.statements, m.version) catch |e| {
                     log.print("[headless:sql] migrate failed: {s}", .{@errorName(e)});
                     return e;
                 };
@@ -47,7 +64,7 @@ fn headlessSystem(backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator,
                 .query => true,
                 .execute, .migrate => false,
             };
-            const out = win_sqlite.run(alloc, q.db, q.sql, q.params, want_rows) catch |e| {
+            const out = sqlite_backend.run(alloc, q.db, q.sql, q.params, want_rows) catch |e| {
                 log.print("[headless:sql] failed: {s} (db={s})", .{ @errorName(e), q.db });
                 return e;
             };
@@ -78,7 +95,7 @@ pub fn run(comptime config: zilt.Config, alloc: std.mem.Allocator) !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const port: u16 = if (win32.getEnvUtf8(alloc, "ZILT_HEADLESS_PORT")) |p| blk: {
+    const port: u16 = if (envUtf8(alloc, "ZILT_HEADLESS_PORT")) |p| blk: {
         defer alloc.free(p);
         break :blk std.fmt.parseInt(u16, p, 10) catch DEFAULT_PORT;
     } else DEFAULT_PORT;

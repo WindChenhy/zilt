@@ -120,6 +120,7 @@ const system_api = @import("../../system_api.zig");
 const shared_services = @import("../../services.zig");
 const updater = @import("../../updater.zig");
 const shell_mod = @import("../../shell.zig");
+const headless = @import("../windows/headless.zig");
 const clipboard = @import("../../clipboard.zig");
 const notification = @import("../../notification.zig");
 const window_state = @import("window_state.zig");
@@ -554,6 +555,15 @@ pub fn run(comptime config: Config) !void {
     // 后端已链接 libc，c_allocator 是最稳的选择（无泄漏检测开销，也不需要 deinit）。
     const alloc = std.heap.c_allocator;
     log.initFileLog("zilt.log");
+
+    // v0.2.8：headless/server 模式（对齐 Windows v0.1.17）——跳过窗口/GTK，
+    // 应用作为 HTTP 服务运行（/zilt/health、/zilt/ipc、/mcp、资产）。
+    // 与 Windows 同一份 headless 实现（std.Io；env/SQL 两处平台点 comptime 分派）。
+    if (std.c.getenv("ZILT_HEADLESS")) |h| {
+        if (std.mem.eql(u8, std.mem.span(h), "1")) {
+            return headless.run(config, alloc);
+        }
+    }
 
     const Self = Backend(config);
     const self = try alloc.create(Self);
