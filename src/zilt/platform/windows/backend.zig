@@ -54,6 +54,7 @@ const asset_routes = @import("../../asset_routes.zig");
 const inflate = @import("../../inflate.zig");
 const protocol = @import("../../protocol.zig");
 const png_mod = @import("../../png.zig");
+const dpapi_mod = @import("dpapi.zig");
 const app_data = @import("app_data.zig");
 const builtin = @import("../../builtin.zig");
 const shared_webview = @import("../../webview.zig");
@@ -3149,10 +3150,29 @@ fn Backend(comptime config: Config) type {
             switch (op) {
                 .get => |key| {
                     const v = st.get(key) orelse return .{ .json = try alloc.dupe(u8, "null") };
+                    // v0.3.5：dpapi: 前缀值自动解密（store_encrypted 写入的混合形态）
+                    if (std.mem.startsWith(u8, v, dpapi_mod.prefix)) {
+                        const plain = dpapi_mod.decrypt(alloc, v) catch |err| {
+                            log.print("[store] decrypt '{s}' failed: {s}", .{ key, @errorName(err) });
+                            return .{ .json = try alloc.dupe(u8, "null") };
+                        };
+                        defer alloc.free(plain);
+                        return .{ .json = try std.json.Stringify.valueAlloc(alloc, plain, .{}) };
+                    }
                     return .{ .json = try std.json.Stringify.valueAlloc(alloc, v, .{}) };
                 },
                 .set => |kv| {
-                    try st.set(kv.key, kv.value);
+                    // v0.3.5：store_encrypted → DPAPI 加密（当前用户作用域；dpapi: 前缀）
+                    if (config.store_encrypted) {
+                        const enc = dpapi_mod.encrypt(alloc, kv.value) catch |err| {
+                            log.print("[store] encrypt '{s}' failed: {s}", .{ kv.key, @errorName(err) });
+                            return error.StoreEncryptFailed;
+                        };
+                        defer alloc.free(enc);
+                        try st.set(kv.key, enc);
+                    } else {
+                        try st.set(kv.key, kv.value);
+                    }
                     self.persistStore();
                     log.print("[store] set {s} ({d} keys)", .{ kv.key, st.count() });
                     return .{ .ok = true };

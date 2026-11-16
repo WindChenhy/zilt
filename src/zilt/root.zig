@@ -117,5 +117,6 @@ test {
         _ = @import("platform/windows/sysinfo.zig");
         _ = @import("platform/windows/system_integration.zig");
         _ = @import("platform/windows/custom_scheme.zig");
+        _ = @import("platform/windows/dpapi.zig");
     }
 }

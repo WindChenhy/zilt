@@ -56,6 +56,8 @@ pub fn main() !void {
         .protocols = &app.protocols,
         // v0.1.12：剪贴板变化事件 + OLE 自定义拖放格式
         .clipboard_change_event = true,
+        // v0.3.5：DPAPI 加密 store（往返语义不变——get 自动解密；c-storage 断言兼容）
+        .store_encrypted = true,
         .drag_formats = &.{"ZiltDemoFormat"},
         // 系统能力（Windows）
         // 图标：项目未指定 → 使用内置 Zig 官方图标（窗口/托盘/exe 资源）

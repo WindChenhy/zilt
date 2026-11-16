@@ -445,8 +445,18 @@
         updateDownloading 事件（updaterFlow 双平台）
       - **验收**：Windows 单测全绿冒烟 54 项（+c-res）；Linux 单测全绿冒烟 78/78
       - **范围**：E2/E4/F2 延后（见 v0.3.x-PLAN 范围说明）
-- [~] **v0.3.5+ 系列规划**（详见 [`docs/v0.3.x-PLAN.md`](v0.3.x-PLAN.md)）：
-      - v0.3.5 安全与系统深化：isolation pattern / Wayland portal 快捷键 / DPAPI 加密 store
+- [x] **v0.3.5 安全深化（DPAPI store）**（2026-11-17）：
+      - dpapi.zig：crypt32 动态加载（对齐 sqlite/winhttp 模式）+ encrypt/decrypt
+        （`dpapi:` 前缀 + base64；非前缀值原样返回=混合形态兼容）+ 真实 crypt32 往返单测
+      - runStoreOp 接线：set 经 config.store_encrypted 加密、get 前缀自动解密
+        （demo 开启后 c-storage 既有断言天然兼容）
+      - **物理证据**：store.json `dpapi:` 值存在且明文 secret 不在磁盘
+      - **延后**：isolation pattern（runtime JS 重设计）与 Wayland portal（需真会话）
+        → 专项版本；GDBus 基建（v0.3.2 logind）可复用
+      - **验收**：Windows 单测全绿冒烟 55 项（+c-dpapi）；Linux 全绿 78/78
+- [~] **v0.3.6+ 系列规划**（详见 [`docs/v0.3.x-PLAN.md`](v0.3.x-PLAN.md)）：
+      - v0.3.6 IPC v2 + CompositionController：原始二进制 IPC（SharedBuffer）/
+        composition hosting + app-region 原生命中
       - v0.3.3 窗口体验包 II：PNG 形状 mask / 每按钮状态 / HideOnFocusLost+HideOnEscape /
         托盘附着窗口 / 窗口级 KeyBindings / startResizeDragging / preventOverflow /
         标题栏双击行为 / move 去抖 / 效果参数（tint/cornerPreference）/ Zig 侧窗口事件钩子

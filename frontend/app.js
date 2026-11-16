@@ -1024,6 +1024,18 @@ async function runChecks() {
         : `resource=${JSON.stringify(r)}`);
     } catch (e) { setCheck('c-res', false, String(e.message || e)); }
 
+
+    // 55. v0.3.5：DPAPI 加密 store（往返 + dpapi: 前缀标记经 Zig 日志佐证）
+    try {
+      const secret = 'dpapi-smoke-' + Date.now();
+      await window.zilt.store.set('dpapi-smoke', secret);
+      const back = await window.zilt.store.get('dpapi-smoke');
+      const ok = back === secret;
+      setCheck('c-dpapi', ok, ok
+        ? 'dpapi store roundtrip ok (get auto-decrypts)'
+        : `roundtrip=${JSON.stringify(back).slice(0, 60)} want=${secret.slice(0, 30)}`);
+    } catch (e) { setCheck('c-dpapi', false, String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -1082,6 +1094,7 @@ async function runChecks() {
       monitor: $('c-monitor').className === 'pass',
       exp2: $('c-exp2').className === 'pass',
       res: $('c-res').className === 'pass',
+      dpapi: $('c-dpapi').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

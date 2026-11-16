@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.4（侧车资源分发 + 更新器 skipVersion/GitHub provider + path.resource）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.5（DPAPI 加密 store——磁盘值不可跨用户读取，往返语义不变）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -90,6 +90,19 @@ v0.3.4 新增（2026-11-17，分发与更新）：
 - **范围说明**：E2（离线 WebView2 fixed 打包 E2E）与 E4（交叉编译 pack 流水线）留待
   专项迭代（fixed loader 代码路径已有单测；deb/AppImage 交叉产出待 CI 验证）；模板
   TS 变体（F2）同批延后
+
+v0.3.5 新增（2026-11-17，安全深化）：
+
+- **DPAPI 加密 store（Windows）**：`Config.store_encrypted = true` → `store.set` 经
+  CryptProtectData（当前用户作用域，crypt32 动态加载）加密落盘（`dpapi:` 前缀 + base64）、
+  `store.get` 自动解密（往返语义不变；混合形态兼容——非前缀值原样读）。
+  **实测物理证据**：store.json 含 `dpapi:` 值且明文 secret 不在磁盘。
+  Linux 无 DPAPI → 开关忽略（明文落盘，libsecret 列 v0.4+ 文档化）
+- **范围说明**：isolation pattern（iframe 沙箱持钥 + postMessage 代理，需 runtime JS
+  重设计）与 Wayland portal 快捷键（需真 Wayland 会话验证；X11 路径已工作）移至
+  专项版本——GDBus 订阅基建（logind）已就位可复用
+- **验收**：Windows 单测全绿（+DPAPI 前缀/往返，真实 crypt32 往返实测）冒烟 **55 项**
+  （+c-dpapi：加密 store 往返）；Linux 单测全绿冒烟 78/78（平台差异文档化）
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 

@@ -81,6 +81,9 @@ pub const Config = struct {
     /// 迁移旧的 %TEMP%\zilt-app-webview2 共享数据目录（v0.1.8）
     migrate_legacy_profile: bool = false,
     /// 监听系统剪贴板变化并发 clipboardChanged 事件（v0.1.12）
+    /// v0.3.5：store 值加密（Windows DPAPI 当前用户作用域；`dpapi:` 前缀标记）。
+    /// Linux 无 DPAPI → 忽略（明文落盘，文档化；libsecret 列 v0.4+）。
+    store_encrypted: bool = false,
     clipboard_change_event: bool = false,
     /// OLE 拖放自定义格式名（v0.1.12）
     drag_formats: []const []const u8 = &.{},
