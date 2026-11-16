@@ -241,6 +241,7 @@ TS 工程用生成的绑定：`const g = await greet({ name: 'Zilt' });`（全�
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 分层架构、IPC/内存契约、运行模式 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 路线图与验收记录 |
+| [docs/v0.3.x-PLAN.md](docs/v0.3.x-PLAN.md) | **v0.3.x 系列规划**（对齐 Wails v3 / Tauri 2 差距：v0.3.2–v0.3.7 里程碑） |
 | [docs/v0.2-LINUX.md](docs/v0.2-LINUX.md) | **v0.2 Linux 开发需求文档**（选型/架构/功能矩阵/v0.2.0–v0.2.5 里程碑） |
 | [docs/research/](docs/research/) | 可行性调研报告（全部一手来源） |
 | [docs/reference/](docs/reference/) | WebView2 ABI 笔记（IID/vtable/loader 协议/实测陷阱） |

@@ -382,7 +382,23 @@
             exe 替换/备份 sha 匹配/10s 健康清理全绿）；
             Linux GUI 冒烟 **75/75 exit 0**（openbox）；Windows 单测 **281/282**
             （1 skip = POSIX 用例）、构建通过、冒烟 **49/49 ALL PASSED**。
-- [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）——v0.3+
+- [~] **v0.3.2+ 系列规划**（2026-11-16 制定；对标 Wails v3.0.0 stable / Tauri 2.12.6
+      全量差距刷新，详见 [`docs/v0.3.x-PLAN.md`](v0.3.x-PLAN.md)）：
+      - v0.3.2 WebView 数据与协议面：Windows 真 scheme（EnvironmentOptions4）/ 无痕窗口
+        （两平台）/ WebView2 设置开关面（autofill/password/zoomControl/backgroundThrottling）/
+        screens 细化（work_area/当前显示器）/ 电源与会话事件（WM_POWERBROADCAST+WTS / logind）
+      - v0.3.3 窗口体验包 II：PNG 形状 mask / 每按钮状态 / HideOnFocusLost+HideOnEscape /
+        托盘附着窗口 / 窗口级 KeyBindings / startResizeDragging / preventOverflow /
+        标题栏双击行为 / move 去抖 / 效果参数（tint/cornerPreference）/ Zig 侧窗口事件钩子
+      - v0.3.4 分发与更新：侧车资源/sidecar 全格式打包 / 离线 WebView2 fixed E2E /
+        更新器事件协议补全 + skipVersion + GitHub provider / 交叉编译 pack / 模板 TS 变体
+      - v0.3.5 安全与系统深化：isolation pattern（iframe 沙箱）/ Wayland portal 快捷键 /
+        DPAPI 加密 store / 绑定参数名保留（附带）
+      - v0.3.6 IPC v2 + CompositionController：原始二进制 IPC（SharedBuffer）/
+        WebView2 composition hosting + app-region 原生命中（失败回退 HWND 模式）
+      - v0.3.7（弹性）server 模式：浏览器客户端作为窗口 + WS 事件总线
+      - 明确推后（v0.4+/Phase 4）：macOS 全栈、iOS/Android、浏览器扩展、WML、GPU 信息、CLI 自更新
+- [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）——v0.4+
 - [x] 平台差异收敛原则：平台无关层（ipc/security/fs_api/protocol/net/sql/store/patch/pack_formats）
       两平台共用，差异只出现在 `platform/<os>/`
 
