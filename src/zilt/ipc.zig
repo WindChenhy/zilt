@@ -160,6 +160,26 @@ pub const WindowOptions = struct {
     /// v0.3.2：无痕窗口（Win：InPrivate controller；Linux：ephemeral data manager）。
     /// Cookie/localStorage/缓存不落盘，窗口关闭即消失。
     incognito: bool = false,
+    // ---- v0.3.3：窗口体验包 II ----
+    /// 窗口形状 mask（PNG 资产路径，alpha>阈值 → 区域外不响应/不渲染）。
+    /// Win：SetWindowRgn；Linux：input+shape region。
+    mask: ?[]const u8 = null,
+    /// 失焦自动隐藏（托盘弹窗类窗口）
+    hide_on_focus_lost: bool = false,
+    /// Escape 键隐藏窗口
+    hide_on_escape: bool = false,
+    /// 窗口位置始终夹取在最近显示器工作区内
+    prevent_overflow: bool = false,
+    /// 标题栏双击行为（overlay 拖动区双击）：maximize（默认）/ none
+    titlebar_double_click: ?bool = null,
+    /// windowMoved 事件去抖毫秒（0 = 不去抖；拖动中合并、结束补发一次终值）
+    move_debounce_ms: u32 = 0,
+    /// 窗口级按键绑定（accel → 事件 id）；accel 语法同 config.hotkeys
+    key_bindings: ?[]const @import("config.zig").Config.Hotkey = null,
+    /// 每按钮状态（Win 实装：系统菜单项；GTK3 无 API 文档化 NotSupported）
+    closable: ?bool = null,
+    minimizable: ?bool = null,
+    maximizable: ?bool = null,
 };
 
 /// v0.2.6：per-window `close_requested_event` 的两平台合并语义——
@@ -259,6 +279,15 @@ pub const WindowCmd = union(enum) {
     icon: ?[]const u8,
     /// 查询窗口当前状态（JSON），用于调试与自动化断言
     state,
+    // ---- v0.3.3：窗口体验包 II ----
+    /// 从内容区拖拽调整窗口大小（edge: n/s/e/w/ne/nw/se/sw）
+    resize_dragging: []const u8,
+    /// simple fullscreen（borderless 全屏别名；语义同 fullscreen，命名对齐 Tauri）
+    simple_fullscreen: bool,
+    /// 运行时每按钮状态（null = 不修改）
+    button_state: struct { closable: ?bool, minimizable: ?bool, maximizable: ?bool },
+    /// windowMoved 去抖毫秒（运行时修改；0 = 关闭去抖）
+    move_debounce: u32,
 };
 
 // ---------------------------------------------------------------------------
@@ -933,6 +962,13 @@ const runtime_js_head =
     \\        // v0.3.0: titlebarOverlay → titlebar_overlay / backgroundColor → background_color
     \\        if (o.titlebarOverlay !== undefined) o.titlebar_overlay = o.titlebarOverlay;
     \\        if (o.backgroundColor !== undefined) o.background_color = o.backgroundColor;
+    \\        // v0.3.3: 窗口体验包 II 的 camelCase → snake_case 映射
+    \\        if (o.hideOnFocusLost !== undefined) o.hide_on_focus_lost = o.hideOnFocusLost;
+    \\        if (o.hideOnEscape !== undefined) o.hide_on_escape = o.hideOnEscape;
+    \\        if (o.preventOverflow !== undefined) o.prevent_overflow = o.preventOverflow;
+    \\        if (o.titlebarDoubleClick !== undefined) o.titlebar_double_click = o.titlebarDoubleClick;
+    \\        if (o.moveDebounceMs !== undefined) o.move_debounce_ms = o.moveDebounceMs;
+    \\        if (o.keyBindings !== undefined) o.key_bindings = o.keyBindings;
     \\        return winApi('create', o);
     \\      },
     \\      close: (id) => winApi('close', { window_id: id }),
@@ -971,6 +1007,13 @@ const runtime_js_head =
     \\      fullscreenOnMonitor: (index, id) => winApi('fullscreenOnMonitor', { monitor: index ?? 0, window_id: id }),
     \\      setIcon: (path, id) => winApi('setIcon', { icon: path ?? null, window_id: id }),
     \\      state: (id) => winApi('state', { window_id: id }),
+    \\      // v0.3.3：窗口体验包 II
+    \\      startResizeDragging: (edge, id) => winApi('startResizeDragging', { cursor: edge ?? 'se', window_id: id }),
+    \\      setSimpleFullscreen: (enabled, id) => winApi('setSimpleFullscreen', { enabled: enabled !== false, window_id: id }),
+    \\      setButtonState: (opts, id) => winApi('setButtonState', {
+    \\        closable: opts?.closable, minimizable: opts?.minimizable, maximizable: opts?.maximizable, window_id: id,
+    \\      }),
+    \\      setMoveDebounce: (ms, id) => winApi('setMoveDebounce', { move_debounce_ms: ms ?? 0, window_id: id }),
     \\    },
     \\    // v0.1.9: eval returns a Promise resolved by __zilt.evalResult
     \\    eval: (script) => new Promise((resolve, reject) => {

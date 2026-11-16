@@ -83,6 +83,26 @@ pub const WM_ERASEBKGND: UINT = 0x0014;
 pub const WM_SETICON: UINT = 0x0080;
 pub const WM_NCLBUTTONDOWN: UINT = 0x00A1;
 pub const WM_TIMER: UINT = 0x0113;
+// v0.3.3：窗口体验包 II
+pub const WM_NCLBUTTONDBLCLK: UINT = 0x00A3;
+pub const WM_ACTIVATE: UINT = 0x0006;
+pub const WA_INACTIVE: WPARAM = 0;
+pub const WM_EXITSIZEMOVE: UINT = 0x0232;
+pub const SC_SIZE: DWORD = 0xF000;
+pub const SC_CLOSE: DWORD = 0xF060;
+pub const SC_MINIMIZE: DWORD = 0xF020;
+pub const SC_MAXIMIZE: DWORD = 0xF030;
+pub const MF_ENABLED: UINT = 0x00000000;
+pub const MF_GRAYED: UINT = 0x00000001;
+pub const RGN_OR: c_int = 2;
+pub extern "user32" fn GetSystemMenu(hwnd: HWND, revert: BOOL) ?*anyopaque;
+pub extern "user32" fn EnableMenuItem(hMenu: ?*anyopaque, uIDEnableItem: DWORD, uEnable: UINT) BOOL;
+pub extern "gdi32" fn CreateRectRgn(x1: c_int, y1: c_int, x2: c_int, y2: c_int) ?*anyopaque;
+pub extern "gdi32" fn CombineRgn(hrgnDest: *anyopaque, hrgnSrc1: *anyopaque, hrgnSrc2: *anyopaque, mode: c_int) c_int;
+pub extern "user32" fn SetWindowRgn(hwnd: HWND, hRgn: ?*anyopaque, redraw: BOOL) c_int;
+pub const RECT_NIF = extern struct { left: c_int, top: c_int, right: c_int, bottom: c_int };
+pub extern "shell32" fn Shell_NotifyIconGetRect(dwIdentifier: DWORD, hWnd: HWND, uID: DWORD, iconLocation: *RECT_NIF) c_int;
+pub extern "user32" fn CopyAcceleratorTableW(hacc: ?*anyopaque, paccel: ?[*]ACCEL, cAccel: c_int) c_int;
 pub const WM_DROPFILES: UINT = 0x0233;
 pub const WM_DPICHANGED: UINT = 0x02E0;
 // v0.3.2：电源/会话事件
@@ -312,6 +332,9 @@ pub extern "user32" fn FillRect(hdc: HDC, lprc: *const RECT, hbr: HBRUSH) callco
 pub extern "user32" fn InvalidateRect(hWnd: HWND, lpRect: ?*const RECT, bErase: BOOL) callconv(.c) BOOL;
 pub extern "gdi32" fn CreateSolidBrush(color: DWORD) callconv(.c) HBRUSH;
 pub extern "gdi32" fn DeleteObject(ho: ?*anyopaque) callconv(.c) BOOL;
+pub extern "user32" fn MonitorFromPoint(pt: POINT, flags: DWORD) ?*anyopaque;
+pub extern "user32" fn SystemParametersInfoW(uiAction: UINT, uiParam: UINT, pvParam: ?*anyopaque, fWinIni: UINT) BOOL;
+
 
 // ---- 剪贴板（user32）----
 

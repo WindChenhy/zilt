@@ -41,13 +41,13 @@ pub const MONITORINFOEXW = extern struct {
     szDevice: [32]u16,
 };
 
-extern "user32" fn EnumDisplayMonitors(
+pub extern "user32" fn EnumDisplayMonitors(
     hdc: ?*anyopaque,
     lprcClip: ?*const win32.RECT,
     lpfnEnum: *const fn (HMONITOR, ?*anyopaque, *win32.RECT, isize) callconv(.c) i32,
     dwData: isize,
 ) callconv(.c) win32.BOOL;
-extern "user32" fn GetMonitorInfoW(hMonitor: HMONITOR, lpmi: *MONITORINFOEXW) callconv(.c) win32.BOOL;
+pub extern "user32" fn GetMonitorInfoW(hMonitor: HMONITOR, lpmi: *MONITORINFOEXW) callconv(.c) win32.BOOL;
 extern "user32" fn GetDpiForWindow(hwnd: win32.HWND) callconv(.c) u32;
 
 const MONITORINFOF_PRIMARY: u32 = 0x1;

@@ -988,6 +988,32 @@ async function runChecks() {
         : `mons=${JSON.stringify(arr).slice(0, 120)} state=${JSON.stringify(st).slice(0, 80)}`);
     } catch (e) { setCheck('c-monitor', false, String(e.message || e)); }
 
+
+    // 53. v0.3.3：窗口体验包 II（创建选项全量 + 运行时 setter 往返）
+    try {
+      const w = await window.zilt.window.create({
+        title: 'exp2 probe', label: 'exp2-' + Date.now(),
+        width: 400, height: 300,
+        hideOnFocusLost: true, preventOverflow: true,
+        moveDebounceMs: 80, closable: false, minimizable: true,
+      });
+      const wid = w && typeof w.id === 'number' ? w.id : null;
+      let apiOk = wid != null;
+      if (apiOk) {
+        await window.zilt.window.setButtonState({ closable: true }, wid);
+        await window.zilt.window.setMoveDebounce(120, wid);
+        await window.zilt.window.setMoveDebounce(0, wid);
+        await window.zilt.window.setSimpleFullscreen(false, wid);
+        const st = await window.zilt.window.state(wid);
+        apiOk = !!st && typeof st.monitor === 'number';
+        await window.zilt.window.close(wid).catch(() => {});
+      }
+      setCheck('c-exp2', apiOk, apiOk
+        ? 'exp2 ok (create{mask-free opts} + setButtonState/setMoveDebounce/setSimpleFullscreen roundtrip)'
+        : `create=${JSON.stringify(w).slice(0, 60)}`);
+      if (!apiOk) window.zilt.log('warn', 'c-exp2 note: ' + JSON.stringify({ w: w, st: typeof st !== 'undefined' ? st : null }).slice(0, 140));
+    } catch (e) { setCheck('c-exp2', false, String(e.message || e)); window.zilt.log('warn', 'c-exp2 error: ' + String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -1044,6 +1070,7 @@ async function runChecks() {
       scheme: $('c-scheme').className === 'pass',
       privacy: $('c-privacy').className === 'pass',
       monitor: $('c-monitor').className === 'pass',
+      exp2: $('c-exp2').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

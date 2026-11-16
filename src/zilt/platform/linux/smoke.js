@@ -1088,6 +1088,19 @@ function runSecondWindowProbe() {
       `${arr.length} display(s) current=${cur.length ? cur[0].index : '-'} work=${cur.length ? cur[0].workWidth : '-'} state=${st.monitor}`);
   } catch (e) { check('monitor', false, String(e.message || e)); }
 
+  // ---- v0.3.3：窗口体验包 II（创建选项 + simple_fullscreen；resize_dragging 不自动测）----
+  try {
+    const w = await Z().window.create({ title: 'exp2 probe', label: 'exp2-' + Date.now(), width: 400, height: 300, hideOnFocusLost: true, preventOverflow: true });
+    const wid = w && typeof w.id === 'number' ? w.id : null;
+    let ok = wid != null;
+    if (ok) {
+      const st = await Z().window.state(wid);
+      ok = !!st && typeof st.monitor === 'number' && typeof st.incognito === 'boolean';
+      try { await Z().window.close(wid); } catch (_) {}
+    }
+    check('exp2', ok, `create=${JSON.stringify(w).slice(0, 40)} state ok=${ok}`);
+  } catch (e) { check('exp2', false, String(e.message || e)); }
+
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {
     await Z().invoke('__zilt.linuxSmoke', {

@@ -87,6 +87,13 @@ pub const Capability = enum {
     profile_settings,
     monitor_current,
     power_events,
+    // v0.3.3：窗口体验包 II
+    window_mask,
+    hide_on_focus_lost,
+    window_key_bindings,
+    resize_dragging,
+    prevent_overflow,
+    tray_attach_window,
 };
 
 /// Windows 后端当前实现的能力（v0.1.24 实测面）。
@@ -109,6 +116,8 @@ pub const windows_capabilities = [_]Capability{
     .msix,
     .real_scheme,           .incognito,      .background_throttling, .profile_settings,
     .monitor_current,       .power_events,
+    .window_mask,           .hide_on_focus_lost, .window_key_bindings, .resize_dragging,
+    .prevent_overflow,      .tray_attach_window,
 };
 
 /// Linux 目标能力（v0.2.0–v0.2.9 的验收清单；见 docs/v0.2-LINUX.md §5）。
@@ -129,8 +138,9 @@ pub const linux_target_capabilities = [_]Capability{
     .updater,               .headless,       .mcp,               .webdriver,
     .packaging,
     .real_scheme,           .incognito,      .monitor_current,   .power_events,
+    .window_mask,           .hide_on_focus_lost, .resize_dragging, .prevent_overflow,
     // v0.3.2 平台差异：background_throttling / profile_settings（autofill/password）
-    // Linux 无标准 API，文档化 NotSupported → 不在目标集
+    // v0.3.3 平台差异：window_key_bindings / tray_attach_window（Linux 未接线，文档化）
 };
 
 /// 编译期校验后端契约（`platform/mod.zig` 在本平台后端上调用一次）。

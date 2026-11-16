@@ -53,6 +53,7 @@ const security = @import("../../security.zig");
 const asset_routes = @import("../../asset_routes.zig");
 const inflate = @import("../../inflate.zig");
 const protocol = @import("../../protocol.zig");
+const png_mod = @import("../../png.zig");
 const app_data = @import("app_data.zig");
 const builtin = @import("../../builtin.zig");
 const shared_webview = @import("../../webview.zig");
@@ -392,8 +393,117 @@ fn wtsUnregister(hwnd: win32.HWND) void {
 }
 
 // ---------------------------------------------------------------------------
-// 启动参数 / 第二实例转发
+// v0.3.3：窗口体验包 II 辅助（每按钮状态 / mask / 按键绑定与 Escape ACCEL / overflow）
 // ---------------------------------------------------------------------------
+
+/// v0.3.3：resize 拖拽边名 → HT 代码（内容区拉伸窗口）。
+fn edgeHtFromName(name: []const u8) ?win32.LRESULT {
+    const map = [_]struct { n: []const u8, ht: win32.LRESULT }{
+        .{ .n = "n", .ht = win32.HTTOP },
+        .{ .n = "s", .ht = win32.HTBOTTOM },
+        .{ .n = "e", .ht = win32.HTRIGHT },
+        .{ .n = "w", .ht = win32.HTLEFT },
+        .{ .n = "ne", .ht = win32.HTTOPRIGHT },
+        .{ .n = "nw", .ht = win32.HTTOPLEFT },
+        .{ .n = "se", .ht = win32.HTBOTTOMRIGHT },
+        .{ .n = "sw", .ht = win32.HTBOTTOMLEFT },
+    };
+    for (map) |m| {
+        if (std.mem.eql(u8, m.n, name)) return m.ht;
+    }
+    return null;
+}
+
+/// 窗口级按键绑定 ACCEL id 基址（与菜单 id 空间隔离；菜单 id 从 1 起）
+const KEY_BINDING_ACCEL_BASE: u16 = 0xE000;
+/// hide_on_escape 的专用 ACCEL id
+const ESCAPE_ACCEL_ID: u16 = 0xF000;
+/// windowMoved 去抖定时器 id（避开 smoke=1 / updater health=3）
+const MOVE_DEBOUNCE_TIMER_ID: usize = 5;
+
+/// 读窗口现有 ACCEL 表内容（TranslateAccelerator 只查不改 → 复制后重建）。
+fn copyAccelEntries(haccel: win32.HACCEL, out: *std.ArrayListUnmanaged(win32.ACCEL)) void {
+    var count: c_int = win32.CopyAcceleratorTableW(haccel, null, 0);
+    if (count <= 0) return;
+    const buf = std.heap.page_allocator.alloc(win32.ACCEL, @intCast(count)) catch return;
+    defer std.heap.page_allocator.free(buf);
+    count = win32.CopyAcceleratorTableW(haccel, buf.ptr, count);
+    if (count > 0) out.appendSlice(std.heap.page_allocator, buf[0..@intCast(count)]) catch {};
+}
+
+/// ACCEL 列表建表（空表返回 null = HACCEL 的 null）。
+fn buildAccelTable(entries: []const win32.ACCEL) win32.HACCEL {
+    if (entries.len == 0) return null;
+    return win32.CreateAcceleratorTableW(@constCast(entries.ptr), @intCast(entries.len));
+}
+
+/// 窗口级按键绑定 → 与既有（菜单）accel 合并（accel.zig 解析，失败跳过该项）。
+fn mergeKeyBindingAccel(existing: win32.HACCEL, bindings: []const Config.Hotkey) win32.HACCEL {
+    var entries: std.ArrayListUnmanaged(win32.ACCEL) = .empty;
+    defer entries.deinit(std.heap.page_allocator);
+    if (existing) |h| copyAccelEntries(h, &entries);
+    for (bindings) |kb| {
+        // Hotkey 模型 = key + 显式修饰符（与 config.hotkeys 同构）
+        const vk = accel_mod.vkFromName(kb.key) orelse continue;
+        var f: u8 = win32.FVIRTKEY | win32.FNOINVERT;
+        if (kb.ctrl) f |= win32.FCONTROL;
+        if (kb.alt) f |= win32.FALT;
+        if (kb.shift) f |= win32.FSHIFT;
+        const idx: u16 = @intCast(entries.items.len);
+        entries.append(std.heap.page_allocator, .{
+            .fVirt = f,
+            .key = vk,
+            .cmd = KEY_BINDING_ACCEL_BASE + idx,
+        }) catch break;
+    }
+    return buildAccelTable(entries.items);
+}
+
+/// Escape 隐藏：给窗口 ACCEL 表追加 VK_ESCAPE 项（id 0xF000）。
+fn appendEscapeAccel(existing: win32.HACCEL) win32.HACCEL {
+    var entries: std.ArrayListUnmanaged(win32.ACCEL) = .empty;
+    defer entries.deinit(std.heap.page_allocator);
+    if (existing) |h| copyAccelEntries(h, &entries);
+    entries.append(std.heap.page_allocator, .{
+        .fVirt = win32.FVIRTKEY | win32.FNOINVERT,
+        .key = 0x1B, // VK_ESCAPE
+        .cmd = ESCAPE_ACCEL_ID,
+    }) catch return existing;
+    return buildAccelTable(entries.items);
+}
+
+/// 每按钮状态：系统菜单项灰化/恢复（SC_CLOSE/SC_MINIMIZE/SC_MAXIMIZE）。
+fn applyButtonStates(hwnd: win32.HWND, closable: ?bool, minimizable: ?bool, maximizable: ?bool) void {
+    const menu = win32.GetSystemMenu(hwnd, 0) orelse return;
+    const pairs = [_]struct { cmd: win32.DWORD, enabled: ?bool }{
+        .{ .cmd = win32.SC_CLOSE, .enabled = closable },
+        .{ .cmd = win32.SC_MINIMIZE, .enabled = minimizable },
+        .{ .cmd = win32.SC_MAXIMIZE, .enabled = maximizable },
+    };
+    for (pairs) |pair| {
+        const enabled = pair.enabled orelse continue;
+        const flags: win32.DWORD = if (enabled) win32.MF_BYCOMMAND | win32.MF_ENABLED else win32.MF_BYCOMMAND | win32.MF_GRAYED;
+        _ = win32.EnableMenuItem(menu, pair.cmd, flags);
+    }
+}
+
+/// 窗口矩形夹取到最近显示器工作区（preventOverflow）。返回夹取后的位置。
+fn clampRectToWorkArea(x: c_int, y: c_int, cx: c_int, cy: c_int) ?struct { x: c_int, y: c_int } {
+    const pt = win32.POINT{ .x = x + @divTrunc(cx, 2), .y = y + @divTrunc(cy, 2) };
+    const hmon = win32.MonitorFromPoint(pt, win32.MONITOR_DEFAULTTONEAREST) orelse return null;
+    var mi = win_sysinfo.MONITORINFOEXW{
+        .cbSize = @sizeOf(win_sysinfo.MONITORINFOEXW),
+        .rcMonitor = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+        .rcWork = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+        .dwFlags = 0,
+        .szDevice = std.mem.zeroes([32]u16),
+    };
+    if (win_sysinfo.GetMonitorInfoW(@ptrCast(hmon), &mi) == 0) return null;
+    const work = mi.rcWork;
+    const max_x = @max(work.left, work.right - cx);
+    const max_y = @max(work.top, work.bottom - cy);
+    return .{ .x = @min(@max(x, work.left), max_x), .y = @min(@max(y, work.top), max_y) };
+}
 
 fn collectArgs(alloc: std.mem.Allocator) ![]const []const u8 {
     var argc: i32 = 0;
@@ -1021,6 +1131,22 @@ fn Backend(comptime config: Config) type {
             user_agent: ?[]u8 = null,
             /// v0.3.2：无痕窗口（InPrivate controller：Cookie/存储不落盘）
             incognito: bool = false,
+            // ---- v0.3.3：窗口体验包 II ----
+            /// 失焦自动隐藏（托盘弹窗类窗口；WM_ACTIVATE WA_INACTIVE）
+            hide_on_focus_lost: bool = false,
+            /// Escape 隐藏（窗口 ACCEL 表专用 id ESCAPE_ACCEL_ID）
+            hide_on_escape: bool = false,
+            /// 窗口位置夹取在最近显示器工作区内（WM_WINDOWPOSCHANGING）
+            prevent_overflow: bool = false,
+            /// 标题栏双击行为（false=禁用最大化切换；null/true=默认切换）
+            titlebar_double_click: ?bool = null,
+            /// windowMoved 去抖毫秒（>0 拖动中合并、WM_TIMER 补发终值）
+            move_debounce_ms: u32 = 0,
+            move_timer_armed: bool = false,
+            /// 窗口级按键绑定（accel id 0xE000+i → windowKeyBinding 事件）
+            key_bindings: []const Config.Hotkey = &.{},
+            /// 托盘附着窗口（label 匹配 config.tray.attach_window → 托盘点击切换）
+            tray_attached: bool = false,
             menu_bitmaps: std.ArrayListUnmanaged(win32.HBITMAP) = .empty,
 
             fn updateBounds(self: *Window) void {
@@ -1337,6 +1463,9 @@ fn Backend(comptime config: Config) type {
             errdefer if (proxy) |p| self.allocator.free(p);
             const user_agent = if (opts.user_agent) |ua| try self.allocator.dupe(u8, ua) else null;
             errdefer if (user_agent) |ua| self.allocator.free(ua);
+            // v0.3.3：窗口级按键绑定（克隆到窗口生命周期）
+            const key_bindings = try self.allocator.dupe(Config.Hotkey, opts.key_bindings orelse &.{});
+            errdefer self.allocator.free(key_bindings);
 
             const w = try self.allocator.create(Window);
             errdefer self.allocator.destroy(w);
@@ -1363,6 +1492,16 @@ fn Backend(comptime config: Config) type {
                 .overlay = opts.titlebar_overlay,
                 .user_agent = user_agent,
                 .incognito = opts.incognito,
+                .hide_on_focus_lost = opts.hide_on_focus_lost,
+                .hide_on_escape = opts.hide_on_escape,
+                .prevent_overflow = opts.prevent_overflow,
+                .titlebar_double_click = opts.titlebar_double_click,
+                .move_debounce_ms = opts.move_debounce_ms,
+                .key_bindings = key_bindings,
+                .tray_attached = if (opts.label) |lbl|
+                    (if (config.tray) |tray| (tray.attach_window != null and std.mem.eql(u8, lbl, tray.attach_window.?)) else false)
+                else
+                    false,
             };
 
             const hinstance = win32.GetModuleHandleW(null);
@@ -1435,6 +1574,19 @@ fn Backend(comptime config: Config) type {
             }
             // v0.1.18：菜单加速键表（TranslateAccelerator 在消息循环里生效）
             if (has_menu) w.accel = menu_mod.buildAccel(self.allocator, menu_items);
+            // v0.3.3：窗口级按键绑定（id 0xE000+i）与 Escape（0xF000）追加进 ACCEL 表
+            if (w.key_bindings.len > 0) {
+                w.accel = mergeKeyBindingAccel(w.accel, w.key_bindings);
+            }
+            if (w.hide_on_escape) {
+                w.accel = appendEscapeAccel(w.accel);
+            }
+            // v0.3.3：每按钮状态（系统菜单项灰化）
+            applyButtonStates(w.hwnd, opts.closable, opts.minimizable, opts.maximizable);
+            // v0.3.3：窗口形状 mask（PNG alpha → SetWindowRgn）
+            if (opts.mask) |mask_path| {
+                applyWindowMask(self.allocator, w, mask_path);
+            }
 
             if (opts.always_on_top) {
                 _ = win32.SetWindowPos(w.hwnd, win32.HWND_TOPMOST, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
@@ -3661,6 +3813,64 @@ fn Backend(comptime config: Config) type {
             }
         }
 
+        /// comptime 资产表按路径查找（mask 用）。
+        fn assetBytes(path: []const u8) ?[]const u8 {
+            for (config.assets) |asset| {
+                if (std.mem.eql(u8, asset.path, path)) return asset.content;
+            }
+            return null;
+        }
+
+        /// 窗口形状 mask：PNG 资产 alpha>8 → SetWindowRgn（区域外不渲染/不点击）。
+        fn applyWindowMask(alloc: std.mem.Allocator, w: *Window, mask_path: []const u8) void {
+            const bytes = assetBytes(mask_path) orelse {
+                log.print("[mask] asset '{s}' not found (mask ignored)", .{mask_path});
+                return;
+            };
+            const img = png_mod.decode(alloc, bytes) catch |err| {
+                log.print("[mask] decode '{s}' failed: {s}", .{ mask_path, @errorName(err) });
+                return;
+            };
+            defer alloc.free(img.pixels);
+            // 逐行扫描 alpha>threshold 的连续段 → 每段一条 rect → CombineRgn 合并
+            var region: ?*anyopaque = null;
+            const threshold: u8 = 8;
+            var y: u32 = 0;
+            while (y < img.height) : (y += 1) {
+                var x: u32 = 0;
+                while (x < img.width) {
+                    if (img.pixels[(y * img.width + x) * 4 + 3] > threshold) {
+                        const start = x;
+                        while (x < img.width and img.pixels[(y * img.width + x) * 4 + 3] > threshold) x += 1;
+                        const r = win32.CreateRectRgn(@intCast(start), @intCast(y), @intCast(x), @intCast(y + 1)) orelse continue;
+                        if (region) |rgn| {
+                            _ = win32.CombineRgn(rgn, rgn, r, win32.RGN_OR);
+                            _ = win32.DeleteObject(r);
+                        } else {
+                            region = r;
+                        }
+                    } else {
+                        x += 1;
+                    }
+                }
+            }
+            if (region == null) {
+                log.print("[mask] '{s}' fully transparent (mask ignored)", .{mask_path});
+                return;
+            }
+            if (win32.SetWindowRgn(w.hwnd, region, 1) == 0) {
+                _ = win32.DeleteObject(@ptrCast(region));
+                log.print("[mask] SetWindowRgn failed", .{});
+                return;
+            }
+            // 成功后 region 所有权归系统（窗口销毁时由系统回收）
+            log.print("[mask] applied '{s}' ({d}x{d})", .{ mask_path, img.width, img.height });
+        }
+
+        // ---------------------------------------------------------------------------
+        // 启动参数 / 第二实例转发
+        // ---------------------------------------------------------------------------
+
         /// v0.3.2：把调用窗口所在显示器标记为 current（system.info('monitors')）。
         fn markCurrentMonitor(self: *Self, monitors: []shared_sysinfo.Monitor, w: ?*Window) void {
             _ = self;
@@ -4012,6 +4222,29 @@ fn Backend(comptime config: Config) type {
                 .start_dragging => {
                     _ = win32.ReleaseCapture();
                     _ = win32.SendMessageW(w.hwnd, win32.WM_NCLBUTTONDOWN, win32.HTCAPTION, 0);
+                    return true;
+                },
+                // v0.3.3：内容区拖拽缩放（SC_SIZE + WM_NCLBUTTONDOWN 到对应 HT 边）
+                .resize_dragging => |edge| {
+                    const ht: win32.LRESULT = edgeHtFromName(edge) orelse return false;
+                    _ = win32.ReleaseCapture();
+                    const WM_SYSCOMMAND_LOCAL: win32.UINT = 0x0112;
+                    _ = win32.SendMessageW(w.hwnd, WM_SYSCOMMAND_LOCAL, win32.SC_SIZE, @bitCast(@as(isize, @intCast(ht))));
+                    return true;
+                },
+                // v0.3.3：simple fullscreen（Win/Linux 全屏即 borderless 语义；命名对齐 Tauri）
+                .simple_fullscreen => |on| {
+                    self.setFullscreen(w, on);
+                    return true;
+                },
+                // v0.3.3：运行时每按钮状态
+                .button_state => |bs| {
+                    applyButtonStates(w.hwnd, bs.closable, bs.minimizable, bs.maximizable);
+                    return true;
+                },
+                // v0.3.3：运行时 move 去抖
+                .move_debounce => |ms| {
+                    w.move_debounce_ms = ms;
                     return true;
                 },
                 .always_on_top => |on| {
@@ -4505,11 +4738,40 @@ fn Backend(comptime config: Config) type {
             switch (action) {
                 .none => {},
                 .toggle_window => {
-                    const w = self.mainWindow() orelse return;
+                    // v0.3.3：attach_window（托盘附着窗）优先——点击托盘切换该窗口，
+                    // 并把窗口定位到托盘图标附近（Shell_NotifyIconGetRect）。
+                    var attached: ?*Window = null;
+                    for (self.windows.items) |win| {
+                        if (win.alive and win.tray_attached) attached = win;
+                    }
+                    const w = attached orelse (self.mainWindow() orelse return);
                     const visible = win32.IsWindowVisible(w.hwnd) != 0;
+                    if (!visible) {
+                        // 显示前定位到托盘图标附近（图标左下角对齐；超出屏幕由
+                        // prevent_overflow/系统夹取兜底）
+                        var loc: win32.RECT_NIF = undefined;
+                        if (self.tray) |*t| {
+                            if (win32.Shell_NotifyIconGetRect(0, t.nid.hWnd, t.nid.uID, &loc) == 0) {
+                                var wa: win32.RECT = undefined;
+                                _ = win32.SystemParametersInfoW(0x0030, 0, &wa, 0); // SPI_GETWORKAREA
+                                var rect: win32.RECT = undefined;
+                                _ = win32.GetWindowRect(w.hwnd, &rect);
+                                const cw = rect.right - rect.left;
+                                const ch = rect.bottom - rect.top;
+                                var x: i32 = loc.right - cw;
+                                var y: i32 = loc.bottom + 4;
+                                // 屏幕底部放不下 → 图标上方
+                                if (y + ch > wa.bottom) y = loc.top - ch - 4;
+                                x = @min(@max(x, wa.left), @max(wa.left, wa.right - cw));
+                                _ = win32.SetWindowPos(w.hwnd, null, x, y, 0, 0, win32.SWP_NOSIZE | win32.SWP_NOZORDER);
+                            }
+                        }
+                    }
                     _ = win32.ShowWindow(w.hwnd, if (visible) win32.SW_HIDE else win32.SW_SHOW);
                     if (!visible) _ = win32.SetForegroundWindow(w.hwnd);
-                    log.print("[tray] click -> {s}", .{if (visible) "hidden" else "shown"});
+                    log.print("[tray] click -> {s} (window #{d}{s})", .{
+                        if (visible) "hidden" else "shown", w.id, if (attached != null) " attached" else "",
+                    });
                 },
                 .show_menu => self.showTrayMenu(hwnd),
                 .emit_event => {
@@ -5122,6 +5384,28 @@ fn Backend(comptime config: Config) type {
                         if (b.windowOfHwnd(hwnd)) |w| {
                             var rc: win32.RECT = undefined;
                             if (win32.GetWindowRect(hwnd, &rc) != 0) {
+                                // v0.3.3：moveDebounceMs>0 → 拖动中合并（重启定时器，WM_TIMER 补发终值）
+                                if (w.move_debounce_ms > 0) {
+                                    _ = win32.SetTimer(w.hwnd, MOVE_DEBOUNCE_TIMER_ID, @max(1, w.move_debounce_ms), null);
+                                    w.move_timer_armed = true;
+                                } else {
+                                    w.emitEventPayload("windowMoved", .{ .id = w.id, .x = rc.left, .y = rc.top });
+                                }
+                            }
+                        }
+                    }
+                    return 0;
+                },
+                // v0.3.3：拖动结束 → 清去抖定时器并立即补发终值
+                win32.WM_EXITSIZEMOVE => {
+                    if (instance) |b| {
+                        if (b.windowOfHwnd(hwnd)) |w| {
+                            if (w.move_timer_armed) {
+                                _ = win32.KillTimer(w.hwnd, MOVE_DEBOUNCE_TIMER_ID);
+                                w.move_timer_armed = false;
+                            }
+                            var rc: win32.RECT = undefined;
+                            if (win32.GetWindowRect(w.hwnd, &rc) != 0) {
                                 w.emitEventPayload("windowMoved", .{ .id = w.id, .x = rc.left, .y = rc.top });
                             }
                         }
@@ -5204,6 +5488,31 @@ fn Backend(comptime config: Config) type {
                     }
                     return 0;
                 },
+                // v0.3.3：失焦自动隐藏（托盘弹窗类窗口；WA_INACTIVE=0 失去激活）
+                win32.WM_ACTIVATE => {
+                    if (instance) |b| {
+                        if (b.windowOfHwnd(hwnd)) |w| {
+                            if (w.hide_on_focus_lost and (wparam & 0xffff) == 0) {
+                                log.print("[window] #{d} focus lost -> hide", .{w.id});
+                                _ = win32.ShowWindow(w.hwnd, win32.SW_HIDE);
+                            }
+                        }
+                    }
+                    return 0;
+                },
+                // v0.3.3：标题栏双击（overlay 拖动区双击 → 切换最大化；false = 不动作）
+                win32.WM_NCLBUTTONDBLCLK => {
+                    if (instance) |b| {
+                        if (b.windowOfHwnd(hwnd)) |w| {
+                            if (w.overlay and (w.titlebar_double_click orelse true)) {
+                                const WM_SYSCOMMAND_DBL: win32.UINT = 0x0112;
+                                _ = win32.PostMessageW(w.hwnd, WM_SYSCOMMAND_DBL, win32.SC_MAXIMIZE, 0);
+                                return 0;
+                            }
+                        }
+                    }
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                },
                 win32.WM_THEMECHANGED => {
                     if (instance) |b| b.emitThemeAll();
                     return 0;
@@ -5247,9 +5556,18 @@ fn Backend(comptime config: Config) type {
                 win32.WM_WINDOWPOSCHANGING => {
                     if (instance) |b| {
                         if (b.windowOfHwnd(hwnd)) |w| {
-                            if (w.always_on_bottom and lparam != 0) {
+                            if (lparam != 0) {
                                 const wp: *win32.WINDOWPOS = @ptrCast(@alignCast(@as(*anyopaque, @ptrFromInt(@as(usize, @bitCast(lparam))))));
-                                if ((wp.flags & win32.SWP_NOZORDER) == 0) wp.hwndInsertAfter = win32.HWND_BOTTOM;
+                                if (w.always_on_bottom and (wp.flags & win32.SWP_NOZORDER) == 0) {
+                                    wp.hwndInsertAfter = win32.HWND_BOTTOM;
+                                }
+                                // v0.3.3：preventOverflow——窗口位置夹取到最近显示器工作区
+                                if (w.prevent_overflow and (wp.flags & win32.SWP_NOMOVE) == 0) {
+                                    if (clampRectToWorkArea(wp.x, wp.y, wp.cx, wp.cy)) |cl| {
+                                        wp.x = cl.x;
+                                        wp.y = cl.y;
+                                    }
+                                }
                             }
                         }
                     }
@@ -5330,6 +5648,20 @@ fn Backend(comptime config: Config) type {
                     return 0;
                 },
                 win32.WM_TIMER => {
+                    if (instance) |b| {
+                        if (b.windowOfHwnd(hwnd)) |w| {
+                            // v0.3.3：move 去抖补发终值（id 5；smoke=1/health=3 走原逻辑）
+                            if (wparam == MOVE_DEBOUNCE_TIMER_ID) {
+                                _ = win32.KillTimer(w.hwnd, MOVE_DEBOUNCE_TIMER_ID);
+                                w.move_timer_armed = false;
+                                var rc: win32.RECT = undefined;
+                                if (win32.GetWindowRect(w.hwnd, &rc) != 0) {
+                                    w.emitEventPayload("windowMoved", .{ .id = w.id, .x = rc.left, .y = rc.top });
+                                }
+                                return 0;
+                            }
+                        }
+                    }
                     if (wparam == 3) {
                         _ = win32.KillTimer(hwnd, 3);
                         const alloc_h = std.heap.page_allocator;
@@ -5356,6 +5688,22 @@ fn Backend(comptime config: Config) type {
                     if (instance) |b| {
                         if (b.windowOfHwnd(hwnd)) |w| {
                             const mid: u16 = @intCast(wparam & 0xffff);
+                            // v0.3.3：窗口级按键绑定（0xE000+i → windowKeyBinding）与 Escape（0xF000 → hide）
+                            if (mid >= KEY_BINDING_ACCEL_BASE and mid < ESCAPE_ACCEL_ID) {
+                                const idx: usize = mid - KEY_BINDING_ACCEL_BASE;
+                                if (idx < w.key_bindings.len) {
+                                    log.print("[keybinding] {s}", .{w.key_bindings[idx].id});
+                                    w.emitEventPayload("windowKeyBinding", .{ .id = w.key_bindings[idx].id });
+                                }
+                                return 0;
+                            }
+                            if (mid == ESCAPE_ACCEL_ID) {
+                                if (w.hide_on_escape) {
+                                    log.print("[window] #{d} escape -> hide", .{w.id});
+                                    _ = win32.ShowWindow(w.hwnd, win32.SW_HIDE);
+                                }
+                                return 0;
+                            }
                             if (menu_mod.idFromPopup(w.menu_items, 0, mid)) |id| {
                                 log.print("[menu] {s}", .{id});
                                 // v0.1.18：预定义角色先执行（copy/paste/…），同时发事件便于观测

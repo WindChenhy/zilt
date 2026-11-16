@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.2（Windows 真 scheme/无痕窗口/Profile 设置 + 电源会话事件 + Linux ephemeral/logind）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.3（窗口体验包 II：形状 mask/每按钮状态/托盘附着窗/KeyBindings/resize 拖拽/overflow/双击/去抖）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -44,6 +44,32 @@ v0.3.2 新增（2026-11-17，WebView 数据与协议面）：
   真 scheme 路由/节流开关/电源事件映射），冒烟 **52 项**（新增 c-scheme/c-privacy/c-monitor；
   clip 两项为已知桌面剪贴板占用环境问题）；Linux 单测全绿，冒烟 **77/77**（新增 privacy/monitor）
   + post terminate PASS；headless/MCP 全链路不受影响
+
+v0.3.3 新增（2026-11-17，窗口体验包 II——对齐 Wails WindowMask/ButtonState/KeyBindings + Tauri resize drag/preventOverflow）：
+
+- **窗口形状 mask**：`window.create({mask: <png 资产>})`——PNG alpha>8 逐行扫描 → 区域合并 →
+  Windows `SetWindowRgn` / Linux `gdk_window_shape_combine_region`+input shape（区域外不渲染/不点击）
+- **每按钮状态**：`window.create({closable,minimizable,maximizable})` + 运行时
+  `window.setButtonState({closable,...}, id)`——Windows 系统菜单项灰化/恢复（GTK3 无 API 文档化）
+- **托盘附着窗口**：`Config.tray.attach_window = <label>`——点击托盘切换该窗口显示/隐藏，
+  定位到托盘图标附近（Shell_NotifyIconGetRect，屏幕边缘自适应；配合 `hideOnFocusLost` 即托盘弹窗）
+- **失焦/Escape 隐藏**：`window.create({hideOnFocusLost, hideOnEscape})`——Windows 失焦
+  WM_ACTIVATE+WA_INACTIVE / Escape 经窗口 ACCEL 表（专用 id 0xF000）；Linux focus-out-event /
+  key-press-event（gdk_event_get_keyval，GdkEventKey opaque 规避）
+- **窗口级 KeyBindings**：`window.create({keyBindings:[{id,key,ctrl,...}]})`（语法同 config.hotkeys）
+  → `windowKeyBinding` 事件——Windows 窗口 ACCEL 表合并（id 空间 0xE000+；与菜单 accel 共存）
+- **内容区拉伸**：`window.startResizeDragging(edge)`（n/s/e/w/ne/nw/se/sw）——Windows
+  SC_SIZE+WM_NCLBUTTONDOWN；Linux `gtk_window_begin_resize_drag`
+- **preventOverflow**：`window.create({preventOverflow})`——窗口位置夹取最近显示器工作区
+  （Win：WM_WINDOWPOSCHANGING；Linux：configure-event 后 gdk workarea 夹取）
+- **标题栏双击**：`window.create({titlebarDoubleClick:false})` 可禁用 overlay 拖动区双击最大化
+  （Windows WM_NCLBUTTONDBLCLK；Linux 沿 WM 语义）
+- **move 去抖**：`window.create({moveDebounceMs})` + 运行时 `window.setMoveDebounce(ms)`——
+  拖动中合并 windowMoved、定时器补发终值（WM_EXITSIZEMOVE 立即补发）
+- **setSimpleFullscreen 别名**：语义同全屏（Win/Linux 全屏即 borderless；命名对齐 Tauri）
+- **验收**：Windows 单测全绿（+体验包动作映射）冒烟 **53 项**（+c-exp2：全量创建选项 +
+  setButtonState/setMoveDebounce/setSimpleFullscreen 往返）；Linux 单测全绿冒烟 **78/78**
+  （+exp2）；clip 两项为已知桌面剪贴板占用环境问题
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 

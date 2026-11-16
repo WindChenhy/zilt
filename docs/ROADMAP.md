@@ -416,11 +416,27 @@
         Linux 77 项（privacy/monitor）。**验收**：Windows 单测全绿 + 冒烟 52/52
         （clip/clipmulti 为桌面剪贴板占用环境问题，PowerShell Set-Clipboard 同样失败）；
         Linux 单测全绿 + 冒烟 77/77 + post terminate PASS（Xvfb+openbox）。
-- [~] **v0.3.3+ 系列规划**（2026-11-16 制定；对标 Wails v3.0.0 stable / Tauri 2.12.6
-      全量差距刷新，详见 [`docs/v0.3.x-PLAN.md`](v0.3.x-PLAN.md)）：
-      - v0.3.3 窗口体验包 II：PNG 形状 mask / 每按钮状态 / HideOnFocusLost+HideOnEscape /
-        托盘附着窗口 / 窗口级 KeyBindings / startResizeDragging / preventOverflow /
-        标题栏双击行为 / move 去抖 / 效果参数（tint/cornerPreference）/ Zig 侧窗口事件钩子
+- [x] **v0.3.3 窗口体验包 II**（2026-11-17；规划见 v0.3.x-PLAN）：
+      - **mask**：共享 png.zig 解码 alpha → 行扫描 rect 合并；Win SetWindowRgn（所有权归系统）/
+        Linux cairo region + shape/input shape 双通道（须 realize 后）
+      - **每按钮状态**：Win 系统菜单 EnableMenuItem（SC_CLOSE/MIN/MAXIMIZE）创建期 + 运行时
+        setButtonState；GTK3 无 API 文档化
+      - **托盘附着窗**：Config.tray.attach_window → 托盘左键切换定位（Shell_NotifyIconGetRect +
+        workarea 边界修正；底部放不下 → 图标上方）
+      - **hideOnFocusLost/Escape**：Win WM_ACTIVATE(WA_INACTIVE) / ACCEL 表专用 id 0xF000
+        （CopyAcceleratorTableW 复制重建合并菜单项）；Linux focus-out-event / key-press-event
+        （GdkEventKey opaque → gdk_event_get_keyval）
+      - **KeyBindings**：窗口 ACCEL id 0xE000+（与菜单 id 空间隔离）→ windowKeyBinding 事件；
+        Linux 未接线（GtkAccelGroup 闭包创建留待后续，文档化）
+      - **resize 拖拽 / overflow / 双击 / 去抖**：Win SC_SIZE+HT 边 / WM_WINDOWPOSCHANGING 夹取
+        （MONITORINFOEXW workarea，经 win_sysinfo pub 化复用）/ WM_NCLBUTTONDBLCLK → SC_MAXIMIZE /
+        WM_MOVE 合并 + WM_TIMER(id=5) 补发 + WM_EXITSIZEMOVE 终值；Linux gtk_window_begin_resize_drag /
+        configure-event 夹取
+      - **验收**：Windows 单测全绿冒烟 **53 项**（+c-exp2）；Linux 单测全绿冒烟 **78/78**；
+        实测坑：HACCEL/HMENU 本身是 optional（?win32.HACCEL = 双 optional 不可作 extern 返回）
+- [~] **v0.3.4+ 系列规划**（2026-11-16 制定；详见 [`docs/v0.3.x-PLAN.md`](v0.3.x-PLAN.md)）：
+      - v0.3.4 分发与更新：侧车资源/sidecar 全格式打包 / 离线 WebView2 fixed E2E /
+        更新器事件协议补全 + skipVersion + GitHub provider / 交叉编译 pack / 模板 TS 变体
       - v0.3.3 窗口体验包 II：PNG 形状 mask / 每按钮状态 / HideOnFocusLost+HideOnEscape /
         托盘附着窗口 / 窗口级 KeyBindings / startResizeDragging / preventOverflow /
         标题栏双击行为 / move 去抖 / 效果参数（tint/cornerPreference）/ Zig 侧窗口事件钩子

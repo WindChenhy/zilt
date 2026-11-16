@@ -134,6 +134,7 @@ const sysinfo_linux = @import("sysinfo_linux.zig");
 const menu_model = @import("../../menu_model.zig");
 const shared_sysinfo = @import("../../sysinfo.zig");
 const shared_power = @import("../../power.zig");
+const shared_png = @import("../../png.zig");
 const autostart_mod = @import("../../autostart.zig");
 const fs_api_mod = @import("../../fs_api.zig");
 const store_mod = @import("../../store.zig");
@@ -937,6 +938,11 @@ fn Backend(comptime config: Config) type {
             titlebar_overlay: bool = false,
             /// v0.3.2：无痕窗口（ephemeral data manager；Cookie/存储不落盘）
             incognito: bool = false,
+            // ---- v0.3.3：窗口体验包 II ----
+            hide_on_focus_lost: bool = false,
+            hide_on_escape: bool = false,
+            prevent_overflow: bool = false,
+            titlebar_double_click: ?bool = null,
             /// 鼠标穿透（GdkWindow input shape 置空）
             ignore_cursor: bool = false,
             /// 当前设置的光标（gdk_window_set_cursor 自己持有 ref；替换时 unref 旧值）
@@ -1719,6 +1725,10 @@ fn Backend(comptime config: Config) type {
                 .titlebar_overlay = overlay_title,
                 .transparent = opts.transparent,
                 .background_color = opts.background_color,
+                .hide_on_focus_lost = opts.hide_on_focus_lost,
+                .hide_on_escape = opts.hide_on_escape,
+                .prevent_overflow = opts.prevent_overflow,
+                .titlebar_double_click = opts.titlebar_double_click,
             };
 
             // 内容根：GtkBox（纵向）＝ 可选菜单栏 + GtkOverlay
@@ -1866,9 +1876,17 @@ fn Backend(comptime config: Config) type {
             //（Wayland 等非 X11 后端的低延迟路径；X11 由 focusPollTick 兜底）。
             _ = c.g_signal_connect_data(win, "notify::has-toplevel-focus", @ptrCast(&Self.onActiveNotify), st, null, 0);
             _ = c.g_signal_connect_data(win, "delete-event", @ptrCast(&Self.onDeleteEvent), st, null, 0);
+            // v0.3.3：Escape 隐藏（key-press-event；hideOnEscape opt-in）
+            if (st.hide_on_escape) {
+                _ = c.g_signal_connect_data(win, "key-press-event", @ptrCast(&Self.onKeyPress), st, null, 0);
+            }
             // v0.3.0：恢复过几何的窗口在 map 后补一次 move（WM 会忽略 map 前的请求）
             if (st.restored_geometry) {
                 _ = c.g_signal_connect_data(win, "map-event", @ptrCast(&Self.onMapRestore), st, null, 0);
+            }
+            // v0.3.3：窗口形状 mask（PNG alpha → cairo region → shape；realize 后有效）
+            if (opts.mask) |mask_path| {
+                Self.applyWindowMask(self.allocator, st, mask_path);
             }
             _ = c.g_signal_connect_data(
                 overlay,
@@ -2106,6 +2124,50 @@ fn Backend(comptime config: Config) type {
                         c.gtk_window_close(win);
                     }
                 },
+                .resize_dragging => |edge| {
+                    // v0.3.3：内容区拖拽缩放（gtk_window_begin_resize_drag）
+                    const st2 = self.windowById(window_id) orelse return false;
+                    const edge_int: c.gint = if (std.mem.eql(u8, edge, "n"))
+                        c.GDK_WINDOW_EDGE_NORTH
+                    else if (std.mem.eql(u8, edge, "s"))
+                        c.GDK_WINDOW_EDGE_SOUTH
+                    else if (std.mem.eql(u8, edge, "e"))
+                        c.GDK_WINDOW_EDGE_EAST
+                    else if (std.mem.eql(u8, edge, "w"))
+                        c.GDK_WINDOW_EDGE_WEST
+                    else if (std.mem.eql(u8, edge, "ne"))
+                        c.GDK_WINDOW_EDGE_NORTH_EAST
+                    else if (std.mem.eql(u8, edge, "nw"))
+                        c.GDK_WINDOW_EDGE_NORTH_WEST
+                    else if (std.mem.eql(u8, edge, "sw"))
+                        c.GDK_WINDOW_EDGE_SOUTH_WEST
+                    else
+                        c.GDK_WINDOW_EDGE_SOUTH_EAST;
+                    var px: c.gint = 0;
+                    var py: c.gint = 0;
+                    const display = c.gdk_display_get_default();
+                    if (display != null) {
+                        const seat = c.gdk_display_get_default_seat(display);
+                        if (seat != null) {
+                            const pointer = c.gdk_seat_get_pointer(seat);
+                            if (pointer != null) c.gdk_device_get_position(pointer, null, &px, &py);
+                        }
+                    }
+                    const ev_time: c.guint32 = @intCast(c.gtk_get_current_event_time());
+                    c.gtk_window_begin_resize_drag(st2.win, @intCast(edge_int), 1, px, py, ev_time);
+                    return true;
+                },
+                // v0.3.3：体验包 II 的 Linux 范围——simple_fullscreen 语义同 fullscreen；
+                // button_state（GTK3 无每按钮 API）与 move_debounce → NotSupported（文档化）
+                .simple_fullscreen => |on| {
+                    if (on) {
+                        c.gtk_window_fullscreen(win);
+                    } else {
+                        c.gtk_window_unfullscreen(win);
+                    }
+                },
+                .button_state => return false, // GTK3 无 per-button API（文档化）
+                .move_debounce => return false, // Linux 未接线（文档化）
                 .start_dragging => {
                     // 无鼠标事件上下文也能拖：取指针根坐标 + GLib 当前事件时间戳
                     const display = c.gdk_display_get_default() orelse return false;
@@ -7691,8 +7753,81 @@ fn Backend(comptime config: Config) type {
         /// 返回 FALSE 表示继续传播给 GTK 默认处理。
         /// 注意：translate-c 里 `GdkEvent` 是不透明 union，信号参数只能按
         /// `?*anyopaque` 接、再转成具体的 GdkEventConfigure。
+        /// v0.3.3：窗口形状 mask（PNG 资产 alpha>8 → cairo region；input+visual shape）。
+        fn applyWindowMask(alloc: std.mem.Allocator, st: *WinState, mask_path: []const u8) void {
+            const bytes = assetBytesFor(mask_path) orelse {
+                log.print("[mask] asset '{s}' not found (mask ignored)", .{mask_path});
+                return;
+            };
+            const img = shared_png.decode(alloc, bytes) catch |err| {
+                log.print("[mask] decode '{s}' failed: {s}", .{ mask_path, @errorName(err) });
+                return;
+            };
+            defer alloc.free(img.pixels);
+            const region = c.cairo_region_create() orelse return;
+            defer c.cairo_region_destroy(@ptrCast(region));
+            const threshold: u8 = 8;
+            var y: u32 = 0;
+            while (y < img.height) : (y += 1) {
+                var x: u32 = 0;
+                while (x < img.width) {
+                    if (img.pixels[(y * img.width + x) * 4 + 3] > threshold) {
+                        const start = x;
+                        while (x < img.width and img.pixels[(y * img.width + x) * 4 + 3] > threshold) x += 1;
+                        var rect = c.cairo_rectangle_int_t{
+                            .x = @intCast(start),
+                            .y = @intCast(y),
+                            .width = @intCast(x - start),
+                            .height = 1,
+                        };
+                        _ = c.cairo_region_union_rectangle(@ptrCast(region), &rect);
+                    } else {
+                        x += 1;
+                    }
+                }
+            }
+            const widget: [*c]c.GtkWidget = @ptrCast(st.win);
+            const gdk_win = c.gtk_widget_get_window(widget) orelse {
+                log.print("[mask] window not realized yet (mask deferred unsupported)", .{});
+                return;
+            };
+            c.gdk_window_shape_combine_region(gdk_win, @ptrCast(region), 0, 0);
+            c.gdk_window_input_shape_combine_region(gdk_win, @ptrCast(region), 0, 0);
+            log.print("[mask] applied '{s}' ({d}x{d})", .{ mask_path, img.width, img.height });
+        }
+
+        fn assetBytesFor(path: []const u8) ?[]const u8 {
+            for (config.assets) |asset| {
+                if (std.mem.eql(u8, asset.path, path)) return asset.content;
+            }
+            return null;
+        }
+
+        /// v0.3.3：窗口位置夹取工作区（preventOverflow；configure-event 时机）。
+        fn clampToWorkArea(st: *WinState) void {
+            if (!st.prevent_overflow or st.win == null) return;
+            const display = c.gdk_display_get_default() orelse return;
+            const widget: [*c]c.GtkWidget = @ptrCast(st.win);
+            const gdk_win = c.gtk_widget_get_window(widget) orelse return;
+            const mon = c.gdk_display_get_monitor_at_window(display, @ptrCast(gdk_win)) orelse return;
+            var work: c.GdkRectangle = std.mem.zeroes(c.GdkRectangle);
+            c.gdk_monitor_get_workarea(mon, &work);
+            var x: c.gint = 0;
+            var y: c.gint = 0;
+            c.gtk_window_get_position(st.win, &x, &y);
+            var w: c.gint = 0;
+            var h: c.gint = 0;
+            c.gtk_window_get_size(st.win, &w, &h);
+            const max_x = @max(work.x, work.x + work.width - w);
+            const max_y = @max(work.y, work.y + work.height - h);
+            const cx = @min(@max(x, work.x), max_x);
+            const cy = @min(@max(y, work.y), max_y);
+            if (cx != x or cy != y) c.gtk_window_move(st.win, cx, cy);
+        }
+
         fn onConfigureEvent(_: [*c]c.GtkWidget, event: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
             const st: *WinState = @ptrCast(@alignCast(user_data orelse return 0));
+            Self.clampToWorkArea(st);
             const cfg: [*c]c.GdkEventConfigure = @ptrCast(@alignCast(event orelse return 0));
             if (cfg.*.width > 0 and cfg.*.height > 0) {
                 st.geom_x = cfg.*.x;
@@ -7827,6 +7962,23 @@ fn Backend(comptime config: Config) type {
         }
 
         /// focus-in/out → windowFocus/windowBlur（去重）。
+        /// v0.3.3：Escape 隐藏（hideOnEscape）。GdkEventKey 是 opaque →
+        /// 经 gdk_event_get_keyval 取键值（translate-c 对 opaque 事件结构不可用）。
+        fn onKeyPress(_: [*c]c.GtkWidget, event: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
+            const st: *WinState = @ptrCast(@alignCast(user_data orelse return 0));
+            var keyval: c.guint = 0;
+            if (event != null) {
+                _ = c.gdk_event_get_keyval(@ptrCast(event), &keyval);
+            }
+            const is_escape: bool = keyval == 0xff1b;
+            if (is_escape and st.win != null) { // GDK_KEY_Escape = 0xff1b
+                c.gtk_widget_hide(@ptrCast(st.win));
+                log.print("[window] #{d} escape -> hide", .{st.id});
+                return 1;
+            }
+            return 0;
+        }
+
         fn onFocusChange(_: [*c]c.GtkWidget, event: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
             const st: *WinState = @ptrCast(@alignCast(user_data orelse return 0));
             const ev: [*c]c.GdkEventFocus = @ptrCast(@alignCast(event orelse return 0));
@@ -7847,6 +7999,11 @@ fn Backend(comptime config: Config) type {
         /// 焦点状态去重 + 事件发射（focus-in/out、属性通知与轮询共用）。
         fn notifyFocus(st: *WinState, focused: bool) void {
             if (focused == st.reported_focus) return;
+            // v0.3.3：失焦自动隐藏（hideOnFocusLost）
+            if (!focused and st.hide_on_focus_lost and st.win != null) {
+                c.gtk_widget_hide(@ptrCast(st.win));
+                log.print("[window] #{d} focus lost -> hide", .{st.id});
+            }
             st.reported_focus = focused;
             log.print("[window] focus changed #{d} focused={}", .{ st.id, focused });
             st.backend.emitWindowEvent(st, if (focused) "windowFocus" else "windowBlur", &.{

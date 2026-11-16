@@ -69,6 +69,17 @@ pub const Args = struct {
     user_agent: ?[]const u8 = null,
     /// v0.3.2：无痕窗口（window.create({incognito}) / webviews.create({incognito})）
     incognito: ?bool = null,
+    // ---- v0.3.3：窗口体验包 II ----
+    mask: ?[]const u8 = null,
+    hide_on_focus_lost: ?bool = null,
+    hide_on_escape: ?bool = null,
+    prevent_overflow: ?bool = null,
+    titlebar_double_click: ?bool = null,
+    move_debounce_ms: ?u32 = null,
+    key_bindings: ?[]const @import("config.zig").Config.Hotkey = null,
+    closable: ?bool = null,
+    minimizable: ?bool = null,
+    maximizable: ?bool = null,
     tag: ?[]const u8 = null,
     group: ?[]const u8 = null,
     progress: ?f64 = null,
@@ -314,6 +325,15 @@ pub fn windowCmdFromArgs(a: Args, current_window: u32) !ipc.WindowCmd {
     if (eql(u8, a.action, "fullscreenOnMonitor")) return .{ .fullscreen_monitor = a.monitor orelse 0 };
     if (eql(u8, a.action, "setIcon")) return .{ .icon = a.icon };
     if (eql(u8, a.action, "state")) return .state;
+    // ---- v0.3.3：窗口体验包 II ----
+    if (eql(u8, a.action, "startResizeDragging")) return .{ .resize_dragging = a.cursor orelse "se" };
+    if (eql(u8, a.action, "setSimpleFullscreen")) return .{ .simple_fullscreen = a.enabled orelse true };
+    if (eql(u8, a.action, "setButtonState")) return .{ .button_state = .{
+        .closable = a.closable,
+        .minimizable = a.minimizable,
+        .maximizable = a.maximizable,
+    } };
+    if (eql(u8, a.action, "setMoveDebounce")) return .{ .move_debounce = a.move_debounce_ms orelse 0 };
     _ = current_window;
     return error.UnknownWindowAction;
 }
@@ -343,6 +363,17 @@ fn windowCmd(ctx: ipc.Context, a: Args) ![]u8 {
             .decorations = a.decorations orelse true,
             // v0.3.2：无痕窗口
             .incognito = a.incognito orelse false,
+            // v0.3.3：窗口体验包 II
+            .mask = a.mask,
+            .hide_on_focus_lost = a.hide_on_focus_lost orelse false,
+            .hide_on_escape = a.hide_on_escape orelse false,
+            .prevent_overflow = a.prevent_overflow orelse false,
+            .titlebar_double_click = a.titlebar_double_click,
+            .move_debounce_ms = a.move_debounce_ms orelse 0,
+            .key_bindings = a.key_bindings,
+            .closable = a.closable,
+            .minimizable = a.minimizable,
+            .maximizable = a.maximizable,
         };
         if (a.window_id) |_| opts.parent = a.window_id;
         const id = spawn(ctx.backend, opts);
@@ -1115,4 +1146,33 @@ test "system dispatch goes through Context and encodes results" {
     const shell = try dispatch(testContext(t.allocator), "__zilt.shell", "{\"action\":\"openUrl\",\"url\":\"https://example.com\"}");
     defer t.allocator.free(shell.?);
     try t.expectEqualStrings("true", shell.?);
+}
+
+test "v0.3.3: 窗口体验包 II 动作映射（resize 拖拽/按钮状态/去抖/simple fullscreen）" {
+    const testing = std.testing;
+    // startResizeDragging
+    const rd = try windowCmdFromArgs(.{ .action = "startResizeDragging", .cursor = "nw" }, 1);
+    try testing.expectEqualStrings("nw", rd.resize_dragging);
+    // 非法边名透传给后端（edgeHtFromName 拒绝 → applyWindowCmd false）；dispatch 层不报错
+    const rd_bad = try windowCmdFromArgs(.{ .action = "startResizeDragging", .cursor = "xx" }, 1);
+    try testing.expectEqualStrings("xx", rd_bad.resize_dragging);
+    // setButtonState（null 全量 = 不修改也能构造）
+    const bs = try windowCmdFromArgs(.{ .action = "setButtonState", .closable = false, .minimizable = true }, 1);
+    try testing.expect(bs.button_state.closable == false);
+    try testing.expect(bs.button_state.minimizable == true);
+    try testing.expect(bs.button_state.maximizable == null);
+    // setMoveDebounce
+    const md = try windowCmdFromArgs(.{ .action = "setMoveDebounce", .move_debounce_ms = 120 }, 1);
+    try testing.expectEqual(@as(u32, 120), md.move_debounce);
+    // setSimpleFullscreen
+    const sf = try windowCmdFromArgs(.{ .action = "setSimpleFullscreen", .enabled = false }, 1);
+    try testing.expect(sf.simple_fullscreen == false);
+}
+
+test "v0.3.3: window.create 选项透传（体验包 II 字段进 WindowOptions）" {
+    const testing = std.testing;
+    // windowCmdFromArgs 之外的 create 分支需要 spawn 回调——这里验证 Args 字段存在与默认值
+    const a = Args{ .action = "create" };
+    try testing.expect(a.hide_on_focus_lost == null);
+    try testing.expectEqual(@as(?u32, null), a.move_debounce_ms);
 }

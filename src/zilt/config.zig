@@ -124,6 +124,9 @@ pub const Config = struct {
         menu: ?[]const MenuItem = null,
         /// 托盘图标（资产路径；null = 用 Config.icon（默认内置 Zig 图标））
         icon: ?[]const u8 = null,
+        /// v0.3.3：托盘附着窗口（label；托盘左键点击切换该窗口显示/隐藏，
+        ///     窗口建议同时 hide_on_focus_lost=true 以获得弹窗行为）
+        attach_window: ?[]const u8 = null,
     };
 
     /// 深链接 / 文件关联（HKCU 注册，per-user 无需管理员）。
