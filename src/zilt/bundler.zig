@@ -117,6 +117,9 @@ pub const InstallerConfig = struct {
     out_path: []const u8,
     /// 要打包的 exe 绝对路径（写入 File 指令）
     exe_path: []const u8,
+    /// v0.3.4：侧车资源目录（相对项目根；null/空 = 不打包）。生成
+    /// SetOutPath + File /r 片段（resources 子目录布局与 build install 一致）。
+    resources: ?[]const u8 = null,
     // ---- v0.1.15 安装器增强 ----
     /// per-machine 安装（Program Files + HKLM + 需要管理员）；默认 per-user
     per_machine: bool = false,
@@ -282,6 +285,22 @@ pub fn generateNsis(alloc: std.mem.Allocator, cfg: InstallerConfig) ![]u8 {
         const assoc_install = try buildAssocInstall(alloc, cfg);
         cur = try repStep(alloc, cur, "{ASSOC_INSTALL}", assoc_install);
         alloc.free(assoc_install);
+
+        // v0.3.4：侧车资源（{RESOURCES_INSTALL}；cfg.resources null/空 → 空片段）
+        {
+            const resources_block: []const u8 = if (cfg.resources) |res_dir| blk: {
+                if (res_dir.len == 0) break :blk "";
+                break :blk try std.fmt.allocPrint(
+                    alloc,
+                    "  SetOutPath \"$INSTDIR\\resources\"" ++ "\n" ++
+                        "  File /r \"{{RES_DIR}}\\*.*\"" ++ "\n" ++
+                        "  SetOutPath \"$INSTDIR\"",
+                    .{},
+                );
+            } else "";
+            cur = try repStep(alloc, cur, "{RESOURCES_INSTALL}", resources_block);
+            cur = try repStep(alloc, cur, "{RES_DIR}", cfg.resources orelse "");
+        }
 
         const assoc_uninstall = try buildAssocUninstall(alloc, cfg);
         cur = try repStep(alloc, cur, "{ASSOC_UNINSTALL}", assoc_uninstall);

@@ -177,5 +177,9 @@ pub const Config = struct {
         auto_restart: bool = false,
         /// 订阅通道（v0.1.15）："stable" | "beta"。beta 同时接受 stable 清单。
         channel: []const u8 = "stable",
+        /// v0.3.4：GitHub Releases provider——"owner/repo"。设置后 check 先请求
+        /// `releases/latest` 并解析 `zilt-manifest.json` asset 作为清单 URL
+        ///（manifest_url 仍作为回退/普通模式）。用户跳过的版本存 skipped.json。
+        github_repo: ?[]const u8 = null,
     };
 };

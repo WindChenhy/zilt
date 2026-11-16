@@ -386,6 +386,31 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // ---- v0.3.4：侧车资源（project.resources）→ zig-out/bin/resources/**（exe 旁）----
+    // 资源原样分发（无内容寻址）；目录缺失/为空静默跳过（模板项目未声明时零开销）。
+    {
+        // b.addInstallDirectory 是惰性 step（构建时由 install 拷贝）——configure 期
+        // 只需判断目录是否存在（configure 缓存毒性由既有 poisonCache 兜底）。
+        for (project.resources) |res_path| {
+            var dir = std.Io.Dir.cwd();
+            var io = std.Io.Threaded.init(b.allocator, .{});
+            defer io.deinit();
+            const st = dir.statFile(io.io(), res_path, .{}) catch continue;
+            if (st.kind == .directory) {
+                const inst = b.addInstallDirectory(.{
+                    .source_dir = .{ .cwd_relative = res_path },
+                    .install_dir = .{ .custom = b.fmt("bin/{s}", .{res_path}) },
+                    .install_subdir = "",
+                    .exclude_extensions = &.{},
+                });
+                b.getInstallStep().dependOn(&inst.step);
+            } else {
+                const inst = b.addInstallFileWithDir(.{ .cwd_relative = res_path }, .{ .custom = b.fmt("bin/{s}", .{res_path}) }, std.fs.path.basename(res_path));
+                b.getInstallStep().dependOn(&inst.step);
+            }
+        }
+    }
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run the demo app");

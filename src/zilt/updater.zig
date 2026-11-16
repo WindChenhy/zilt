@@ -12,6 +12,7 @@
 //! 使全部决策/验签/staging 逻辑可离线单测。
 
 const std = @import("std");
+const log = @import("log.zig");
 // v0.1.15: channel + rollback + health confirmation
 const bundler = @import("bundler.zig");
 
@@ -124,6 +125,33 @@ pub const Fetcher = struct {
 
 /// 检查更新：取 manifest → 比较 → 返回新版本 manifest；已是最新返回 null。
 /// 返回的 Manifest 字符串指向 arena。
+/// v0.3.4：github_repo 非空 → 经 releases/latest 解析清单 URL 再检查；
+/// 否则 manifest_url 直查。skipped_version 命中返回 null（视为无更新）。
+pub fn checkForUpdateEnv(arena: std.mem.Allocator, env: Env) UpdateError!?Manifest {
+    var effective_url = env.manifest_url;
+    if (env.github_repo) |repo| {
+        const api = try std.fmt.allocPrint(arena, "https://api.github.com/repos/{s}/releases/latest", .{repo});
+        const body = env.fetcher.fetchFn(env.fetcher.ctx, arena, api) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.UpdateUnsupported, // 网络/HTTP 失败 → 更新不可用
+        };
+        effective_url = manifestUrlFromGithubRelease(arena, body) orelse {
+            log.print("[updater] github release has no zilt-manifest.json asset", .{});
+            return null;
+        };
+    }
+    const m = try checkForUpdate(arena, env.fetcher, effective_url, env.current_version, env.channel);
+    if (m) |manifest| {
+        if (env.skipped_version) |skipped| {
+            if (std.mem.eql(u8, skipped, manifest.version)) {
+                log.print("[updater] {s} skipped by user", .{skipped});
+                return null;
+            }
+        }
+    }
+    return m;
+}
+
 pub fn checkForUpdate(arena: std.mem.Allocator, fetcher: Fetcher, manifest_url: []const u8, current_version: []const u8, channel: UpdateChannel) UpdateError!?Manifest {
     const raw = fetcher.fetchFn(fetcher.ctx, arena, manifest_url) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -316,6 +344,63 @@ pub fn cleanupOld(alloc: std.mem.Allocator, exe_path: []const u8) void {
 }
 
 /// 更新器运行环境（backend 组装后挂到 Context.updater_env）。
+// ---------------------------------------------------------------------------
+// v0.3.4：skipVersion + GitHub Releases provider
+// ---------------------------------------------------------------------------
+
+/// skipped.json 形态 `{"version":"1.2.3"}`（单版本；重复 skip 覆盖）。
+pub const Skipped = struct {
+    version: []const u8,
+};
+
+/// 解析 skipped.json（非法/为空 → null；调用方 arena）。
+pub fn parseSkipped(arena: std.mem.Allocator, json_bytes: []const u8) ?Skipped {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, json_bytes, .{}) catch return null;
+    const obj = switch (parsed) {
+        .object => |o| o,
+        else => return null,
+    };
+    const v = obj.get("version") orelse return null;
+    return switch (v) {
+        .string => |str| .{ .version = str },
+        else => null,
+    };
+}
+
+/// GitHub releases/latest 响应 → 更新清单 asset 的下载 URL。
+/// 约定：release assets 里名字为 `zilt-manifest.json` 的附件是更新清单。
+/// 非 GitHub API JSON / 无匹配 asset → null。
+pub fn manifestUrlFromGithubRelease(arena: std.mem.Allocator, json_bytes: []const u8) ?[]const u8 {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, json_bytes, .{}) catch return null;
+    const obj = switch (parsed) {
+        .object => |o| o,
+        else => return null,
+    };
+    const assets = obj.get("assets") orelse return null;
+    const arr = switch (assets) {
+        .array => |a| a,
+        else => return null,
+    };
+    for (arr.items) |item| {
+        const asset = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        const name_v = asset.get("name") orelse continue;
+        const name = switch (name_v) {
+            .string => |str| str,
+            else => continue,
+        };
+        if (!std.ascii.eqlIgnoreCase(name, "zilt-manifest.json")) continue;
+        const url_v = asset.get("browser_download_url") orelse continue;
+        return switch (url_v) {
+            .string => |str| str,
+            else => null,
+        };
+    }
+    return null;
+}
+
 pub const Env = struct {
     manifest_url: []const u8,
     public_key: [32]u8,
@@ -326,6 +411,11 @@ pub const Env = struct {
     fetcher: Fetcher,
     /// 订阅通道（stable 默认；beta 同时接受 stable 清单）
     channel: UpdateChannel = .stable,
+    /// v0.3.4：GitHub Releases provider（manifest_url 兼容：provider=github 时
+    /// 先经 releases/latest 解析 zilt-manifest.json asset 再走常规清单检查）
+    github_repo: ?[]const u8 = null,
+    /// v0.3.4：用户跳过的版本（skipped.json 持久化；check 命中则视为无更新）
+    skipped_version: ?[]const u8 = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -672,3 +762,30 @@ test "v0.3.1: POSIX rollbackToBackup / cleanupOld" {
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(io, old, alloc, .limited(64)));
 }
 
+
+
+test "v0.3.4: parseSkipped（合法/非法/缺字段）" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ok = parseSkipped(arena.allocator(), "{\"version\":\"1.2.3\"}").?;
+    try std.testing.expectEqualStrings("1.2.3", ok.version);
+    try std.testing.expect(parseSkipped(arena.allocator(), "{}") == null);
+    try std.testing.expect(parseSkipped(arena.allocator(), "not-json") == null);
+    try std.testing.expect(parseSkipped(arena.allocator(), "[1,2]") == null);
+}
+
+test "v0.3.4: manifestUrlFromGithubRelease（asset 匹配/大小写/缺失）" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture =
+        \\{"tag_name":"v2.0.0","assets":[
+        \\  {"name":"app-setup.exe","browser_download_url":"https://x/app.exe"},
+        \\  {"name":"Zilt-Manifest.json","browser_download_url":"https://x/zilt-manifest.json"}
+        \\]}
+    ;
+    const url = manifestUrlFromGithubRelease(a, fixture).?;
+    try std.testing.expectEqualStrings("https://x/zilt-manifest.json", url);
+    try std.testing.expect(manifestUrlFromGithubRelease(a, "{\"assets\":[]}") == null);
+    try std.testing.expect(manifestUrlFromGithubRelease(a, "garbage") == null);
+}

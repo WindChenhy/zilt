@@ -3589,6 +3589,27 @@ fn Backend(comptime config: Config) type {
                     log.print("[updater] manual check started (from JS)", .{});
                     return .{ .ok = true };
                 },
+                // v0.3.4：跳过版本（skipped.json 持久化；updaterFlow 读取）
+                .skip => |version| {
+                    var io_io = std.Io.Threaded.init(alloc, .{});
+                    defer io_io.deinit();
+                    const root = self.storage_root orelse return .{ .ok = false };
+                    const path = std.fmt.allocPrint(alloc, "{s}\\skipped.json", .{root}) catch return .{ .ok = false };
+                    defer alloc.free(path);
+                    const body = try std.fmt.allocPrint(alloc, "{{\"version\":\"{s}\"}}", .{version});
+                    defer alloc.free(body);
+                    var wd = std.Io.Dir.cwd();
+                    wd.writeFile(io_io.io(), .{ .sub_path = path, .data = body }) catch {
+                        log.print("[updater] skipped.json write failed", .{});
+                        return .{ .ok = false };
+                    };
+                    log.print("[updater] version {s} skipped", .{version});
+                    // 立即刷新 env 的 skipped_version（本进程内后续 check 生效）
+                    if (self.updater_env) |*env| {
+                        env.skipped_version = self.allocator.dupe(u8, version) catch null;
+                    }
+                    return .{ .ok = true };
+                },
             }
         }
 
@@ -6808,6 +6829,21 @@ fn buildUpdaterEnv(self: anytype, uc: anytype) !updater.Env {
 
     const channel: updater.UpdateChannel = if (std.mem.eql(u8, uc.channel, "beta")) .beta else .stable;
 
+    // v0.3.4：skipped.json（用户跳过的版本；缺失 = 无跳过）
+    var skipped_version: ?[]const u8 = null;
+    if (self.storage_root) |root| {
+        const skip_path = std.fmt.allocPrint(self.allocator, "{s}\\skipped.json", .{root}) catch null;
+        if (skip_path) |sp| {
+            defer self.allocator.free(sp);
+            if (win32.readFileAlloc(self.allocator, sp)) |body| {
+                defer self.allocator.free(body);
+                if (updater.parseSkipped(self.allocator, body)) |sk| {
+                    skipped_version = self.allocator.dupe(u8, sk.version) catch null;
+                }
+            }
+        }
+    }
+
     return .{
         .channel = channel,
         .manifest_url = manifest_url,
@@ -6816,6 +6852,8 @@ fn buildUpdaterEnv(self: anytype, uc: anytype) !updater.Env {
         .exe_path = try currentExePath(self.allocator),
         .exe_name = uc.exe_name,
         .fetcher = .{ .ctx = self, .fetchFn = httpFetch },
+        .github_repo = uc.github_repo,
+        .skipped_version = skipped_version,
     };
 }
 
@@ -7938,7 +7976,7 @@ fn updaterFlow(self: anytype) void {
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
 
-    const m = updater.checkForUpdate(arena.allocator(), env.fetcher, env.manifest_url, env.current_version, env.channel) catch |err| {
+    const m = updater.checkForUpdateEnv(arena.allocator(), env) catch |err| {
         log.print("[updater] check failed: {s}", .{@errorName(err)});
         ctx.emit("updaterFailed", .{ .stage = "check", .err = @errorName(err) });
         return;
@@ -7964,6 +8002,8 @@ fn updaterFlow(self: anytype) void {
         }
     }
     if (artifact == null) {
+        // v0.3.4：下载/校验生命周期事件（细粒度字节进度需要 fetcher 回调，列后续）
+        ctx.emit("updateDownloading", .{ .version = m.version });
         artifact = updater.downloadAndVerify(self.allocator, env.fetcher, m, env.public_key) catch |err| {
             log.print("[updater] download/verify failed: {s}", .{@errorName(err)});
             ctx.emit("updaterFailed", .{ .stage = "download", .err = @errorName(err) });

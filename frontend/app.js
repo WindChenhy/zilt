@@ -1014,6 +1014,16 @@ async function runChecks() {
       if (!apiOk) window.zilt.log('warn', 'c-exp2 note: ' + JSON.stringify({ w: w, st: typeof st !== 'undefined' ? st : null }).slice(0, 140));
     } catch (e) { setCheck('c-exp2', false, String(e.message || e)); window.zilt.log('warn', 'c-exp2 error: ' + String(e.message || e)); }
 
+
+    // 54. v0.3.4：侧车资源（path.resource 解析 + 存在性；dev 下 exe 旁 resources/）
+    try {
+      const r = await window.zilt.invoke('__zilt.path', { action: 'resource', path: 'demo/manifest.json' });
+      const ok = !!r && typeof r.path === 'string' && r.path.length > 0 && r.exists === true;
+      setCheck('c-res', ok, ok
+        ? `resource ok (${String(r.path).slice(-60)})`
+        : `resource=${JSON.stringify(r)}`);
+    } catch (e) { setCheck('c-res', false, String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -1071,6 +1081,7 @@ async function runChecks() {
       privacy: $('c-privacy').className === 'pass',
       monitor: $('c-monitor').className === 'pass',
       exp2: $('c-exp2').className === 'pass',
+      res: $('c-res').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

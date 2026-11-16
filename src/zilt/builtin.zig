@@ -69,6 +69,8 @@ pub const Args = struct {
     user_agent: ?[]const u8 = null,
     /// v0.3.2：无痕窗口（window.create({incognito}) / webviews.create({incognito})）
     incognito: ?bool = null,
+    /// v0.3.4：updater.skipVersion 的版本串
+    version_str: ?[]const u8 = null,
     // ---- v0.3.3：窗口体验包 II ----
     mask: ?[]const u8 = null,
     hide_on_focus_lost: ?bool = null,
@@ -793,6 +795,11 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
     if (eql(u8, name, "updater")) {
         if (eql(u8, a.action, "info")) return .{ .updater = .info };
         if (eql(u8, a.action, "check")) return .{ .updater = .check };
+        // v0.3.4：跳过版本（skipped.json；version 字段复用现有 Args.version）
+        if (eql(u8, a.action, "skip")) {
+            const ver = a.version_str orelse return error.MissingVersion;
+            return .{ .updater = .{ .skip = ver } };
+        }
         return error.UnknownUpdaterAction;
     }
 
@@ -931,6 +938,29 @@ fn pathCmd(ctx: ipc.Context, a: Args) ![]u8 {
         const joined = try std.fs.path.join(alloc, items);
         defer alloc.free(joined);
         return std.json.Stringify.valueAlloc(alloc, joined, .{});
+    }
+
+    // v0.3.4：侧车资源解析（<exe 目录>/resources/<rel> + 存在性检查）。
+    // 安装器/便携包把 resources/ 放在 exe 旁边（build install 与 NSIS 同布局）。
+    if (eql(u8, a.action, "resource")) {
+        const rel = a.path orelse return error.MissingPath;
+        if (std.fs.path.isAbsolute(rel) or std.mem.indexOf(u8, rel, "..") != null) {
+            return std.json.Stringify.valueAlloc(alloc, .{ .path = "", .exists = false }, .{});
+        }
+        var io = std.Io.Threaded.init(alloc, .{});
+        defer io.deinit();
+        const exe = std.process.executablePathAlloc(io.io(), alloc) catch {
+            return std.json.Stringify.valueAlloc(alloc, .{ .path = "", .exists = false }, .{});
+        };
+        defer alloc.free(exe);
+        const dir = std.fs.path.dirname(exe) orelse "";
+        const full = try std.fs.path.join(alloc, &.{ dir, "resources", rel });
+        var exists = false;
+        var rdir = std.Io.Dir.cwd();
+        if (rdir.statFile(io.io(), full, .{})) |_| {
+            exists = true;
+        } else |_| {}
+        return std.json.Stringify.valueAlloc(alloc, .{ .path = full, .exists = exists }, .{});
     }
 
     const p = a.path orelse return error.MissingPath;

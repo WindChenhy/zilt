@@ -292,7 +292,12 @@ pub const AclOp = union(enum) {
     revoke: AclGrant,
 };
 
-pub const UpdaterOp = enum { info, check };
+pub const UpdaterOp = union(enum) {
+    info,
+    check,
+    /// v0.3.4：跳过指定版本（skipped.json；重复 skip 覆盖）
+    skip: []const u8,
+};
 
 /// v0.1.17：SQL 操作。query 返回行集 JSON；execute 返回 {changes,last_id}。
 pub const SqlOp = union(enum) {

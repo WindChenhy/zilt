@@ -5,7 +5,7 @@ pub const app_name = "Zilt";
 pub const publisher = "Zilt";
 /// 运行时版本在 `src/zilt/version.zig`（zilt 模块内）；两处必须一致，
 /// build.zig 顶部有编译期断言强制校验（不一致直接编译失败）。
-pub const version = "0.3.3";
+pub const version = "0.3.4";
 pub const app_id = "app.zilt.desktop";
 pub const exe_name = "zilt-app.exe";
 
@@ -14,6 +14,13 @@ pub const exe_name = "zilt-app.exe";
 pub const icon: ?[]const u8 = null;
 
 // 前端工程配置（语义对齐 Tauri build 四件套，见 docs/research/frontend-integration.md §4.1）
+// v0.3.4：侧车资源（resources）——随安装器/便携包分发的外部文件（相对项目根）。
+// 目录 = 整树复制；文件 = 单文件。安装布局：<安装目录>/resources/<相对路径>。
+// 运行时经 `window.zilt.path.resource(rel)` 解析（exe 目录 + resources/rel）。
+pub const resources = [_][]const u8{
+    "resources",
+};
+
 pub const frontend = .{
     // 前端工程目录（package.json 所在处；build_command 的 cwd）
     .dir = "frontend",

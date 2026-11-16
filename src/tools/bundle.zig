@@ -123,6 +123,8 @@ pub fn main() !void {
         .setup_icon = setup_icon,
         .schemes = schemes,
         .file_exts = file_exts,
+        // v0.3.4：侧车资源（project.resources 首项；build install 同布局）
+        .resources = if (app_meta.resources.len > 0) app_meta.resources[0] else null,
     });
     // makensis 以 UTF-8 BOM 识别编码（脚本含非 ASCII 注释）
     const bom = "\xEF\xBB\xBF";

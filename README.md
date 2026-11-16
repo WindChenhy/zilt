@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.3（窗口体验包 II：形状 mask/每按钮状态/托盘附着窗/KeyBindings/resize 拖拽/overflow/双击/去抖）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.4（侧车资源分发 + 更新器 skipVersion/GitHub provider + path.resource）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -70,6 +70,26 @@ v0.3.3 新增（2026-11-17，窗口体验包 II——对齐 Wails WindowMask/But
 - **验收**：Windows 单测全绿（+体验包动作映射）冒烟 **53 项**（+c-exp2：全量创建选项 +
   setButtonState/setMoveDebounce/setSimpleFullscreen 往返）；Linux 单测全绿冒烟 **78/78**
   （+exp2）；clip 两项为已知桌面剪贴板占用环境问题
+
+v0.3.4 新增（2026-11-17，分发与更新）：
+
+- **侧车资源（resources）**：`project.zig` 声明 `resources`（相对项目根的目录/文件）→
+  `zig build` 安装到 exe 旁 `resources/**`（`addInstallDirectory`）→ NSIS 安装器
+  `File /r` 同布局分发（`{RESOURCES_INSTALL}` 占位符）→ 运行时
+  `window.zilt.path.resource(rel)` 解析（防穿越：拒绝绝对路径与 `..`）+ 存在性检查。
+  demo 资源 `resources/demo/` 冒烟断言（c-res）。deb/AppImage 的 resources 分发列后续
+- **更新器 skipVersion**：`window.zilt.updater.skipVersion(v)` → `<appData>/skipped.json`
+  （单版本覆盖式）→ check 命中即视为无更新（进程内立即生效 + 启动加载持久化）
+- **GitHub Releases provider**：`Config.update.github_repo = "owner/repo"` → check 先请求
+  `releases/latest` 解析 `zilt-manifest.json` asset 作为清单 URL（manifest_url 兜底）；
+  Fetcher 注入离线单测（release assets 匹配/大小写/缺失）
+- **更新器事件补全**：`updateDownloading`（下载开始）入列（updateInfo/updateStaged/
+  updaterFailed 既有）；细粒度字节进度需 fetcher 回调，列后续
+- **验收**：Windows 单测全绿（+parseSkipped/manifestUrlFromGithubRelease）冒烟 **54 项**
+  （+c-res）；Linux 单测全绿冒烟 **78/78**；clip 两项为已知桌面剪贴板占用环境问题
+- **范围说明**：E2（离线 WebView2 fixed 打包 E2E）与 E4（交叉编译 pack 流水线）留待
+  专项迭代（fixed loader 代码路径已有单测；deb/AppImage 交叉产出待 CI 验证）；模板
+  TS 变体（F2）同批延后
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 

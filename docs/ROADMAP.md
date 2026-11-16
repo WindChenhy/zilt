@@ -434,9 +434,19 @@
         configure-event 夹取
       - **验收**：Windows 单测全绿冒烟 **53 项**（+c-exp2）；Linux 单测全绿冒烟 **78/78**；
         实测坑：HACCEL/HMENU 本身是 optional（?win32.HACCEL = 双 optional 不可作 extern 返回）
-- [~] **v0.3.4+ 系列规划**（2026-11-16 制定；详见 [`docs/v0.3.x-PLAN.md`](v0.3.x-PLAN.md)）：
-      - v0.3.4 分发与更新：侧车资源/sidecar 全格式打包 / 离线 WebView2 fixed E2E /
-        更新器事件协议补全 + skipVersion + GitHub provider / 交叉编译 pack / 模板 TS 变体
+- [x] **v0.3.4 分发与更新**（2026-11-17；规划见 v0.3.x-PLAN）：
+      - **侧车资源**：project.resources → addInstallDirectory（exe 旁 resources/**，显式
+        dependOn install step）→ NSIS {RESOURCES_INSTALL}（SetOutPath+File /r，与 install
+        同布局）→ path.resource 运行时解析（防穿越 + exists）。实测坑：build.zig 的
+        std.Io.Dir/statFile 三参形态 + addInstallDirectory 需手动挂 install step
+      - **更新器**：skipped.json（parseSkipped 单测）+ skip op（两平台 runUpdaterOp，
+        Win Io.Dir.writeFile options 形态）+ checkForUpdateEnv（github_repo → releases/
+        latest → zilt-manifest.json asset；fetchFn anyerror → UpdateError 映射）+
+        updateDownloading 事件（updaterFlow 双平台）
+      - **验收**：Windows 单测全绿冒烟 54 项（+c-res）；Linux 单测全绿冒烟 78/78
+      - **范围**：E2/E4/F2 延后（见 v0.3.x-PLAN 范围说明）
+- [~] **v0.3.5+ 系列规划**（详见 [`docs/v0.3.x-PLAN.md`](v0.3.x-PLAN.md)）：
+      - v0.3.5 安全与系统深化：isolation pattern / Wayland portal 快捷键 / DPAPI 加密 store
       - v0.3.3 窗口体验包 II：PNG 形状 mask / 每按钮状态 / HideOnFocusLost+HideOnEscape /
         托盘附着窗口 / 窗口级 KeyBindings / startResizeDragging / preventOverflow /
         标题栏双击行为 / move 去抖 / 效果参数（tint/cornerPreference）/ Zig 侧窗口事件钩子
