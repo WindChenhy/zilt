@@ -269,6 +269,22 @@ pub const Driver = struct {
             defer self.allocator.free(wide);
             try check(s2.lpVtbl.put_UserAgent(s2, wide.ptr));
         }
+        // v0.3.2：Profile6 autofill / password autosave（Profile 级设置）。
+        // Profile6 需 WebView2 运行时 1.0.1661+——QI 失败仅跳过，不视为致命
+        // （与 transparent 依赖 Controller2 的降级策略一致）。
+        if (wv2.ICoreWebView2_4.fromWebView(self.webview)) |wv4| {
+            defer wv4.release();
+            const gp = wv4.getProfile();
+            if (com.succeeded(gp.hr)) {
+                if (gp.profile) |profile| {
+                    if (profile.asProfile6()) |p6| {
+                        defer p6.release();
+                        _ = p6.putGeneralAutofill(o.autofill);
+                        _ = p6.putPasswordAutosave(o.password_autosave);
+                    }
+                }
+            }
+        }
     }
 
     fn emit(self: *Driver, name: []const u8, value: anytype) void {

@@ -67,6 +67,8 @@ pub const Args = struct {
     download_id: ?u64 = null,
     /// v0.1.24：窗口/WebView 的 User-Agent
     user_agent: ?[]const u8 = null,
+    /// v0.3.2：无痕窗口（window.create({incognito}) / webviews.create({incognito})）
+    incognito: ?bool = null,
     tag: ?[]const u8 = null,
     group: ?[]const u8 = null,
     progress: ?f64 = null,
@@ -339,6 +341,8 @@ fn windowCmd(ctx: ipc.Context, a: Args) ![]u8 {
             .background_color = a.background_color,
             .titlebar_overlay = a.titlebar_overlay orelse false,
             .decorations = a.decorations orelse true,
+            // v0.3.2：无痕窗口
+            .incognito = a.incognito orelse false,
         };
         if (a.window_id) |_| opts.parent = a.window_id;
         const id = spawn(ctx.backend, opts);
@@ -822,6 +826,7 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
             .height = @intCast(a.height orelse 300),
             .url = a.url orelse "",
             .partition = a.partition,
+            .incognito = a.incognito orelse false,
         } } };
         if (eql(u8, a.action, "remove")) return .{ .webviews = .{ .remove = a.id orelse return error.MissingId } };
         if (eql(u8, a.action, "navigate")) return .{ .webviews = .{ .navigate = .{

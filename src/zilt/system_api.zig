@@ -217,6 +217,9 @@ pub const WebviewCreate = struct {
     /// folder（`<profile>\WebView2-partitions\<name>`），该 webview 的 Web 存储
     /// 与主页面完全隔离。同一 partition 名在多次 create 间复用同一个 Environment。
     partition: ?[]const u8 = null,
+    /// v0.3.2：无痕子 webview（Win：InPrivate controller；Linux：ephemeral data
+    /// manager）。与 partition 互斥——同时给出时 incognito 优先（分区被忽略）。
+    incognito: bool = false,
 };
 pub const WebviewsOp = union(enum) {
     create: WebviewCreate,

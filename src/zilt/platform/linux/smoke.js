@@ -1069,6 +1069,25 @@ function runSecondWindowProbe() {
     check('drag.out', ok !== false && alive, `start=${ok} alive=${alive}`);
   } catch (e) { check('drag.out', false, String(e.message || e)); }
 
+  // ---- v0.3.2：无痕窗口（window.create({incognito}) → state().incognito）----
+  try {
+    const w = await Z().window.create({ title: 'incognito probe', label: 'incog-' + Date.now(), width: 240, height: 160, incognito: true });
+    const st = w && typeof w.id === 'number' ? await Z().window.state(w.id) : null;
+    try { if (w && typeof w.id === 'number') await Z().window.close(w.id); } catch (_) {}
+    check('privacy', !!st && st.incognito === true, JSON.stringify(st).slice(0, 60));
+  } catch (e) { check('privacy', false, String(e.message || e)); }
+
+  // ---- v0.3.2：显示器细化（current 标记 + workarea + state().monitor）----
+  try {
+    const mons = await Z().system.monitors();
+    const arr = Array.isArray(mons) ? mons : (mons && mons.monitors) || [];
+    const cur = arr.filter((m) => m.current === true);
+    const st = await Z().window.state();
+    const workOk = arr.every((m) => typeof m.workX === 'number' && typeof m.workWidth === 'number');
+    check('monitor', arr.length >= 1 && cur.length === 1 && workOk && typeof st.monitor === 'number' && st.monitor === cur[0].index,
+      `${arr.length} display(s) current=${cur.length ? cur[0].index : '-'} work=${cur.length ? cur[0].workWidth : '-'} state=${st.monitor}`);
+  } catch (e) { check('monitor', false, String(e.message || e)); }
+
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {
     await Z().invoke('__zilt.linuxSmoke', {

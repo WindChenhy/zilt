@@ -382,11 +382,45 @@
             exe 替换/备份 sha 匹配/10s 健康清理全绿）；
             Linux GUI 冒烟 **75/75 exit 0**（openbox）；Windows 单测 **281/282**
             （1 skip = POSIX 用例）、构建通过、冒烟 **49/49 ALL PASSED**。
-- [~] **v0.3.2+ 系列规划**（2026-11-16 制定；对标 Wails v3.0.0 stable / Tauri 2.12.6
+- [x] **v0.3.2 WebView 数据与协议面**（2026-11-17；规划见 v0.3.x-PLAN）：
+      - **真 scheme（Windows）**：纯 Zig COM 实现 `ICoreWebView2CustomSchemeRegistration`
+        （IID d60ac92c…，10 槽）+ `ICoreWebView2EnvironmentOptions4`（IID ac52d13f…，
+        WRL 式聚合分片：QI/AddRef/Release 委托 owner）→ `SetCustomSchemeRegistrations`。
+        注册名沿用 validName 门控（`schemeNameOf` + `find` 防 https 误拦）。
+        **实测坑**：`HasAuthorityComponent=false` 会让 iframe 导航直接崩溃浏览器进程
+        （保持 true）；authority 段并入 path（`echo://a/b` → path=`a/b`，与 Linux
+        serveProtocol 逐字同约定）；https 页面 fetch/XHR 的 CORS 判定拒绝（ACAO 精确/
+        `*`、AllowedOrigins 精确/通配均无效；iframe 导航与 no-cors 正常）——冒烟断言
+        用 iframe 导航全链，fetch 场景文档化引导用路径式。
+      - **无痕窗口（两平台）**：Windows `ICoreWebView2Environment10::
+        CreateCoreWebView2ControllerOptions` + `ControllerWithOptions`
+        （IsInPrivateModeEnabled；老运行时 QI 失败回退并记日志）——主窗口与子
+        webview（webviews.create({incognito})，与 partition 互斥 incognito 优先）
+        双路接入；Linux `webkit_website_data_manager_new_ephemeral()`（每窗口独立
+        context，scheme 处理器齐全）。`window.state().incognito` 断言。
+      - **Profile 设置 / 节流**：`ICoreWebView2Profile6`（IID bd82fa6a…，槽 18–21）
+        autofill/password_autosave（driver.applySettings 接入，QI 失败跳过）；
+        `environment.background_throttling=false` → buildBrowserArguments 追加三个
+        Chromium 开关（join 语义重写，proxy/raw/throttle 三段拼接）。
+      - **显示器细化**：`Monitor.current` 标记（Win：MonitorFromWindow+枚举序匹配；
+        Linux：gdk_display_get_monitor_at_window）+ `window.state()` 增 incognito/
+        monitor（Linux 用内联 blk 计算 monitorAtWindow 枚举序）。
+      - **电源/会话事件**：共享 `power.zig`（事件码→事件名纯函数 + 单测）——
+        Windows WM_POWERBROADCAST + WM_WTSSESSION_CHANGE（wtsapi32 **动态加载**
+        改直接 extern + 链接 wtsapi32；emitAll 广播所有存活窗口）；Linux GDBus
+        订阅 org.freedesktop.login1（**translate-c 的 GDBusConnection 是 opaque，
+        [*c] 不可用 → 自声明 extern + *anyopaque 句柄**；PrepareForSleep 参数经
+        g_variant_get "(b)"，GetSessionByPID "(so)" 取会话路径订阅 Lock/Unlock；
+        信号在 worker 线程 → g_idle_add 封送；无系统总线降级仅日志）。
+      - **冒烟**：Windows 52 项（c-scheme=iframe 导航断言 / c-privacy / c-monitor）；
+        Linux 77 项（privacy/monitor）。**验收**：Windows 单测全绿 + 冒烟 52/52
+        （clip/clipmulti 为桌面剪贴板占用环境问题，PowerShell Set-Clipboard 同样失败）；
+        Linux 单测全绿 + 冒烟 77/77 + post terminate PASS（Xvfb+openbox）。
+- [~] **v0.3.3+ 系列规划**（2026-11-16 制定；对标 Wails v3.0.0 stable / Tauri 2.12.6
       全量差距刷新，详见 [`docs/v0.3.x-PLAN.md`](v0.3.x-PLAN.md)）：
-      - v0.3.2 WebView 数据与协议面：Windows 真 scheme（EnvironmentOptions4）/ 无痕窗口
-        （两平台）/ WebView2 设置开关面（autofill/password/zoomControl/backgroundThrottling）/
-        screens 细化（work_area/当前显示器）/ 电源与会话事件（WM_POWERBROADCAST+WTS / logind）
+      - v0.3.3 窗口体验包 II：PNG 形状 mask / 每按钮状态 / HideOnFocusLost+HideOnEscape /
+        托盘附着窗口 / 窗口级 KeyBindings / startResizeDragging / preventOverflow /
+        标题栏双击行为 / move 去抖 / 效果参数（tint/cornerPreference）/ Zig 侧窗口事件钩子
       - v0.3.3 窗口体验包 II：PNG 形状 mask / 每按钮状态 / HideOnFocusLost+HideOnEscape /
         托盘附着窗口 / 窗口级 KeyBindings / startResizeDragging / preventOverflow /
         标题栏双击行为 / move 去抖 / 效果参数（tint/cornerPreference）/ Zig 侧窗口事件钩子

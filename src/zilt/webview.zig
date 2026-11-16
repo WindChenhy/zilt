@@ -33,6 +33,12 @@ pub const Settings = struct {
     script_dialogs: bool = true,
     host_objects: bool = false,
     user_agent: ?[]const u8 = null,
+    /// v0.3.2：表单自动填充（Win：Profile6 IsGeneralAutofillEnabled；
+    /// Linux：WebKitSettings enable-auto-fill）。默认开（浏览器语义）。
+    autofill: bool = true,
+    /// v0.3.2：密码保存（Win：Profile6 IsPasswordAutosaveEnabled；Linux 无 API）。
+    /// 默认关（保守安全面：桌面壳应用通常不需要）。
+    password_autosave: bool = false,
 };
 
 pub const Downloads = struct {

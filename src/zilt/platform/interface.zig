@@ -80,6 +80,13 @@ pub const Capability = enum {
     pe_resources,
     authenticode,
     msix,
+    // v0.3.2：WebView 数据与协议面
+    real_scheme,
+    incognito,
+    background_throttling,
+    profile_settings,
+    monitor_current,
+    power_events,
 };
 
 /// Windows 后端当前实现的能力（v0.1.24 实测面）。
@@ -100,6 +107,8 @@ pub const windows_capabilities = [_]Capability{
     .packaging,
     .taskbar,               .window_material, .pe_resources,     .authenticode,
     .msix,
+    .real_scheme,           .incognito,      .background_throttling, .profile_settings,
+    .monitor_current,       .power_events,
 };
 
 /// Linux 目标能力（v0.2.0–v0.2.9 的验收清单；见 docs/v0.2-LINUX.md §5）。
@@ -119,6 +128,9 @@ pub const linux_target_capabilities = [_]Capability{
     .theme,
     .updater,               .headless,       .mcp,               .webdriver,
     .packaging,
+    .real_scheme,           .incognito,      .monitor_current,   .power_events,
+    // v0.3.2 平台差异：background_throttling / profile_settings（autofill/password）
+    // Linux 无标准 API，文档化 NotSupported → 不在目标集
 };
 
 /// 编译期校验后端契约（`platform/mod.zig` 在本平台后端上调用一次）。

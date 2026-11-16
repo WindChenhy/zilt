@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.1.24（Windows 全栈）+ v0.3.1（Linux 桌面体验包 + MCP stdio + 差分更新）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.2（Windows 真 scheme/无痕窗口/Profile 设置 + 电源会话事件 + Linux ephemeral/logind）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -20,6 +20,30 @@ store、http（WinHTTP：https/wss/代理/multipart/流式）、托盘/菜单/�
 自启/深链/单实例、更新器（ed25519 + 差分 + 回滚）、打包（NSIS/MSI/MSIX/zip）、headless + MCP、
 WebDriver、8 套模板、`zilt` CLI；v0.1.23 起含 CDP 逃生口/截图/每请求头/页内查找/每窗代理、
 v0.1.24 起含每窗口 UA 与应用自定义协议。
+
+v0.3.2 新增（2026-11-17，WebView 数据与协议面）：
+
+- **真 scheme 自定义协议（Windows）**：`Config.protocols` 注册的协议在 Windows 上也以
+  真 `scheme://` 可达（`ICoreWebView2EnvironmentOptions4` + `ICoreWebView2CustomSchemeRegistration`
+  纯 Zig COM 实现；老运行时 QI 失败自动回退路径式）。两平台同约定 `<scheme>://<path>?<query>`。
+  实测文档化限制：https 页面对自定义 scheme 的 fetch/XHR（cors 模式）被 WebView2 CORS 判定拒绝
+  （iframe 导航/no-cors 正常）——可读响应体用同源路径式 `/__proto/<name>/…`
+- **无痕窗口**：`window.create({incognito})` / `webviews.create({incognito})`——Windows 走
+  `ControllerOptions.IsInPrivateModeEnabled`（Environment10，老运行时回退普通 controller 并记日志），
+  Linux 走 `webkit_website_data_manager_new_ephemeral()`；`window.state().incognito` 可断言
+- **Profile 设置面**：`webview.settings.autofill / password_autosave`（Windows：Profile6
+  IsGeneralAutofillEnabled/IsPasswordAutosaveEnabled，QI 失败跳过；Linux 无对应 API 文档化）
+- **backgroundThrottling**：`Config.environment.background_throttling=false` → 追加 Chromium
+  节流禁用开关（环境级；Linux 无标准 API 文档化）
+- **显示器细化**：`system.info('monitors')` 每条增 `current`（调用窗口所在屏）；
+  `window.state()` 增 `incognito` 与 `monitor`（枚举序 index）；Linux 同接（gdk_monitor_at_window）
+- **电源/会话事件**：`powerSuspend / powerResume / powerStatusChanged / sessionLock / sessionUnlock`
+  ——Windows `WM_POWERBROADCAST` + `WTSRegisterSessionNotification`（wtsapi32）；Linux GDBus 订阅
+  `org.freedesktop.login1`（PrepareForSleep + GetSessionByPID→Session Lock/Unlock；无系统总线降级）
+- **验收**：Windows 单测全绿（+custom_scheme/SchemeRegistration/Options4 聚合语义/
+  真 scheme 路由/节流开关/电源事件映射），冒烟 **52 项**（新增 c-scheme/c-privacy/c-monitor；
+  clip 两项为已知桌面剪贴板占用环境问题）；Linux 单测全绿，冒烟 **77/77**（新增 privacy/monitor）
+  + post terminate PASS；headless/MCP 全链路不受影响
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 

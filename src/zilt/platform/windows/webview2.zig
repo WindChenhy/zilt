@@ -95,6 +95,76 @@ pub const ICoreWebView2Environment = extern struct {
     }
 };
 
+// ============================== ICoreWebView2Environment10 ==============================
+// v0.3.2：ControllerOptions（无痕窗口）。ABI/IID 取自官方 WebView2.h：
+// IID {ee0eb9df-6f12-46ce-b53f-3f47b9c928e0}。flat vtable 22 槽（0–19 既有）+
+// CreateCoreWebView2ControllerOptions(20) / CreateCoreWebView2ControllerWithOptions(21)
+// / CreateCoreWebView2CompositionControllerWithOptions(22)。
+
+pub const IID_ICoreWebView2Environment10: com.GUID = .parse("{ee0eb9df-6f12-46ce-b53f-3f47b9c928e0}");
+
+pub const ICoreWebView2Environment10 = extern struct {
+    lpVtbl: *const VTable,
+
+    pub const VTable = extern struct {
+        base: [20]?*const anyopaque, // QI..CreateContextMenuItem（槽 0–19）
+        CreateCoreWebView2ControllerOptions: *const fn (*ICoreWebView2Environment10, *?*ICoreWebView2ControllerOptions) callconv(.c) HRESULT, // 20
+        CreateCoreWebView2ControllerWithOptions: *const fn (*ICoreWebView2Environment10, win32.HWND, ?*ICoreWebView2ControllerOptions, *anyopaque) callconv(.c) HRESULT, // 21
+        CreateCoreWebView2CompositionControllerWithOptions: *const fn (*ICoreWebView2Environment10, win32.HWND, ?*ICoreWebView2ControllerOptions, ?*anyopaque, *anyopaque) callconv(.c) HRESULT, // 22
+    };
+
+    /// QI 失败（老运行时 < 1.0.1722）返回 null——调用方回退普通 controller。
+    pub fn fromEnvironment(env: *ICoreWebView2Environment) ?*ICoreWebView2Environment10 {
+        var out: ?*anyopaque = null;
+        const hr = env.lpVtbl.QueryInterface(env, &IID_ICoreWebView2Environment10, &out);
+        if (com.failed(hr)) return null;
+        return @ptrCast(@alignCast(out.?));
+    }
+
+    pub fn release(self: *ICoreWebView2Environment10) void {
+        const f: *const fn (*ICoreWebView2Environment10) callconv(.c) u32 = @ptrCast(self.lpVtbl.base[2] orelse return);
+        _ = f(self);
+    }
+
+    pub fn createControllerOptions(self: *ICoreWebView2Environment10) struct { hr: HRESULT, options: ?*ICoreWebView2ControllerOptions } {
+        var options: ?*ICoreWebView2ControllerOptions = null;
+        const hr = self.lpVtbl.CreateCoreWebView2ControllerOptions(self, &options);
+        return .{ .hr = hr, .options = options };
+    }
+
+    pub fn createControllerWithOptions(self: *ICoreWebView2Environment10, parent: win32.HWND, options: ?*ICoreWebView2ControllerOptions, handler: *anyopaque) HRESULT {
+        return self.lpVtbl.CreateCoreWebView2ControllerWithOptions(self, parent, options, handler);
+    }
+};
+
+// ============================== ICoreWebView2ControllerOptions ==============================
+// v0.3.2：无痕窗口开关。IID {12aae616-8ccb-44ec-bcb3-eb18311881635}，vtable：
+// QI/AddRef/Release + get/put_ProfileName + get/put_IsInPrivateModeEnabled。
+
+pub const IID_ICoreWebView2ControllerOptions: com.GUID = .parse("{12aae616-8ccb-44ec-bcb3-eb18311881635}");
+
+pub const ICoreWebView2ControllerOptions = extern struct {
+    lpVtbl: *const VTable,
+
+    pub const VTable = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2ControllerOptions, *const com.GUID, *?*anyopaque) callconv(.c) HRESULT,
+        AddRef: *const fn (*ICoreWebView2ControllerOptions) callconv(.c) u32,
+        Release: *const fn (*ICoreWebView2ControllerOptions) callconv(.c) u32,
+        get_ProfileName: *const fn (*ICoreWebView2ControllerOptions, *?LPWSTR) callconv(.c) HRESULT,
+        put_ProfileName: *const fn (*ICoreWebView2ControllerOptions, LPCWSTR) callconv(.c) HRESULT,
+        get_IsInPrivateModeEnabled: *const fn (*ICoreWebView2ControllerOptions, *BOOL) callconv(.c) HRESULT,
+        put_IsInPrivateModeEnabled: *const fn (*ICoreWebView2ControllerOptions, BOOL) callconv(.c) HRESULT,
+    };
+
+    pub fn putInPrivateMode(self: *ICoreWebView2ControllerOptions, enabled: bool) HRESULT {
+        return self.lpVtbl.put_IsInPrivateModeEnabled(self, if (enabled) 1 else 0);
+    }
+
+    pub fn release(self: *ICoreWebView2ControllerOptions) void {
+        _ = self.lpVtbl.Release(self);
+    }
+};
+
 // ============================== ICoreWebView2Controller ==============================
 
 pub const ICoreWebView2Controller = extern struct {
@@ -313,6 +383,95 @@ pub const ICoreWebView2 = extern struct {
     }
     pub fn addWebResourceRequestedFilter(self: *ICoreWebView2, uri: LPCWSTR, context: u32) HRESULT {
         return self.lpVtbl.AddWebResourceRequestedFilter(self, uri, context);
+    }
+};
+
+// ============================== ICoreWebView2_4（Profile 入口） ==============================
+// v0.3.2：autofill/password 设置走 Profile6。IID {20d02d59-6df2-42dc-bd06-f98a694b1302}，
+// 自有方法仅 get_Profile（QI/AddRef/Release 之后第 4 槽）。
+
+pub const IID_ICoreWebView2_4: com.GUID = .parse("{20d02d59-6df2-42dc-bd06-f98a694b1302}");
+
+pub const ICoreWebView2_4 = extern struct {
+    lpVtbl: *const VTable,
+
+    pub const VTable = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2_4, *const com.GUID, *?*anyopaque) callconv(.c) HRESULT,
+        AddRef: *const fn (*ICoreWebView2_4) callconv(.c) u32,
+        Release: *const fn (*ICoreWebView2_4) callconv(.c) u32,
+        get_Profile: *const fn (*ICoreWebView2_4, *?*ICoreWebView2Profile) callconv(.c) HRESULT,
+    };
+
+    /// QI 失败（老运行时）返回 null。
+    pub fn fromWebView(webview: *ICoreWebView2) ?*ICoreWebView2_4 {
+        var out: ?*anyopaque = null;
+        const hr = webview.lpVtbl.QueryInterface(webview, &IID_ICoreWebView2_4, &out);
+        if (com.failed(hr)) return null;
+        return @ptrCast(@alignCast(out.?));
+    }
+
+    pub fn release(self: *ICoreWebView2_4) void {
+        _ = self.lpVtbl.Release(self);
+    }
+
+    pub fn getProfile(self: *ICoreWebView2_4) struct { hr: HRESULT, profile: ?*ICoreWebView2Profile } {
+        var profile: ?*ICoreWebView2Profile = null;
+        const hr = self.lpVtbl.get_Profile(self, &profile);
+        return .{ .hr = hr, .profile = profile };
+    }
+};
+
+// ============================== ICoreWebView2Profile6 ==============================
+// v0.3.2：autofill / password autosave 开关。IID {bd82fa6a-1d65-4c33-b2b4-0393020cc61b}。
+// flat vtable：0–2 IUnknown + Profile(3–9) + Profile2(10–12) + Profile3(13–14) +
+// Profile4(15–16) + Profile5 get_CookieManager(17) + Profile6 自有四槽（18–21）。
+
+pub const IID_ICoreWebView2Profile6: com.GUID = .parse("{bd82fa6a-1d65-4c33-b2b4-0393020cc61b}");
+
+pub const ICoreWebView2Profile = extern struct {
+    lpVtbl: *const VTable,
+
+    pub const VTable = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2Profile, *const com.GUID, *?*anyopaque) callconv(.c) HRESULT,
+        AddRef: *const fn (*ICoreWebView2Profile) callconv(.c) u32,
+        Release: *const fn (*ICoreWebView2Profile) callconv(.c) u32,
+    };
+
+    pub fn release(self: *ICoreWebView2Profile) void {
+        _ = self.lpVtbl.Release(self);
+    }
+
+    /// QI 到 Profile6（老运行时返回 null）。
+    pub fn asProfile6(self: *ICoreWebView2Profile) ?*ICoreWebView2Profile6 {
+        var out: ?*anyopaque = null;
+        const hr = self.lpVtbl.QueryInterface(self, &IID_ICoreWebView2Profile6, &out);
+        if (com.failed(hr)) return null;
+        return @ptrCast(@alignCast(out.?));
+    }
+};
+
+pub const ICoreWebView2Profile6 = extern struct {
+    lpVtbl: *const VTable,
+
+    pub const VTable = extern struct {
+        base: [18]?*const anyopaque, // QI..get_CookieManager（槽 0–17）
+        get_IsPasswordAutosaveEnabled: *const fn (*ICoreWebView2Profile6, *BOOL) callconv(.c) HRESULT, // 18
+        put_IsPasswordAutosaveEnabled: *const fn (*ICoreWebView2Profile6, BOOL) callconv(.c) HRESULT, // 19
+        get_IsGeneralAutofillEnabled: *const fn (*ICoreWebView2Profile6, *BOOL) callconv(.c) HRESULT, // 20
+        put_IsGeneralAutofillEnabled: *const fn (*ICoreWebView2Profile6, BOOL) callconv(.c) HRESULT, // 21
+    };
+
+    pub fn putPasswordAutosave(self: *ICoreWebView2Profile6, enabled: bool) HRESULT {
+        return self.lpVtbl.put_IsPasswordAutosaveEnabled(self, if (enabled) 1 else 0);
+    }
+
+    pub fn putGeneralAutofill(self: *ICoreWebView2Profile6, enabled: bool) HRESULT {
+        return self.lpVtbl.put_IsGeneralAutofillEnabled(self, if (enabled) 1 else 0);
+    }
+
+    pub fn release(self: *ICoreWebView2Profile6) void {
+        const f: *const fn (*ICoreWebView2Profile6) callconv(.c) u32 = @ptrCast(self.lpVtbl.base[2] orelse return);
+        _ = f(self);
     }
 };
 

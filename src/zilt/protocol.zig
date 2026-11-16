@@ -1,17 +1,29 @@
-//! 应用自定义协议（v0.1.24）。
+//! 应用自定义协议（v0.1.24 路径式 + v0.3.2 真 scheme 式）。
 //!
 //! 语义对齐 Tauri `register_uri_scheme_protocol`：应用注册一个名字 + 处理函数，
 //! 由框架把请求交给它，响应体/状态码/内容类型由应用决定。
 //!
-//! **Windows 实现是路径式**：`https://<app-origin>/__proto/<name>/<rest>?<query>`。
-//! 原因：WebView2 的「真 scheme」（`media://…`）必须经
-//! `ICoreWebView2EnvironmentOptions4::SetCustomSchemeRegistrations` 注册，而该接口需要
-//! 自行实现 17 槽 vtable + `ICoreWebView2CustomSchemeRegistration`（含版本间有差异的
-//! 方法序）。路径式在同一 origin 内经 `WebResourceRequested` 拦截，零 CORS 成本，
-//! 能力等价（动态响应/自定义头/二进制流）；真 scheme 列为后续项（见 ROADMAP）。
+//! **两种访问形态并存**：
+//! - 路径式（v0.1.24，所有平台可用）：`https://<app-origin>/__proto/<name>/<rest>?<query>`。
+//!   同一 origin 内经 `WebResourceRequested` 拦截，零 CORS 成本。
+//! - 真 scheme 式（v0.3.2）：`<scheme>://localhost/<rest>?<query>`。
+//!   Windows 经 `ICoreWebView2EnvironmentOptions4::SetCustomSchemeRegistrations` +
+//!   `ICoreWebView2CustomSchemeRegistration` 注册（见 platform/windows/custom_scheme.zig；
+//!   注册名沿用 `validName` 规则，`hasAuthorityComponent=true` 因此统一用 `localhost`
+//!   作为 authority）；Linux 侧本就是真 scheme。老运行时不支持 Options4 时 QI 失败，
+//!   自动回退路径式（仅记录日志，不视为致命）。
 //!
-//! 限制：WebView2 的 `WebResourceRequested` 拿不到请求体，因此 POST 的 body 不可读——
-//! 需要上传内容时用 `zilt.invoke` 命令或 `zilt.http`。
+//! 限制（Windows/WebView2，实测 runtime 157）：
+//! 1. `WebResourceRequested` 拿不到请求体，因此 POST 的 body 不可读——需要上传内容
+//!    时用 `zilt.invoke` 命令或 `zilt.http`。
+//! 2. **fetch CORS**：https 页面对真 scheme 的 fetch/XHR（cors 模式）被 WebView2 的
+//!    CORS 判定拒绝——响应带 `Access-Control-Allow-Origin`（精确 origin 或 `*`）、
+//!    注册的 AllowedOrigins（精确/通配 `*`）均不生效；iframe 导航、no-cors fetch、
+//!    `<img>` 类无 origin 请求正常。JS 侧需要可读响应体时用同源路径式
+//!    `/__proto/<name>/…`（fetch 全功能可用）。
+//! 3. `HasAuthorityComponent=false`（opaque origin）会在 iframe 导航时直接崩溃
+//!    浏览器进程——保持 true（tuple origin），authority 段并入 path 由处理函数
+//!    自行解释。
 const std = @import("std");
 
 pub const Header = struct {
@@ -71,6 +83,40 @@ pub fn parseRoute(path: []const u8, uri: []const u8) ?Route {
     const tail = if (slash < rest.len) rest[slash + 1 ..] else "";
     const query = if (std.mem.indexOfScalar(u8, uri, '?')) |q| uri[q + 1 ..] else "";
     return .{ .name = name, .path = tail, .query = if (query.len == 0) "" else query };
+}
+
+/// 提取 URI 的 scheme 名（`name://…` 的 name）；无 scheme 形态返回 null。
+/// 调用方必须再用 `find` 门控——`https`/`http` 等内置 scheme 也会通过本解析，
+/// 只有注册过的名字才按自定义协议处理。
+pub fn schemeNameOf(uri: []const u8) ?[]const u8 {
+    const sep = std.mem.indexOf(u8, uri, "://") orelse return null;
+    if (sep == 0) return null;
+    const name = uri[0..sep];
+    if (!validName(name)) return null;
+    return name;
+}
+
+/// 真 scheme 路由解析（v0.3.2）：`<scheme>://<path>?<query>`——两平台同约定
+/// （与 Linux v0.2.3 的 `serveProtocol` 逐字一致：去掉**一个**前导 `/`，首个 `?`
+/// 之后是 query）。authority 段（若 URL 携带）**并入 path**——fetch 方决定
+/// URL 形态，处理函数只看 path/query。`media://clip/1.bin` 与
+/// `media://localhost/clip/1.bin` 分别给出 path=`clip/1.bin` /
+/// `localhost/clip/1.bin`（文档化：demo/冒烟统一用无 authority 形态）。
+/// **调用方必须先经 `schemeNameOf` + `find` 门控**——本函数对任何合法 scheme 名
+/// 都会解析成功（包括 https），门控是防误拦内置 scheme 的关键。
+pub fn parseSchemeRoute(uri: []const u8) ?Route {
+    const sep = std.mem.indexOf(u8, uri, "://") orelse return null;
+    const name = uri[0..sep];
+    if (!validName(name)) return null;
+    var rest = uri[sep + 3 ..];
+    if (rest.len > 0 and rest[0] == '/') rest = rest[1..];
+    var path = rest;
+    var query: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, rest, '?')) |q| {
+        path = rest[0..q];
+        query = rest[q + 1 ..];
+    }
+    return .{ .name = name, .path = path, .query = query };
 }
 
 pub fn validName(name: []const u8) bool {
@@ -143,6 +189,47 @@ test "v0.1.24: 注册表查找与状态短语" {
     try testing.expectEqualStrings("Not Found", reasonFor(404));
     try testing.expectEqualStrings("Internal Server Error", reasonFor(500));
     try testing.expectEqualStrings("OK", reasonFor(299));
+}
+
+test "v0.3.2: 真 scheme 路由解析（两平台同约定：去一个前导斜杠 + query 分离 + 门控）" {
+    // 与 Linux 冒烟一致的形态：echo://a/b?x=1 → path=a/b query=x=1
+    const r = parseSchemeRoute("media://clip/1.bin?a=1&b=2").?;
+    try testing.expectEqualStrings("media", r.name);
+    try testing.expectEqualStrings("clip/1.bin", r.path);
+    try testing.expectEqualStrings("a=1&b=2", r.query);
+
+    // 显式前导 '/'（Chromium 规范化可能补）→ 同样去掉一个
+    const slashed = parseSchemeRoute("media:///clip/2.bin").?;
+    try testing.expectEqualStrings("clip/2.bin", slashed.path);
+    try testing.expectEqualStrings("", slashed.query);
+
+    // authority 形态：并入 path（文档化；demo/冒烟统一用无 authority 形态）
+    const localhosted = parseSchemeRoute("media://localhost/clip/1.bin?a=1").?;
+    try testing.expectEqualStrings("localhost/clip/1.bin", localhosted.path);
+    try testing.expectEqualStrings("a=1", localhosted.query);
+
+    // 裸 path（无 query / 无斜杠）
+    const bare = parseSchemeRoute("app://ping").?;
+    try testing.expectEqualStrings("app", bare.name);
+    try testing.expectEqualStrings("ping", bare.path);
+
+    // 非法 scheme 名 / 非 scheme 形态 → null
+    try testing.expect(parseSchemeRoute("Bad_Name://x") == null);
+    try testing.expect(parseSchemeRoute("notaurl") == null);
+
+    // **门控**：https 是合法 scheme 名、parseSchemeRoute 也会解析它——
+    // 调用方必须经 schemeNameOf + find 只放行注册过的名字
+    try testing.expectEqualStrings("https", schemeNameOf("https://zilt.app/index.html").?);
+    const gated = [_]Protocol{.{ .name = "media", .handle = echo }};
+    const uri = "https://zilt.app/index.html";
+    if (schemeNameOf(uri)) |name| {
+        try testing.expect(find(&gated, name) == null); // 未注册 → 不按协议处理
+    }
+    const media_uri = "media://clip/1.bin";
+    if (schemeNameOf(media_uri)) |name| {
+        try testing.expect(find(&gated, name) != null); // 已注册 → 协议处理
+    }
+    try testing.expect(schemeNameOf("://no-name") == null);
 }
 
 test "v0.1.24: 处理函数通过 allocator 产出响应体" {

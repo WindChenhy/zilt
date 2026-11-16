@@ -157,6 +157,9 @@ pub const WindowOptions = struct {
     titlebar_overlay: bool = false,
     /// v0.1.24：本窗口 User-Agent（null = 用 config.webview.settings.user_agent）
     user_agent: ?[]const u8 = null,
+    /// v0.3.2：无痕窗口（Win：InPrivate controller；Linux：ephemeral data manager）。
+    /// Cookie/localStorage/缓存不落盘，窗口关闭即消失。
+    incognito: bool = false,
 };
 
 /// v0.2.6：per-window `close_requested_event` 的两平台合并语义——

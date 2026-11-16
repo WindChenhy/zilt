@@ -23,3 +23,5 @@
 #include <libsoup/soup.h>
 /* 全局快捷键（XGrabKey/XOpenDisplay，v0.2.6） */
 #include <X11/Xlib.h>
+/* v0.3.2：电源/会话事件（GDBus 订阅 org.freedesktop.login1） */
+#include <gio/gio.h>

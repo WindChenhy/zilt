@@ -133,6 +133,7 @@ const desktop_entry = @import("desktop_entry.zig");
 const sysinfo_linux = @import("sysinfo_linux.zig");
 const menu_model = @import("../../menu_model.zig");
 const shared_sysinfo = @import("../../sysinfo.zig");
+const shared_power = @import("../../power.zig");
 const autostart_mod = @import("../../autostart.zig");
 const fs_api_mod = @import("../../fs_api.zig");
 const store_mod = @import("../../store.zig");
@@ -800,6 +801,9 @@ pub fn run(comptime config: Config) !void {
     // v0.2.6：X11 全局快捷键（config.hotkeys 声明式注册 + hotkey.* 运行时 op）
     self.initHotkeys();
 
+    // v0.3.2：电源/会话事件（GDBus 订阅 org.freedesktop.login1；无系统总线仅日志）
+    self.initLogindEvents();
+
     // v0.2.3：应用自定义协议 → 真 scheme（Config.protocols；每协议一个 scheme）
     self.registerProtocolSchemes(wc);
 
@@ -931,6 +935,8 @@ fn Backend(comptime config: Config) type {
             background_color: ?u32 = null,
             /// 覆盖式标题栏（无原生边框；前端 data-zilt-drag-region 拖动）
             titlebar_overlay: bool = false,
+            /// v0.3.2：无痕窗口（ephemeral data manager；Cookie/存储不落盘）
+            incognito: bool = false,
             /// 鼠标穿透（GdkWindow input shape 置空）
             ignore_cursor: bool = false,
             /// 当前设置的光标（gdk_window_set_cursor 自己持有 ref；替换时 unref 旧值）
@@ -1036,6 +1042,16 @@ fn Backend(comptime config: Config) type {
             indicator: ?*anyopaque,
             set_status: *const fn (?*anyopaque, c_int) callconv(.c) void,
             set_menu: *const fn (?*anyopaque, ?*c.GtkMenu) callconv(.c) void,
+        };
+
+        /// v0.3.2：logind 订阅状态（signal id 供将来注销；connection 生命周期
+        /// 与进程一致——GIO 全局默认主上下文持有，无需显式 unref）。
+        const LogindState = struct {
+            /// GDBusConnection 是 opaque 类型——以 anyopaque 句柄持有（调用点 @ptrCast）
+            connection: ?*anyopaque = null,
+            sleep_sub: c.guint = 0,
+            lock_sub: c.guint = 0,
+            unlock_sub: c.guint = 0,
         };
 
         /// emit 的封送任务（worker 线程 → UI 线程，g_idle_add）。
@@ -1201,6 +1217,8 @@ fn Backend(comptime config: Config) type {
         /// 通知按钮载荷表 + GAction 注册标记（v0.3.0）
         notify_actions: std.ArrayListUnmanaged(NotifyActionEntry) = .empty,
         notify_action_added: bool = false,
+        /// v0.3.2：logind 订阅状态（电源/会话事件）
+        logind: LogindState = .{},
 
         fn deinit(self: *Self) void {
             // 主循环退出后可能仍有窗口未 destroy（ctx.quit 路径）→ 逐个释放记录
@@ -1745,6 +1763,18 @@ fn Backend(comptime config: Config) type {
                     log.print("[proxy] context unavailable for '{s}' -> shared context", .{proxy});
                 }
             }
+            // v0.3.2：无痕窗口（ephemeral data manager；与 proxy 独立 context 同手法）
+            if (view_widget == null and opts.incognito) {
+                if (self.incognitoContext()) |vctx| {
+                    view_widget = @ptrCast(c.webkit_web_view_new_with_context(vctx));
+                    if (view_widget != null) {
+                        st.ucm = c.webkit_web_view_get_user_content_manager(@ptrCast(view_widget));
+                        st.incognito = true;
+                    }
+                } else {
+                    log.print("[incognito] context unavailable -> shared context (data will persist)", .{});
+                }
+            }
             if (view_widget == null) {
                 view_widget = c.webkit_web_view_new_with_user_content_manager(ucm);
             }
@@ -2241,7 +2271,7 @@ fn Backend(comptime config: Config) type {
             }
 
             return std.fmt.allocPrint(alloc,
-                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":0,"ex_style":0,"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":false,"overlay":{s},"transparent":{s},"background_color":{d},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d}}}
+                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":0,"ex_style":0,"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":false,"overlay":{s},"incognito":{s},"monitor":{d},"transparent":{s},"background_color":{d},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d}}}
             , .{
                 st.id,
                 x,
@@ -2259,6 +2289,21 @@ fn Backend(comptime config: Config) type {
                 boolStr(st.ignore_cursor),
                 boolStr(c.gtk_window_get_accept_focus(win) != 0),
                 boolStr(st.titlebar_overlay),
+                boolStr(st.incognito),
+                @as(i64, blk: {
+                    // v0.3.2：当前窗口所在显示器（枚举序；无 GDK 窗口时 0）
+                    const widget2: [*c]c.GtkWidget = @ptrCast(win);
+                    const gdk_win = c.gtk_widget_get_window(widget2);
+                    const display = c.gdk_display_get_default() orelse break :blk 0;
+                    const mon = if (gdk_win != null) c.gdk_display_get_monitor_at_window(display, @ptrCast(gdk_win)) else null;
+                    if (mon == null) break :blk 0;
+                    const n = c.gdk_display_get_n_monitors(display);
+                    var idx: c_int = 0;
+                    while (idx < n) : (idx += 1) {
+                        if (c.gdk_display_get_monitor(display, idx) == mon) break;
+                    }
+                    break :blk @intCast(idx);
+                }),
                 boolStr(st.transparent),
                 if (st.background_color) |bg| @as(i64, bg) else -1,
                 st.min_width,
@@ -4314,7 +4359,7 @@ fn Backend(comptime config: Config) type {
                 .window_state => |op| return self.runWindowStateOp(w, op, alloc),
                 // v0.2.2：运行时菜单模型 / 系统信息 / 自启动
                 .menu => |op| return self.runMenuOp(op, alloc),
-                .info => |kind| return .{ .json = try self.collectSystemInfo(kind, alloc) },
+                .info => |kind| return .{ .json = try self.collectSystemInfo(kind, alloc, w) },
                 .autostart => |op| return .{ .state = try self.runAutostartOp(op, alloc) },
                 // v0.2.3：存储 / fs / ACL / SQL / http / ws
                 .store => |op| return self.runStoreOp(op, alloc),
@@ -4521,7 +4566,7 @@ fn Backend(comptime config: Config) type {
         // JSON 形状与 Windows 同构（shared sysinfo.osToJson / monitorsToJson）
         // ------------------------------------------------------------------
 
-        fn collectSystemInfo(self: *Self, kind: system_api.InfoKind, alloc: std.mem.Allocator) ![]u8 {
+        fn collectSystemInfo(self: *Self, kind: system_api.InfoKind, alloc: std.mem.Allocator, w: ?*WinState) ![]u8 {
             switch (kind) {
                 .os => {
                     var info = try self.collectOsInfo(alloc);
@@ -4531,6 +4576,23 @@ fn Backend(comptime config: Config) type {
                 .monitors => {
                     const monitors = try self.collectMonitors(alloc);
                     defer alloc.free(monitors);
+                    // v0.3.2：标记调用窗口所在显示器
+                    if (w) |st| {
+                        if (st.win != null) {
+                            const display = c.gdk_display_get_default();
+                            if (display != null) {
+                                const widget: [*c]c.GtkWidget = @ptrCast(st.win);
+                                if (c.gtk_widget_get_window(widget)) |gdk_win| {
+                                    const mon = c.gdk_display_get_monitor_at_window(display, @ptrCast(gdk_win));
+                                    const n = c.gdk_display_get_n_monitors(display);
+                                    var idx: c_int = 0;
+                                    while (idx < n) : (idx += 1) {
+                                        if (idx < monitors.len) monitors[@intCast(idx)].current = (c.gdk_display_get_monitor(display, idx) == mon);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     return shared_sysinfo.monitorsToJson(alloc, monitors);
                 },
                 .all => {
@@ -4948,6 +5010,184 @@ fn Backend(comptime config: Config) type {
 
         /// 主题变化监听（v0.2.7）：GTK settings 是全局的 → 变化时广播所有窗口
         /// （Windows 是每窗口 WM_THEMECHANGED，payload 同形 {id, theme}）。
+        // GDBus extern（translate-c 把 GDBusConnection 变成 opaque → [*c] 不可用；
+        // 全部用 *anyopaque 句柄，libgio 已随 GTK 链接）
+        extern fn g_bus_get_sync(bus_type: c_int, err_ptr: ?*anyopaque) ?*anyopaque;
+        extern fn g_dbus_connection_signal_subscribe(
+            connection: *anyopaque,
+            sender: ?[*:0]const u8,
+            interface_name: ?[*:0]const u8,
+            member: ?[*:0]const u8,
+            object_path: ?[*:0]const u8,
+            arg0: ?*anyopaque,
+            flags: c_uint,
+            callback: *const fn (?*anyopaque, ?[*:0]const u8, ?[*:0]const u8, ?[*:0]const u8, ?[*:0]const u8, ?*anyopaque, ?*anyopaque) callconv(.c) void,
+            user_data: ?*anyopaque,
+            user_data_free_func: ?*const fn (?*anyopaque) callconv(.c) void,
+        ) c.guint;
+        extern fn g_dbus_connection_call_sync(
+            connection: *anyopaque,
+            bus_name: ?[*:0]const u8,
+            object_path: ?[*:0]const u8,
+            interface_name: ?[*:0]const u8,
+            method_name: ?[*:0]const u8,
+            parameters: ?*anyopaque,
+            reply_type: ?*anyopaque,
+            flags: c_int,
+            timeout_msec: c_int,
+            cancellable: ?*anyopaque,
+            err_ptr: ?*anyopaque,
+        ) ?*anyopaque;
+        extern fn g_variant_new(fmt: [*:0]const u8, ...) ?*anyopaque;
+        extern fn g_variant_unref(v: *anyopaque) void;
+        extern fn g_variant_get(v: *anyopaque, fmt: [*:0]const u8, ...) void;
+        // GVariant 的可变参数回调签名（PrepareForSleep 参数解析用）
+        const GDBusSignalCallback = *const fn (?*anyopaque, ?[*:0]const u8, ?[*:0]const u8, ?[*:0]const u8, ?[*:0]const u8, ?*anyopaque, ?*anyopaque) callconv(.c) void;
+
+        // ------------------------------------------------------------------
+        // v0.3.2：电源/会话事件（GDBus → org.freedesktop.login1）
+        //   PrepareForSleep(true/false) → powerSuspend / powerResume
+        //   GetSessionByPID → 会话对象 Lock/Unlock → sessionLock / sessionUnlock
+        // 无系统总线（CI/无 logind）→ 订阅失败仅日志，事件面降级不致命。
+        // 信号回调在 GDBus worker 线程 → g_idle_add 封送到 UI 线程再投递。
+        // ------------------------------------------------------------------
+
+        fn initLogindEvents(self: *Self) void {
+            const conn = g_bus_get_sync(2, null) orelse { // 2 = G_BUS_TYPE_SYSTEM
+                log.print("[power] no system bus (logind events unavailable)", .{});
+                return;
+            };
+            self.logind.connection = conn;
+            // PrepareForSleep(b start)：true=进入睡眠，false=恢复
+            self.logind.sleep_sub = g_dbus_connection_signal_subscribe(
+                conn,
+                "org.freedesktop.login1",
+                "org.freedesktop.login1.Manager",
+                "PrepareForSleep",
+                "/org/freedesktop/login1",
+                null,
+                0, // G_DBUS_SIGNAL_FLAGS_NONE
+                &Self.onPrepareForSleep,
+                self,
+                null,
+            );
+            // 会话对象 Lock/Unlock（GetSessionByPID 定位当前会话路径）
+            const pid: u32 = @intCast(std.os.linux.getpid());
+            if (Self.currentSessionPath(conn, pid)) |path| {
+                defer self.allocator.free(path);
+                const path_z = dupeZ(self.allocator, path) catch return;
+                defer self.allocator.free(path_z);
+                self.logind.lock_sub = g_dbus_connection_signal_subscribe(
+                    conn,
+                    "org.freedesktop.login1",
+                    "org.freedesktop.login1.Session",
+                    "Lock",
+                    path_z.ptr,
+                    null,
+                    0,
+                    &Self.onSessionLocked,
+                    self,
+                    null,
+                );
+                self.logind.unlock_sub = g_dbus_connection_signal_subscribe(
+                    conn,
+                    "org.freedesktop.login1",
+                    "org.freedesktop.login1.Session",
+                    "Unlock",
+                    path_z.ptr,
+                    null,
+                    0,
+                    &Self.onSessionUnlocked,
+                    self,
+                    null,
+                );
+                log.print("[power] logind subscribed (sleep + session {s})", .{path});
+            } else {
+                log.print("[power] logind sleep subscribed (session path unavailable)", .{});
+            }
+        }
+
+        fn currentSessionPath(conn: *anyopaque, pid: u32) ?[]u8 {
+            const params = g_variant_new("(u)", @as(c_uint, pid)) orelse return null;
+            const reply = g_dbus_connection_call_sync(
+                conn,
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+                "GetSessionByPID",
+                params,
+                null, // 回复类型按服务端给（"(so)"）
+                0, // G_DBUS_CALL_FLAGS_NONE
+                2000,
+                null,
+                null,
+            ) orelse return null;
+            defer g_variant_unref(@ptrCast(@alignCast(reply)));
+            var object_path: ?[*:0]u8 = null;
+            var session_id: ?[*:0]u8 = null;
+            g_variant_get(@ptrCast(@alignCast(reply)), "(so)", &object_path, &session_id);
+            if (session_id != null) c.g_free(@constCast(session_id.?));
+            if (object_path == null) return null;
+            defer c.g_free(@constCast(object_path.?));
+            return self_alloc_dupe(std.mem.span(object_path.?)) catch null;
+        }
+
+        /// currentSessionPath 的分配辅助（无 self 上下文的 extern 路径用 c_allocator）
+        fn self_alloc_dupe(src: []const u8) ![]u8 {
+            return std.heap.c_allocator.dupe(u8, src);
+        }
+
+        const LogindTask = struct {
+            backend: *Self,
+            name: []u8,
+        };
+
+        fn marshalLogindName(self: *Self, name: []const u8) void {
+            const t = self.allocator.create(LogindTask) catch return;
+            const name_copy = self.allocator.dupe(u8, name) catch {
+                self.allocator.destroy(t);
+                return;
+            };
+            t.* = .{ .backend = self, .name = name_copy };
+            if (c.g_idle_add(logindIdle, t) == 0) {
+                self.allocator.free(name_copy);
+                self.allocator.destroy(t);
+            }
+        }
+
+        fn logindIdle(data: c.gpointer) callconv(.c) c.gboolean {
+            const task: *LogindTask = @ptrCast(@alignCast(data orelse return G_SOURCE_REMOVE));
+            const self = task.backend;
+            defer {
+                self.allocator.free(task.name);
+                self.allocator.destroy(task);
+            }
+            for (self.windows.items) |w| {
+                self.emitRawToWindow(w.id, task.name, "null");
+            }
+            log.print("[power] {s}", .{task.name});
+            return G_SOURCE_REMOVE;
+        }
+
+        fn onPrepareForSleep(_: ?*anyopaque, _: ?[*:0]const u8, _: ?[*:0]const u8, _: ?[*:0]const u8, _: ?[*:0]const u8, parameters: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return));
+            var start: c.gboolean = 0;
+            if (parameters != null) {
+                g_variant_get(@ptrCast(@alignCast(parameters.?)), "(b)", &start);
+            }
+            marshalLogindName(self, shared_power.sleepEventName(start != 0));
+        }
+
+        fn onSessionLocked(_: ?*anyopaque, _: ?[*:0]const u8, _: ?[*:0]const u8, _: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return));
+            marshalLogindName(self, "sessionLock");
+        }
+
+        fn onSessionUnlocked(_: ?*anyopaque, _: ?[*:0]const u8, _: ?[*:0]const u8, _: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return));
+            marshalLogindName(self, "sessionUnlock");
+        }
+
         fn watchThemeChanges(self: *Self) void {
             const settings = c.gtk_settings_get_default() orelse return;
             _ = c.g_signal_connect_data(
@@ -5026,6 +5266,22 @@ fn Backend(comptime config: Config) type {
                 return null;
             };
             log.print("[proxy] webview context ready ({s}, dir={s})", .{ proxy, dir });
+            return ctx;
+        }
+
+        /// v0.3.2：无痕窗口 context——`webkit_website_data_manager_new_ephemeral()`
+        /// （内存态，Cookie/localStorage/缓存不落盘，context 销毁即消失）。
+        /// 不缓存：每个无痕窗口独立 context（互不共享，也和主 context 隔离）。
+        fn incognitoContext(self: *Self) ?[*c]c.WebKitWebContext {
+            const mgr = c.webkit_website_data_manager_new_ephemeral();
+            if (mgr == null) return null;
+            defer c.g_object_unref(@ptrCast(mgr));
+            const ctx = c.webkit_web_context_new_with_website_data_manager(mgr);
+            if (ctx == null) return null;
+            c.webkit_web_context_register_uri_scheme(ctx, scheme, Self.onSchemeRequest, self, null);
+            _ = c.g_signal_connect_data(ctx, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
+            self.registerProtocolSchemes(ctx);
+            log.print("[incognito] ephemeral web context ready", .{});
             return ctx;
         }
 

@@ -216,6 +216,36 @@ pub fn collectMonitors(alloc: std.mem.Allocator) ![]sysinfo.Monitor {
     return list.toOwnedSlice(alloc);
 }
 
+// v0.3.2：MonitorFromWindow（当前窗口所在显示器标记用）
+const MONITOR_DEFAULTTONEAREST: u32 = 2;
+extern "user32" fn MonitorFromWindow(hwnd: win32.HWND, flags: u32) HMONITOR;
+
+const HandleCollector = struct {
+    handles: std.ArrayListUnmanaged(HMONITOR) = .empty,
+    alloc: std.mem.Allocator,
+};
+
+fn handleEnumProc(hmon: HMONITOR, hdc: ?*anyopaque, rect: *win32.RECT, data: isize) callconv(.c) i32 {
+    _ = hdc;
+    _ = rect;
+    const c: *HandleCollector = @ptrFromInt(@as(usize, @bitCast(data)));
+    c.handles.append(c.alloc, hmon) catch return 0;
+    return 1;
+}
+
+/// `hwnd` 所在显示器的枚举序 index（system.info('monitors') 的 current 标记用）。
+pub fn monitorIndexOf(hwnd: win32.HWND) ?usize {
+    const hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (hmon == null) return null;
+    var hc = HandleCollector{ .alloc = std.heap.page_allocator };
+    defer hc.handles.deinit(std.heap.page_allocator);
+    _ = EnumDisplayMonitors(null, null, handleEnumProc, @bitCast(@as(usize, @intFromPtr(&hc))));
+    for (hc.handles.items, 0..) |h, i| {
+        if (h == hmon) return i;
+    }
+    return null;
+}
+
 const testing = std.testing;
 
 test "accent color conversion keeps alpha and swaps to ARGB" {

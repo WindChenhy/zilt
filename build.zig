@@ -192,7 +192,7 @@ fn windowsOnlyStep(b: *std.Build, name: []const u8, desc: []const u8, target_os:
 /// Win32 导入库（未声明的 extern 会在链接期报 undefined symbol，
 /// 因此按需显式列全；MinGW 自带这些导入库，无需 MSVC）。
 fn linkWindowsLibs(module: *std.Build.Module) void {
-    for ([_][]const u8{ "user32", "gdi32", "ole32", "advapi32", "comdlg32", "shell32" }) |lib| {
+    for ([_][]const u8{ "user32", "gdi32", "ole32", "advapi32", "comdlg32", "shell32", "wtsapi32" }) |lib| {
         module.linkSystemLibrary(lib, .{});
     }
 }

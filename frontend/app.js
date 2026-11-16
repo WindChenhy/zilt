@@ -927,6 +927,67 @@ async function runChecks() {
         : `probe=${String(seen).slice(-80)}`);
     } catch (e) { setCheck('c-ua', false, String(e.message || e)); }
 
+
+    // 50. v0.3.2：真 scheme 协议（<scheme>://<path>?<query>，两平台同约定）。
+    // 断言形态 = iframe 导航（onload 即「注册→filter→处理器→响应→渲染」全链）。
+    // **文档化限制**：https 页面对自定义 scheme 的 fetch/XHR（cors 模式）实测被
+    // WebView2 的 CORS 判定拒绝——响应带 Access-Control-Allow-Origin（精确或 *）、
+    // AllowedOrigins（精确/通配）均不生效；iframe 导航与 no-cors fetch 正常。
+    // JS 侧需要可读响应体时用同源路径式 /__proto/<name>/…（fetch 全功能）。
+    try {
+      const stamp = Date.now();
+      const loaded = await new Promise((resolve) => {
+        const f = document.createElement('iframe');
+        f.style.display = 'none';
+        let done = false;
+        const finish = (v) => { if (!done) { done = true; try { f.remove(); } catch (_) {} resolve(v); } };
+        const timer = setTimeout(() => finish(false), 6000);
+        f.onload = () => { clearTimeout(timer); finish(true); };
+        f.onerror = () => { clearTimeout(timer); finish(false); };
+        f.src = `echo://a/b?x=1&y=${stamp}`;
+        document.body.appendChild(f);
+      });
+      setCheck('c-scheme', loaded, loaded
+        ? 'real scheme ok (iframe navigation served by protocol handler)'
+        : 'iframe navigation failed');
+      if (!loaded) window.zilt.log('warn', 'c-scheme note: iframe navigation failed');
+    } catch (e) {
+      setCheck('c-scheme', false, String(e.message || e));
+      window.zilt.log('warn', 'c-scheme error: ' + String(e.message || e));
+    }
+
+    // 51. v0.3.2：无痕窗口（window.create({incognito}) → state().incognito=true）
+    try {
+      const id0 = await window.zilt.window.create({
+        title: 'incognito probe', label: 'incognito-probe-' + Date.now(),
+        width: 240, height: 160, incognito: true, hidden: false,
+      });
+      const wid = id0 && typeof id0.id === 'number' ? id0.id : null;
+      let st = null;
+      if (wid != null) {
+        st = await window.zilt.window.state(wid);
+        await window.zilt.window.close(wid).catch(() => {});
+      }
+      const ok = !!st && st.incognito === true;
+      setCheck('c-privacy', ok, ok
+        ? 'incognito window ok (state().incognito=true)'
+        : `state=${JSON.stringify(st).slice(0, 80)}`);
+    } catch (e) { setCheck('c-privacy', false, String(e.message || e)); }
+
+    // 52. v0.3.2：显示器细化（current 标记 + workarea + window.state().monitor）
+    try {
+      const mons = await window.zilt.system.monitors();
+      const arr = Array.isArray(mons) ? mons : (mons && mons.monitors) || [];
+      const cur = arr.filter((m) => m.current === true);
+      const workOk = arr.every((m) => typeof m.workX === 'number' && typeof m.workWidth === 'number');
+      const st = await window.zilt.window.state();
+      const ok = arr.length >= 1 && cur.length === 1 && workOk && typeof st.monitor === 'number' &&
+        st.monitor === cur[0].index;
+      setCheck('c-monitor', ok, ok
+        ? `monitors ok (${arr.length} display(s), current=${cur[0].index}, work=${cur[0].workWidth}x${cur[0].workHeight}, state.monitor=${st.monitor})`
+        : `mons=${JSON.stringify(arr).slice(0, 120)} state=${JSON.stringify(st).slice(0, 80)}`);
+    } catch (e) { setCheck('c-monitor', false, String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -980,6 +1041,9 @@ async function runChecks() {
       overlay: $('c-overlay').className === 'pass',
       proto: $('c-proto').className === 'pass',
       ua: $('c-ua').className === 'pass',
+      scheme: $('c-scheme').className === 'pass',
+      privacy: $('c-privacy').className === 'pass',
+      monitor: $('c-monitor').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

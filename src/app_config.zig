@@ -45,6 +45,24 @@ pub const security: zilt.security.Options = .{    .capabilities = &.{.{
 
 /// 回显：`/__proto/echo/<path>?<query>` → `echo|<path>|<query>|<method>|<ua>`
 fn protocolEcho(req: zilt.protocol.Request, alloc: std.mem.Allocator) anyerror!zilt.protocol.Response {
+    // v0.3.2：真 scheme 的 CORS 探针——WebView2 实测：https 页面 fetch 自定义
+    // scheme（authority 模式）即使响应带 Access-Control-Allow-Origin 也被 CORS
+    // 判定拒绝（iframe 导航正常）；同 scheme origin 的请求"总是允许"（官方
+    // spec），所以冒烟经 iframe 内同源 fetch + postMessage 中继拿响应体。
+    // Chromium 规范化会在 authority 空路径后补 '/'（echo://x → echo://x/），
+    // 且 authority 段并入 path（echo://a/cors-probe → path=a/cors-probe）——
+    // 所以此处用 endsWith 匹配。
+    if (std.mem.endsWith(u8, req.path, "cors-probe")) {
+        return .{
+            .content_type = "text/html; charset=utf-8",
+            .body = try alloc.dupe(u8,
+            "<!doctype html><script>" ++
+            "fetch('/inner?relay=1').then(function(r){return r.text();})" ++
+            ".then(function(t){parent.postMessage({ok:true,body:t},'*');})" ++
+            ".catch(function(e){parent.postMessage({ok:false,error:String(e)},'*');});" ++
+            "</script>"),
+        };
+    }
     return .{
         .content_type = "text/plain; charset=utf-8",
         .body = try std.fmt.allocPrint(alloc, "echo|{s}|{s}|{s}|{s}", .{

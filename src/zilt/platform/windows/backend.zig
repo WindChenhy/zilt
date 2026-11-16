@@ -36,6 +36,7 @@ const autostart_mod = @import("../../autostart.zig");
 const theme_mod = @import("../../theme.zig");
 const shared_taskbar = @import("../../taskbar.zig");
 const shared_sysinfo = @import("../../sysinfo.zig");
+const power = @import("../../power.zig");
 const shared_store = @import("../../store.zig");
 const fs_api_mod = @import("../../fs_api.zig");
 const shared_services = @import("../../services.zig");
@@ -298,7 +299,11 @@ pub fn run(comptime config: Config) !void {
         eo.additional_browser_arguments = browser_args;
         log.print("[env] ZILT_WEBVIEW2_ARGS={s}", .{browser_args});
     }
-    if (eo.language != null or eo.proxy_server != null or eo.additional_browser_arguments != null or eo.channel != .evergreen or eo.browser_directory != null) {
+    // v0.3.2：真 scheme 注册需要 options 对象（EnvironmentOptions4）
+    const need_env_opts = eo.language != null or eo.proxy_server != null or eo.additional_browser_arguments != null or
+        eo.channel != .evergreen or eo.browser_directory != null or !eo.background_throttling or
+        config.protocols.len > 0;
+    if (need_env_opts) {
         env_opts = env_options.EnvironmentOptions.create(alloc, eo) catch |err| blk: {
             log.print("[env] environment options unavailable: {s}", .{@errorName(err)});
             break :blk null;
@@ -308,6 +313,15 @@ pub fn run(comptime config: Config) !void {
             if (eo.proxy_server) |v| v else "-",
             if (eo.additional_browser_arguments) |v| v else "-",
         });
+        // v0.3.2：真 scheme 注册（`media://localhost/…`）；老运行时 QI 失败仅日志，
+        // 路径式 `/__proto/<name>/` 仍然可用。
+        if (env_opts) |opts_ptr| {
+            if (config.protocols.len > 0) {
+                opts_ptr.setCustomSchemes(alloc, config.protocols, originOf(config.url)) catch |err| {
+                    log.print("[scheme] register failed: {s} (path-style protocols still work)", .{@errorName(err)});
+                };
+            }
+        }
     }
     defer if (env_opts) |o| o.dropRef();
 
@@ -335,6 +349,15 @@ pub fn run(comptime config: Config) !void {
         log.print("[updater] health timer armed (10s)", .{});
     }
 
+    // v0.3.2：注册会话通知（锁屏/解锁事件）。失败仅日志（事件面降级，不致命）。
+    if (backend.mainWindow()) |mw| {
+        if (wtsRegister(mw.hwnd)) |_| {
+            log.print("[session] WTS notifications registered", .{});
+        } else |err| {
+            log.print("[session] WTS registration unavailable: {s}", .{@errorName(err)});
+        }
+    }
+
     // 消息泵
     var msg: win32.MSG = undefined;
     while (win32.GetMessageW(&msg, null, 0, 0) > 0) {
@@ -351,6 +374,21 @@ pub fn run(comptime config: Config) !void {
     backend.saveAllStates();
     backend.cleanup();
     if (backend.quit_code.load(.monotonic) != 0) return error.AppFailed;
+}
+
+// ---------------------------------------------------------------------------
+// v0.3.2：WTS 会话通知（wtsapi32；锁屏/解锁事件）
+// ---------------------------------------------------------------------------
+
+extern "wtsapi32" fn WTSRegisterSessionNotification(hwnd: win32.HWND, flags: win32.DWORD) callconv(.winapi) win32.BOOL;
+extern "wtsapi32" fn WTSUnRegisterSessionNotification(hwnd: win32.HWND) callconv(.winapi) win32.BOOL;
+
+fn wtsRegister(hwnd: win32.HWND) !void {
+    if (WTSRegisterSessionNotification(hwnd, win32.NOTIFY_FOR_THIS_SESSION) == 0) return error.WtsRegisterFailed;
+}
+
+fn wtsUnregister(hwnd: win32.HWND) void {
+    _ = WTSUnRegisterSessionNotification(hwnd);
 }
 
 // ---------------------------------------------------------------------------
@@ -981,6 +1019,8 @@ fn Backend(comptime config: Config) type {
             overlay: bool = false,
             /// v0.1.24：本窗口 User-Agent（覆盖 config.webview.settings.user_agent）
             user_agent: ?[]u8 = null,
+            /// v0.3.2：无痕窗口（InPrivate controller：Cookie/存储不落盘）
+            incognito: bool = false,
             menu_bitmaps: std.ArrayListUnmanaged(win32.HBITMAP) = .empty,
 
             fn updateBounds(self: *Window) void {
@@ -1322,6 +1362,7 @@ fn Backend(comptime config: Config) type {
                 .proxy = proxy,
                 .overlay = opts.titlebar_overlay,
                 .user_agent = user_agent,
+                .incognito = opts.incognito,
             };
 
             const hinstance = win32.GetModuleHandleW(null);
@@ -1436,7 +1477,38 @@ fn Backend(comptime config: Config) type {
             if (w.own_env) |env| return self.beginControllerWithEnv(w, env);
             if (w.proxy) |proxy| return self.beginProxyEnv(w, proxy);
             const env = self.env orelse return;
+            // v0.3.2：无痕窗口 → ControllerWithOptions（InPrivate；老运行时回退普通 controller）
+            if (w.incognito) return self.beginIncognitoController(w, env);
             self.beginControllerWithEnv(w, env);
+        }
+
+        /// v0.3.2：无痕窗口（InPrivate）。Environment10 的 ControllerOptions +
+        /// ControllerWithOptions；QI 失败（WebView2 运行时 < 1.0.1722）时记日志并
+        /// 回退普通 controller（行为差异 = 数据落盘，与 InPrivate 的差异已在文档注明）。
+        fn beginIncognitoController(self: *Self, w: *Window, env: *wv2.ICoreWebView2Environment) void {
+            const env10 = wv2.ICoreWebView2Environment10.fromEnvironment(env) orelse {
+                log.print("[incognito] window #{d}: runtime lacks Environment10, falling back to normal controller", .{w.id});
+                return self.beginControllerWithEnv(w, env);
+            };
+            defer env10.release();
+            const created = env10.createControllerOptions();
+            if (com.failed(created.hr) or created.options == null) {
+                log.print("[incognito] window #{d}: CreateCoreWebView2ControllerOptions failed hr=0x{x}", .{ w.id, @as(u32, @bitCast(created.hr)) });
+                return self.beginControllerWithEnv(w, env);
+            }
+            const copts = created.options.?;
+            defer copts.release();
+            _ = copts.putInPrivateMode(true);
+            const handler = ControllerCompletedHandler.create(self, w) catch {
+                log.print("[fatal] controller handler alloc failed", .{});
+                return;
+            };
+            const hr = env10.createControllerWithOptions(w.hwnd, copts, handler);
+            handler.dropRef();
+            if (com.failed(hr)) {
+                log.print("[fatal] CreateCoreWebView2ControllerWithOptions failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+                win32.PostQuitMessage(3);
+            }
         }
 
         fn beginControllerWithEnv(self: *Self, w: *Window, env: *wv2.ICoreWebView2Environment) void {
@@ -1563,6 +1635,16 @@ fn Backend(comptime config: Config) type {
                     defer self.allocator.free(filter_w);
                     const hr3 = webview.addWebResourceRequestedFilter(filter_w.ptr, wv2.WEB_RESOURCE_CONTEXT_ALL);
                     log.print("[webview] AddWebResourceRequestedFilter({s}) hr=0x{x}", .{ filter, @as(u32, @bitCast(hr3)) });
+
+                    // v0.3.2：真 scheme filter（每个注册的协议一条 `<scheme>://*`）
+                    for (config.protocols) |p| {
+                        const scheme_filter = std.fmt.allocPrint(self.allocator, "{s}://*", .{p.name}) catch continue;
+                        defer self.allocator.free(scheme_filter);
+                        const scheme_filter_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, scheme_filter) catch continue;
+                        defer self.allocator.free(scheme_filter_w);
+                        const hr4 = webview.addWebResourceRequestedFilter(scheme_filter_w.ptr, wv2.WEB_RESOURCE_CONTEXT_ALL);
+                        log.print("[webview] AddWebResourceRequestedFilter({s}) hr=0x{x}", .{ scheme_filter, @as(u32, @bitCast(hr4)) });
+                    }
                 }
             }
 
@@ -2130,7 +2212,7 @@ fn Backend(comptime config: Config) type {
                     const supported = try self.runTaskbarOp(w, op, alloc);
                     return .{ .ok = supported };
                 },
-                .info => |kind| return .{ .json = try self.collectSystemInfo(kind, alloc) },
+                .info => |kind| return .{ .json = try self.collectSystemInfo(kind, alloc, w) },
                 .shell => |target| {
                     try sys_integration.open(alloc, target);
                     return .{ .ok = true };
@@ -2493,6 +2575,32 @@ fn Backend(comptime config: Config) type {
             }
         }
 
+        /// v0.3.2：无痕子 webview（Environment10 ControllerOptions；老运行时回退普通 controller）。
+        fn beginChildIncognitoController(self: *Self, w: *Window, c: *ChildWebview, env: *wv2.ICoreWebView2Environment) void {
+            const env10 = wv2.ICoreWebView2Environment10.fromEnvironment(env) orelse {
+                log.print("[webviews] child #{d}: runtime lacks Environment10, incognito falls back", .{c.id});
+                return self.beginChildController(w, c, env);
+            };
+            defer env10.release();
+            const created = env10.createControllerOptions();
+            if (com.failed(created.hr) or created.options == null) {
+                log.print("[webviews] child #{d}: ControllerOptions failed hr=0x{x}", .{ c.id, @as(u32, @bitCast(created.hr)) });
+                return self.beginChildController(w, c, env);
+            }
+            const copts = created.options.?;
+            defer copts.release();
+            _ = copts.putInPrivateMode(true);
+            const handler = ControllerCompletedHandler.createChild(self, w, c) catch {
+                log.print("[webviews] child handler alloc failed", .{});
+                return;
+            };
+            const hr = env10.createControllerWithOptions(c.hwnd, copts, handler);
+            handler.dropRef();
+            if (com.failed(hr)) {
+                log.print("[webviews] child #{d} incognito controller failed hr=0x{x}", .{ c.id, @as(u32, @bitCast(hr)) });
+            }
+        }
+
         /// 用指定 Environment 给子 HWND 建 controller（共享/分区共用）。
         fn beginChildController(self: *Self, w: *Window, c: *ChildWebview, env: *wv2.ICoreWebView2Environment) void {
             const handler = ControllerCompletedHandler.createChild(self, w, c) catch {
@@ -2580,6 +2688,7 @@ fn Backend(comptime config: Config) type {
                         break :blk std.heap.page_allocator.dupe(u8, sane) catch null;
                     };
                     c.partition = part_name;
+                    c.incognito = req.incognito and part_name == null; // incognito 优先（partition 忽略）
                     w.child_webviews.append(self.allocator, c) catch {
                         if (part_name) |p| std.heap.page_allocator.free(p);
                         std.heap.page_allocator.destroy(c);
@@ -2600,14 +2709,18 @@ fn Backend(comptime config: Config) type {
                         return .{ .json = try std.fmt.allocPrint(alloc, "{{\"id\":{d},\"partition\":\"{s}\",\"queued\":true}}", .{ id, pname }) };
                     }
 
-                    const handler = ControllerCompletedHandler.createChild(self, w, c) catch {
-                        log.print("[webviews] child handler alloc failed", .{});
-                        return .{ .json = try std.fmt.allocPrint(alloc, "{{\"id\":{d}}}", .{id}) };
-                    };
-                    const hr = env.createController(child_hwnd, handler);
-                    handler.dropRef();
-                    if (com.failed(hr)) {
-                        log.print("[webviews] child controller create failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+                    if (c.incognito) {
+                        self.beginChildIncognitoController(w, c, env);
+                    } else {
+                        const handler = ControllerCompletedHandler.createChild(self, w, c) catch {
+                            log.print("[webviews] child handler alloc failed", .{});
+                            return .{ .json = try std.fmt.allocPrint(alloc, "{{\"id\":{d}}}", .{id}) };
+                        };
+                        const hr = env.createController(child_hwnd, handler);
+                        handler.dropRef();
+                        if (com.failed(hr)) {
+                            log.print("[webviews] child controller create failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+                        }
                     }
                     log.print("[webviews] child #{d} created on window #{d} ({d}x{d}@{d},{d}) url={s}", .{
                         id, w.id, req.width, req.height, req.x, req.y, req.url,
@@ -3521,8 +3634,7 @@ fn Backend(comptime config: Config) type {
             return true;
         }
 
-        fn collectSystemInfo(self: *Self, kind: shared_system.InfoKind, alloc: std.mem.Allocator) ![]u8 {
-            _ = self;
+        fn collectSystemInfo(self: *Self, kind: shared_system.InfoKind, alloc: std.mem.Allocator, w: ?*Window) ![]u8 {
             switch (kind) {
                 .os => {
                     var owned = win_sysinfo.collectOs();
@@ -3531,6 +3643,8 @@ fn Backend(comptime config: Config) type {
                 .monitors => {
                     const monitors = try win_sysinfo.collectMonitors(alloc);
                     defer alloc.free(monitors);
+                    // v0.3.2：标记调用窗口所在显示器（MonitorFromWindow → 匹配枚举序）
+                    self.markCurrentMonitor(monitors, w);
                     return shared_sysinfo.monitorsToJson(alloc, monitors);
                 },
                 .all => {
@@ -3539,11 +3653,20 @@ fn Backend(comptime config: Config) type {
                     defer alloc.free(os_json);
                     const monitors = try win_sysinfo.collectMonitors(alloc);
                     defer alloc.free(monitors);
+                    self.markCurrentMonitor(monitors, w);
                     const mons_json = try shared_sysinfo.monitorsToJson(alloc, monitors);
                     defer alloc.free(mons_json);
                     return std.fmt.allocPrint(alloc, "{{\"os\":{s},\"monitors\":{s}}}", .{ os_json, mons_json });
                 },
             }
+        }
+
+        /// v0.3.2：把调用窗口所在显示器标记为 current（system.info('monitors')）。
+        fn markCurrentMonitor(self: *Self, monitors: []shared_sysinfo.Monitor, w: ?*Window) void {
+            _ = self;
+            const hwnd = if (w) |win| win.hwnd else return;
+            const index = win_sysinfo.monitorIndexOf(hwnd) orelse return;
+            for (monitors, 0..) |*m, i| m.current = i == index;
         }
 
         fn runAutostartOp(self: *Self, op: shared_system.AutostartOp, alloc: std.mem.Allocator) !autostart_mod.State {
@@ -4176,7 +4299,7 @@ fn Backend(comptime config: Config) type {
             const style: u32 = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_STYLE));
             const ex: u32 = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_EXSTYLE));
             return std.fmt.allocPrint(alloc,
-                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":{d},"ex_style":{d},"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":{s},"overlay":{s},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d}}}
+                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":{d},"ex_style":{d},"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":{s},"overlay":{s},"incognito":{s},"monitor":{d},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d}}}
             , .{
                 w.id,
                 rc.left,
@@ -4197,6 +4320,8 @@ fn Backend(comptime config: Config) type {
                 boolStr(w.focusable),
                 boolStr(w.content_protected),
                 boolStr(w.overlay),
+                boolStr(w.incognito),
+                (win_sysinfo.monitorIndexOf(w.hwnd) orelse 0),
                 w.min_width orelse 0,
                 w.min_height orelse 0,
                 w.max_width orelse 0,
@@ -4307,6 +4432,13 @@ fn Backend(comptime config: Config) type {
         }
 
         /// 应用主题变化广播（每个窗口一条事件）。
+        /// v0.3.2：无窗口上下文的全局广播（电源/会话事件：发往所有存活窗口）。
+        fn emitAll(self: *Self, name: []const u8, payload: anytype) void {
+            for (self.windows.items) |w| {
+                if (w.alive) w.emitEventPayload(name, payload);
+            }
+        }
+
         fn emitThemeAll(self: *Self) void {
             const theme = themeName();
             log.print("[theme] changed -> {s}", .{theme});
@@ -4409,6 +4541,17 @@ fn Backend(comptime config: Config) type {
             var range_start: u64 = 0;
             var range_end: u64 = 0;
             var range_total: u64 = 0;
+
+            // v0.3.2：真 scheme 请求（`<scheme>://…`）先于同源资产——URI 形态与
+            // 应用 origin 不同，不会进 sameOrigin 分支。**必须经已注册名门控**，
+            // 否则 https 等内置 scheme 也会被解析并误拦。
+            if (protocol.schemeNameOf(uri_u8)) |scheme_name| {
+                if (protocol.find(config.protocols, scheme_name) != null) {
+                    if (protocol.parseSchemeRoute(uri_u8)) |route| {
+                        if (self.serveProtocolRoute(route, uri_u8, args, true)) return;
+                    }
+                }
+            }
 
             if (security.sameOrigin(uri_u8, config.url)) {
                 const authority_start = (std.mem.indexOf(u8, uri_u8, "://") orelse return) + 3;
@@ -4549,8 +4692,19 @@ fn Backend(comptime config: Config) type {
         /// 未注册的名字返回 false（走静态资产 404）。
         fn serveProtocol(self: *Self, uri: []const u8, path: []const u8, args: *wv2.ICoreWebView2WebResourceRequestedEventArgs) bool {
             const route = protocol.parseRoute(path, uri) orelse return false;
+            return self.serveProtocolRoute(route, uri, args, false);
+        }
+
+        /// v0.1.24/v0.3.2 共通实现：路由已解析的协议请求。真 scheme 请求
+        /// （`scheme://…`）带 CORS 允许头（跨 origin fetch 需要；路径式同源不需要）。
+        fn serveProtocolRoute(self: *Self, route: protocol.Route, uri: []const u8, args: *wv2.ICoreWebView2WebResourceRequestedEventArgs, cross_origin: bool) bool {
             const p = protocol.find(config.protocols, route.name) orelse {
                 log.print("[proto] '{s}' 未注册 <- {s}", .{ route.name, uri });
+                // 真 scheme 没有静态资产兜底——未注册名直接给 404，避免引擎错误页
+                if (cross_origin) {
+                    self.writeProtocolResponse(args, .{ .status = 404, .body = "protocol not registered", .owned = false }, uri, true);
+                    return true;
+                }
                 return false;
             };
 
@@ -4582,16 +4736,16 @@ fn Backend(comptime config: Config) type {
                 .url = uri,
             }, self.allocator) catch |err| {
                 log.print("[proto] {s} handler failed: {s}", .{ route.name, @errorName(err) });
-                self.writeProtocolResponse(args, .{ .status = 500, .body = "protocol handler failed", .owned = false }, uri);
+                self.writeProtocolResponse(args, .{ .status = 500, .body = "protocol handler failed", .owned = false }, uri, cross_origin);
                 return true;
             };
             defer if (res.owned) self.allocator.free(res.body);
-            log.print("[proto] {d} {s}/{s} {d} bytes", .{ res.status, route.name, route.path, res.body.len });
-            self.writeProtocolResponse(args, res, uri);
+            log.print("[proto] {d} {s}/{s} {d} bytes <- {s} (cors={})", .{ res.status, route.name, route.path, res.body.len, uri, cross_origin });
+            self.writeProtocolResponse(args, res, uri, cross_origin);
             return true;
         }
 
-        fn writeProtocolResponse(self: *Self, args: *wv2.ICoreWebView2WebResourceRequestedEventArgs, res: protocol.Response, uri: []const u8) void {
+        fn writeProtocolResponse(self: *Self, args: *wv2.ICoreWebView2WebResourceRequestedEventArgs, res: protocol.Response, uri: []const u8, cross_origin: bool) void {
             const env = self.env orelse return;
             const reason = protocol.reasonFor(res.status);
             const reason_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, reason) catch return;
@@ -4601,6 +4755,12 @@ fn Backend(comptime config: Config) type {
             defer hb.deinit();
             hb.writer.print("Content-Type: {s}", .{res.content_type}) catch return;
             for (res.headers) |h| hb.writer.print("\r\n{s}: {s}", .{ h.name, h.value }) catch return;
+            // v0.3.2：真 scheme 与应用 origin 不同源——补 CORS 允许（对齐 Linux
+            // 真 scheme 的行为；AllowedOrigins 已在环境侧限制来源，这里是响应面）
+            if (cross_origin) {
+                hb.writer.print("\r\nAccess-Control-Allow-Origin: *", .{}) catch return;
+                hb.writer.print("\r\nAccess-Control-Expose-Headers: *", .{}) catch return;
+            }
             const headers_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, hb.written()) catch return;
             defer self.allocator.free(headers_w);
 
@@ -4800,7 +4960,10 @@ fn Backend(comptime config: Config) type {
         }
 
         fn cleanup(self: *Self) void {
-            if (self.mainWindow()) |w| _ = win32.KillTimer(w.hwnd, 1);
+            if (self.mainWindow()) |w| {
+                _ = win32.KillTimer(w.hwnd, 1);
+                wtsUnregister(w.hwnd); // v0.3.2：注销会话通知
+            }
             if (Self.hotkey_cfg) |hks| {
                 if (self.mainWindow()) |w| hotkey_mod.unregisterAll(w.hwnd, hks);
             }
@@ -5050,6 +5213,25 @@ fn Backend(comptime config: Config) type {
                         if (instance) |b| b.emitThemeAll();
                         return 0;
                     }
+                },
+                // v0.3.2：电源/会话事件（powerSuspend/powerResume/powerStatusChanged/sessionLock/sessionUnlock）
+                win32.WM_POWERBROADCAST => {
+                    if (instance) |b| {
+                        if (power.powerEventName(@intCast(wparam)) ) |name| {
+                            log.print("[power] {s}", .{name});
+                            b.emitAll(name, @as(?u8, null));
+                        }
+                    }
+                    return 1; // TRUE：已处理
+                },
+                win32.WM_WTSSESSION_CHANGE => {
+                    if (instance) |b| {
+                        if (power.sessionEventName(@intCast(wparam))) |name| {
+                            log.print("[session] {s}", .{name});
+                            b.emitAll(name, @as(?u8, null));
+                        }
+                    }
+                    return 0;
                 },
                 // v0.1.18：自定义光标 / 置底 / 托盘 hover 结束
                 win32.WM_SETCURSOR => {
@@ -6785,6 +6967,8 @@ const ChildWebview = struct {
     partition: ?[]u8 = null,
     /// 分区 Environment（本 child 持有的一份引用，销毁时 Release）
     env: ?*wv2.ICoreWebView2Environment = null,
+    /// v0.3.2：无痕子 webview（InPrivate controller；与 partition 互斥，incognito 优先）
+    incognito: bool = false,
 };
 
 /// v0.1.17：子 webview eval 的延后任务（WM_ZILT_EVAL 携带，UI 线程执行）
