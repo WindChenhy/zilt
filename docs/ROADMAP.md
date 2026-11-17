@@ -485,17 +485,17 @@
       - **范围说明**：浏览器端 runtime 传输 shim（二阶段）——协议层已被 python
         E2E 完整覆盖
       - **验收**：Windows/Linux 单测全绿；Linux 冒烟 79/79 + headless/server E2E
-      - v0.3.3 窗口体验包 II：PNG 形状 mask / 每按钮状态 / HideOnFocusLost+HideOnEscape /
-        托盘附着窗口 / 窗口级 KeyBindings / startResizeDragging / preventOverflow /
-        标题栏双击行为 / move 去抖 / 效果参数（tint/cornerPreference）/ Zig 侧窗口事件钩子
-      - v0.3.4 分发与更新：侧车资源/sidecar 全格式打包 / 离线 WebView2 fixed E2E /
-        更新器事件协议补全 + skipVersion + GitHub provider / 交叉编译 pack / 模板 TS 变体
-      - v0.3.5 安全与系统深化：isolation pattern（iframe 沙箱）/ Wayland portal 快捷键 /
-        DPAPI 加密 store / 绑定参数名保留（附带）
-      - v0.3.6 IPC v2 + CompositionController：原始二进制 IPC（SharedBuffer）/
-        WebView2 composition hosting + app-region 原生命中（失败回退 HWND 模式）
-      - v0.3.7（弹性）server 模式：浏览器客户端作为窗口 + WS 事件总线
-      - 明确推后（v0.4+/Phase 4）：macOS 全栈、iOS/Android、浏览器扩展、WML、GPU 信息、CLI 自更新
+      - 后续规划（v0.3.8–v0.3.13，二轮差距刷新 2026-11-17——对标 Wails v3.1.0 /
+        Tauri 2.12.6；差距总表与实现路径见 v0.3.x-PLAN §0.4/§1）：
+        **v0.3.8** IPC/协议收尾（B8 协议 POST body 读取 + C1L Linux 二进制 IPC +
+        C3 绑定参数名 + E6 上传进度）→ **v0.3.9** 窗口对称（A12 tint/cornerPreference +
+        A4L Linux KeyBindings）→ **v0.3.10** 安全（C2 isolation pattern +
+        D1 Wayland portal 快捷键）→ **v0.3.11** 分发（E1b external_bin sidecar +
+        E2 fixed 运行时 E2E + E4 交叉编译 pack + F2 模板 TS 变体）→
+        **v0.3.12** CompositionController 专项（A11，失败回退 HWND）→
+        **v0.3.13** server 模式二阶段（F1b 浏览器端 runtime shim）
+      - 明确推后（v0.4+/Phase 4）：macOS 全栈、iOS/Android、浏览器扩展、WML、GPU 信息、
+        CLI 自更新、Tauri cli 插件（参数解析）、upload 断点续传（E6 stretch）
 - [ ] macOS：zig-objc 路线（NSApplication/NSWindow/WKWebView + 运行时注册 delegate）——v0.4+
 - [x] 平台差异收敛原则：平台无关层（ipc/security/fs_api/protocol/net/sql/store/patch/pack_formats）
       两平台共用，差异只出现在 `platform/<os>/`
