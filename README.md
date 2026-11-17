@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.6（SharedBuffer 二进制 IPC——1MB 级零拷贝传输，Windows）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.7（server 模式——浏览器客户端作为窗口 + WS 会话独立路由，双平台 E2E）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -123,6 +123,22 @@ v0.3.6 新增（2026-11-17，二进制 IPC）：
   非客户区 API——v0.3.x 最大单项 COM 工程）移至专项版本：ABI 面已核对
   （Environment10::CreateCoreWebView2CompositionControllerWithOptions 槽 22 + NonClientRegion
   接口族），技术方案记录在 v0.3.x-PLAN §v0.3.6
+
+v0.3.7 新增（2026-11-17，server 模式——对齐 Wails application_server/BrowserWindow）：
+
+- **server 模式 WS 会话**：headless HTTP 服务扩容 `/zilt/ws` 升级端点——每个浏览器
+  连接一个会话（server 窗口 id 空间 0x100000+，与原生窗口隔离），invoke 走与
+  POST /zilt/ipc 同一 dispatch 链路（builtin 优先 + 应用命令），响应/事件按会话
+  独立回帧；broadcast 事件投递所有会话（Wails BrowserWindow 语义）
+- **accept 循环线程化**：每连接一线程（WS 会话的阻塞帧读不再阻塞 accept 与其他
+  连接；HTTP 短连接与长会话并存）——comptime config 经 spawn 参数剥离传入线程；
+  常规 headless 四端点回归 PASS
+- **E2E**：`scripts/server_mode_e2e.py`（python 原生 WS 客户端：握手 accept 校验 +
+  greet/add 往返 + **双会话独立路由**）——Windows 手动 ALL PASSED + Linux CI
+  （dev-headless.sh 接入 SERVER_E2E=PASS）
+- **验收**：Windows/Linux 单测全绿；Linux 冒烟 79/79 + headless/server E2E 全 PASS
+- **范围说明**：浏览器端 runtime 传输 shim（页面经 WS 桥接 window.zilt）列为
+  server 模式二阶段——协议层已被 python E2E 完整覆盖（该脚本即协议实现）
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 

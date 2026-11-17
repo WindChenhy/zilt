@@ -105,9 +105,16 @@ PORT="${ZILT_HEADLESS_PORT_OVERRIDE:-8793}"
   echo "$ACL_OUT" | grep -q '"name":"greet"' || PASS=0
   echo "$ACL_OUT" | grep -q 'ToolNotAllowed: add' || PASS=0
   if [ "$PASS" = "1" ]; then echo "HEADLESS_E2E=PASS"; else echo "HEADLESS_E2E=FAIL"; fi
+
+  # v0.3.7：server 模式 E2E（WS 会话 → invoke 往返 + 双会话路由）
+  ZILT_HEADLESS=1 ZILT_HEADLESS_PORT=8791 timeout 60 ./zig-out/bin/zilt-app > /tmp/zilt-server.log 2>&1 &
+  server_pid=$!
+  sleep 2
+  python3 scripts/server_mode_e2e.py 8791 && echo "SERVER_E2E=PASS" || echo "SERVER_E2E=FAIL"
+  kill $server_pid 2>/dev/null
 } > "$LOG" 2>&1
 
 grep -a 'HEALTH=\|MCP_STDIO_LINES=\|HEADLESS_E2E' "$LOG"
-code=$(grep -aq 'HEADLESS_E2E=PASS' "$LOG" && echo 0 || echo 1)
+code=$(grep -aq 'HEADLESS_E2E=PASS' "$LOG" && grep -aq 'SERVER_E2E=PASS' "$LOG" && echo 0 || echo 1)
 echo "$code" > .zilt-probe/headless-last.exit
 exit "$code"

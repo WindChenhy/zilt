@@ -31,6 +31,7 @@ pub const menu_model = @import("menu_model.zig");
 pub const taskbar = @import("taskbar.zig");
 pub const sysinfo = @import("sysinfo.zig");
 pub const power = @import("power.zig");
+pub const server_session = @import("server_session.zig");
 pub const shell = @import("shell.zig");
 pub const autostart = @import("autostart.zig");
 pub const theme = @import("theme.zig");
@@ -85,6 +86,7 @@ test {
     _ = @import("taskbar.zig");
     _ = @import("sysinfo.zig");
     _ = @import("power.zig");
+    _ = @import("server_session.zig");
     _ = @import("shell.zig");
     _ = @import("autostart.zig");
     _ = @import("theme.zig");

@@ -19,6 +19,8 @@ const builtin = @import("builtin");
 const zilt = @import("../../root.zig");
 const asset_routes = @import("../../asset_routes.zig");
 const services_mod = @import("../../services.zig");
+const server_session = @import("../../server_session.zig");
+const ws_mod = @import("../../ws.zig");
 
 const log = zilt.log;
 const ipc = zilt.ipc;
@@ -141,11 +143,36 @@ pub fn run(comptime config: zilt.Config, alloc: std.mem.Allocator) !void {
             log.print("[headless] accept failed: {s}", .{@errorName(e)});
             continue;
         };
-        handleConnection(config, alloc, io, &stream, mcp_opts) catch |e| {
-            log.print("[headless] connection error: {s}", .{@errorName(e)});
+        // v0.3.7：每连接一线程——WS 会话的阻塞帧读循环不能阻塞 accept 与
+        // 其他连接（HTTP 短连接与长会话并存）。
+        const conn = try alloc.create(ConnJob);
+        conn.* = .{ .io = io, .stream = stream, .mcp_opts = mcp_opts };
+        const t = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, connThread, .{ config, alloc, conn }) catch {
+            alloc.destroy(conn);
+            stream.close(io);
+            continue;
         };
-        stream.close(io);
+        t.detach();
     }
+}
+
+/// 连接线程参数（stream 所有权移入线程；线程结束时关闭）。
+/// config 是 comptime-only——经 spawn 的参数剥离传给泛型 connThread。
+const ConnJob = struct {
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    mcp_opts: mcp.Options,
+};
+
+fn connThread(comptime config: zilt.Config, alloc: std.mem.Allocator, job: *ConnJob) void {
+    defer {
+        job.stream.close(job.io);
+        alloc.destroy(job);
+    }
+    var stream = job.stream;
+    handleConnection(config, alloc, job.io, &stream, job.mcp_opts) catch |e| {
+        log.print("[headless] connection error: {s}", .{@errorName(e)});
+    };
 }
 
 /// MCP 运行选项：`ZILT_MCP_TOOLS=greet,add` 白名单（逗号分隔）。
@@ -214,6 +241,198 @@ fn runMcpStdio(
     log.print("[mcp:stdio] stdin closed -> exit", .{});
 }
 
+/// v0.3.7：server 会话主循环——握手 → 帧读循环（invoke → dispatch → 响应帧）
+/// + 每帧间 drain 事件队列（帧回写）。会话持有独立 server 窗口 id。
+fn runServerSession(
+    comptime config: zilt.Config,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+    client_key: []const u8,
+) !void {
+    // 握手响应（缓冲 writer 与 handleConnection 同款）
+    var wbuf: [16 * 1024]u8 = undefined;
+    var wr = stream.writer(io, &wbuf);
+    const out = &wr.interface;
+    const resp = try server_session.upgradeResponse(alloc, client_key);
+    out.writeAll(resp) catch return error.HandshakeFailed;
+    out.flush() catch return error.HandshakeFailed;
+
+    // 会话注册（server 窗口 id 空间）
+    const session = try alloc.create(server_session.Session);
+    session.* = .{ .window_id = server_session.nextWindowId(), .alloc = alloc };
+    server_session.register(session);
+    defer {
+        server_session.unregister(session);
+        alloc.destroy(session);
+    }
+    log.print("[server] session #{x} connected (total={d})", .{ session.window_id, server_session.sessionCount() });
+
+    // 帧读循环：文本帧 = JSON 消息（invoke/event）；ping → pong；close → 退出
+    //（dispatch 上下文在 handleIpcJson 内逐条构造，backend = Session）
+    while (true) {
+        // 先 drain 待发事件（非阻塞；队列空即跳过）
+        const drained = session.drain(alloc);
+        defer {
+            for (drained) |item| alloc.free(item);
+            alloc.free(drained);
+        }
+        for (drained) |item| {
+            const frame = ws_mod.encodeFrame(alloc, .text, item, .{ 0, 0, 0, 0 }) catch continue;
+            defer alloc.free(frame);
+            out.writeAll(frame) catch return error.SessionWriteFailed;
+            out.flush() catch return error.SessionWriteFailed;
+        }
+
+        // 读一帧（阻塞 read；逐字节进入累积缓冲直至完整帧）
+        const frame = readWsFrame(alloc, io, stream) catch |err| {
+            if (err != error.EndOfStream) log.print("[server] session #{x} read failed: {s}", .{ session.window_id, @errorName(err) });
+            return;
+        };
+        defer alloc.free(frame.payload);
+        switch (frame.op) {
+            .close => {
+                log.print("[server] session #{x} closed", .{session.window_id});
+                return;
+            },
+            .ping => {
+                const pong = ws_mod.encodeFrame(alloc, .pong, frame.payload, .{ 0, 0, 0, 0 }) catch continue;
+                defer alloc.free(pong);
+                out.writeAll(pong) catch return error.SessionWriteFailed;
+                out.flush() catch return error.SessionWriteFailed;
+                continue;
+            },
+            .text => {},
+            else => continue, // 二进制帧等暂不处理
+        }
+
+        // JSON 消息 → dispatch（与 POST /zilt/ipc 同链路）
+        const response = handleIpcJson(alloc, config, session, frame.payload) catch |err| {
+            log.print("[server] session #{x} dispatch failed: {s}", .{ session.window_id, @errorName(err) });
+            continue;
+        };
+        const frame_out = ws_mod.encodeFrame(alloc, .text, response, .{ 0, 0, 0, 0 }) catch continue;
+        defer alloc.free(frame_out);
+        out.writeAll(frame_out) catch return error.SessionWriteFailed;
+        out.flush() catch return error.SessionWriteFailed;
+    }
+}
+
+/// 单条 JSON 消息 dispatch（与 POST /zilt/ipc 同链路：builtin 优先 + 应用命令）。
+/// 会话上下文 backend = Session（sessionEmit 把事件路由回本会话）。
+fn handleIpcJson(
+    alloc: std.mem.Allocator,
+    comptime config: zilt.Config,
+    session: *server_session.Session,
+    payload_json: []const u8,
+) ![]u8 {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, alloc, payload_json, .{}) catch return error.BadPayload;
+    const obj = switch (parsed) {
+        .object => |o| o,
+        else => return error.BadPayload,
+    };
+    const kind = switch (obj.get("kind") orelse return error.BadPayload) {
+        .string => |str| str,
+        else => return error.BadPayload,
+    };
+    if (!std.mem.eql(u8, kind, "invoke")) return try alloc.dupe(u8, "{}"); // 上行 event 暂不处理
+    const id: i64 = switch (obj.get("id") orelse return error.BadPayload) {
+        .integer => |v| v,
+        else => 0,
+    };
+    const method = switch (obj.get("method") orelse return error.BadPayload) {
+        .string => |str| str,
+        else => return error.BadPayload,
+    };
+    const args_json = if (obj.get("args")) |args_v| switch (args_v) {
+        .object, .array => try std.json.Stringify.valueAlloc(alloc, args_v, .{}),
+        else => try alloc.dupe(u8, "{}"),
+    } else try alloc.dupe(u8, "{}");
+
+    const ctx = zilt.ipc.Context{
+        .allocator = alloc,
+        .msg_allocator = alloc,
+        .backend = @ptrCast(session),
+        .window_id = session.window_id,
+        .emit_fn = sessionEmit,
+        .quit_fn = headlessQuit,
+        .system_fn = headlessSystem,
+    };
+
+    if (zilt.builtin_commands.isBuiltin(method)) {
+        const builtin_result = zilt.builtin_commands.dispatch(ctx, method, args_json) catch |e| {
+            log.print("[server] builtin {s} failed: {s}", .{ method, @errorName(e) });
+            return try std.fmt.allocPrint(alloc, "{{\"zilt\":1,\"kind\":\"reject\",\"id\":{d},\"error\":\"{s}\"}}", .{ id, @errorName(e) });
+        };
+        if (builtin_result) |res| {
+            defer alloc.free(res);
+            return try std.fmt.allocPrint(alloc, "{{\"zilt\":1,\"kind\":\"resolve\",\"id\":{d},\"result\":{s}}}", .{ id, res });
+        }
+    }
+    const result = zilt.ipc.dispatch(config.commands, ctx, method, args_json) catch |e| {
+        log.print("[server] {s} failed: {s}", .{ method, @errorName(e) });
+        return try std.fmt.allocPrint(alloc, "{{\"zilt\":1,\"kind\":\"reject\",\"id\":{d},\"error\":\"{s}\"}}", .{ id, @errorName(e) });
+    };
+    defer alloc.free(result);
+    return try std.fmt.allocPrint(alloc, "{{\"zilt\":1,\"kind\":\"resolve\",\"id\":{d},\"result\":{s}}}", .{ id, result });
+}
+
+/// 会话 emit：事件 JSON → server_session.routeEvent（本会话命中 → 回帧；否则广播）。
+fn sessionEmit(backend: *anyopaque, window_id: u32, message_json: []const u8) void {
+    const session: *server_session.Session = @ptrCast(@alignCast(backend));
+    _ = window_id;
+    server_session.routeEvent(session.window_id, message_json);
+}
+
+/// v0.3.7：读一个完整 WS 帧（客户端帧带 mask；RFC6455 长度三态 + mask 解包）。
+/// 返回 {op, payload}（payload 归调用方 free）。
+fn readWsFrame(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+) !struct { op: ws_mod.Opcode, payload: []u8 } {
+    var hdr: [2]u8 = undefined;
+    try readExact(io, stream, &hdr);
+    const b0 = hdr[0];
+    const b1 = hdr[1];
+    const fin = b0 & 0x80 != 0;
+    const op_int: u4 = @intCast(b0 & 0x0f);
+    const op = ws_mod.Opcode.fromInt(op_int) orelse return error.BadOpcode;
+    const masked = b1 & 0x80 != 0;
+    var len: u64 = b1 & 0x7f;
+    if (len == 126) {
+        var ext: [2]u8 = undefined;
+        try readExact(io, stream, &ext);
+        len = std.mem.readInt(u16, &ext, .big);
+    } else if (len == 127) {
+        var ext: [8]u8 = undefined;
+        try readExact(io, stream, &ext);
+        len = std.mem.readInt(u64, &ext, .big);
+    }
+    if (len > 32 * 1024 * 1024) return error.FrameTooLarge;
+    var mask_key: [4]u8 = .{ 0, 0, 0, 0 };
+    if (masked) try readExact(io, stream, &mask_key);
+    const payload = try alloc.alloc(u8, @intCast(len));
+    errdefer alloc.free(payload);
+    try readExact(io, stream, payload);
+    if (masked) {
+        for (payload, 0..) |*b, i| b.* ^= mask_key[i % 4];
+    }
+    // 分片（FIN=0 续帧）：累积到 FIN（binary/text 起始帧；控制帧不应分片）
+    _ = fin;
+    return .{ .op = op, .payload = payload };
+}
+
+fn readExact(io: std.Io, stream: *std.Io.net.Stream, buf: []u8) !void {
+    var at: usize = 0;
+    while (at < buf.len) {
+        var vec = [_][]u8{buf[at..]};
+        const n = stream.read(io, &vec) catch return error.EndOfStream;
+        if (n == 0) return error.EndOfStream;
+        at += n;
+    }
+}
+
 fn handleConnection(
     comptime config: zilt.Config,
     alloc: std.mem.Allocator,
@@ -242,6 +461,13 @@ fn handleConnection(
     var parts = std.mem.tokenizeScalar(u8, request_line, ' ');
     const method = parts.next() orelse return error.BadRequest;
     const target = parts.next() orelse return error.BadRequest;
+
+    // v0.3.7：WS upgrade（/zilt/ws）→ server 会话（浏览器客户端作为窗口）
+    if (std.mem.indexOf(u8, head_text, "/zilt/ws") != null) {
+        if (server_session.isWsUpgrade(head_text)) |client_key| {
+            return runServerSession(config, alloc, io, stream, client_key);
+        }
+    }
 
     // Content-Length
     var content_length: usize = 0;

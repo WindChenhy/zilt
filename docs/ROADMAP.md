@@ -467,8 +467,24 @@
       - **验收**：Windows 冒烟 56 项（+c-binipc 16KB checksum match）；Linux 79/79
         （binipc 平台差异 skip）；A11 CompositionController 延后（ABI 已核对，
         方案在 v0.3.x-PLAN）
-- [~] **v0.3.7 系列规划**（详见 [`docs/v0.3.x-PLAN.md`](v0.3.x-PLAN.md)）：
-      - v0.3.7 server 模式：浏览器客户端作为窗口 + WS 事件总线
+- [x] **v0.3.7 server 模式**（2026-11-17）：
+      - server_session.zig：WS upgrade（RFC6455 已知向量单测）+ 会话注册表
+        （server 窗口 id 0x100000+；自旋锁——Io.Mutex 需 io 实例而注册表从任意
+        线程调用）+ routeEvent（命中回会话 / 未命中广播）
+      - headless：/zilt/ws upgrade 分流 → runServerSession（帧读循环 invoke →
+        dispatch 响应回帧 + drain 事件队列传帧；ping→pong）→ handleIpcJson
+        （builtin 优先 + ipc.dispatch，backend=Session）；**accept 线程化**
+        （每连接一线程；comptime config 经 spawn 参数剥离传入）
+      - **E2E**：scripts/server_mode_e2e.py（原生 WS 客户端：握手 accept 校验 +
+        greet/add 往返 + 双会话独立路由）——Windows ALL PASSED + Linux
+        SERVER_E2E=PASS（dev-headless.sh 接入 CI）；headless 四端点回归 PASS
+      - **实测坑**：Io.Mutex 需 io 实例（自旋锁替代）；Io.Mutex= .init 哨兵；
+        Stream.read 是矢量读（[][]u8）；ws.zig encodeFrame 是客户端形态（服务端
+        帧也带 mask 位——python E2E 兼容处理）；ConnJob 不能持 comptime-only
+        Config（spawn 参数剥离）
+      - **范围说明**：浏览器端 runtime 传输 shim（二阶段）——协议层已被 python
+        E2E 完整覆盖
+      - **验收**：Windows/Linux 单测全绿；Linux 冒烟 79/79 + headless/server E2E
       - v0.3.3 窗口体验包 II：PNG 形状 mask / 每按钮状态 / HideOnFocusLost+HideOnEscape /
         托盘附着窗口 / 窗口级 KeyBindings / startResizeDragging / preventOverflow /
         标题栏双击行为 / move 去抖 / 效果参数（tint/cornerPreference）/ Zig 侧窗口事件钩子
