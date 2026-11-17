@@ -485,6 +485,32 @@
       - **范围说明**：浏览器端 runtime 传输 shim（二阶段）——协议层已被 python
         E2E 完整覆盖
       - **验收**：Windows/Linux 单测全绿；Linux 冒烟 79/79 + headless/server E2E
+- [x] **v0.3.9 窗口效果与键盘对称**（2026-11-18；二轮差距刷新第二批）：
+      - **A12 效果参数（Windows）**：theme.zig 增 CornerPreference（DWMWCP_*，
+        DWMWA_WINDOW_CORNER_PREFERENCE 33）+ AccentPolicy/WindowCompositionAttribData
+        （extern struct 对齐 winuser 私有头）+ parseTint（"RRGGBB"/"AARRGGBB" →
+        GradientColor 0xAABBGGRR，缺省 alpha 0xCC）+ 单测；system_integration 增
+        applyTint（SetWindowCompositionAttribute user32 GetProcAddress 动态加载，
+        ACCENT_ENABLE_ACRYLICBLURBEHIND——Tauri windowEffects 同款）+ applyCornerPreference；
+        builtin 解析 tint/corner_preference；runtime appearance.apply 做 camelCase 映射；
+        Linux 无 accent API → NotSupported 文档化（radius macOS-only 不变）
+      - **A4L Linux KeyBindings**：KeyBindEntry（创建时 accelTextOf→parseAccelGtk 解析
+        keyval/mods，id 归 WinState 所有权）→ key-press-event 匹配（与 v0.3.3 Escape
+        同一 handler）→ windowKeyBinding {id, windowId}（与 Windows 逐字一致）；
+        matchKeyBinding 文件级纯函数（keyval ASCII 归一小写——**实测坑**：keyvalForGtk
+        统一大写键位 0x41-0x5A 而事件 keyval 是实际 level（'x'=0x78），且测试构建不链
+        GTK 不能调 gdk_keyval_to_lower → keyvalLower 手写）；mods 只比较四个语义位
+        （numlock/MOD2 忽略）；菜单 accel 由 GTK accel group 先行消费（优先级对齐）
+      - **实测坑（X 层注入）**：XSendEvent 核心 KeyPress 被 GDK3 的 XI2 后端丢弃
+        （事件不到达）；XTestFakeKeyEvent（dlopen libXtst，XSetInputFocus 后注入）
+        四步全部执行成功但 WebKit 事件路径稳定段错（无 Zig 栈帧、PC=坏地址）——
+        Xvfb+WebKitGTK 环境限制，与 v0.3.3 Escape 同测试深度。冒烟改为探针走
+        **同一条匹配→事件派发路径**（合成 keyval/mods → matchKeyBinding → emit；
+        确认结果经 linuxSmokeKeyBind 事件回传主页面——secondWindowProbe 先例）+
+        matchKeyBinding 单测锁定大小写/掩码语义
+      - **验收**：Windows 冒烟 58 项（c-appearance 扩展：tint=true 应用日志 + corner；
+        c-exp2 增 keyBindings 创建）+ 单测全绿；Linux 单测全绿（+matchKeyBinding），
+        冒烟 **82/82** + post terminate PASS
 - [x] **v0.3.8 IPC 与协议收尾**（2026-11-18；二轮差距刷新第一批，规划见 v0.3.x-PLAN §0.4/§1）：
       - **B8 协议 POST body**：protocol.Request 增 `body`——Windows
         `WebResourceRequest::get_Content`（IStream 局部 vtable Read 循环，10MB 上限；
@@ -524,7 +550,7 @@
         Tauri 2.12.6；差距总表与实现路径见 v0.3.x-PLAN §0.4/§1）：
         **v0.3.8** IPC/协议收尾（B8 协议 POST body 读取 + C1L Linux 二进制 IPC +
         C3 绑定参数名 + E6 上传进度）✅ → **v0.3.9** 窗口对称（A12 tint/cornerPreference +
-        A4L Linux KeyBindings）→ **v0.3.10** 安全（C2 isolation pattern +
+        A4L Linux KeyBindings）✅ → **v0.3.10** 安全（C2 isolation pattern +
         D1 Wayland portal 快捷键）→ **v0.3.11** 分发（E1b external_bin sidecar +
         E2 fixed 运行时 E2E + E4 交叉编译 pack + F2 模板 TS 变体）→
         **v0.3.12** CompositionController 专项（A11，失败回退 HWND）→

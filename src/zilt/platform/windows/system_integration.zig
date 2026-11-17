@@ -131,12 +131,46 @@ fn setDwmAttr(hwnd: win32.HWND, attr: u32, value: u32) bool {
     return com.succeeded(hr);
 }
 
-pub const AppearResult = struct { dark: bool, backdrop: bool, colors: bool = false };
+pub const AppearResult = struct {
+    dark: bool,
+    backdrop: bool,
+    colors: bool = false,
+    /// v0.3.9 A12：tint（SetWindowCompositionAttribute）与圆角偏好（Win11 33）应用结果
+    tint: bool = false,
+    corner: bool = false,
+};
+
+/// SetWindowCompositionAttribute（user32 未公开 API，Tauri windowEffects tint 同款；
+/// 进程内一次加载）。
+fn setWindowCompositionAttribute() ?*const fn (win32.HWND, *const theme.WindowCompositionAttribData) callconv(.c) win32.BOOL {
+    const user32 = win32.GetModuleHandleW(std.unicode.utf8ToUtf16LeStringLiteral("user32.dll")) orelse return null;
+    return @ptrCast(win32.GetProcAddress(user32, "SetWindowCompositionAttribute"));
+}
+
+/// v0.3.9 A12：窗口底色 tint——ACCENT_ENABLE_ACRYLICBLURBEHIND + GradientColor。
+pub fn applyTint(hwnd: win32.HWND, tint: u32) bool {
+    const setAttr = setWindowCompositionAttribute() orelse return false;
+    var policy = theme.AccentPolicy{
+        .accent_state = @intFromEnum(theme.AccentState.enable_acrylic_blur_behind),
+        .gradient_color = tint,
+    };
+    var data = theme.WindowCompositionAttribData{
+        .attrib = theme.WCA_ACCENT_POLICY,
+        .data = @ptrCast(&policy),
+        .size = @sizeOf(theme.AccentPolicy),
+    };
+    return setAttr(hwnd, &data) != 0;
+}
+
+/// v0.3.9 A12：Win11 窗口圆角偏好（DWMWA_WINDOW_CORNER_PREFERENCE；旧系统静默失败）。
+pub fn applyCornerPreference(hwnd: win32.HWND, pref: theme.CornerPreference) bool {
+    return setDwmAttr(hwnd, theme.DWMWA_WINDOW_CORNER_PREFERENCE, @intFromEnum(pref));
+}
 
 /// 应用暗色标题栏与背景效果。Win10（无 backdrop 属性）会静默跳过
 /// DWMWA_SYSTEMBACKDROP_TYPE；暗色标题栏在 1809 前用旧槽位 19 回退。
 pub fn applyAppearance(hwnd: win32.HWND, appearance: theme.Appearance) AppearResult {
-    var result = AppearResult{ .dark = false, .backdrop = false, .colors = false };
+    var result = AppearResult{ .dark = false, .backdrop = false };
     if (appearance.dark_titlebar) |dark| {
         const v: u32 = @intFromBool(dark);
         result.dark = setDwmAttr(hwnd, theme.DWMWA_USE_IMMERSIVE_DARK_MODE, v) or
@@ -154,6 +188,13 @@ pub fn applyAppearance(hwnd: win32.HWND, appearance: theme.Appearance) AppearRes
     }
     if (appearance.border_color) |c| {
         result.colors = setDwmAttr(hwnd, theme.DWMWA_BORDER_COLOR, theme.colorRef(c)) or result.colors;
+    }
+    // v0.3.9 A12：效果参数（tint / 圆角偏好）
+    if (appearance.tint) |t| {
+        result.tint = applyTint(hwnd, t);
+    }
+    if (appearance.corner_preference) |p| {
+        result.corner = applyCornerPreference(hwnd, p);
     }
     return result;
 }

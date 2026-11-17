@@ -310,10 +310,19 @@ async function runChecks() {
         : 'missing fields');
     } catch (e) { setCheck('c-sysinfo', false, String(e)); }
 
-    // 23. v0.1.14：窗口外观（暗色标题栏 + Mica）
+    // 23. v0.1.14：窗口外观（暗色标题栏 + Mica）+ v0.3.9 A12 效果参数（tint/圆角）
     try {
       const applied = await window.zilt.appearance.apply({ dark_titlebar: true, backdrop: 'mica' });
-      setCheck('c-appearance', applied === true, applied ? 'mica + dark titlebar' : 'not applied');
+      const isWin = !!(window.chrome && window.chrome.webview);
+      let extras = true;
+      if (isWin) {
+        const tintOk = await window.zilt.appearance.apply({ tint: '66AACC' });
+        const cornerOk = await window.zilt.appearance.apply({ cornerPreference: 'round' });
+        extras = tintOk === true && cornerOk === true;
+      }
+      setCheck('c-appearance', applied === true && extras, applied && extras
+        ? 'mica + dark titlebar + tint/corner'
+        : `applied=${applied} extras=${extras}`);
     } catch (e) { setCheck('c-appearance', false, String(e)); }
 
     // 24. v0.1.14：开机自启状态往返（启用后立即关闭，避免污染系统设置）
@@ -996,6 +1005,7 @@ async function runChecks() {
         width: 400, height: 300,
         hideOnFocusLost: true, preventOverflow: true,
         moveDebounceMs: 80, closable: false, minimizable: true,
+        keyBindings: [{ id: 'exp2-kb', key: 'F8' }],
       });
       const wid = w && typeof w.id === 'number' ? w.id : null;
       let apiOk = wid != null;

@@ -2430,8 +2430,8 @@ fn Backend(comptime config: Config) type {
                 .autostart => |op| return .{ .state = try self.runAutostartOp(op, alloc) },
                 .appearance => |ap| {
                     const r = sys_integration.applyAppearance(w.hwnd, ap);
-                    log.print("[appearance] dark_titlebar={} backdrop={}", .{ r.dark, r.backdrop });
-                    return .{ .ok = r.dark or r.backdrop };
+                    log.print("[appearance] dark_titlebar={} backdrop={} tint={} corner={}", .{ r.dark, r.backdrop, r.tint, r.corner });
+                    return .{ .ok = r.dark or r.backdrop or r.tint or r.corner };
                 },
                 .store => |op| return self.runStoreOp(op, alloc),
                 .fs => |op| return self.runFsOp(op, alloc),

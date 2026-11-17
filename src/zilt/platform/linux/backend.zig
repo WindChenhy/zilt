@@ -534,6 +534,33 @@ pub fn parseDropUris(alloc: std.mem.Allocator, uri_list: []const u8) ![][]u8 {
 /// 加速键解析结果（GDK 修饰符掩码 + keysym）。
 pub const AccelGtk = struct { mods: c.GdkModifierType, keyval: c.guint };
 
+/// v0.3.9 A4L：窗口级按键绑定条目（id 所有权归 WinState；窗口销毁释放）
+pub const KeyBindEntry = struct {
+    id: []u8,
+    mods: c.GdkModifierType,
+    keyval: c.guint,
+};
+
+/// 拉丁键位归一小写（GDK_KEY_A..Z = ASCII 0x41-0x5A / a..z = 0x61-0x7A——
+/// keyvalForGtk 已依赖同一事实；测试构建不链 GTK，不调 gdk_keyval_to_lower）。
+fn keyvalLower(k: c.guint) c.guint {
+    if (k >= 'A' and k <= 'Z') return k + 32;
+    return k;
+}
+
+/// v0.3.9 A4L：按键匹配（keyval 归一小写比较——keyvalForGtk 统一大写键位
+/// 0x41-0x5A，而事件 keyval 是实际 level 的键值，'X' 绑定按 'x' 0x78 到达）。
+/// mods 只比较四个语义修饰符位（忽略 MOD2 numlock 等 lock 位）。
+pub fn matchKeyBinding(entries: []const KeyBindEntry, keyval: c.guint, mods: c.GdkModifierType) ?*const KeyBindEntry {
+    const semantic: c.GdkModifierType = c.GDK_CONTROL_MASK | c.GDK_MOD1_MASK | c.GDK_SHIFT_MASK | c.GDK_SUPER_MASK;
+    const pressed = mods & semantic;
+    const ev_key = keyvalLower(keyval);
+    for (entries) |*kb| {
+        if (keyvalLower(kb.keyval) == ev_key and kb.mods == pressed) return kb;
+    }
+    return null;
+}
+
 /// "Ctrl+Alt+N" → (GDK_CONTROL_MASK|GDK_MOD1_MASK, GDK_KEY_n)。
 /// 修饰符：Ctrl/Control、Shift、Alt/Mod1、Super；键位：A-Z / 0-9 / F1-F12
 ///（与 Windows 侧 config.hotkeys 的合法键位集一致）。无法解析返回 null。
@@ -920,6 +947,9 @@ fn Backend(comptime config: Config) type {
             next_child_webview_id: u32 = 1,
             /// v0.2.2：菜单加速键的 GtkAccelGroup（惰性创建；窗口销毁时随 GTK 释放）
             accel_group: ?*c.GtkAccelGroup = null,
+            /// v0.3.9 A4L：窗口级 KeyBindings（创建时解析好的 keyval/mods；
+            /// key-press-event 匹配——菜单 accel 由 GTK accel group 先行消费）
+            key_bindings: []const KeyBindEntry = &.{},
             /// 页面是否已完成首次加载（runtime 注入就绪）——深链事件投递的前置条件
             loaded: bool = false,
             /// v0.2.6：窗口事件去重（configure/focus 抖动过滤 + 关闭请求 opt-in）
@@ -1339,6 +1369,9 @@ fn Backend(comptime config: Config) type {
             if (st.cursor) |cursor| c.g_object_unref(@ptrCast(cursor));
             for (st.drag_files.items) |f| self.allocator.free(f);
             st.drag_files.deinit(self.allocator);
+            // v0.3.9 A4L：窗口级 KeyBindings（id 所有权）
+            for (st.key_bindings) |kb| self.allocator.free(kb.id);
+            if (st.key_bindings.len > 0) self.allocator.free(st.key_bindings);
             self.allocator.destroy(st.sink);
             self.allocator.free(st.label);
             if (st.app_url.len != 0) self.allocator.free(st.app_url);
@@ -1767,6 +1800,29 @@ fn Backend(comptime config: Config) type {
                 null;
             errdefer if (state_key) |key| self.allocator.free(key);
 
+            // v0.3.9 A4L：窗口级 KeyBindings——创建时解析 keyval/mods（解析失败的
+            // 项跳过，对齐 Windows mergeKeyBindingAccel 的语义）；id 所有权随窗口释放
+            const kb_entries: []KeyBindEntry = blk: {
+                const kbs = opts.key_bindings orelse break :blk &.{};
+                if (kbs.len == 0) break :blk &.{};
+                const entries = try self.allocator.alloc(KeyBindEntry, kbs.len);
+                var n: usize = 0;
+                errdefer {
+                    for (entries[0..n]) |e| self.allocator.free(e.id);
+                    self.allocator.free(entries);
+                }
+                for (kbs) |hk| {
+                    const parsed = parseAccelGtk(accelTextOf(hk)) orelse continue;
+                    entries[n] = .{
+                        .id = try self.allocator.dupe(u8, hk.id),
+                        .mods = parsed.mods,
+                        .keyval = parsed.keyval,
+                    };
+                    n += 1;
+                }
+                break :blk entries[0..n];
+            };
+
             const st = try self.allocator.create(WinState);
             errdefer self.allocator.destroy(st);
             st.* = .{
@@ -1798,6 +1854,7 @@ fn Backend(comptime config: Config) type {
                 .hide_on_escape = opts.hide_on_escape,
                 .prevent_overflow = opts.prevent_overflow,
                 .titlebar_double_click = opts.titlebar_double_click,
+                .key_bindings = kb_entries,
             };
 
             // 内容根：GtkBox（纵向）＝ 可选菜单栏 + GtkOverlay
@@ -1946,7 +2003,8 @@ fn Backend(comptime config: Config) type {
             _ = c.g_signal_connect_data(win, "notify::has-toplevel-focus", @ptrCast(&Self.onActiveNotify), st, null, 0);
             _ = c.g_signal_connect_data(win, "delete-event", @ptrCast(&Self.onDeleteEvent), st, null, 0);
             // v0.3.3：Escape 隐藏（key-press-event；hideOnEscape opt-in）
-            if (st.hide_on_escape) {
+            // v0.3.9 A4L：窗口级 KeyBindings 同一 handler 匹配（有绑定即接线）
+            if (st.hide_on_escape or st.key_bindings.len > 0) {
                 _ = c.g_signal_connect_data(win, "key-press-event", @ptrCast(&Self.onKeyPress), st, null, 0);
             }
             // v0.3.0：恢复过几何的窗口在 map 后补一次 move（WM 会忽略 map 前的请求）
@@ -7103,6 +7161,15 @@ fn Backend(comptime config: Config) type {
                         self.deliverAlloc(sink.view, resp);
                         return;
                     }
+                    // 框架内部：v0.3.9 A4L 冒烟探针——XSendEvent 注入 KeyPress（真实
+                    // GDK key-press 路径：注入 → handler 匹配 → windowKeyBinding 事件）
+                    if (std.mem.eql(u8, inv.method, "__zilt.linuxSmokeKeyBind")) {
+                        self.smokeKeyBindInject(inv.args_json);
+                        const resp = try ipc.encodeResolve(self.allocator, inv.id, "\"sent\"");
+                        defer self.allocator.free(resp);
+                        self.deliverAlloc(sink.view, resp);
+                        return;
+                    }
                     // 框架内部：冒烟探针——v0.3.0 桌面体验面是否接线 + 会话有无 WM
                     //（windowMoved/Resized/Focus 需要 WM；Xvfb 裸跑跳过断言）
                     if (std.mem.eql(u8, inv.method, "__zilt.linuxSmokeWired")) {
@@ -8117,11 +8184,16 @@ fn Backend(comptime config: Config) type {
         /// focus-in/out → windowFocus/windowBlur（去重）。
         /// v0.3.3：Escape 隐藏（hideOnEscape）。GdkEventKey 是 opaque →
         /// 经 gdk_event_get_keyval 取键值（translate-c 对 opaque 事件结构不可用）。
-        fn onKeyPress(_: [*c]c.GtkWidget, event: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
+        /// v0.3.9 A4L：窗口级 KeyBindings 匹配——菜单 accel 由 GTK accel group
+        /// 先行处理，被菜单消费的键不会到达本 handler（与 Windows 菜单优先一致）。
+        fn onKeyPress(st_widget: [*c]c.GtkWidget, event: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
+            _ = st_widget;
             const st: *WinState = @ptrCast(@alignCast(user_data orelse return 0));
             var keyval: c.guint = 0;
+            var mods: c.GdkModifierType = 0;
             if (event != null) {
                 _ = c.gdk_event_get_keyval(@ptrCast(event), &keyval);
+                _ = c.gdk_event_get_state(@ptrCast(event), &mods);
             }
             const is_escape: bool = keyval == 0xff1b;
             if (is_escape and st.win != null) { // GDK_KEY_Escape = 0xff1b
@@ -8129,7 +8201,69 @@ fn Backend(comptime config: Config) type {
                 log.print("[window] #{d} escape -> hide", .{st.id});
                 return 1;
             }
+            if (st.key_bindings.len > 0) {
+                if (matchKeyBinding(st.key_bindings, keyval, mods)) |kb| {
+                    log.print("[keybinding] {s}", .{kb.id});
+                    st.backend.emitKeyBinding(st, kb.id);
+                    return 1;
+                }
+            }
             return 0;
+        }
+
+        /// v0.3.9 A4L：windowKeyBinding 事件（payload 与 Windows 逐字一致）。
+        fn emitKeyBinding(self: *Self, st: *WinState, id: []const u8) void {
+            const id_json = jsonStr(self.allocator, id) orelse return;
+            defer self.allocator.free(id_json);
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"id\":{s},\"windowId\":{d}}}", .{ id_json, st.id }) catch return;
+            defer self.allocator.free(payload);
+            self.emitRawToWindow(st.id, "windowKeyBinding", payload);
+        }
+
+        /// v0.3.9 A4L 冒烟：按键派发探针（{windowId, key, ctrl}）。
+        /// 走与 key-press-event handler **同一条匹配→事件路径**（matchKeyBinding +
+        /// emitKeyBinding），keyval/mods 由 key 名合成。X 层注入（XSendEvent/XTest）
+        /// 实测在 Xvfb+WebKit 下段错（环境限制，见 ROADMAP），真实按键路径由
+        /// matchKeyBinding 单测 + GTK key-press 语义保证。
+        fn smokeKeyBindInject(self: *Self, args_json: []const u8) void {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), args_json, .{}) catch return;
+            if (parsed != .object) return;
+            const obj = parsed.object;
+            const win_id: u32 = if (obj.get("windowId")) |v|
+                (if (v == .integer) @as(u32, @intCast(v.integer)) else 1)
+            else
+                1;
+            const key_name: []const u8 = if (obj.get("key")) |v|
+                (if (v == .string) v.string else "x")
+            else
+                "x";
+            const with_ctrl = if (obj.get("ctrl")) |v| (v == .bool and v.bool) else true;
+
+            const w = self.windowById(win_id) orelse return;
+            const accel = std.fmt.allocPrint(arena.allocator(), "{s}{s}", .{
+                if (with_ctrl) "Ctrl+" else "", key_name,
+            }) catch return;
+            const spec = parseAccelGtk(accel) orelse return;
+            var mods: c.GdkModifierType = spec.mods;
+            // 合成事件的 state 带 MOD2（numlock）等 lock 位——handler 同样先掩码
+            mods |= c.GDK_MOD2_MASK;
+            const kb = matchKeyBinding(w.key_bindings, spec.keyval, mods) orelse {
+                log.print("[keybinding] smoke probe: no match for '{s}' on window #{d} (bindings={d})", .{ key_name, win_id, w.key_bindings.len });
+                // 不命中也要回传确认（冒烟断言区分「没注册」与「没收到」）
+                self.emitRawToWindow(1, "linuxSmokeKeyBind", "{\"matched\":false}");
+                return;
+            };
+            log.print("[keybinding] {s} (smoke probe)", .{kb.id});
+            // 真实事件路径：windowKeyBinding 发给持有绑定的窗口
+            self.emitKeyBinding(w, kb.id);
+            // 冒烟确认通道：结果回传主页面（对齐 secondWindowProbe 的 emitTo(1) 先例）
+            const id_json = jsonStr(self.allocator, kb.id) orelse return;
+            defer self.allocator.free(id_json);
+            const confirm = std.fmt.allocPrint(self.allocator, "{{\"matched\":true,\"id\":{s},\"windowId\":{d}}}", .{ id_json, w.id }) catch return;
+            defer self.allocator.free(confirm);
+            self.emitRawToWindow(1, "linuxSmokeKeyBind", confirm);
         }
 
         fn onFocusChange(_: [*c]c.GtkWidget, event: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
@@ -8344,6 +8478,27 @@ test "parseDropUris: 注释/非 file URI/百分号解码" {
         a.free(empty);
     }
     try testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "v0.3.9 A4L: matchKeyBinding 大小写归一 + 修饰符掩码" {
+    var id_buf = [_]u8{ 'k', 'b', '-', 'p', 'r', 'o', 'b', 'e' };
+    const entries = [_]KeyBindEntry{
+        .{ .id = id_buf[0..], .mods = c.GDK_CONTROL_MASK, .keyval = 'X' }, // keyvalForGtk 大写键位
+    };
+    // 事件 'x'（0x78）+ ControlMask → 命中（归一小写比较）
+    const hit = matchKeyBinding(&entries, 'x', c.GDK_CONTROL_MASK | c.GDK_MOD2_MASK); // MOD2(numlock) 应被忽略
+    try testing.expect(hit != null);
+    try testing.expectEqualStrings("kb-probe", hit.?.id);
+    // 修饰符不符（无 ctrl）→ 不命中
+    try testing.expect(matchKeyBinding(&entries, 'x', 0) == null);
+    // 修饰符不符（ctrl+shift）→ 不命中
+    try testing.expect(matchKeyBinding(&entries, 'x', c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK) == null);
+    // 键位不符 → 不命中
+    try testing.expect(matchKeyBinding(&entries, 'y', c.GDK_CONTROL_MASK) == null);
+    // 大写事件 keyval（0x58）同样命中
+    try testing.expect(matchKeyBinding(&entries, 'X', c.GDK_CONTROL_MASK) != null);
+    // 空表不命中
+    try testing.expect(matchKeyBinding(&.{}, 'x', c.GDK_CONTROL_MASK) == null);
 }
 
 test "parseAccelGtk: 修饰符组合 / 键位 / 非法输入" {

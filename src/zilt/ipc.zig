@@ -1144,7 +1144,12 @@ const runtime_js_head =
     \\      toggle: () => builtin('__zilt.autostart', { action: 'toggle' }),
     \\    },
     \\    appearance: {
-    \\      apply: (opts) => builtin('__zilt.appearance', Object.assign({ action: 'apply' }, opts ?? {})),
+    \\      // v0.3.9 A12：cornerPreference（camelCase）→ corner_preference（snakeCase）
+    \\      apply: (opts) => {
+    \\        const o = Object.assign({ action: 'apply' }, opts ?? {});
+    \\        if (o.cornerPreference !== undefined) o.corner_preference = o.cornerPreference;
+    \\        return builtin('__zilt.appearance', o);
+    \\      },
     \\    },
     \\    // v0.1.16: KV store / scoped fs
     \\    store: {

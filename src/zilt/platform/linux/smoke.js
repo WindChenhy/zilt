@@ -1101,6 +1101,26 @@ function runSecondWindowProbe() {
     check('exp2', ok, `create=${JSON.stringify(w).slice(0, 40)} state ok=${ok}`);
   } catch (e) { check('exp2', false, String(e.message || e)); }
 
+  // ---- v0.3.9 A4L：窗口级 KeyBindings（创建解析 + 匹配 + 事件派发链路；
+  //      X 层注入在 Xvfb+WebKit 下段错为环境限制——真实 key-press 路径由
+  //      matchKeyBinding 单测与 GTK key-press 语义保证）----
+  try {
+    const w = await Z().window.create({ title: 'kb probe', label: 'kb-' + Date.now(), width: 320, height: 200, keyBindings: [{ id: 'kb-probe', key: 'X', ctrl: true }] });
+    let ok = false;
+    let note = 'create=' + JSON.stringify(w).slice(0, 40);
+    if (w && typeof w.id === 'number') {
+      const got = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(null), 4000);
+        Z().on('linuxSmokeKeyBind', (p) => { clearTimeout(timer); resolve(p); });
+        Z().invoke('__zilt.linuxSmokeKeyBind', { windowId: w.id, key: 'x', ctrl: true }).catch(() => {});
+      });
+      ok = !!got && got.matched === true && got.id === 'kb-probe' && got.windowId === w.id;
+      note += ' confirm=' + JSON.stringify(got);
+      try { await Z().window.close(w.id); } catch (_) {}
+    }
+    check('keybind', ok, note);
+  } catch (e) { check('keybind', false, String(e.message || e)); }
+
   // ---- v0.3.8：二进制 IPC（evaluate base64 通道——契约与 Windows SharedBuffer 同）----
   try {
     const r = await Z().binary.request(16 * 1024);

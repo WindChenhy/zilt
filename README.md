@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.8（IPC 与协议收尾——POST body 读取/Linux 二进制 IPC/绑定命名参数/上传进度）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.9（窗口效果与键盘对称——tint/圆角偏好 + Linux 窗口级 KeyBindings）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -167,6 +167,25 @@ v0.3.8 新增（2026-11-18，IPC 与协议收尾——二轮差距刷新第一�
   冒烟 **58 项**（新增 c-postbody/c-upload；仅 clip/clipmulti 桌面剪贴板占用环境问题）；
   Linux 单测全绿，冒烟 **81/81**（新增 binipc 真 check/postbody skip/upload）+ post terminate；
   server E2E ALL PASSED；`zig build gen` 产出命名参数签名
+
+v0.3.9 新增（2026-11-18，窗口效果与键盘对称——二轮差距刷新第二批）：
+
+- **效果参数（A12，Windows）**：`appearance.apply({ tint, cornerPreference })`——tint 走
+  `SetWindowCompositionAttribute`（user32 动态加载，ACCENT_ENABLE_ACRYLICBLURBEHIND +
+  GradientColor 0xAABBGGRR，Tauri windowEffects 同款；`"RRGGBB"`/`"AARRGGBB"` 解析，缺省
+  alpha 0xCC）+ Win11 圆角偏好 `DWMWA_WINDOW_CORNER_PREFERENCE`（default/donotround/
+  round/smallround）；radius 文档化 macOS-only；Linux 无 accent API → NotSupported 文档化
+- **Linux 窗口级 KeyBindings（A4L）**：`window.create({keyBindings})` → 创建时解析
+  keyval/mods（keyvalForGtk 大写键位）→ key-press-event 匹配（matchKeyBinding：
+  keyval 大小写归一 + 只比较四个语义修饰符位，忽略 numlock 等 lock 位）→
+  `windowKeyBinding {id, windowId}` 事件（与 Windows 逐字一致）；菜单 accel 由 GTK
+  accel group 先行消费（优先级与 Windows 一致）
+- **验收**：Windows 冒烟 58 项（c-appearance 扩展 tint/corner 实测应用 + c-exp2 增
+  keyBindings 创建）+ 单测全绿（+theme tint/corner 解析）；Linux 冒烟 **82/82**
+  （新增 keybind——探针走创建解析→匹配→事件派发全链，匹配函数单测锁定大小写/
+  掩码语义）+ post terminate PASS；**实测记录**：X 层按键注入（XSendEvent 与
+  XTestFakeKeyEvent）在 Xvfb+WebKitGTK 下稳定段错（环境限制），与 v0.3.3 Escape
+  同测试深度——真实按键路径由单测保证
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 

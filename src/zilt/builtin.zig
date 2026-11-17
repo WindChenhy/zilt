@@ -104,6 +104,9 @@ pub const Args = struct {
     click_double: ?[]const u8 = null,
     backdrop: ?[]const u8 = null,
     dark_titlebar: ?bool = null,
+    /// v0.3.9 A12：效果参数（tint "AARRGGBB"/"RRGGBB"；cornerPreference 圆角偏好名）
+    tint: ?[]const u8 = null,
+    corner_preference: ?[]const u8 = null,
     exe_args: ?[]const u8 = null,
     count: ?u32 = null,
     // ---- v0.1.18：窗口精细控制 ----
@@ -945,6 +948,13 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
         var ap = theme.Appearance{};
         if (a.dark_titlebar) |d| ap.dark_titlebar = d;
         if (a.backdrop) |b| ap.backdrop = try theme.Backdrop.fromName(b);
+        // v0.3.9 A12：效果参数（tint / 圆角偏好；Linux 无对等 API → 文档化 NotSupported）
+        if (a.tint) |t| {
+            if (t.len > 0) ap.tint = try theme.parseTint(t);
+        }
+        if (a.corner_preference) |p| {
+            if (p.len > 0) ap.corner_preference = try theme.CornerPreference.fromName(p);
+        }
         return .{ .appearance = ap };
     }
 
