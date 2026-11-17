@@ -94,6 +94,8 @@ pub const Capability = enum {
     resize_dragging,
     prevent_overflow,
     tray_attach_window,
+    // v0.3.6：二进制 IPC（WebView2 SharedBuffer；WebKitGTK 无对等 API）
+    binary_ipc,
 };
 
 /// Windows 后端当前实现的能力（v0.1.24 实测面）。
@@ -117,7 +119,7 @@ pub const windows_capabilities = [_]Capability{
     .real_scheme,           .incognito,      .background_throttling, .profile_settings,
     .monitor_current,       .power_events,
     .window_mask,           .hide_on_focus_lost, .window_key_bindings, .resize_dragging,
-    .prevent_overflow,      .tray_attach_window,
+    .prevent_overflow,      .tray_attach_window,   .binary_ipc,
 };
 
 /// Linux 目标能力（v0.2.0–v0.2.9 的验收清单；见 docs/v0.2-LINUX.md §5）。
@@ -141,6 +143,7 @@ pub const linux_target_capabilities = [_]Capability{
     .window_mask,           .hide_on_focus_lost, .resize_dragging, .prevent_overflow,
     // v0.3.2 平台差异：background_throttling / profile_settings（autofill/password）
     // v0.3.3 平台差异：window_key_bindings / tray_attach_window（Linux 未接线，文档化）
+    // v0.3.6 平台差异：binary_ipc（WebView2 SharedBuffer 独占；Linux 走 base64 分块）
 };
 
 /// 编译期校验后端契约（`platform/mod.zig` 在本平台后端上调用一次）。

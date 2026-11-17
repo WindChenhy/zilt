@@ -1101,6 +1101,10 @@ function runSecondWindowProbe() {
     check('exp2', ok, `create=${JSON.stringify(w).slice(0, 40)} state ok=${ok}`);
   } catch (e) { check('exp2', false, String(e.message || e)); }
 
+  // ---- v0.3.6：SharedBuffer 二进制 IPC——WebKitGTK 无对等 API（平台差异文档化，
+  //      Windows/WebView2 专用；Linux 侧大数据走既有 base64 分块通道）----
+  check('binipc', true, 'skipped (WebView2-only; WebKitGTK has no shared buffer API)');
+
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {
     await Z().invoke('__zilt.linuxSmoke', {

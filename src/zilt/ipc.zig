@@ -325,6 +325,10 @@ pub const Context = struct {
     window_query_fn: ?*const fn (backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator) ?[]u8 = null,
     /// 新建窗口（返回新窗口 id；null = 创建失败/平台不支持）。
     spawn_window_fn: ?*const fn (backend: *anyopaque, opts: WindowOptions) ?u32 = null,
+    /// v0.3.6：SharedBuffer 二进制通道（Zig→JS；ICoreWebView2_17::
+    /// PostSharedBufferToScript）。additional_json 为 JS 侧
+    /// `sharedbufferreceived` 事件 additionalData 的 JSON（如 {"rid":N}）。
+    post_binary_fn: ?*const fn (backend: *anyopaque, window_id: u32, bytes: []const u8, additional_json: []const u8) anyerror!void = null,
     /// 剪贴板写文本（成功 true）。
     clipboard_write_fn: ?*const fn (backend: *anyopaque, text: []const u8) bool = null,
     /// 剪贴板读文本（调用方 allocator 分配；无文本 null）。
@@ -521,6 +525,12 @@ pub const Context = struct {
     }
 
     /// 新建窗口（title/width/height/url）。失败返回 error.WindowCreateFailed。
+    /// v0.3.6：SharedBuffer 二进制通道（Zig→JS）。未接线（headless/Linux）→ error。
+    pub fn postBinary(self: Context, bytes: []const u8, additional_json: []const u8) !void {
+        const f = self.post_binary_fn orelse return error.BinaryNotAvailable;
+        try f(self.backend, self.window_id, bytes, additional_json);
+    }
+
     pub fn newWindow(self: Context, opts: WindowOptions) !u32 {
         const f = self.spawn_window_fn orelse return error.WindowCreateFailed;
         return f(self.backend, opts) orelse error.WindowCreateFailed;
@@ -888,6 +898,7 @@ const runtime_js_head =
     \\  let webviewEvalSeq = 0;
     \\  let channelSeq = 0;
     \\  let cdpSeq = 0;
+    \\  let binarySeq = 0;
     \\  const webviewEvalWaiters = new Map();
     \\  const cdpWaiters = new Map();
     \\  // SQL 参数编码：原生值 → Zig 侧 {kind:'text'|'int'|'real'|'nul', ...}
@@ -1355,6 +1366,25 @@ const runtime_js_head =
     \\        action: 'migrate', path: db, version, statements: statements ?? [],
     \\      }),
     \\    },
+    \\    // v0.3.6：SharedBuffer 二进制通道（Zig→JS）。request(size) → Promise<Uint8Array>
+    \\    //（载荷确定性可重算校验；rid 匹配 additionalData）。
+    \\    binary: {
+    \\      request: (size) => new Promise((resolve, reject) => {
+    \\        const rid = ++binarySeq;
+    \\        let done = false;
+    \\        const finish = (fn, v) => { if (!done) { done = true; clearTimeout(timer); off(); fn(v); } };
+    \\        const timer = setTimeout(() => finish(reject, new Error('binipc timeout (5s)')), 5000);
+    \\        const off = window.zilt.on('__zilt.sharedBuffer', (p) => {
+    \\          if (!p || p.rid !== rid) return;
+    \\          if (p.error) { finish(reject, new Error(p.error)); return; }
+    \\          finish(resolve, p);
+    \\        });
+    \\        builtin('__zilt.binary', { action: 'request', size: size ?? 0, rid }).then((r) => {
+    \\          // 期望 checksum 随 invoke 返回；sharedbufferreceived 到达后比对
+    \\          window['__zilt.expected_' + rid] = r;
+    \\        }).catch((e) => finish(reject, e));
+    \\      }),
+    \\    },
 ;
 const runtime_js_tail =
     \\  };
@@ -1390,6 +1420,27 @@ const runtime_js_tail =
     \\    const region = e.target.closest ? e.target.closest('[data-zilt-drag-region]') : null;
     \\    if (region) { e.preventDefault(); window.zilt.startDragging(); }
     \\  });
+    \\  // v0.3.6：SharedBuffer → 统一事件桥。getBuffer() 必须在处理器内同步调用
+    \\  //（WebView2 语义：事件返回后缓冲失效），checksum 由 JS 侧重算后回传。
+    \\  if (window.chrome && window.chrome.webview) {
+    \\    window.chrome.webview.addEventListener('sharedbufferreceived', (e) => {
+    \\      try {
+    \\        const ab = e.getBuffer(); // ArrayBuffer 本体（非视图）
+    \\        const bytes = new Uint8Array(ab);
+    \\        let sum = 0;
+    \\        for (let i = 0; i < bytes.length; i++) sum = (sum + bytes[i]) >>> 0;
+    \\        const ad = e.additionalData || {};
+    \\        const expected = window['__zilt.expected_' + ad.rid];
+    \\        window['__zilt.expected_' + ad.rid] = undefined;
+    \\        window.__ziltDeliver({ zilt: 1, kind: 'event', name: '__zilt.sharedBuffer', payload: {
+    \\          rid: ad.rid, size: ad.size, sum: sum,
+    \\          match: !!expected && expected.sum === sum && expected.size === bytes.length,
+    \\        } });
+    \\      } catch (err) {
+    \\        window.__ziltDeliver({ zilt: 1, kind: 'event', name: '__zilt.sharedBuffer', payload: { rid: 0, error: String(err) } });
+    \\      }
+    \\    });
+    \\  }
     \\  window.zilt.on('__reload', () => window.location.reload());
     \\})();
     \\

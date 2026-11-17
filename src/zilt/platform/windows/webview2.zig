@@ -137,6 +137,103 @@ pub const ICoreWebView2Environment10 = extern struct {
     }
 };
 
+// ============================== ICoreWebView2Environment12 / SharedBuffer / _17 ==============================
+// v0.3.6：原始二进制 IPC（Zig→JS 方向）。ABI/IID 取自官方 WebView2.h：
+// - Environment12 IID {f503db9b-739f-48dd-b151-fdfcf253f54e}，flat vtable 25 槽
+//   （0–23 既有 + CreateSharedBuffer@24）；postSharedBufferToWebview 实为
+//   ICoreWebView2_17::PostSharedBufferToScript（槽 116，IID 702e75d4-…）。
+// - SharedBuffer IID {b747a495-0c6f-449e-97b8-2f81e9d6ab43}：get_Size(3)/get_Buffer(4)/
+//   OpenStream(5)/get_FileMappingHandle(6)/Close(7)。
+
+pub const IID_ICoreWebView2Environment12: com.GUID = .parse("{f503db9b-739f-48dd-b151-fdfcf253f54e}");
+pub const IID_ICoreWebView2SharedBuffer: com.GUID = .parse("{b747a495-0c6f-449e-97b8-2f81e9d6ab43}");
+pub const IID_ICoreWebView2_17: com.GUID = .parse("{702e75d4-fd44-434d-9d70-1a68a6b1192a}");
+
+pub const ICoreWebView2Environment12 = extern struct {
+    lpVtbl: *const VTable,
+
+    pub const VTable = extern struct {
+        base: [24]?*const anyopaque, // QI..get_FailureReportFolderPath（槽 0–23）
+        CreateSharedBuffer: *const fn (*ICoreWebView2Environment12, u32, *?*ICoreWebView2SharedBuffer) callconv(.c) HRESULT, // 24
+    };
+
+    pub fn fromEnvironment(env: *ICoreWebView2Environment) ?*ICoreWebView2Environment12 {
+        var out: ?*anyopaque = null;
+        const hr = env.lpVtbl.QueryInterface(env, &IID_ICoreWebView2Environment12, &out);
+        if (com.failed(hr)) return null;
+        return @ptrCast(@alignCast(out.?));
+    }
+
+    pub fn release(self: *ICoreWebView2Environment12) void {
+        const f: *const fn (*ICoreWebView2Environment12) callconv(.c) u32 = @ptrCast(self.lpVtbl.base[2] orelse return);
+        _ = f(self);
+    }
+
+    pub fn createSharedBuffer(self: *ICoreWebView2Environment12, size: u32) struct { hr: HRESULT, buffer: ?*ICoreWebView2SharedBuffer } {
+        var buffer: ?*ICoreWebView2SharedBuffer = null;
+        const hr = self.lpVtbl.CreateSharedBuffer(self, size, &buffer);
+        return .{ .hr = hr, .buffer = buffer };
+    }
+};
+
+pub const SHARED_BUFFER_ACCESS_READ_ONLY: u32 = 0;
+
+pub const ICoreWebView2SharedBuffer = extern struct {
+    lpVtbl: *const VTable,
+
+    pub const VTable = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2SharedBuffer, *const com.GUID, *?*anyopaque) callconv(.c) HRESULT,
+        AddRef: *const fn (*ICoreWebView2SharedBuffer) callconv(.c) u32,
+        Release: *const fn (*ICoreWebView2SharedBuffer) callconv(.c) u32,
+        get_Size: *const fn (*ICoreWebView2SharedBuffer, *u32) callconv(.c) HRESULT,
+        get_Buffer: *const fn (*ICoreWebView2SharedBuffer, *?*anyopaque) callconv(.c) HRESULT,
+        OpenStream: *const fn (*ICoreWebView2SharedBuffer, *?*IStream) callconv(.c) HRESULT,
+        get_FileMappingHandle: *const fn (*ICoreWebView2SharedBuffer, *?*anyopaque) callconv(.c) HRESULT,
+        Close: *const fn (*ICoreWebView2SharedBuffer) callconv(.c) HRESULT,
+    };
+
+    pub fn getSize(self: *ICoreWebView2SharedBuffer) struct { hr: HRESULT, size: u32 } {
+        var size: u32 = 0;
+        const hr = self.lpVtbl.get_Size(self, &size);
+        return .{ .hr = hr, .size = size };
+    }
+
+    pub fn getBuffer(self: *ICoreWebView2SharedBuffer) struct { hr: HRESULT, ptr: ?*anyopaque } {
+        var ptr: ?*anyopaque = null;
+        const hr = self.lpVtbl.get_Buffer(self, &ptr);
+        return .{ .hr = hr, .ptr = ptr };
+    }
+
+    pub fn release(self: *ICoreWebView2SharedBuffer) void {
+        _ = self.lpVtbl.Release(self);
+    }
+};
+
+pub const ICoreWebView2_17 = extern struct {
+    lpVtbl: *const VTable,
+
+    pub const VTable = extern struct {
+        base: [116]?*const anyopaque, // QI..PrintToPdfStream（槽 0–115）
+        PostSharedBufferToScript: *const fn (*ICoreWebView2_17, *ICoreWebView2SharedBuffer, u32, LPCWSTR) callconv(.c) HRESULT, // 116
+    };
+
+    pub fn fromWebView(webview: *ICoreWebView2) ?*ICoreWebView2_17 {
+        var out: ?*anyopaque = null;
+        const hr = webview.lpVtbl.QueryInterface(webview, &IID_ICoreWebView2_17, &out);
+        if (com.failed(hr)) return null;
+        return @ptrCast(@alignCast(out.?));
+    }
+
+    pub fn release(self: *ICoreWebView2_17) void {
+        const f: *const fn (*ICoreWebView2_17) callconv(.c) u32 = @ptrCast(self.lpVtbl.base[2] orelse return);
+        _ = f(self);
+    }
+
+    pub fn postSharedBufferToScript(self: *ICoreWebView2_17, buffer: *ICoreWebView2SharedBuffer, access: u32, additional_json: LPCWSTR) HRESULT {
+        return self.lpVtbl.PostSharedBufferToScript(self, buffer, access, additional_json);
+    }
+};
+
 // ============================== ICoreWebView2ControllerOptions ==============================
 // v0.3.2：无痕窗口开关。IID {12aae616-8ccb-44ec-bcb3-eb18311881635}，vtable：
 // QI/AddRef/Release + get/put_ProfileName + get/put_IsInPrivateModeEnabled。

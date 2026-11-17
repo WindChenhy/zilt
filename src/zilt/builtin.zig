@@ -71,6 +71,8 @@ pub const Args = struct {
     incognito: ?bool = null,
     /// v0.3.4：updater.skipVersion 的版本串
     version_str: ?[]const u8 = null,
+    /// v0.3.6：SharedBuffer 二进制 IPC（__zilt.binary.request 的载荷字节数）
+    size: ?u32 = null,
     // ---- v0.3.3：窗口体验包 II ----
     mask: ?[]const u8 = null,
     hide_on_focus_lost: ?bool = null,
@@ -187,6 +189,9 @@ pub fn dispatch(ctx: ipc.Context, method: []const u8, args_json: []const u8) !?[
     if (std.mem.eql(u8, method, "__zilt.notification")) return try notificationCmd(ctx, a);
     if (std.mem.eql(u8, method, "__zilt.drag")) return try dragCmd(ctx, a);
     if (std.mem.eql(u8, method, "__zilt.path")) return try pathCmd(ctx, a);
+    // v0.3.6：SharedBuffer 二进制通道（Zig→JS；请求即分配发送，结果经
+    // 'sharedbufferreceived' 事件回 JS）
+    if (std.mem.eql(u8, method, "__zilt.binary")) return try binaryCmd(ctx, a);
     if (std.mem.eql(u8, method, "__zilt.log")) return try logCmd(ctx, a);
     if (std.mem.eql(u8, method, "__zilt.dialog")) return try dialogCmd(ctx, a);
     if (isSystemMethod(method)) return try systemCmd(ctx, method, a);
@@ -598,6 +603,7 @@ pub fn isSystemMethod(method: []const u8) bool {
         eql(u8, name, "autostart") or eql(u8, name, "appearance") or
         eql(u8, name, "store") or eql(u8, name, "fs") or eql(u8, name, "windowState") or
         eql(u8, name, "services") or eql(u8, name, "http") or eql(u8, name, "ws") or
+        eql(u8, name, "binary") or
         eql(u8, name, "webviews") or eql(u8, name, "process") or eql(u8, name, "sql") or
         eql(u8, name, "updater") or eql(u8, name, "acl");
 }
@@ -929,6 +935,31 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
 }
 
 /// `window.zilt.path.*`（v0.1.16）：纯路径运算，不触碰文件系统。
+/// v0.3.6：SharedBuffer 二进制通道。request {size, rid} → 分配确定性载荷
+/// （pseudorandom 字节 + 头部 8 字节 size/seed）→ ctx.postBinary（SharedBuffer）
+/// → JS 'sharedbufferreceived' 事件（additionalData.rid 匹配 Promise）。
+fn binaryCmd(ctx: ipc.Context, a: Args) ![]u8 {
+    const size = a.size orelse return error.MissingSize;
+    if (size > 32 * 1024 * 1024) return error.BinaryTooLarge; // 上限 32MB
+    const rid = a.rid orelse 0;
+
+    // 确定性载荷：字节值 = (i * 31 + seed) 截断——JS 侧在 sharedbufferreceived
+    // 处理器内重算 checksum 并与这里返回的期望值比对（字节本身零拷贝留在缓冲区）
+    const bytes = try ctx.allocator.alloc(u8, size);
+    defer ctx.allocator.free(bytes);
+    const seed: u8 = @truncate(@as(u64, @bitCast(rid)) +% 0x5A);
+    var sum: u32 = 0;
+    for (bytes, 0..) |*b, i| {
+        b.* = @truncate((i *% 31 +% seed) & 0xff);
+        sum +%= b.*;
+    }
+
+    const additional = try std.fmt.allocPrint(ctx.allocator, "{{\"rid\":{d},\"size\":{d}}}", .{ rid, size });
+    defer ctx.allocator.free(additional);
+    try ctx.postBinary(bytes, additional);
+    return try std.fmt.allocPrint(ctx.allocator, "{{\"size\":{d},\"sum\":{d}}}", .{ size, sum });
+}
+
 fn pathCmd(ctx: ipc.Context, a: Args) ![]u8 {
     const eql = std.mem.eql;
     const alloc = ctx.allocator;

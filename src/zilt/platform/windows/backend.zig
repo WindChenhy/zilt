@@ -83,6 +83,7 @@ const WM_LBUTTONDBLCLK: win32.UINT = 0x0203;
 const WM_MBUTTONUP: win32.UINT = 0x0207;
 const WM_ZILT_ACTION: win32.UINT = win32.WM_APP + 7; // 统一能力动作 marshal（UI 线程）
 const WM_ZILT_WAKE: win32.UINT = win32.WM_APP + 8; // WebView driver 延迟派发
+const WM_ZILT_BINARY: win32.UINT = win32.WM_APP + 20; // v0.3.6：SharedBuffer post 延迟（WebMessageReceived 重入规避；12-15 已占）
 const WM_ZILT_TOAST_EVENT: win32.UINT = win32.WM_APP + 9; // WinRT 线程 → UI 线程
 const WM_ZILT_HTTP: win32.UINT = win32.WM_APP + 10; // HTTP 后台线程 → UI 线程
 const WM_ZILT_WS: win32.UINT = win32.WM_APP + 11; // WebSocket 读线程 → UI 线程
@@ -2032,6 +2033,8 @@ fn Backend(comptime config: Config) type {
                 .window_fn = runWindowCmd,
                 .window_query_fn = runWindowQuery,
                 .spawn_window_fn = spawnWindowFromBackend,
+                // v0.3.6：SharedBuffer 二进制通道（Zig→JS）
+                .post_binary_fn = postBinaryFromBackend,
                 .clipboard_write_fn = clipboardWriteFromBackend,
                 .clipboard_read_fn = clipboardReadFromBackend,
                 // ---- v0.1.9–v0.1.12 ----
@@ -4192,6 +4195,99 @@ fn Backend(comptime config: Config) type {
             return req.id;
         }
 
+        /// v0.3.6：SharedBuffer 二进制通道。Environment12.CreateSharedBuffer →
+        /// 写载荷 → _17.PostSharedBufferToScript（READ_ONLY）→ JS
+        /// 'sharedbufferreceived' 事件（getBuffer() 需在处理器内同步取用）。
+        /// 老运行时（无 Environment12/_17）→ error.BinaryNotAvailable。
+        /// v0.3.6：postBinary 入口——**必须延后**：PostSharedBufferToScript 在
+        /// WebMessageReceived 回调内同步调用会重入（与 v0.1.17 ExecuteScript
+        /// 实测同款陷阱）→ WM_ZILT_BINARY marshal 到消息循环再执行。
+        fn postBinaryFromBackend(backend_ptr: *anyopaque, window_id: u32, bytes: []const u8, additional_json: []const u8) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(backend_ptr));
+            const main = self.mainWindow() orelse return error.WindowNotFound;
+            const job = try std.heap.page_allocator.create(BinaryJob);
+            job.* = .{
+                .window_id = window_id,
+                .bytes = std.heap.page_allocator.dupe(u8, bytes) catch {
+                    std.heap.page_allocator.destroy(job);
+                    return error.OutOfMemory;
+                },
+                .additional = std.heap.page_allocator.dupe(u8, additional_json) catch {
+                    std.heap.page_allocator.free(job.bytes);
+                    std.heap.page_allocator.destroy(job);
+                    return error.OutOfMemory;
+                },
+            };
+            _ = win32.PostMessageW(main.hwnd, WM_ZILT_BINARY, 0, @bitCast(@intFromPtr(job)));
+        }
+
+        const BinaryJob = struct {
+            window_id: u32,
+            bytes: []u8,
+            additional: []u8,
+        };
+
+        /// WM_ZILT_BINARY：SharedBuffer 创建 + 写载荷 + PostSharedBufferToScript。
+        fn runBinaryPost(self: *Self, job: *BinaryJob) void {
+            defer {
+                std.heap.page_allocator.free(job.bytes);
+                std.heap.page_allocator.free(job.additional);
+                std.heap.page_allocator.destroy(job);
+            }
+            const w = self.windowById(job.window_id) orelse return;
+            const webview = w.webview orelse return;
+            const env = self.env orelse return;
+            const env12 = wv2.ICoreWebView2Environment12.fromEnvironment(env) orelse {
+                log.print("[binipc] runtime lacks Environment12", .{});
+                return;
+            };
+            defer env12.release();
+            const created = env12.createSharedBuffer(@intCast(job.bytes.len));
+            if (com.failed(created.hr) or created.buffer == null) {
+                log.print("[binipc] CreateSharedBuffer failed hr=0x{x}", .{@as(u32, @bitCast(created.hr))});
+                return;
+            }
+            const buffer = created.buffer.?;
+            defer buffer.release();
+            // v0.3.6 实测：get_Buffer 直写后 JS 侧读到全零——改用官方样例的
+            // OpenStream + IStream::Write 路径（见 MS 文档 ICoreWebView2_17 示例）。
+            // IStream 在 webview2.zig 是 opaque → 局部 vtable 结构直调（slot4=Write）。
+            var stream: ?*wv2.IStream = null;
+            if (com.failed(buffer.lpVtbl.OpenStream(buffer, &stream)) or stream == null) {
+                log.print("[binipc] OpenStream failed", .{});
+                return;
+            }
+            const StreamVTable = extern struct {
+                QueryInterface: *const fn (*anyopaque, *const com.GUID, *?*anyopaque) callconv(.c) com.HRESULT,
+                AddRef: *const fn (*anyopaque) callconv(.c) u32,
+                Release: *const fn (*anyopaque) callconv(.c) u32,
+                Read: *const fn (*anyopaque, [*]u8, u32, ?*u32) callconv(.c) com.HRESULT,
+                Write: *const fn (*anyopaque, [*]const u8, u32, ?*u32) callconv(.c) com.HRESULT,
+            };
+            const stream_obj: *anyopaque = @ptrCast(@alignCast(stream.?));
+            const svtable: *const StreamVTable = @as(*const *const StreamVTable, @ptrCast(@alignCast(stream_obj))).*;
+            defer _ = svtable.Release(stream_obj);
+            var written: u32 = 0;
+            const wr = svtable.Write(stream_obj, job.bytes.ptr, @intCast(job.bytes.len), &written);
+            if (com.failed(wr) or written != job.bytes.len) {
+                log.print("[binipc] IStream write failed (written={d}/{d})", .{ written, job.bytes.len });
+                return;
+            }
+            const wv17 = wv2.ICoreWebView2_17.fromWebView(webview) orelse {
+                log.print("[binipc] runtime lacks ICoreWebView2_17", .{});
+                return;
+            };
+            defer wv17.release();
+            const additional_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, job.additional) catch return;
+            defer self.allocator.free(additional_w);
+            const hr = wv17.postSharedBufferToScript(buffer, wv2.SHARED_BUFFER_ACCESS_READ_ONLY, additional_w.ptr);
+            if (com.failed(hr)) {
+                log.print("[binipc] PostSharedBufferToScript failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+                return;
+            }
+            log.print("[binipc] posted {d} bytes (rid from additional)", .{job.bytes.len});
+        }
+
         fn clipboardWriteFromBackend(backend_ptr: *anyopaque, text: []const u8) bool {
             const self: *Self = @ptrCast(@alignCast(backend_ptr));
             const main = self.mainWindow() orelse return false;
@@ -5563,6 +5659,17 @@ fn Backend(comptime config: Config) type {
                         if (instance) |b| b.emitThemeAll();
                         return 0;
                     }
+                },
+                // v0.3.6：SharedBuffer post（WebMessageReceived 重入规避）
+                WM_ZILT_BINARY => {
+                    if (instance) |b| {
+                        const job_ptr: usize = @intCast(lparam);
+                        if (job_ptr != 0) {
+                            const job: *BinaryJob = @ptrCast(@alignCast(@as(*anyopaque, @ptrFromInt(job_ptr))));
+                            b.runBinaryPost(job);
+                        }
+                    }
+                    return 0;
                 },
                 // v0.3.2：电源/会话事件（powerSuspend/powerResume/powerStatusChanged/sessionLock/sessionUnlock）
                 win32.WM_POWERBROADCAST => {

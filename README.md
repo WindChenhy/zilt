@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.5（DPAPI 加密 store——磁盘值不可跨用户读取，往返语义不变）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.6（SharedBuffer 二进制 IPC——1MB 级零拷贝传输，Windows）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -103,6 +103,26 @@ v0.3.5 新增（2026-11-17，安全深化）：
   专项版本——GDBus 订阅基建（logind）已就位可复用
 - **验收**：Windows 单测全绿（+DPAPI 前缀/往返，真实 crypt32 往返实测）冒烟 **55 项**
   （+c-dpapi：加密 store 往返）；Linux 单测全绿冒烟 78/78（平台差异文档化）
+
+v0.3.6 新增（2026-11-17，二进制 IPC）：
+
+- **SharedBuffer 二进制通道（Zig→JS，Windows）**：`window.zilt.binary.request(size)` →
+  Promise<{size,sum,match}>——Environment12.CreateSharedBuffer → OpenStream+IStream::Write
+  写载荷 → ICoreWebView2_17.PostSharedBufferToScript（READ_ONLY）→ JS
+  `sharedbufferreceived` 事件（getBuffer() 返回 **ArrayBuffer 本体**；处理器内同步取用 +
+  `chrome.webview.releaseBuffer` 语义）→ checksum 处理器内重算比对（字节零拷贝不进 JSON 管道）。
+  **实测坑**：① PostSharedBufferToScript 在 WebMessageReceived 回调内调用会重入挂死
+  （v0.1.17 ExecuteScript 同款陷阱）→ WM_APP+20 marshal 出回调；② get_Buffer 直写 +
+  JS 经 `view.buffer` 包装得空数组（ArrayBuffer 无 .buffer 属性）→ sum=0 假象，改
+  `new Uint8Array(ab)` 后通过；③ WM_APP 槽位 9/10/12 已占（TOAST/HTTP/PROC）→ 20
+- **平台差异**：WebKitGTK 无 SharedBuffer 对等 API（文档化；Linux 大数据走既有 base64
+  分块通道）——Linux 冒烟 skip 形态
+- **验收**：Windows 单测全绿冒烟 **56 项**（+c-binipc：16KB SharedBuffer 往返 checksum
+  match）；Linux 单测全绿冒烟 **79/79**（binipc skip）
+- **范围说明**：A11 CompositionController（DirectComposition visual tree + 输入转发 +
+  非客户区 API——v0.3.x 最大单项 COM 工程）移至专项版本：ABI 面已核对
+  （Environment10::CreateCoreWebView2CompositionControllerWithOptions 槽 22 + NonClientRegion
+  接口族），技术方案记录在 v0.3.x-PLAN §v0.3.6
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 

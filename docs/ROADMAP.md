@@ -454,9 +454,21 @@
       - **延后**：isolation pattern（runtime JS 重设计）与 Wayland portal（需真会话）
         → 专项版本；GDBus 基建（v0.3.2 logind）可复用
       - **验收**：Windows 单测全绿冒烟 55 项（+c-dpapi）；Linux 全绿 78/78
-- [~] **v0.3.6+ 系列规划**（详见 [`docs/v0.3.x-PLAN.md`](v0.3.x-PLAN.md)）：
-      - v0.3.6 IPC v2 + CompositionController：原始二进制 IPC（SharedBuffer）/
-        composition hosting + app-region 原生命中
+- [x] **v0.3.6 二进制 IPC（SharedBuffer）**（2026-11-17）：
+      - COM 绑定：Environment12（IID f503db9b…，flat 槽 24=CreateSharedBuffer）/
+        ICoreWebView2SharedBuffer（get_Size/get_Buffer/OpenStream/Close）/
+        ICoreWebView2_17（IID 702e75d4…，flat 槽 116=PostSharedBufferToScript）
+      - Context.post_binary hook + WM_APP+20 marshal（WebMessageReceived 重入规避，
+        实测：回调内同步调用挂死整个页面——v0.1.17 ExecuteScript 同款陷阱）
+      - 写路径：get_Buffer 直写后 JS 读到全零（ArrayBuffer 无 .buffer 属性的 JS 包装
+        bug + IStream 路径双保险），定案 OpenStream+IStream::Write（官方样例路径）
+      - JS：runtime tail `sharedbufferreceived` 桥（getBuffer()=ArrayBuffer 本体 →
+        `new Uint8Array(ab)`；checksum 处理器内重算）+ binary.request Promise（5s 超时）
+      - **验收**：Windows 冒烟 56 项（+c-binipc 16KB checksum match）；Linux 79/79
+        （binipc 平台差异 skip）；A11 CompositionController 延后（ABI 已核对，
+        方案在 v0.3.x-PLAN）
+- [~] **v0.3.7 系列规划**（详见 [`docs/v0.3.x-PLAN.md`](v0.3.x-PLAN.md)）：
+      - v0.3.7 server 模式：浏览器客户端作为窗口 + WS 事件总线
       - v0.3.3 窗口体验包 II：PNG 形状 mask / 每按钮状态 / HideOnFocusLost+HideOnEscape /
         托盘附着窗口 / 窗口级 KeyBindings / startResizeDragging / preventOverflow /
         标题栏双击行为 / move 去抖 / 效果参数（tint/cornerPreference）/ Zig 侧窗口事件钩子

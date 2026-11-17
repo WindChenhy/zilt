@@ -1036,6 +1036,17 @@ async function runChecks() {
         : `roundtrip=${JSON.stringify(back).slice(0, 60)} want=${secret.slice(0, 30)}`);
     } catch (e) { setCheck('c-dpapi', false, String(e.message || e)); }
 
+
+    // 56. v0.3.6：SharedBuffer 二进制 IPC（1MB；checksum 在处理器内重算比对）
+    try {
+      const r = await window.zilt.binary.request(16 * 1024);
+      const ok = !!r && r.match === true && r.size === 16 * 1024;
+      setCheck('c-binipc', ok, ok
+        ? `binipc ok (16KB shared buffer, checksum match sum=${r.sum})`
+        : `result=${JSON.stringify(r).slice(0, 80)}`);
+      if (!ok) window.zilt.log('warn', 'c-binipc note: ' + JSON.stringify(r).slice(0, 100));
+    } catch (e) { setCheck('c-binipc', false, String(e.message || e)); window.zilt.log('warn', 'c-binipc error: ' + String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -1095,6 +1106,7 @@ async function runChecks() {
       exp2: $('c-exp2').className === 'pass',
       res: $('c-res').className === 'pass',
       dpapi: $('c-dpapi').className === 'pass',
+      binipc: $('c-binipc').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });
