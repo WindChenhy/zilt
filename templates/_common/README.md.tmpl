@@ -30,6 +30,7 @@ frontend/bindings/  生成的 TS 绑定（zig build gen）
 ```ts
 // 直接使用注入的运行时
 const g = await window.zilt.invoke('greet', { name: 'Zilt' });
-// 或使用类型化绑定（zig build gen 后）
+// 或使用类型化绑定（zig build gen 后；v0.3.8 起参数名保留为 TS 形参）
 import { greet } from './bindings/zilt';
+const g2 = await greet('Zilt');
 ```

@@ -5,14 +5,14 @@
   let out = $state('');
 
   async function onGreet() {
-    const g = await greet({ name: 'Svelte' });
+    const g = await greet('Svelte');
     out = g.message;
   }
   async function onNotify() {
-    await notifyMe({ title: 'Svelte → Zig', body: '系统通知链路验证' });
+    await notifyMe('Svelte → Zig', '系统通知链路验证');
   }
   async function onPick() {
-    const r = await pickFile({});
+    const r = await pickFile();
     out = r.path ?? '已取消';
   }
   window.zilt.on('menu', (p) => { out = `菜单: ${p.id}`; });

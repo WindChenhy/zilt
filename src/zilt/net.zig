@@ -178,6 +178,17 @@ pub fn base64Alloc(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
     return @constCast(std.base64.standard.Encoder.encode(out, data));
 }
 
+/// v0.3.8 E6：base64 解码（multipart 二进制分片 `encoding: "base64"` 用）。
+/// 错误归一为 `error.InvalidBase64`（调用方按统一错误名拒绝非法载荷）。
+pub fn base64DecodeAlloc(alloc: std.mem.Allocator, data: []const u8) error{OutOfMemory, InvalidBase64}![]u8 {
+    const dec = std.base64.standard.Decoder;
+    const n = dec.calcSizeForSlice(data) catch return error.InvalidBase64;
+    const out = alloc.alloc(u8, n) catch return error.OutOfMemory;
+    errdefer alloc.free(out);
+    dec.decode(out, data) catch return error.InvalidBase64;
+    return out;
+}
+
 const testing = std.testing;
 
 test "v0.1.20: parse http/https/ws/wss urls" {
@@ -244,4 +255,16 @@ test "v0.1.20: base64 chunk" {
     const out = try base64Alloc(testing.allocator, "hello");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("aGVsbG8=", out);
+}
+
+test "v0.3.8 E6: base64 解码往返 + 篡改拒绝" {
+    const raw = "hello-post-body-42\x00\xfe\xffbinary";
+    const enc = try base64Alloc(testing.allocator, raw);
+    defer testing.allocator.free(enc);
+    const dec = try base64DecodeAlloc(testing.allocator, enc);
+    defer testing.allocator.free(dec);
+    try testing.expectEqualStrings(raw, dec);
+    try testing.expectError(error.InvalidBase64, base64DecodeAlloc(testing.allocator, "a!"));
+    // 长度非 4 的倍数
+    try testing.expectError(error.InvalidBase64, base64DecodeAlloc(testing.allocator, "abc"));
 }

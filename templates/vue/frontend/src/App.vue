@@ -10,7 +10,7 @@ import { greet, notifyMe, pickFile } from '../bindings/zilt';
 async function onGreet() {
   loading.value = true;
   try {
-    const g = await greet({ name: 'Vue' });
+    const g = await greet('Vue');
     out.value = g.message;
   } finally {
     loading.value = false;
@@ -18,11 +18,11 @@ async function onGreet() {
 }
 
 async function onNotify() {
-  await notifyMe({ title: 'Vue → Zig', body: '系统通知链路验证' });
+  await notifyMe('Vue → Zig', '系统通知链路验证');
 }
 
 async function onPick() {
-  const r = await pickFile({});
+  const r = await pickFile();
   out.value = r.path ?? '已取消';
 }
 

@@ -60,7 +60,35 @@ fn protocolEcho(req: zilt.protocol.Request, alloc: std.mem.Allocator) anyerror!z
             "fetch('/inner?relay=1').then(function(r){return r.text();})" ++
             ".then(function(t){parent.postMessage({ok:true,body:t},'*');})" ++
             ".catch(function(e){parent.postMessage({ok:false,error:String(e)},'*');});" ++
+            // v0.3.8 B8：POST 经表单导航——Chromium 的 fetch/XHR 只允许 http(s)/
+            // blob/data 等 scheme（自定义 scheme 的请求根本不会发出，与 CORS 无关；
+            // 实测 /inner fetch 也不达处理器）；表单导航是文档级导航，body 经
+            // get_Content 链路读取。DOMContentLoaded 后提交（脚本先于 body 存在）。
+            "document.addEventListener('DOMContentLoaded',function(){" ++
+            "var f=document.createElement('form');" ++
+            "f.method='POST';f.action='/inner-post?relay=1';" ++
+            "var h=document.createElement('input');h.name='probe';h.value='ok';" ++
+            "f.appendChild(h);document.body.appendChild(f);f.submit();" ++
+            "});" ++
             "</script>"),
+        };
+    }
+    // v0.3.8 B8：表单 POST 的落点（HTML 自报 body——iframe 内脚本文档级导航回传）
+    if (std.mem.endsWith(u8, req.path, "inner-post")) {
+        const b = req.body orelse "";
+        // 仅转义 JS 字符串敏感字符（' 与 \；冒烟载荷为纯 ASCII 表单体）
+        var esc: std.ArrayListUnmanaged(u8) = .empty;
+        for (b) |c| {
+            switch (c) {
+                '\'' => try esc.appendSlice(alloc, "\\'"),
+                '\\' => try esc.appendSlice(alloc, "\\\\"),
+                else => try esc.append(alloc, c),
+            }
+        }
+        return .{
+            .content_type = "text/html; charset=utf-8",
+            .body = try std.fmt.allocPrint(alloc,
+                "<!doctype html><script>parent.postMessage({{postOk:true,body:'{s}'}},'*');</script>", .{esc.items}),
         };
     }
     return .{
@@ -69,6 +97,17 @@ fn protocolEcho(req: zilt.protocol.Request, alloc: std.mem.Allocator) anyerror!z
             req.path, req.query, req.method, req.user_agent orelse "-",
         }),
         .headers = &.{.{ .name = "X-Proto", .value = "zilt" }},
+    };
+}
+
+/// v0.3.8 B8：POST body 回显（`/__proto/postecho/<path>` 或真 scheme `postecho://`）
+/// → `post|<len>|<body>`。验证 get_Content（Windows）/ http_body（Linux）读取链路。
+fn protocolPostEcho(req: zilt.protocol.Request, alloc: std.mem.Allocator) anyerror!zilt.protocol.Response {
+    const b = req.body orelse "";
+    return .{
+        .content_type = "text/plain; charset=utf-8",
+        .body = try std.fmt.allocPrint(alloc, "post|{d}|{s}", .{ b.len, b }),
+        .headers = &.{.{ .name = "X-Proto-Body", .value = "yes" }},
     };
 }
 
@@ -94,4 +133,5 @@ pub const protocols = [_]zilt.protocol.Protocol{
     .{ .name = "echo", .handle = protocolEcho },
     .{ .name = "json", .handle = protocolJson },
     .{ .name = "bin", .handle = protocolBin },
+    .{ .name = "postecho", .handle = protocolPostEcho },
 };

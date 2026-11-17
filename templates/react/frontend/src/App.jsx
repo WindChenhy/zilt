@@ -6,14 +6,14 @@ export default function App() {
   const [out, setOut] = useState('');
 
   const onGreet = async () => {
-    const g = await greet({ name: 'React' });
+    const g = await greet('React');
     setOut(g.message);
   };
   const onNotify = async () => {
-    await notifyMe({ title: 'React → Zig', body: '系统通知链路验证' });
+    await notifyMe('React → Zig', '系统通知链路验证');
   };
   const onPick = async () => {
-    const r = await pickFile({});
+    const r = await pickFile();
     setOut(r.path ?? '已取消');
   };
   window.zilt.on('menu', (p) => setOut(`菜单: ${p.id}`));

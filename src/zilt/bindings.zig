@@ -36,14 +36,37 @@ pub fn generateTs(comptime Commands: type, comptime Events: type) []const u8 {
         ;
 
         // ---- 命令函数 ----
+        // v0.3.8 C3：参数名保留——args 结构体的字段升级为 TS 形参
+        // （`greet(name: string)` 而非 `greet(args: { name: string })`），
+        // 调用侧 `invoke("greet", { name })`。无参数命令直接 `ping()`。
+        // 不满足命名形态（非 struct / 可选字段出现在必填字段之前 / TS 属性名
+        // 非法标识符）的命令保留 v0.1.3 的 args 对象形态。
         for (ipc.commandMetas(Commands)) |m| {
-            const args_t = if (m.args) |A| tsType(A) else "void";
             const ret_t = if (m.result == void) "void" else tsType(m.result);
-            out = out ++ "export async function " ++ m.name ++ "(args: " ++ args_t ++ "): Promise<" ++ ret_t ++ "> {\n";
-            if (m.result == void) {
-                out = out ++ "  await window.zilt.invoke(\"" ++ m.name ++ "\", args ?? {});\n}\n\n";
+            if (m.args == null) {
+                // v0.3.8 C3：无参数命令 → 零形参
+                out = out ++ "export async function " ++ m.name ++ "(): Promise<" ++ ret_t ++ "> {\n";
+                if (m.result == void) {
+                    out = out ++ "  await window.zilt.invoke(\"" ++ m.name ++ "\", {});\n}\n\n";
+                } else {
+                    out = out ++ "  return window.zilt.invoke(\"" ++ m.name ++ "\", {}) as Promise<" ++ ret_t ++ ">;\n}\n\n";
+                }
+            } else if (paramSig(m.args)) |ps| {
+                const call = if (ps.call_args.len == 0) "{}" else "{ " ++ ps.call_args ++ " }";
+                out = out ++ "export async function " ++ m.name ++ "(" ++ ps.params ++ "): Promise<" ++ ret_t ++ "> {\n";
+                if (m.result == void) {
+                    out = out ++ "  await window.zilt.invoke(\"" ++ m.name ++ "\", " ++ call ++ ");\n}\n\n";
+                } else {
+                    out = out ++ "  return window.zilt.invoke(\"" ++ m.name ++ "\", " ++ call ++ ") as Promise<" ++ ret_t ++ ">;\n}\n\n";
+                }
             } else {
-                out = out ++ "  return window.zilt.invoke(\"" ++ m.name ++ "\", args ?? {}) as Promise<" ++ ret_t ++ ">;\n}\n\n";
+                const args_t = if (m.args) |A| tsType(A) else "void";
+                out = out ++ "export async function " ++ m.name ++ "(args: " ++ args_t ++ "): Promise<" ++ ret_t ++ "> {\n";
+                if (m.result == void) {
+                    out = out ++ "  await window.zilt.invoke(\"" ++ m.name ++ "\", args ?? {});\n}\n\n";
+                } else {
+                    out = out ++ "  return window.zilt.invoke(\"" ++ m.name ++ "\", args ?? {}) as Promise<" ++ ret_t ++ ">;\n}\n\n";
+                }
             }
         }
 
@@ -127,6 +150,69 @@ fn hasEvent(comptime Events: type, comptime name: []const u8) bool {
             if (std.mem.eql(u8, decl, name)) return true;
         }
         return false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 命名参数形态（v0.3.8 C3）
+// ---------------------------------------------------------------------------
+
+const ParamSig = struct {
+    /// TS 形参串：`name: string, tag?: string`
+    params: []const u8,
+    /// 调用侧对象字面量：`name, tag`（`invoke(m, { name, tag })`）
+    call_args: []const u8,
+};
+
+/// args 结构体可升级为命名形参的条件：
+/// 1. 是普通 struct（tuple / 非结构类型走对象形态）
+/// 2. TS 属性名（经 jsonName 映射）都是合法 JS 标识符——形参名与对象键共用
+/// 3. 可选/默认值字段不出现在必填字段之前（TS「必填参数不能跟在可选参数后」约束）
+fn paramSig(comptime args_t: ?type) ?ParamSig {
+    comptime {
+        @setEvalBranchQuota(100000);
+        const T = args_t orelse return null;
+        const ti = @typeInfo(T);
+        if (ti != .@"struct") return null;
+        const st = ti.@"struct";
+        if (st.is_tuple) return null;
+        const has_json_name = @hasDecl(T, "jsonName");
+        var params: []const u8 = "";
+        var call_args: []const u8 = "";
+        var seen_optional = false;
+        for (st.field_names, st.field_types, st.field_attrs, 0..) |fname, ftype, fattr, i| {
+            const is_optional = @typeInfo(ftype) == .optional;
+            const has_default = fattr.defaultValue(ftype) != null;
+            const ts_name = if (has_json_name) T.jsonName(fname) else fname;
+            if (!isValidJsIdent(ts_name)) return null;
+            if (seen_optional and !is_optional and !has_default) return null;
+            if (is_optional or has_default) seen_optional = true;
+            const base = if (is_optional) @typeInfo(ftype).optional.child else ftype;
+            if (i > 0) {
+                params = params ++ ", ";
+                call_args = call_args ++ ", ";
+            }
+            params = params ++ ts_name ++ (if (is_optional or has_default) "?:" else ":") ++ " " ++ tsType(base);
+            call_args = call_args ++ ts_name;
+        }
+        return .{ .params = params, .call_args = call_args };
+    }
+}
+
+fn isValidJsIdent(comptime s: []const u8) bool {
+    comptime {
+        if (s.len == 0) return false;
+        for (s, 0..) |c, i| {
+            const head = std.ascii.isAlphabetic(c) or c == '_' or c == '$';
+            if (i == 0) {
+                if (!head) return false;
+            } else if (!head and !std.ascii.isDigit(c)) return false;
+        }
+        const reserved = [_][]const u8{ "class", "const", "default", "export", "function", "import", "let", "new", "return", "var" };
+        for (reserved) |r| {
+            if (std.mem.eql(u8, s, r)) return false;
+        }
+        return true;
     }
 }
 
@@ -246,15 +332,16 @@ test "v0.1.21: jsonName 映射 TS 属性名" {
     try testing.expectEqualStrings("{ user_name: string }", comptime tsType(struct { user_name: []const u8 }));
 }
 
-test "generateTs contains typed commands and events" {
+test "v0.3.8 C3: generateTs 命名参数形态 + 事件表" {
     const ts = comptime generateTs(SampleCommands, SampleEvents);
 
-    // 命令签名
-    try testing.expect(std.mem.indexOf(u8, ts, "export async function greet(args: { name: string }): Promise<{ message: string; length: number }> {") != null);
-    try testing.expect(std.mem.indexOf(u8, ts, "window.zilt.invoke(\"greet\", args ?? {}) as Promise<{ message: string; length: number }>;") != null);
-    // 无参数命令
-    try testing.expect(std.mem.indexOf(u8, ts, "export async function ping(args: void): Promise<void> {") != null);
-    // 默认值 → 可选属性
+    // 单必填参数 → 命名形参（v0.3.8 C3：参数名保留）
+    try testing.expect(std.mem.indexOf(u8, ts, "export async function greet(name: string): Promise<{ message: string; length: number }> {") != null);
+    try testing.expect(std.mem.indexOf(u8, ts, "window.zilt.invoke(\"greet\", { name }) as Promise<{ message: string; length: number }>;") != null);
+    // 无参数命令 → 零形参
+    try testing.expect(std.mem.indexOf(u8, ts, "export async function ping(): Promise<void> {") != null);
+    try testing.expect(std.mem.indexOf(u8, ts, "window.zilt.invoke(\"ping\", {});") != null);
+    // 可选字段在必填字段之前 → 保留 args 对象形态（TS 形参顺序约束）
     try testing.expect(std.mem.indexOf(u8, ts, "export async function query(args: { id: number; tag?: string; flags: boolean[] })") != null);
     // 事件表
     try testing.expect(std.mem.indexOf(u8, ts, "\"tick\": { n: number },") != null);
@@ -264,4 +351,64 @@ test "generateTs contains typed commands and events" {
     try testing.expect(std.mem.indexOf(u8, ts, "\"dropFiles\": { files: string[] },") != null);
     try testing.expect(std.mem.indexOf(u8, ts, "\"deepLink\": { url?: string; files: string[] },") != null);
     try testing.expect(std.mem.indexOf(u8, ts, "\"__reload\": null,") != null);
+}
+
+test "v0.3.8 C3: 命名形态边界（可选全在尾部 / jsonName 映射 / 空参数结构）" {
+    // 可选字段全在必填之后 → 命名形态带 `?:`
+    const Trailing = struct {
+        pub fn upload(_: ipc.Context, args: struct { url: []const u8, note: ?[]const u8 = null }) !void {
+            _ = args;
+        }
+    };
+    const ts1 = comptime generateTs(Trailing, struct {});
+    try testing.expect(std.mem.indexOf(u8, ts1, "upload(url: string, note?: string): Promise<void>") != null);
+    try testing.expect(std.mem.indexOf(u8, ts1, "invoke(\"upload\", { url, note });") != null);
+
+    // jsonName 映射（声明在 args 结构体上，v0.1.21 契约）→ 形参名与对象键都用映射名
+    const Renamed = struct {
+        pub fn find(_: ipc.Context, args: struct {
+            user_name: []const u8,
+
+            pub fn jsonName(comptime field: []const u8) []const u8 {
+                comptime {
+                    if (std.mem.eql(u8, field, "user_name")) return "userName";
+                    return field;
+                }
+            }
+        }) !void {
+            _ = args;
+        }
+    };
+    const ts2 = comptime generateTs(Renamed, struct {});
+    try testing.expect(std.mem.indexOf(u8, ts2, "find(userName: string): Promise<void>") != null);
+    try testing.expect(std.mem.indexOf(u8, ts2, "invoke(\"find\", { userName });") != null);
+
+    // 空 args 结构体 → 零形参 + `invoke(m, {})`
+    const Empty = struct {
+        pub fn pingEmpty(_: ipc.Context, args: struct {}) !u32 {
+            _ = args;
+            return 0;
+        }
+    };
+    const ts3 = comptime generateTs(Empty, struct {});
+    try testing.expect(std.mem.indexOf(u8, ts3, "pingEmpty(): Promise<number>") != null);
+    try testing.expect(std.mem.indexOf(u8, ts3, "invoke(\"pingEmpty\", {}) as Promise<number>;") != null);
+}
+
+test "v0.3.8 C3: 非法标识符/必填跟在可选后 → 回退对象形态" {
+    const Bad = struct {
+        pub fn f(_: ipc.Context, args: struct { @"class": []const u8 }) !void {
+            _ = args;
+        }
+    };
+    const ts1 = comptime generateTs(Bad, struct {});
+    try testing.expect(std.mem.indexOf(u8, ts1, "f(args: { class: string })") != null);
+
+    const Order = struct {
+        pub fn g(_: ipc.Context, args: struct { a: ?[]const u8 = null, b: u32 }) !void {
+            _ = args;
+        }
+    };
+    const ts2 = comptime generateTs(Order, struct {});
+    try testing.expect(std.mem.indexOf(u8, ts2, "g(args: { a?: string; b: number })") != null);
 }

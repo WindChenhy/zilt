@@ -825,6 +825,23 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
                 .multipart = a.parts,
             } } };
         }
+        // v0.3.8 E6：multipart 上传（强制 POST + `httpUploadProgress` 进度事件）
+        if (eql(u8, a.action, "upload")) {
+            const parts = a.parts orelse return error.MissingParts;
+            if (parts.len == 0) return error.MissingParts;
+            return .{ .http = .{ .request = .{
+                .id = a.id orelse 0,
+                .url = a.url orelse return error.MissingUrl,
+                .method = "POST",
+                .headers = a.headers orelse "",
+                .timeout_ms = a.timeout_ms orelse 60_000,
+                .proxy = a.proxy,
+                .insecure_tls = a.insecure_tls orelse false,
+                .follow_redirects = a.follow_redirects orelse true,
+                .multipart = parts,
+                .upload_progress = true,
+            } } };
+        }
         return error.UnknownHttpAction;
     }
 

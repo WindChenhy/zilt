@@ -1038,14 +1038,78 @@ async function runChecks() {
 
 
     // 56. v0.3.6：SharedBuffer 二进制 IPC（1MB；checksum 在处理器内重算比对）
+    // v0.3.8 C1L：Linux 走 evaluate base64 通道（同一事件契约），两平台同断言
     try {
       const r = await window.zilt.binary.request(16 * 1024);
       const ok = !!r && r.match === true && r.size === 16 * 1024;
       setCheck('c-binipc', ok, ok
-        ? `binipc ok (16KB shared buffer, checksum match sum=${r.sum})`
+        ? `binipc ok (16KB binary channel, checksum match sum=${r.sum})`
         : `result=${JSON.stringify(r).slice(0, 80)}`);
       if (!ok) window.zilt.log('warn', 'c-binipc note: ' + JSON.stringify(r).slice(0, 100));
     } catch (e) { setCheck('c-binipc', false, String(e.message || e)); window.zilt.log('warn', 'c-binipc error: ' + String(e.message || e)); }
+
+    // 57. v0.3.8 B8：协议 POST body（Win: /__proto/ 路径式 get_Content + 真 scheme
+    //     同源 iframe POST；Linux: postecho:// fetch POST → http_body）→ `post|<len>|<body>`
+    try {
+      const isWin = !!(window.chrome && window.chrome.webview);
+      const postUrl = isWin ? '/__proto/postecho/body?x=1' : 'postecho://body?x=1';
+      const res = await fetch(postUrl, { method: 'POST', body: 'hello-post-body-42' });
+      const text = await res.text();
+      const hdr = res.headers.get('X-Proto-Body') || '';
+      let iframeOk = true;
+      if (isWin) {
+        // 真 scheme 同源 POST：iframe 内 echo:// 文档 fetch POST（跨 scheme fetch 被
+        // WebView2 CORS 拒绝；同 scheme origin 的请求"总是允许"——见 c-scheme 注释）
+        iframeOk = await new Promise((resolve) => {
+          const f = document.createElement('iframe');
+          f.style.display = 'none';
+          let done = false;
+          const finish = (v) => { if (!done) { done = true; try { f.remove(); } catch (_) {} resolve(v); } };
+          const timer = setTimeout(() => finish(false), 8000);
+          const onMsg = (e) => {
+            const d = e.data || {};
+            if (typeof d.postOk === 'boolean') {
+              clearTimeout(timer);
+              window.removeEventListener('message', onMsg);
+              finish(d.postOk === true && d.body === 'probe=ok');
+            }
+          };
+          window.addEventListener('message', onMsg);
+          f.src = 'echo://a/cors-probe';
+          document.body.appendChild(f);
+        });
+      }
+      const ok = res.status === 200 && text === 'post|18|hello-post-body-42' && hdr === 'yes' && iframeOk;
+      setCheck('c-postbody', ok, ok
+        ? `post body ok (${text}${isWin ? ' + iframe true-scheme POST' : ''})`
+        : `text=${String(text).slice(0, 60)} hdr=${hdr} iframeOk=${iframeOk}`);
+      if (!ok) window.zilt.log('warn', 'c-postbody note: text=' + JSON.stringify(text).slice(0, 80) + ' iframeOk=' + iframeOk);
+    } catch (e) { setCheck('c-postbody', false, String(e.message || e)); window.zilt.log('warn', 'c-postbody error: ' + String(e.message || e)); }
+
+    // 58. v0.3.8 E6：multipart 上传进度（1MB base64 分片 → httpUploadProgress 递增 + 完成 200）
+    try {
+      const echoBase = 'http://127.0.0.1:8788';
+      const total = 1024 * 1024;
+      // 整段编码（分段 btoa 会把 padding 嵌进串中部 → 解码失败）
+      const blob64 = btoa('Z'.repeat(total));
+      const progress = [];
+      const r = await window.zilt.http.upload({
+        url: echoBase + '/multipart', parts: [
+          { name: 'field', data: 'upload-smoke' },
+          { name: 'blob', filename: 'blob.bin', contentType: 'application/octet-stream', data: blob64, encoding: 'base64' },
+        ],
+        onProgress: (written) => progress.push(written),
+      });
+      const monotonic = progress.every((v, i) => i === 0 || v >= progress[i - 1]);
+      const last = progress.length > 0 ? progress[progress.length - 1] : 0;
+      let parts = [];
+      try { parts = JSON.parse(r.body).parts; } catch (_) {}
+      const ok = r.status === 200 && parts.length === 2 && parts[1] && parts[1].len >= total && monotonic && last >= total;
+      setCheck('c-upload', ok, ok
+        ? `upload ok (1MB blob, ${progress.length} progress events, last=${last})`
+        : `status=${r.status} parts=${JSON.stringify(parts).slice(0, 140)} prog=${progress.length}/${last} mono=${monotonic}`);
+      if (!ok) window.zilt.log('warn', 'c-upload note: ' + JSON.stringify({ status: r.status, prog: progress.length, last, parts, body: String(r.body).slice(0, 80) }).slice(0, 240));
+    } catch (e) { setCheck('c-upload', false, String(e.message || e)); window.zilt.log('warn', 'c-upload error: ' + String(e.message || e)); }
 
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
@@ -1107,6 +1171,8 @@ async function runChecks() {
       res: $('c-res').className === 'pass',
       dpapi: $('c-dpapi').className === 'pass',
       binipc: $('c-binipc').className === 'pass',
+      postbody: $('c-postbody').className === 'pass',
+      upload: $('c-upload').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

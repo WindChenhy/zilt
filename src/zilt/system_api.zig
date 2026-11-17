@@ -175,6 +175,10 @@ pub const HttpRequest = struct {
     stream: bool = false,
     /// multipart/form-data 分片（非空时覆盖 body 并自动设置 Content-Type）
     multipart: ?[]const MultiPart = null,
+    /// v0.3.8 E6：multipart 上传进度——发送过程中发 `httpUploadProgress`
+    /// {id, written, total} 事件（Win ~10Hz 节流；Linux 粗粒度 0/total 两帧，
+    /// libsoup3 无字节级上传进度 API，文档化差异）
+    upload_progress: bool = false,
 };
 
 pub const MultiPart = struct {
@@ -182,6 +186,9 @@ pub const MultiPart = struct {
     data: []const u8 = "",
     filename: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
+    /// v0.3.8 E6：data 的编码（"text" | "base64"）——二进制分片走 base64
+    /// （JS 侧 `http.upload` 的 parts 默认 base64，构建 multipart 前解码）
+    encoding: []const u8 = "text",
 };
 
 pub const HttpOp = union(enum) {

@@ -88,6 +88,9 @@ const Api = struct {
     ReceiveResponse: *const fn (HINTERNET, ?*anyopaque) callconv(.c) win32.BOOL,
     QueryHeaders: *const fn (HINTERNET, u32, ?[*:0]const u16, ?*anyopaque, *u32, ?*u32) callconv(.c) win32.BOOL,
     ReadData: *const fn (HINTERNET, [*]u8, u32, *u32) callconv(.c) win32.BOOL,
+    /// v0.3.8 E6：分块写请求体（SendRequest 传 NULL body + dwTotalLength 后逐块写，
+    /// 每块回调节流上报上传进度）
+    WriteData: *const fn (HINTERNET, *const anyopaque, u32, *u32) callconv(.c) win32.BOOL,
     CloseHandle: *const fn (HINTERNET) callconv(.c) win32.BOOL,
     SetTimeouts: *const fn (HINTERNET, i32, i32, i32, i32) callconv(.c) win32.BOOL,
     QueryOption: *const fn (HINTERNET, u32, ?*anyopaque, *u32) callconv(.c) win32.BOOL,
@@ -184,6 +187,10 @@ fn api() ?*const Api {
             api_state = .missing;
             return null;
         }),
+        .WriteData = @ptrCast(p.get(lib, "WinHttpWriteData") orelse {
+            api_state = .missing;
+            return null;
+        }),
     };
     api_state = .{ .ready = a };
     return &api_state.ready;
@@ -205,8 +212,11 @@ pub const RequestOptions = struct {
 
 pub const Sink = struct {
     ctx: *anyopaque,
-    /// 返回 false 表示中止读取
-    on_chunk: *const fn (ctx: *anyopaque, data: []const u8) bool,
+    /// 返回 false 表示中止读取（流式下载；与 on_upload 互斥使用）
+    on_chunk: ?*const fn (ctx: *anyopaque, data: []const u8) bool = null,
+    /// v0.3.8 E6：上传进度（body 按块 WriteData 时回调；返回 false 表示中止）。
+    /// null = 不上报进度（body 整块随 SendRequest 发送）
+    on_upload: ?*const fn (ctx: *anyopaque, written: usize, total: usize) bool = null,
 };
 
 const Watchdog = struct {
@@ -313,7 +323,28 @@ pub fn request(alloc: std.mem.Allocator, url: net.Url, opts: RequestOptions, sin
     };
 
     const body_ptr: ?*const anyopaque = if (opts.body.len == 0) null else opts.body.ptr;
-    if (a.SendRequest(req, hdrs_w, hdrs_len, body_ptr, @intCast(opts.body.len), @intCast(opts.body.len), 0) == 0) {
+    // v0.3.8 E6：带上传进度时 SendRequest 只发头（dwTotalLength 声明 Content-Length），
+    // body 经 WinHttpWriteData 分块写出并逐块回调
+    const upload_cb: ?*const fn (*anyopaque, usize, usize) bool = if (sink) |s| s.on_upload else null;
+    if (upload_cb != null and opts.body.len > 0) blk: {
+        if (a.SendRequest(req, hdrs_w, hdrs_len, null, 0, @intCast(opts.body.len), 0) == 0) {
+            if (wd.fired.load(.acquire)) return error.Timeout;
+            return errFor(win32.GetLastError());
+        }
+        var off: usize = 0;
+        while (off < opts.body.len) {
+            const chunk_len: u32 = @intCast(@min(@as(usize, 64 * 1024), opts.body.len - off));
+            var written: u32 = 0;
+            if (a.WriteData(req, opts.body[off..].ptr, chunk_len, &written) == 0) {
+                if (wd.fired.load(.acquire)) return error.Timeout;
+                return errFor(win32.GetLastError());
+            }
+            if (written == 0) return error.WriteFailed;
+            off += written;
+            if (!upload_cb.?(sink.?.ctx, off, opts.body.len)) return error.Aborted;
+        }
+        break :blk;
+    } else if (a.SendRequest(req, hdrs_w, hdrs_len, body_ptr, @intCast(opts.body.len), @intCast(opts.body.len), 0) == 0) {
         if (wd.fired.load(.acquire)) return error.Timeout;
         return errFor(win32.GetLastError());
     }
@@ -330,6 +361,9 @@ pub fn request(alloc: std.mem.Allocator, url: net.Url, opts: RequestOptions, sin
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
+    // 流式模式 = sink 带 on_chunk（v0.3.8：上传进度 sink 只有 on_upload——响应体
+    // 必须正常累积，不能因为 sink 非 null 就当流式丢弃）
+    const streaming = if (sink) |s| s.on_chunk != null else false;
     var buf: [16 * 1024]u8 = undefined;
     while (true) {
         var read: u32 = 0;
@@ -338,8 +372,8 @@ pub fn request(alloc: std.mem.Allocator, url: net.Url, opts: RequestOptions, sin
             return errFor(win32.GetLastError());
         }
         if (read == 0) break;
-        if (sink) |s| {
-            if (!s.on_chunk(s.ctx, buf[0..read])) return error.Aborted;
+        if (streaming) {
+            if (!sink.?.on_chunk.?(sink.?.ctx, buf[0..read])) return error.Aborted;
         } else {
             try out.appendSlice(alloc, buf[0..read]);
         }

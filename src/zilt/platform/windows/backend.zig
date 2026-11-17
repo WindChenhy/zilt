@@ -90,6 +90,7 @@ const WM_ZILT_WS: win32.UINT = win32.WM_APP + 11; // WebSocket 读线程 → UI 
 const WM_ZILT_PROC: win32.UINT = win32.WM_APP + 12; // 子进程 worker → UI 线程
 const WM_ZILT_EVAL: win32.UINT = win32.WM_APP + 13; // 子 webview eval（延后到回调外执行）
 const WM_ZILT_HTTP_CHUNK: win32.UINT = win32.WM_APP + 14; // v0.1.20 流式下载分块
+const WM_ZILT_HTTP_PROGRESS: win32.UINT = win32.WM_APP + 21; // v0.3.8 E6 上传进度（20=binary 已占）
 const WM_ZILT_FSWATCH: win32.UINT = win32.WM_APP + 15; // v0.1.22 目录监视事件
 const WM_ZILT_FSCHUNK: win32.UINT = win32.WM_APP + 16; // v0.1.22 文件流式读取分块
 const WM_CLIPBOARDUPDATE: win32.UINT = 0x031D;
@@ -867,6 +868,52 @@ fn streamFromBytes(bytes: []const u8) ?*wv2.IStream {
     }
     return @ptrCast(stream);
 }
+
+/// v0.3.8 B8：读取协议请求的 body——WebView2 对带 body 的请求**不回传
+/// Content-Length 头**，但 `ICoreWebView2WebResourceRequest::get_Content`
+/// （IStream）拿得到完整请求体（Wails PR#6326 核实同款行为与修复方式；
+/// 此前「POST body 不可读」限制即源于把 ContentLength=0 当真）。
+/// IStream 生命周期限于 WebResourceRequested 回调内 → 同步读完
+/// （默认 10MB 上限，超限返回 null 并记日志）。无 body（GET 等）返回 null。
+/// IStream 在 webview2.zig 是 opaque → 局部 vtable 直调（slot3=Read，
+/// 同 runBinaryPost 的 Write 用法）。
+fn readRequestBody(alloc: std.mem.Allocator, req: *wv2.ICoreWebView2WebResourceRequest) ?[]u8 {
+    var stream: ?*wv2.IStream = null;
+    if (com.failed(req.lpVtbl.get_Content(req, &stream)) or stream == null) return null;
+    const StreamVTable = extern struct {
+        QueryInterface: *const fn (*anyopaque, *const com.GUID, *?*anyopaque) callconv(.c) com.HRESULT,
+        AddRef: *const fn (*anyopaque) callconv(.c) u32,
+        Release: *const fn (*anyopaque) callconv(.c) u32,
+        Read: *const fn (*anyopaque, [*]u8, u32, ?*u32) callconv(.c) com.HRESULT,
+        Write: *const fn (*anyopaque, [*]const u8, u32, ?*u32) callconv(.c) com.HRESULT,
+    };
+    const obj: *anyopaque = @ptrCast(@alignCast(stream.?));
+    const vtbl: *const StreamVTable = @as(*const *const StreamVTable, @ptrCast(@alignCast(obj))).*;
+    defer _ = vtbl.Release(obj);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var buf: [16 * 1024]u8 = undefined;
+    while (true) {
+        var got: u32 = 0;
+        const hr = vtbl.Read(obj, &buf, buf.len, &got);
+        if (com.failed(hr)) break;
+        if (got == 0) break; // 流末尾
+        if (out.items.len + got > proto_body_max) {
+            log.print("[proto] request body exceeds {d}MB limit — dropped", .{proto_body_max / (1024 * 1024)});
+            out.deinit(alloc);
+            return null;
+        }
+        out.appendSlice(alloc, buf[0..got]) catch {
+            out.deinit(alloc);
+            return null;
+        };
+    }
+    return out.toOwnedSlice(alloc) catch null;
+}
+
+/// 协议请求 body 上限（B8：同步读的防御边界；需求更大的场景走 zilt.http）。
+const proto_body_max: usize = 10 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // 资产服务纯函数（Phase C；单测覆盖）
@@ -5096,6 +5143,7 @@ fn Backend(comptime config: Config) type {
 
         /// v0.1.24/v0.3.2 共通实现：路由已解析的协议请求。真 scheme 请求
         /// （`scheme://…`）带 CORS 允许头（跨 origin fetch 需要；路径式同源不需要）。
+        /// v0.3.8 B8：请求体经 `get_Content`（IStream）读取传入 handler。
         fn serveProtocolRoute(self: *Self, route: protocol.Route, uri: []const u8, args: *wv2.ICoreWebView2WebResourceRequestedEventArgs, cross_origin: bool) bool {
             const p = protocol.find(config.protocols, route.name) orelse {
                 log.print("[proto] '{s}' 未注册 <- {s}", .{ route.name, uri });
@@ -5110,6 +5158,8 @@ fn Backend(comptime config: Config) type {
             var method: []const u8 = "GET";
             var method_buf: ?[]u8 = null;
             defer if (method_buf) |m| self.allocator.free(m);
+            var body_buf: ?[]u8 = null;
+            defer if (body_buf) |b| self.allocator.free(b);
             const rr = args.getRequest();
             if (com.succeeded(rr.hr) and rr.request != null) {
                 const req = rr.request.?;
@@ -5122,6 +5172,7 @@ fn Backend(comptime config: Config) type {
                         method = m;
                     } else |_| {}
                 }
+                body_buf = readRequestBody(self.allocator, req);
             }
 
             const ua = requestHeaderUtf8(args, self.allocator, "User-Agent");
@@ -5132,6 +5183,7 @@ fn Backend(comptime config: Config) type {
                 .query = route.query,
                 .method = method,
                 .user_agent = ua,
+                .body = body_buf,
                 .url = uri,
             }, self.allocator) catch |err| {
                 log.print("[proto] {s} handler failed: {s}", .{ route.name, @errorName(err) });
@@ -6050,6 +6102,17 @@ fn Backend(comptime config: Config) type {
                     if (instance) |b| {
                         if (b.mainWindow()) |w| {
                             w.emitEventPayload("httpChunk", .{ .id = ch.id, .seq = ch.seq, .data = ch.data });
+                        }
+                    }
+                    return 0;
+                },
+                WM_ZILT_HTTP_PROGRESS => {
+                    // v0.3.8 E6：multipart 上传进度（worker 侧已节流 ~10Hz）
+                    const p: *HttpProgress = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    defer freeHttpProgress(p);
+                    if (instance) |b| {
+                        if (b.mainWindow()) |w| {
+                            w.emitEventPayload("httpUploadProgress", .{ .id = p.id, .written = p.written, .total = p.total });
                         }
                     }
                     return 0;
@@ -7107,6 +7170,8 @@ const HttpJob = struct {
     insecure_tls: bool = false,
     follow_redirects: bool = true,
     stream: bool = false,
+    /// v0.3.8 E6：multipart 上传进度（WriteData 分块回调节流上报）
+    progress: bool = false,
     parts: []const shared_system.MultiPart = &.{},
     /// 所有字符串都从 arena 分配：freeHttpJob 一次回收
     arena: std.heap.ArenaAllocator,
@@ -7146,6 +7211,7 @@ fn makeHttpJob(hwnd: win32.HWND, req: shared_system.HttpRequest) ?*HttpJob {
     job.insecure_tls = req.insecure_tls;
     job.follow_redirects = req.follow_redirects;
     job.stream = req.stream;
+    job.progress = req.upload_progress;
     if (req.proxy) |p| job.proxy = ja.dupe(u8, p) catch null;
 
     if (req.multipart) |parts| {
@@ -7166,6 +7232,7 @@ fn makeHttpJob(hwnd: win32.HWND, req: shared_system.HttpRequest) ?*HttpJob {
                     },
                     .filename = if (p.filename) |f| ja.dupe(u8, f) catch null else null,
                     .content_type = if (p.content_type) |c| ja.dupe(u8, c) catch null else null,
+                    .encoding = ja.dupe(u8, p.encoding) catch "text",
                 };
             }
             job.parts = owned;
@@ -7244,6 +7311,44 @@ fn httpChunkCb(ctx: *anyopaque, data: []const u8) bool {
     return true;
 }
 
+// ---- v0.3.8 E6：multipart 上传进度（worker → UI 线程，~10Hz 节流）----
+
+/// worker 侧进度状态（栈变量，request() 同步使用）。
+const ProgressCtx = struct {
+    hwnd: win32.HWND,
+    id: i64,
+    total: usize,
+    last_ms: i64 = 0,
+};
+
+/// worker → UI 线程的进度帧。page_allocator 持有，UI 线程 free。
+const HttpProgress = struct {
+    hwnd: win32.HWND,
+    id: i64,
+    written: usize,
+    total: usize,
+};
+
+fn freeHttpProgress(p: *HttpProgress) void {
+    std.heap.page_allocator.destroy(p);
+}
+
+/// WriteData 每块回调：节流 10Hz（首块 + 末块必发，保证 0 与 total 可见）。
+fn httpUploadCb(ctx: *anyopaque, written: usize, total: usize) bool {
+    const c: *ProgressCtx = @ptrCast(@alignCast(ctx));
+    const a = std.heap.page_allocator;
+    const now: i64 = @intCast(win32.GetTickCount64());
+    const final = written >= total;
+    if (!final and c.last_ms != 0 and now - c.last_ms < 100) return true; // 节流窗口内跳过
+    c.last_ms = now;
+    const p = a.create(HttpProgress) catch return true; // 进度帧丢失不影响上传本身
+    p.* = .{ .hwnd = c.hwnd, .id = c.id, .written = written, .total = total };
+    if (win32.PostMessageW(c.hwnd, WM_ZILT_HTTP_PROGRESS, 0, @bitCast(@intFromPtr(p))) == 0) {
+        freeHttpProgress(p);
+    }
+    return true;
+}
+
 fn postHttpResult(job: *HttpJob, res: *HttpResult) void {
     if (win32.PostMessageW(job.hwnd, WM_ZILT_HTTP, 0, @bitCast(@intFromPtr(res))) == 0) {
         freeHttpResult(res);
@@ -7281,10 +7386,27 @@ fn httpWorker(job: *HttpJob) void {
     defer if (headers_owned) |h| a.free(h);
     var parts_tmp: []net_mod.Part = &.{};
     defer if (parts_tmp.len > 0) a.free(parts_tmp);
+    // v0.3.8 E6：base64 编码分片在构建 multipart 前解码（buffer 随函数结束释放）
+    var decoded_bufs: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (decoded_bufs.items) |d| a.free(d);
+        decoded_bufs.deinit(a);
+    }
     if (job.parts.len > 0) {
         parts_tmp = a.alloc(net_mod.Part, job.parts.len) catch &.{};
         for (job.parts, 0..) |p, i| {
-            parts_tmp[i] = .{ .name = p.name, .data = p.data, .filename = p.filename, .content_type = p.content_type };
+            var data = p.data;
+            if (std.ascii.eqlIgnoreCase(p.encoding, "base64")) {
+                if (net_mod.base64DecodeAlloc(a, p.data)) |dec| {
+                    decoded_bufs.append(a, dec) catch {
+                        a.free(dec);
+                    };
+                    data = dec;
+                } else |_| {
+                    log.print("[http] part '{s}' base64 decode failed ({d}B) — sent as text", .{ p.name, p.data.len });
+                }
+            }
+            parts_tmp[i] = .{ .name = p.name, .data = data, .filename = p.filename, .content_type = p.content_type };
         }
     }
     if (job.parts.len > 0) {
@@ -7304,7 +7426,11 @@ fn httpWorker(job: *HttpJob) void {
     }
 
     var cctx = ChunkCtx{ .hwnd = job.hwnd, .id = job.id };
-    const sink: ?winhttp.Sink = if (job.stream) .{ .ctx = &cctx, .on_chunk = httpChunkCb } else null;
+    var pctx = ProgressCtx{ .hwnd = job.hwnd, .id = job.id, .total = body.len };
+    const sink: ?winhttp.Sink = if (job.stream) .{ .ctx = &cctx, .on_chunk = httpChunkCb } else if (job.progress) .{
+        .ctx = &pctx,
+        .on_upload = httpUploadCb,
+    } else null;
 
     const r = winhttp.request(a, url, .{
         .method = job.method,

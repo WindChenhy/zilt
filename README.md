@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.7（server 模式——浏览器客户端作为窗口 + WS 会话独立路由，双平台 E2E）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.8（IPC 与协议收尾——POST body 读取/Linux 二进制 IPC/绑定命名参数/上传进度）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -26,8 +26,10 @@ v0.3.2 新增（2026-11-17，WebView 数据与协议面）：
 - **真 scheme 自定义协议（Windows）**：`Config.protocols` 注册的协议在 Windows 上也以
   真 `scheme://` 可达（`ICoreWebView2EnvironmentOptions4` + `ICoreWebView2CustomSchemeRegistration`
   纯 Zig COM 实现；老运行时 QI 失败自动回退路径式）。两平台同约定 `<scheme>://<path>?<query>`。
-  实测文档化限制：https 页面对自定义 scheme 的 fetch/XHR（cors 模式）被 WebView2 CORS 判定拒绝
-  （iframe 导航/no-cors 正常）——可读响应体用同源路径式 `/__proto/<name>/…`
+  实测文档化限制（v0.3.8 修正）：自定义 scheme 的 fetch/XHR 请求根本不会发出（Chromium
+  的 fetch scheme 白名单，跨 origin 与同 scheme 文档内均如此）——可读响应体用同源路径式
+  `/__proto/<name>/…`；导航类请求（iframe/表单 POST）全链可达，POST body 经 get_Content 读取
+  （v0.3.8 B8）
 - **无痕窗口**：`window.create({incognito})` / `webviews.create({incognito})`——Windows 走
   `ControllerOptions.IsInPrivateModeEnabled`（Environment10，老运行时回退普通 controller 并记日志），
   Linux 走 `webkit_website_data_manager_new_ephemeral()`；`window.state().incognito` 可断言
@@ -139,6 +141,32 @@ v0.3.7 新增（2026-11-17，server 模式——对齐 Wails application_server/
 - **验收**：Windows/Linux 单测全绿；Linux 冒烟 79/79 + headless/server E2E 全 PASS
 - **范围说明**：浏览器端 runtime 传输 shim（页面经 WS 桥接 window.zilt）列为
   server 模式二阶段——协议层已被 python E2E 完整覆盖（该脚本即协议实现）
+
+v0.3.8 新增（2026-11-18，IPC 与协议收尾——二轮差距刷新第一批）：
+
+- **协议 POST body（B8）**：`Request.body` 携带请求体——Windows 经
+  `ICoreWebView2WebResourceRequest::get_Content`（IStream 同步读，10MB 上限；WebView2
+  对带 body 的请求不回传 Content-Length 头但 body 可读，Wails PR#6326 同款核实），
+  Linux 经 `webkit_uri_scheme_request_get_http_body`；解除 v0.1.24 的「body 不可读」限制。
+  **实测文档化**：WebKitGTK 不转发自定义 scheme 请求 body（上游已知限制
+  littledivy/laufey#98，2.50.4 实测仅 1 字节垃圾）——Zig 侧读取已接线，上游修复自动生效；
+  Windows 的自定义 scheme fetch/XHR 同样不发出请求（Chromium 的 fetch scheme 白名单），
+  导航类请求（iframe/表单 POST）全链可达
+- **Linux 二进制 IPC（C1L）**：`binary.request` 在 Linux 走 evaluate base64 通道
+  （WebKitGTK 无 SharedBuffer 对等）——载荷经 evaluateJavaScript 注入
+  `window.__ziltSharedBufferArrived`，事件契约与 Windows SharedBuffer 逐字一致；
+  Linux 冒烟 binipc 从平台 skip 转为真实断言（16KB checksum match）
+- **绑定参数名保留（C3）**：TS 绑定升级为命名形参——`greet(name: string)` 而非
+  `greet(args: {...})`（无参数命令 `ping()`；可选/默认值字段合法时带 `?:`）；
+  jsonName 映射同步生效；非法标识符/必填跟在可选后回退对象形态（单测锁定边界）
+- **http 上传进度（E6）**：`http.upload({url, parts, onProgress})`（强制 POST multipart）→
+  `httpUploadProgress {id, written, total}` 事件——Windows `WinHttpWriteData` 分块
+  （~10Hz 节流，真字节进度）；Linux 粗粒度两帧（libsoup3 无字节级上传进度 API，文档化）；
+  分片 `encoding: 'base64'` 承载二进制
+- **验收**：Windows 单测全绿（+bindings 命名参数/net base64/protocol body 契约），
+  冒烟 **58 项**（新增 c-postbody/c-upload；仅 clip/clipmulti 桌面剪贴板占用环境问题）；
+  Linux 单测全绿，冒烟 **81/81**（新增 binipc 真 check/postbody skip/upload）+ post terminate；
+  server E2E ALL PASSED；`zig build gen` 产出命名参数签名
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 
@@ -360,7 +388,7 @@ TS 工程用生成的绑定：`const g = await greet({ name: 'Zilt' });`（全�
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 分层架构、IPC/内存契约、运行模式 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 路线图与验收记录 |
-| [docs/v0.3.x-PLAN.md](docs/v0.3.x-PLAN.md) | **v0.3.x 系列规划**（对齐 Wails v3 / Tauri 2 差距：v0.3.2–v0.3.7 里程碑） |
+| [docs/v0.3.x-PLAN.md](docs/v0.3.x-PLAN.md) | **v0.3.x 系列规划**（对齐 Wails v3 / Tauri 2 差距：v0.3.2–v0.3.13 里程碑） |
 | [docs/v0.2-LINUX.md](docs/v0.2-LINUX.md) | **v0.2 Linux 开发需求文档**（选型/架构/功能矩阵/v0.2.0–v0.2.5 里程碑） |
 | [docs/research/](docs/research/) | 可行性调研报告（全部一手来源） |
 | [docs/reference/](docs/reference/) | WebView2 ABI 笔记（IID/vtable/loader 协议/实测陷阱） |

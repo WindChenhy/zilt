@@ -485,10 +485,45 @@
       - **范围说明**：浏览器端 runtime 传输 shim（二阶段）——协议层已被 python
         E2E 完整覆盖
       - **验收**：Windows/Linux 单测全绿；Linux 冒烟 79/79 + headless/server E2E
+- [x] **v0.3.8 IPC 与协议收尾**（2026-11-18；二轮差距刷新第一批，规划见 v0.3.x-PLAN §0.4/§1）：
+      - **B8 协议 POST body**：protocol.Request 增 `body`——Windows
+        `WebResourceRequest::get_Content`（IStream 局部 vtable Read 循环，10MB 上限；
+        WebView2 对带 body 请求不回传 Content-Length 但 body 可得，Wails PR#6326 同款）；
+        Linux `webkit_uri_scheme_request_get_http_body`（dupe 进 handler arena）。
+        **实测坑（两条平台限制文档化）**：① WebKitGTK 不转发自定义 scheme 请求 body
+        （上游已知限制 littledivy/laufey#98，2.50.4 实测仅 1 字节垃圾 0xf0——Zig 侧
+        读取已接线，上游修复自动生效，Linux 检查 skip 文档化）；② Chromium 的
+        fetch/XHR 对自定义 scheme 根本不发出请求（v0.3.2 的「no-cors fetch 正常」
+        系 Linux 侧观察，Windows 修正），真 scheme POST 探针改走**表单导航**
+        （文档级导航可达 + 响应 HTML 自报 body）
+      - **C1L Linux 二进制 IPC**：post_binary hook 接线——载荷 base64 后 evaluate
+        `window.__ziltSharedBufferArrived`（runtime tail 全局，契约与 Windows
+        sharedbufferreceived 桥一致）；g_idle_add 封送（对齐 Windows WM marshal 策略）+
+        evaluate 完成回调回显 JS 错误（null 回调静默吞 ReferenceError 的排查教训）。
+        **实测坑**：Zig 嵌入的 JSON 在脚本里是 JS 对象实参而非字符串——
+        `JSON.parse(adJson)` 报 "Unexpected identifier object"（adJson typeof 分支兼容
+        两种形态）。Linux 冒烟 binipc 从 skip 转**真实断言**（16KB checksum match）
+      - **C3 绑定参数名**：bindings.zig paramSig（comptime 反射，@setEvalBranchQuota
+        100000）——args 字段升级 TS 形参 `greet(name: string)` + `invoke("greet", { name })`；
+        无参数命令 `ping()`；可选/默认值在尾部时带 `?:`；jsonName 映射同步；
+        非法标识符/必填跟在可选后 → 回退对象形态（三组单测锁定）。模板四套调用点
+        同步更新（greet('Vue')/notifyMe(t,b)/pickFile()）
+      - **E6 http 上传进度**：`http.upload({url, parts, onProgress})`（强制 POST multipart）
+        → `httpUploadProgress {id, written, total}`——Win `WinHttpWriteData` 分块
+        （SendRequest 传 NULL body + dwTotalLength，64KB 块，GetTickCount64 节流 ~10Hz，
+        首末块必发）；Linux 粗粒度两帧（libsoup3 无字节级上传进度，文档化）；
+        MultiPart 增 `encoding`（base64 分片构建前解码）。**实测坑**：winhttp 响应读取
+        循环把任何非 null sink 都当流式丢弃数据（上传 sink 只有 on_upload → 响应体为空）
+        ——streaming 判定改为 on_chunk != null；分段 btoa 把 padding 嵌进串中部导致
+        base64 解码失败（JS 侧整段编码）；Sink 双回调改 optional 修复 errdefer 双重释放
+      - **验收**：Windows 单测全绿（+bindings 命名参数边界/net base64/protocol body
+        契约），冒烟 **58 项**（+c-postbody/c-upload；clip/clipmulti 环境问题照旧）；
+        Linux 单测全绿，冒烟 **81/81**（+binipc 真 check/postbody skip/upload）+
+        post terminate PASS；server E2E ALL PASSED；`zig build gen` 命名参数签名
       - 后续规划（v0.3.8–v0.3.13，二轮差距刷新 2026-11-17——对标 Wails v3.1.0 /
         Tauri 2.12.6；差距总表与实现路径见 v0.3.x-PLAN §0.4/§1）：
         **v0.3.8** IPC/协议收尾（B8 协议 POST body 读取 + C1L Linux 二进制 IPC +
-        C3 绑定参数名 + E6 上传进度）→ **v0.3.9** 窗口对称（A12 tint/cornerPreference +
+        C3 绑定参数名 + E6 上传进度）✅ → **v0.3.9** 窗口对称（A12 tint/cornerPreference +
         A4L Linux KeyBindings）→ **v0.3.10** 安全（C2 isolation pattern +
         D1 Wayland portal 快捷键）→ **v0.3.11** 分发（E1b external_bin sidecar +
         E2 fixed 运行时 E2E + E4 交叉编译 pack + F2 模板 TS 变体）→

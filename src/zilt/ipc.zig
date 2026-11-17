@@ -1298,6 +1298,39 @@ const runtime_js_head =
     \\          }).catch((e) => { off(); offChunk(); reject(e); });
     \\        });
     \\      },
+    \\      // v0.3.8 E6：multipart 上传（强制 POST）+ 上传进度（onProgress(written, total)）。
+    \\      // parts.data 为字符串（encoding: 'base64' 标记二进制）；平台差异：Windows
+    \\      // ~10Hz 真进度，Linux 粗粒度两帧（libsoup3 无字节级上传进度 API）。
+    \\      upload: (opts) => {
+    \\        const o = opts ?? {};
+    \\        const id = ++httpSeq;
+    \\        return new Promise((resolve, reject) => {
+    \\          const offProg = window.zilt.on('httpUploadProgress', (p) => {
+    \\            if (!p || p.id !== id) return;
+    \\            if (typeof o.onProgress === 'function') o.onProgress(p.written, p.total);
+    \\          });
+    \\          const off = window.zilt.on('httpResponse', (p) => {
+    \\            if (!p || p.id !== id) return;
+    \\            off(); offProg();
+    \\            if (p.err) reject(new Error(p.err));
+    \\            else resolve({ status: p.status, body: p.body });
+    \\          });
+    \\          builtin('__zilt.http', {
+    \\            action: 'upload', id,
+    \\            url: o.url,
+    \\            headers: typeof o.headers === 'string' ? o.headers : Object.entries(o.headers ?? {}).map(([k, v]) => k + ': ' + v).join('\\n'),
+    \\            timeout_ms: o.timeout_ms ?? 60000,
+    \\            proxy: o.proxy,
+    \\            insecure_tls: o.insecureTls === true,
+    \\            follow_redirects: o.followRedirects !== false,
+    \\            parts: (o.parts ?? []).map((p) => ({
+    \\              name: p.name, data: p.data ?? '', filename: p.filename,
+    \\              content_type: p.contentType ?? p.content_type,
+    \\              encoding: p.encoding ?? 'text',
+    \\            })),
+    \\          }).catch((e) => { off(); offProg(); reject(e); });
+    \\        });
+    \\      },
     \\    },
     \\    // v0.1.16: WebSocket。connect 异步 —— 握手在后台线程执行，立即返回连接 id；
     \\    // open/message/close/error 全走 wsEvent 事件（kind 字段区分）。
@@ -1420,6 +1453,31 @@ const runtime_js_tail =
     \\    const region = e.target.closest ? e.target.closest('[data-zilt-drag-region]') : null;
     \\    if (region) { e.preventDefault(); window.zilt.startDragging(); }
     \\  });
+    \\  // v0.3.8 C1L：二进制 IPC 的 evaluate 通道（Linux/WebKitGTK 无 SharedBuffer
+    \\  // API → 后端把载荷 base64 编码后 evaluate 调本函数；契约与 Windows
+    \\  // sharedbufferreceived 桥一致：同步解码 + 重算 checksum + 期望值比对）。
+    \\  window.__ziltSharedBufferArrived = (adJson, b64) => {
+    \\    try {
+    \\      const bin = atob(b64);
+    \\      const bytes = new Uint8Array(bin.length);
+    \\      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    \\      let sum = 0;
+    \\      for (let i = 0; i < bytes.length; i++) sum = (sum + bytes[i]) >>> 0;
+    \\      // adJson 可为对象字面量（Zig 嵌入 JSON → JS 对象实参）或字符串
+    \\      const ad = (typeof adJson === 'string') ? JSON.parse(adJson || '{}') : (adJson || {});
+    \\      const expected = window['__zilt.expected_' + ad.rid];
+    \\      window['__zilt.expected_' + ad.rid] = undefined;
+    \\      window.__ziltDeliver({ zilt: 1, kind: 'event', name: '__zilt.sharedBuffer', payload: {
+    \\        rid: ad.rid, size: ad.size, sum: sum,
+    \\        match: !!expected && expected.sum === sum && expected.size === bytes.length,
+    \\      } });
+    \\    } catch (err) {
+    \\      // 错误必须可见：rid=0 的 payload 会被等待方忽略（表现为超时），
+    \\      // 经 zilt.log 进 Zig 日志才能定位
+    \\      try { window.zilt.log('warn', 'sharedBufferArrived error: ' + String(err)); } catch (_) {}
+    \\      window.__ziltDeliver({ zilt: 1, kind: 'event', name: '__zilt.sharedBuffer', payload: { rid: 0, error: String(err) } });
+    \\    }
+    \\  };
     \\  // v0.3.6：SharedBuffer → 统一事件桥。getBuffer() 必须在处理器内同步调用
     \\  //（WebView2 语义：事件返回后缓冲失效），checksum 由 JS 侧重算后回传。
     \\  if (window.chrome && window.chrome.webview) {

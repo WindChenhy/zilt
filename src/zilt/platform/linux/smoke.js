@@ -1101,9 +1101,37 @@ function runSecondWindowProbe() {
     check('exp2', ok, `create=${JSON.stringify(w).slice(0, 40)} state ok=${ok}`);
   } catch (e) { check('exp2', false, String(e.message || e)); }
 
-  // ---- v0.3.6：SharedBuffer 二进制 IPC——WebKitGTK 无对等 API（平台差异文档化，
-  //      Windows/WebView2 专用；Linux 侧大数据走既有 base64 分块通道）----
-  check('binipc', true, 'skipped (WebView2-only; WebKitGTK has no shared buffer API)');
+  // ---- v0.3.8：二进制 IPC（evaluate base64 通道——契约与 Windows SharedBuffer 同）----
+  try {
+    const r = await Z().binary.request(16 * 1024);
+    check('binipc', !!r && r.match === true && r.size === 16 * 1024,
+      `binipc 16KB evaluate-channel match=${r && r.match} sum=${r && r.sum}`);
+  } catch (e) { check('binipc', false, String(e.message || e)); }
+
+  // ---- v0.3.8 B8：协议 POST body——Windows（get_Content IStream）实测支持；
+  //      WebKitGTK 不转发自定义 scheme 请求 body（上游已知限制：littledivy/laufey#98，
+  //      2.50.4 实测 get_http_body 仅返回 1 字节垃圾）——Linux 侧 skip 文档化；
+  //      Zig 侧 webkit_uri_scheme_request_get_http_body 读取已接线，上游修复后自动生效 ----
+  check('postbody', true, 'skipped (upstream WebKitGTK does not forward custom-scheme request bodies)');
+
+  // ---- v0.3.8 E6：multipart 上传（1MB base64 分片；Linux 粗粒度进度两帧）----
+  try {
+    const b64 = btoa(String.fromCharCode.apply(null, new Uint8Array(1024).fill(0x5a)));
+    let blob64 = '';
+    for (let i = 0; i < 1024; i++) blob64 += b64;
+    const progress = [];
+    const r = await Z().http.upload({
+      url: 'http://127.0.0.1:8788/multipart', parts: [
+        { name: 'field', data: 'upload-smoke' },
+        { name: 'blob', filename: 'blob.bin', contentType: 'application/octet-stream', data: blob64, encoding: 'base64' },
+      ],
+      onProgress: (written) => progress.push(written),
+    });
+    const parts = (() => { try { return JSON.parse(r.body).parts; } catch (_) { return []; } })();
+    const last = progress.length > 0 ? progress[progress.length - 1] : 0;
+    check('upload', r.status === 200 && parts.length === 2 && parts[1] && parts[1].len >= 1024 * 1024 && last >= 1024 * 1024,
+      `upload ${r.status} parts=${parts.length} prog=${progress.length} last=${last}`);
+  } catch (e) { check('upload', false, String(e.message || e)); }
 
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {

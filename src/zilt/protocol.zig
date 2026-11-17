@@ -13,14 +13,20 @@
 //!   作为 authority）；Linux 侧本就是真 scheme。老运行时不支持 Options4 时 QI 失败，
 //!   自动回退路径式（仅记录日志，不视为致命）。
 //!
-//! 限制（Windows/WebView2，实测 runtime 157）：
-//! 1. `WebResourceRequested` 拿不到请求体，因此 POST 的 body 不可读——需要上传内容
-//!    时用 `zilt.invoke` 命令或 `zilt.http`。
-//! 2. **fetch CORS**：https 页面对真 scheme 的 fetch/XHR（cors 模式）被 WebView2 的
-//!    CORS 判定拒绝——响应带 `Access-Control-Allow-Origin`（精确 origin 或 `*`）、
-//!    注册的 AllowedOrigins（精确/通配 `*`）均不生效；iframe 导航、no-cors fetch、
-//!    `<img>` 类无 origin 请求正常。JS 侧需要可读响应体时用同源路径式
-//!    `/__proto/<name>/…`（fetch 全功能可用）。
+//! 限制（Windows/WebView2，实测 runtime 157→157+；v0.3.8 B8 解除 body 限制）：
+//! 1. ~~POST body 不可读~~ **v0.3.8 已支持**：WebView2 对带 body 的请求不回传
+//!    `Content-Length` 头，但 `ICoreWebView2WebResourceRequest::get_Content`
+//!    （IStream）拿得到完整请求体（Wails PR#6326 核实同款行为与修复方式）。
+//!    `Request.body` 携带读取结果（同步读，10MB 上限；无 body 的请求为 null）。
+//!    Linux 侧经 `webkit_uri_scheme_request_get_http_body`（SoupMessageBody）。
+//! 2. **fetch/XHR 对自定义 scheme 不发请求（Windows，v0.3.8 B8 实测）**：Chromium 的
+//!    fetch()/XHR 只允许 http(s)/blob/data 等 scheme——无论跨 origin（https 页面 →
+//!    `echo://`）还是同 scheme 文档内（`echo://` 页面 → `echo://`），请求根本不会
+//!    发出（响应侧 ACAO/AllowedOrigins 与此无关）。可用的自定义 scheme 请求通道 =
+//!    **导航类**（iframe/frame 导航、表单 POST、`<img>` 等，经 WebResourceRequested
+//!    全链可达，POST body 经 `get_Content` 读取）+ 同源路径式 `/__proto/<name>/…`
+//!    （fetch 全功能可用）。Linux/WebKit 的 fetch 自定义 scheme 正常（v0.2.3 实测）
+//!    ——平台差异文档化。
 //! 3. `HasAuthorityComponent=false`（opaque origin）会在 iframe 导航时直接崩溃
 //!    浏览器进程——保持 true（tuple origin），authority 段并入 path 由处理函数
 //!    自行解释。
@@ -42,6 +48,11 @@ pub const Request = struct {
     method: []const u8,
     /// 请求的 `User-Agent` 头（无该头时为 null）
     user_agent: ?[]const u8 = null,
+    /// v0.3.8 B8：请求体（POST/PUT 等；无 body 的请求为 null）。
+    /// Windows 经 `get_Content` IStream 同步读取（10MB 上限，超限返回 null 并记
+    /// 日志）；Linux 经 `webkit_uri_scheme_request_get_http_body`。所有权归框架，
+    /// 处理函数返回后释放——如需保留请 `alloc.dupe`。
+    body: ?[]const u8 = null,
     /// 完整请求 URI（调试用）
     url: []const u8,
 };
@@ -238,4 +249,19 @@ test "v0.1.24: 处理函数通过 allocator 产出响应体" {
     const res = try echo(.{ .name = "echo", .path = "a/b", .query = "q=1", .method = "GET", .url = "u" }, arena.allocator());
     try testing.expectEqualStrings("echo|a/b|q=1", res.body);
     try testing.expect(res.owned);
+}
+
+test "v0.3.8 B8: Request.body 传入处理函数（POST 回显契约）" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const bodyEcho = struct {
+        fn handle(req: Request, alloc: std.mem.Allocator) anyerror!Response {
+            const b = req.body orelse "";
+            return .{ .body = try std.fmt.allocPrint(alloc, "post|{d}|{s}", .{ b.len, b }) };
+        }
+    }.handle;
+    const with_body = try bodyEcho(.{ .name = "postecho", .path = "upload", .query = "", .method = "POST", .body = "hello-post-body-42", .url = "u" }, arena.allocator());
+    try testing.expectEqualStrings("post|18|hello-post-body-42", with_body.body);
+    const without_body = try bodyEcho(.{ .name = "postecho", .path = "upload", .query = "", .method = "GET", .body = null, .url = "u" }, arena.allocator());
+    try testing.expectEqualStrings("post|0|", without_body.body);
 }

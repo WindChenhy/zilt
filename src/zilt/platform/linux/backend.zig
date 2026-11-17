@@ -1106,6 +1106,10 @@ fn Backend(comptime config: Config) type {
             body: std.ArrayListUnmanaged(u8) = .empty,
             stream_mode: bool = false,
             seq: u64 = 0,
+            /// v0.3.8 E6：multipart 上传（粗粒度进度：libsoup3 无字节级上传
+            /// 进度 API → send 前 0/total、httpFinish 时 total/total 两帧，文档化差异）
+            upload: bool = false,
+            upload_total: usize = 0,
         };
 
         /// WebSocket 连接（soup_websocket_connect_async 的会话 + 连接 + 信号 id）。
@@ -1555,6 +1559,8 @@ fn Backend(comptime config: Config) type {
                 .eval_async_fn = evalAsyncEntry,
                 .spawn_window_fn = spawnWindowEntry,
                 .system_fn = systemEntry,
+                // v0.3.8 C1L：二进制 IPC（evaluate base64 通道；Windows 为 SharedBuffer）
+                .post_binary_fn = postBinaryEntry,
                 // v0.2.2：剪贴板 + 原生对话框
                 .clipboard_write_fn = clipboardWriteTextEntry,
                 .clipboard_read_fn = clipboardReadTextEntry,
@@ -1594,6 +1600,69 @@ fn Backend(comptime config: Config) type {
             _ = code;
             const self: *Self = @ptrCast(@alignCast(backend));
             _ = c.g_idle_add(quitIdle, self);
+        }
+
+        // ---- v0.3.8 C1L：二进制 IPC（evaluate base64 通道）----
+        // WebKitGTK 无 SharedBuffer 对等 API（Windows 走 CreateSharedBuffer +
+        // PostSharedBufferToScript）→ 载荷 base64 编码后 evaluateJavaScript 注入
+        // `window.__ziltSharedBufferArrived(additional, b64)`（runtime tail 定义，
+        // 与 Windows sharedbufferreceived 桥同一事件契约：解码 + checksum 比对）。
+        // g_idle_add 封送——script-message-handler 回调内直接 evaluate 有重入
+        // 风险，对齐 Windows 的 WM marshal 策略（v0.3.6 实测同款陷阱）。
+
+        const BinaryJob = struct {
+            backend: *Self,
+            win_id: u32,
+            bytes: []u8,
+            additional: []u8,
+        };
+
+        fn postBinaryEntry(backend: *anyopaque, window_id: u32, bytes: []const u8, additional_json: []const u8) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            const job = try self.allocator.create(BinaryJob);
+            errdefer self.allocator.destroy(job);
+            job.* = .{
+                .backend = self,
+                .win_id = if (window_id == 0) 1 else window_id,
+                .bytes = try self.allocator.dupe(u8, bytes),
+                .additional = try self.allocator.dupe(u8, additional_json),
+            };
+            _ = c.g_idle_add(binaryPostIdle, job);
+        }
+
+        fn binaryPostIdle(data: c.gpointer) callconv(.c) c.gboolean {
+            const job: *BinaryJob = @ptrCast(@alignCast(data orelse return G_SOURCE_REMOVE));
+            const self = job.backend;
+            defer {
+                self.allocator.free(job.bytes);
+                self.allocator.free(job.additional);
+                self.allocator.destroy(job);
+            }
+            if (self.windowById(job.win_id)) |w| {
+                const encoder = std.base64.standard.Encoder;
+                const b64 = self.allocator.alloc(u8, encoder.calcSize(job.bytes.len)) catch return G_SOURCE_REMOVE;
+                defer self.allocator.free(b64);
+                _ = encoder.encode(b64, job.bytes);
+                const script = std.fmt.allocPrint(self.allocator, "window.__ziltSharedBufferArrived({s}, '{s}')", .{ job.additional, b64 }) catch return G_SOURCE_REMOVE;
+                defer self.allocator.free(script);
+                // evaluate 的 JS 错误必须显式回显（null 回调会静默吞掉
+                // ReferenceError——smoke.js 超时的排查证据）
+                c.webkit_web_view_evaluate_javascript(w.view, script.ptr, @intCast(script.len), null, null, null, onBinaryEvalDone, self);
+                log.print("[binipc] posted {d} bytes via evaluate channel (additional={s})", .{ job.bytes.len, job.additional });
+            } else {
+                log.print("[binipc] dropped (window #{d} gone)", .{job.win_id});
+            }
+            return G_SOURCE_REMOVE;
+        }
+
+        fn onBinaryEvalDone(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
+            _ = user_data;
+            var err: [*c]c.GError = null;
+            _ = c.webkit_web_view_evaluate_javascript_finish(@ptrCast(source), res, &err);
+            if (err != null) {
+                log.print("[binipc] evaluate js error: {s}", .{std.mem.span(err.*.message)});
+                c.g_error_free(err);
+            }
         }
 
         /// UI 线程：把 emit 消息投递到目标窗口（窗口可能已销毁 → 只释放）。
@@ -6251,11 +6320,24 @@ fn Backend(comptime config: Config) type {
             defer if (body_owned) |b| self.allocator.free(b);
             var ct_owned: ?[]u8 = null;
             defer if (ct_owned) |t| self.allocator.free(t);
+            // v0.3.8 E6：base64 编码分片在构建 multipart 前解码
+            var decoded_bufs: std.ArrayListUnmanaged([]u8) = .empty;
+            defer {
+                for (decoded_bufs.items) |d| self.allocator.free(d);
+                decoded_bufs.deinit(self.allocator);
+            }
             if (req.multipart) |parts| {
                 const conv = try self.allocator.alloc(shared_net.Part, parts.len);
                 defer self.allocator.free(conv);
                 for (parts, 0..) |mp, i| {
-                    conv[i] = .{ .name = mp.name, .data = mp.data, .filename = mp.filename, .content_type = mp.content_type };
+                    var data = mp.data;
+                    if (std.ascii.eqlIgnoreCase(mp.encoding, "base64")) {
+                        if (shared_net.base64DecodeAlloc(self.allocator, mp.data)) |dec| {
+                            decoded_bufs.append(self.allocator, dec) catch {};
+                            data = dec;
+                        } else |_| {}
+                    }
+                    conv[i] = .{ .name = mp.name, .data = data, .filename = mp.filename, .content_type = mp.content_type };
                 }
                 var boundary_buf: [32]u8 = undefined;
                 const boundary = std.fmt.bufPrint(&boundary_buf, "zilt-{x}", .{@as(u64, @bitCast(c.g_get_real_time()))}) catch "zilt-boundary";
@@ -6291,12 +6373,19 @@ fn Backend(comptime config: Config) type {
                 .session = newSoupSession(req.timeout_ms, req.proxy),
                 .msg = msg,
                 .stream_mode = req.stream,
+                .upload = req.upload_progress,
+                .upload_total = if (body_owned) |b| b.len else 0,
             };
             if (job.session == null) return error.SoupUnavailable;
 
-            log.print("[http] {s} {s} (id={d}, stream={s}, proxy={s})", .{
+            log.print("[http] {s} {s} (id={d}, stream={s}, proxy={s}{s})", .{
                 req.method, req.url, id, boolStr(req.stream), req.proxy orelse "-",
+                if (req.upload_progress) ", upload" else "",
             });
+            // v0.3.8 E6：粗粒度上传进度（0/total 起始帧；soup 无字节级上传进度）
+            if (req.upload_progress) {
+                self.emitHttpProgress(id, 0, job.upload_total);
+            }
             c.soup_session_send_async(job.session, msg, 0, null, httpSendDone, job);
             // 立即返回；结果走 httpResponse / httpChunk 事件（对齐 Windows）
             return .{ .json = try std.fmt.allocPrint(alloc, "{{\"id\":{d},\"pending\":true}}", .{id}) };
@@ -6366,6 +6455,10 @@ fn Backend(comptime config: Config) type {
             const status: u16 = @intCast(c.soup_message_get_status(job.msg.?));
             const body: []const u8 = if (job.stream_mode) "" else job.body.items;
             log.print("[http] done id={d} status={d} bytes={d}", .{ job.id, status, body.len });
+            // v0.3.8 E6：粗粒度上传进度收尾帧（total/total）
+            if (job.upload) {
+                self.emitHttpProgress(job.id, job.upload_total, job.upload_total);
+            }
             self.emitHttpResponse(job.id, status, body, null);
             self.freeHttpJob(job);
         }
@@ -6401,6 +6494,15 @@ fn Backend(comptime config: Config) type {
             const payload = std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"seq\":{d},\"data\":\"{s}\"}}", .{ id, seq, encoded }) catch return;
             defer self.allocator.free(payload);
             self.emitRawToWindow(w.id, "httpChunk", payload);
+        }
+
+        /// v0.3.8 E6：上传进度事件（Linux 粗粒度——send 前 0/total、完成时 total/total；
+        /// libsoup3 无字节级上传进度信号，文档化平台差异）
+        fn emitHttpProgress(self: *Self, id: i64, written: usize, total: usize) void {
+            const w = self.windowById(0) orelse return;
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"written\":{d},\"total\":{d}}}", .{ id, written, total }) catch return;
+            defer self.allocator.free(payload);
+            self.emitRawToWindow(w.id, "httpUploadProgress", payload);
         }
 
         // ---- WebSocket（SoupWebsocketConnection）----
@@ -6876,14 +6978,28 @@ fn Backend(comptime config: Config) type {
                 if (ua != null) user_agent = std.mem.span(ua);
             }
 
+            // v0.3.8 B8：请求体——SoupMessageBody 的 data/length 仅在回调内有效
+            //（dupe 进 handler 的 arena）；无 body（GET 等）为 null
+            var body_raw: ?[]const u8 = null;
+            const soup_body = c.webkit_uri_scheme_request_get_http_body(request);
+            if (soup_body != null) {
+                const sb: *c.SoupMessageBody = @ptrCast(soup_body.?);
+                if (sb.length > 0 and sb.data != null) {
+                    body_raw = @as([*]const u8, @ptrCast(sb.data))[0..@intCast(sb.length)];
+                }
+            }
+            if (body_raw) |b| log.print("[proto] body {d} bytes head={x}", .{ b.len, b[0..@min(b.len, 16)] });
+
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
+            const arena_body: ?[]const u8 = if (body_raw) |b| arena.allocator().dupe(u8, b) catch null else null;
             const resp = p.handle(.{
                 .name = name,
                 .path = path,
                 .query = query,
                 .method = method,
                 .user_agent = user_agent,
+                .body = arena_body,
                 .url = uri,
             }, arena.allocator()) catch |err| {
                 log.print("[proto] {s} handler failed: {s}", .{ name, @errorName(err) });
