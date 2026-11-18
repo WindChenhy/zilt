@@ -12,6 +12,7 @@
 //! 忽略页面上其他 postMessage 流量。
 
 const std = @import("std");
+const isolation = @import("isolation.zig");
 const updater = @import("updater.zig");
 const clipboard = @import("clipboard.zig");
 const notification = @import("notification.zig");
@@ -664,8 +665,12 @@ pub fn encodeEvent(alloc: std.mem.Allocator, name: []const u8, payload_json: []c
 // 解码（JS → Zig）
 // ---------------------------------------------------------------------------
 
+/// v0.3.10 C2：密封字段（nonce/签名的 hex；method/args 保留明文——签名覆盖校验）
+pub const Seal = struct { nonce_hex: []const u8, sig_hex: []const u8 };
+
 pub const Message = union(enum) {
-    invoke: struct { id: u64, method: []const u8, args_json: []const u8 },
+    /// seal != null = 到达时为密封形态（isolation 签名校验后放行）
+    invoke: struct { id: u64, method: []const u8, args_json: []const u8, seal: ?Seal = null },
     event: struct { name: []const u8, payload_json: []const u8 },
     ignore,
 };
@@ -681,6 +686,12 @@ pub const Decoded = struct {
 };
 
 pub fn decode(gpa: std.mem.Allocator, raw: []const u8) !Decoded {
+    return decodeIsolated(gpa, raw, null);
+}
+
+/// v0.3.10 C2：isolation 解码（iso != null 时解封 sealed invoke）。
+/// 启用 isolation 的 GUI 后端用它替代 decode；headless 保持明文 decode。
+pub fn decodeIsolated(gpa: std.mem.Allocator, raw: []const u8, iso: ?isolation.Key) !Decoded {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -696,6 +707,34 @@ pub fn decode(gpa: std.mem.Allocator, raw: []const u8) !Decoded {
     if (kind != .string) return .{ .arena = arena, .msg = .ignore };
 
     if (std.mem.eql(u8, kind.string, "invoke")) {
+        // v0.3.10 C2：密封形态（{id, method, args, sealed:{n,s}}——签名覆盖校验，
+        // 验证与防重放在分发层（需要 ReplayCache））
+        if (obj.get("sealed")) |sv| {
+            if (iso == null) return .{ .arena = arena, .msg = .ignore };
+            if (sv != .object) return .{ .arena = arena, .msg = .ignore };
+            const n_v = sv.object.get("n") orelse return .{ .arena = arena, .msg = .ignore };
+            const s_v = sv.object.get("s") orelse return .{ .arena = arena, .msg = .ignore };
+            if (n_v != .string or s_v != .string) return .{ .arena = arena, .msg = .ignore };
+            const id_v = obj.get("id") orelse return .{ .arena = arena, .msg = .ignore };
+            if (id_v != .integer or id_v.integer < 0) return .{ .arena = arena, .msg = .ignore };
+            const method_v = obj.get("method") orelse return .{ .arena = arena, .msg = .ignore };
+            if (method_v != .string) return .{ .arena = arena, .msg = .ignore };
+            const args_v = obj.get("args") orelse std.json.Value{ .null = {} };
+            // v0.3.10 C2：args 规范化（键排序）——签名与分发共用同一形态
+            //（jsc_value_to_json 不保留键序，规范化是跨引擎签名的唯一可靠基础）
+            var args_buf: std.ArrayListUnmanaged(u8) = .empty;
+            isolation.canonicalize(a, args_v, &args_buf) catch return .{ .arena = arena, .msg = .ignore };
+            const args_json = args_buf.items;
+            return .{ .arena = arena, .msg = .{ .invoke = .{
+                .id = @intCast(id_v.integer),
+                .method = method_v.string,
+                .args_json = args_json,
+                .seal = .{
+                    .nonce_hex = a.dupe(u8, n_v.string) catch return .{ .arena = arena, .msg = .ignore },
+                    .sig_hex = a.dupe(u8, s_v.string) catch return .{ .arena = arena, .msg = .ignore },
+                },
+            } } };
+        }
         const id_v = obj.get("id") orelse return .{ .arena = arena, .msg = .ignore };
         if (id_v != .integer or id_v.integer < 0) return .{ .arena = arena, .msg = .ignore };
         const method_v = obj.get("method") orelse return .{ .arena = arena, .msg = .ignore };
@@ -937,6 +976,57 @@ const runtime_js_head =
     \\    window.chrome.webview.addEventListener('message', (e) => deliver(e.data));
     \\  }
     \\  window.__ziltDeliver = deliver;
+    \\  // v0.3.10 C2：isolation（`window.__ZILT_ISO__` = 随机 origin 隔离 iframe 的
+    \\  // URL，由后端在启用 Config.isolation 时先于 runtime 注入）。invoke 先经
+    \\  // postMessage 让持钥 iframe 做 WebCrypto AES-256-GCM 封装，再以 sealed
+    \\  // 形态发给后端；跨源 iframe 的 key 页面脚本读不到（伪造调用无法产出合法
+    \\  // 密文，Zig 侧明文 invoke 直接拒绝）。
+    \\  const isoSrc = window.__ZILT_ISO__ || '';
+    \\  const isoWaiters = new Map();
+    \\  let isoSeq = 0;
+    \\  if (isoSrc) {
+    \\    window.addEventListener('message', (e) => {
+    \\      const d = e.data || {};
+    \\      if (d.ziltIso !== 1) return;
+    \\      if (d.kind === 'ready') { isoReady = true; post({ zilt: 1, kind: 'event', name: 'frontendLog', payload: { msg: '[iso] iframe ready' } }); return; }
+    \\      if (d.kind !== 'sealed') return;
+    \\      if (d.dbg) post({ zilt: 1, kind: 'event', name: 'frontendLog', payload: { msg: '[iso] page msg: ' + d.dbg } });
+    \\      const w = isoWaiters.get(d.reqId);
+    \\      if (w) { isoWaiters.delete(d.reqId); w(d.sealed, d.error); }
+    \\    });
+    \\    const mountIso = () => {
+    \\      if (document.querySelector('iframe[data-zilt-iso]')) return;
+    \\      const f = document.createElement('iframe');
+    \\      f.src = isoSrc;
+    \\      f.style.display = 'none';
+    \\      f.setAttribute('data-zilt-iso', '1');
+    \\      document.body.appendChild(f);
+    \\    };
+    \\    if (document.readyState === 'loading') {
+    \\      document.addEventListener('DOMContentLoaded', mountIso);
+    \\    } else { mountIso(); }
+    \\  }
+    \\  let isoReady = false; // iframe 页脚本就绪（ready ping）
+    \\  const isoSeal = (method, args) => new Promise((resolve) => {
+    \\    if (!isoSrc) return resolve(null);
+    \\    const reqId = ++isoSeq;
+    \\    let done = false;
+    \\    const finish = (v) => { if (!done) { done = true; clearTimeout(timer); isoWaiters.delete(reqId); resolve(v); } };
+    \\    const timer = setTimeout(() => finish(null), 5000);
+    \\    isoWaiters.set(reqId, (sealed, error) => {
+    \\      if (!sealed && error) { setTimeout(send, 25); return; } // iframe 密钥未就绪 → 重试（总时限内）
+    \\      finish(sealed || null);
+    \\    });
+    \\    // 重发直到回复（iframe 页加载期间 postMessage 会丢——ready 前/首次送达前
+    \\    // 必须重试；done 后 no-op）
+    \\    const send = () => {
+    \\      if (done) return;
+    \\      const f = document.querySelector('iframe[data-zilt-iso]');
+    \\      if (f && f.contentWindow && isoReady) f.contentWindow.postMessage({ ziltIso: 1, kind: 'seal', reqId, method, args }, '*');
+    \\      setTimeout(send, 30);
+    \\    };
+    \\    send();
+    \\  });
     \\  const evalWaiters = new Map();
     \\  let evalId = 1;
     \\  const builtin = (method, args) => window.zilt.invoke(method, args ?? {});
@@ -945,7 +1035,15 @@ const runtime_js_head =
     \\    invoke: (method, args) => new Promise((resolve, reject) => {
     \\      const id = nextId++;
     \\      resolvers.set(id, { resolve, reject });
-    \\      post({ zilt: 1, kind: 'invoke', id, method, args: args ?? {} });
+    \\      if (isoSrc) {
+    \\        // isolation：等签名（iframe 未挂载就绪时 isoSeal 自旋重试），{n,s} 随 invoke 发出
+    \\        isoSeal(method, args ?? {}).then((sealed) => {
+    \\          if (sealed) post({ zilt: 1, kind: 'invoke', id, method, args: args ?? {}, sealed });
+    \\          else { post({ zilt: 1, kind: 'event', name: 'frontendLog', payload: { msg: '[iso] seal failed -> plaintext (will be rejected)' } }); post({ zilt: 1, kind: 'invoke', id, method, args: args ?? {} }); }
+    \\        });
+    \\      } else {
+    \\        post({ zilt: 1, kind: 'invoke', id, method, args: args ?? {} });
+    \\      }
     \\    }),
     \\    emit: (name, payload) => post({ zilt: 1, kind: 'event', name, payload: payload ?? null }),
     \\    on: (name, cb) => {
@@ -1518,6 +1616,52 @@ pub const runtime_js = runtime_js_head ++ "\n" ++
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "v0.3.10 C2: decodeIsolated 密封往返 + 明文伪造区分" {
+    const key_hex = "1122334455667788" ++ "1122334455667788" ++ "1122334455667788" ++ "1122334455667788";
+    const key = try isolation.keyFromHex(key_hex);
+
+    // 密封 invoke（签名覆盖明文 method/args）
+    var nonce: [16]u8 = undefined;
+    for (&nonce, 0..) |*b, i| b.* = @truncate(i *% 7 +% 3);
+    const nonce_hex = isolation.nonceHex(nonce);
+    const sig = isolation.signJson(key, "greet", "{\"name\":\"iso\"}", &nonce_hex);
+    var sig_hex: [64]u8 = undefined;
+    for (sig, 0..) |b, i| {
+        sig_hex[i * 2] = "0123456789abcdef"[(b >> 4) & 0xF];
+        sig_hex[i * 2 + 1] = "0123456789abcdef"[b & 0xF];
+    }
+    const raw = try std.fmt.allocPrint(testing.allocator,
+        "{{\"zilt\":1,\"kind\":\"invoke\",\"id\":7,\"method\":\"greet\",\"args\":{{\"name\":\"iso\"}},\"sealed\":{{\"n\":\"{s}\",\"s\":\"{s}\"}}}}",
+        .{ nonce_hex, sig_hex });
+    defer testing.allocator.free(raw);
+    var d = try decodeIsolated(testing.allocator, raw, key);
+    defer d.deinit();
+    try testing.expect(d.msg == .invoke);
+    try testing.expect(d.msg.invoke.seal != null);
+    try testing.expectEqual(@as(u64, 7), d.msg.invoke.id);
+    try testing.expectEqualStrings("greet", d.msg.invoke.method);
+    try testing.expectEqualStrings("{\"name\":\"iso\"}", d.msg.invoke.args_json);
+
+    // 校验签名通过（模拟分发层）
+    var cache = isolation.ReplayCache{};
+    try testing.expect(isolation.verifyJson(&cache, key, d.msg.invoke.seal.?.nonce_hex, d.msg.invoke.method, d.msg.invoke.args_json, d.msg.invoke.seal.?.sig_hex));
+
+    // 篡改 args → 签名不符
+    const tampered_raw = try std.fmt.allocPrint(testing.allocator,
+        "{{\"zilt\":1,\"kind\":\"invoke\",\"id\":8,\"method\":\"greet\",\"args\":{{\"name\":\"hacked\"}},\"sealed\":{{\"n\":\"{s}\",\"s\":\"{s}\"}}}}",
+        .{ nonce_hex, sig_hex });
+    defer testing.allocator.free(tampered_raw);
+    var d2 = try decodeIsolated(testing.allocator, tampered_raw, key);
+    defer d2.deinit();
+    try testing.expect(d2.msg == .invoke);
+    try testing.expect(!isolation.verifyJson(&cache, key, d2.msg.invoke.seal.?.nonce_hex, d2.msg.invoke.method, d2.msg.invoke.args_json, d2.msg.invoke.seal.?.sig_hex));
+
+    // 无密钥（iso=null）时密封消息 → ignore
+    var d3 = try decodeIsolated(testing.allocator, raw, null);
+    defer d3.deinit();
+    try testing.expect(d3.msg == .ignore);
+}
 
 test "v0.1.23: runtime_js 的版本号来自 version.zig（拼接无语法破坏）" {
     const expected = "    version: '" ++ runtime_version ++ "',\n";

@@ -1121,6 +1121,29 @@ async function runChecks() {
       if (!ok) window.zilt.log('warn', 'c-upload note: ' + JSON.stringify({ status: r.status, prog: progress.length, last, parts, body: String(r.body).slice(0, 80) }).slice(0, 240));
     } catch (e) { setCheck('c-upload', false, String(e.message || e)); window.zilt.log('warn', 'c-upload error: ' + String(e.message || e)); }
 
+    // 59. v0.3.10 C2：isolation——明文伪造 invoke 必拒（IsolationRequired）。
+    // 绕过 runtime 直接 post 裸 invoke；后端拒绝并发 __zilt.isoRejected。
+    try {
+      const isIso = !!window.__ZILT_ISO__;
+      const isWin = !!(window.chrome && window.chrome.webview);
+      const rejected = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve('timeout'), 3000);
+        const off = window.zilt.on('__zilt.isoRejected', (p) => {
+          clearTimeout(timer); off();
+          resolve(p && p.id === 424242 ? 'rejected' : 'other');
+        });
+        const raw = { zilt: 1, kind: 'invoke', id: 424242, method: 'greet', args: { name: 'forged' } };
+        if (isWin && window.chrome.webview) window.chrome.webview.postMessage(raw);
+        else if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.zilt) window.webkit.messageHandlers.zilt.postMessage(raw);
+        else { clearTimeout(timer); off(); resolve('no-transport'); }
+      });
+      const ok = isIso && rejected === 'rejected';
+      setCheck('c-iso', ok, ok
+        ? 'isolation ok (sealed transport; plaintext forged → IsolationRequired)'
+        : `iso=${isIso} rejected=${rejected}`);
+      if (!ok) window.zilt.log('warn', 'c-iso note: iso=' + isIso + ' rejected=' + rejected);
+    } catch (e) { setCheck('c-iso', false, String(e.message || e)); window.zilt.log('warn', 'c-iso error: ' + String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -1183,6 +1206,7 @@ async function runChecks() {
       binipc: $('c-binipc').className === 'pass',
       postbody: $('c-postbody').className === 'pass',
       upload: $('c-upload').className === 'pass',
+      iso: $('c-iso').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

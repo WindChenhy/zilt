@@ -110,6 +110,7 @@ const std = @import("std");
 const c = @import("gtk");
 
 const ipc = @import("../../ipc.zig");
+const iso_mod = @import("../../isolation.zig");
 const webview = @import("../../webview.zig");
 const asset_routes = @import("../../asset_routes.zig");
 const inflate = @import("../../inflate.zig");
@@ -128,6 +129,7 @@ const window_state = @import("window_state.zig");
 const sys = @import("../../sys.zig");
 const gtk_compat = @import("gtk_compat.zig");
 const hotkey_mod = @import("hotkey.zig");
+const portal_hotkey = @import("portal_hotkey.zig");
 const deep_link = @import("deep_link.zig");
 const desktop_entry = @import("desktop_entry.zig");
 const sysinfo_linux = @import("sysinfo_linux.zig");
@@ -696,6 +698,21 @@ pub fn run(comptime config: Config) !void {
         .smoke = smokeEnabled(),
         .smoke_stay = smokeStaySeconds(),
     };
+    // v0.3.10 C2：isolation 会话随机段（ziltiso://<random>/ —— iframe origin 每进程不同）
+    if (config.isolation) |iso| {
+        self.iso_key = iso_mod.keyFromHex(iso.key_hex) catch |err| blk: {
+            log.print("[iso] key parse failed: {s} — isolation disabled", .{@errorName(err)});
+            break :blk null;
+        };
+        if (self.iso_key != null) {
+            var hex: [16]u8 = undefined;
+            // 会话随机段：时间 ^ 栈地址（origin 区分用途，非密钥）
+            const rnd: u64 = @as(u64, @bitCast(c.g_get_real_time())) ^ (@as(u64, @intFromPtr(&hex)) +% 0x9E3779B97F4A7C15);
+            _ = iso_mod.sessionRandom(&hex, rnd);
+            self.iso_url = std.fmt.allocPrint(alloc, "ziltiso://{s}/", .{hex}) catch null;
+            if (self.iso_url) |u| log.print("[iso] enabled (isolation origin {s})", .{u});
+        }
+    }
     defer {
         self.deinit();
         alloc.destroy(self);
@@ -1223,8 +1240,14 @@ fn Backend(comptime config: Config) type {
         next_fs_stream_id: i64 = 1,
         /// SQL lib 缓存（进程内一次加载）
         sqlite_lib: ?*linux_sqlite.Lib = null,
+        /// v0.3.10 C2：isolation（随机 origin 的隔离 iframe URL + 解封密钥）
+        iso_url: ?[]u8 = null,
+        iso_key: ?iso_mod.Key = null,
+        iso_cache: iso_mod.ReplayCache = .{},
         /// X11 全局快捷键（v0.2.6；config.hotkeys 启动注册 + hotkey.* 运行时 op）
         hotkeys: ?*hotkey_mod.Manager = null,
+        /// v0.3.10 D1：Wayland portal 快捷键（Wayland 会话取代 XGrabKey Manager）
+        hotkeys_portal: ?*portal_hotkey.Portal = null,
         /// HTTP（libsoup3；事件 httpResponse / httpChunk）
         next_http_id_seq: i64 = 1,
         /// WebSocket 连接表（SoupWebsocketConnection 所有权在此）
@@ -1531,6 +1554,13 @@ fn Backend(comptime config: Config) type {
                 null,
                 0,
             );
+            if (self.iso_url) |u| {
+                const iso_script = std.fmt.allocPrint(self.allocator, "window.__ZILT_ISO__='{s}';", .{u}) catch null;
+                if (iso_script) |sc| {
+                    self.addUserScriptTo(scripts, ucm, sc);
+                    self.allocator.free(sc);
+                }
+            }
             self.addUserScriptTo(scripts, ucm, ipc.runtime_js);
             for (config.init_scripts) |script| self.addUserScriptTo(scripts, ucm, script);
             if (self.smoke) {
@@ -6183,7 +6213,34 @@ fn Backend(comptime config: Config) type {
             self.emitRawToWindow(w.id, "hotkey", payload);
         }
 
+        /// v0.3.10 D1：环境变量读取（libc getenv；Wayland 判定用）
+        fn getenvZ(name: [:0]const u8) ?[:0]const u8 {
+            const v = std.c.getenv(name.ptr) orelse return null;
+            return std.mem.span(v);
+        }
+
         fn initHotkeys(self: *Self) void {
+            // v0.3.10 D1：Wayland 会话 → portal GlobalShortcuts（XGrabKey 在 Wayland
+            // 下无法全局捕获）；X11/CI（Xvfb）保持 XGrabKey 分支不变
+            const wayland_env = getenvZ("WAYLAND_DISPLAY");
+            const gdk_backend = getenvZ("GDK_BACKEND");
+            if (portal_hotkey.isWaylandSession(wayland_env, gdk_backend)) {
+                const p = portal_hotkey.Portal.init(self.allocator, wayland_env, gdk_backend, onHotkeyPress, self) catch |err| {
+                    log.print("[hotkey] portal unavailable ({s}) — global hotkeys disabled (Wayland)", .{@errorName(err)});
+                    return;
+                };
+                self.hotkeys_portal = p;
+                log.print("[hotkey] Wayland session — portal GlobalShortcuts backend", .{});
+                for (config.hotkeys orelse &.{}) |hk| {
+                    const accel_text = accelTextOf(hk);
+                    p.register(hk.id, accel_text) catch |err| {
+                        log.print("[hotkey] config '{s}' portal register failed ({s})——不致命", .{ hk.id, @errorName(err) });
+                        continue;
+                    };
+                    log.print("[hotkey] config '{s}' = {s} registered (portal)", .{ hk.id, accel_text });
+                }
+                return;
+            }
             const m = hotkey_mod.Manager.init(self.allocator, onHotkeyPress, self) catch |err| {
                 log.print("[hotkey] X11 unavailable ({s}) — global hotkeys disabled", .{@errorName(err)});
                 return;
@@ -6209,6 +6266,46 @@ fn Backend(comptime config: Config) type {
             }
         }
 
+        /// v0.3.10 D1：portal 版 hotkey op（list/register/unregister；事件面与 X11 一致）。
+        fn runHotkeyOpPortal(p: *portal_hotkey.Portal, op: system_api.HotkeyOp, alloc: std.mem.Allocator) !system_api.Result {
+            switch (op) {
+                .list => {
+                    var out: std.ArrayListUnmanaged(u8) = .empty;
+                    errdefer out.deinit(alloc);
+                    try out.append(alloc, '[');
+                    const items = try p.list(alloc);
+                    defer alloc.free(items);
+                    for (items, 0..) |e, i| {
+                        if (i != 0) try out.appendSlice(alloc, ",");
+                        const id = try std.json.Stringify.valueAlloc(alloc, e.id, .{});
+                        defer alloc.free(id);
+                        const accel = try std.json.Stringify.valueAlloc(alloc, e.description, .{});
+                        defer alloc.free(accel);
+                        try out.appendSlice(alloc, "{\"id\":");
+                        try out.appendSlice(alloc, id);
+                        try out.appendSlice(alloc, ",\"accel\":");
+                        try out.appendSlice(alloc, accel);
+                        try out.appendSlice(alloc, "}");
+                    }
+                    try out.append(alloc, ']');
+                    return .{ .json = try out.toOwnedSlice(alloc) };
+                },
+                .register => |spec| {
+                    p.register(spec.id, spec.accel) catch |err| return switch (err) {
+                        error.InvalidAccel, error.InvalidShortcutId => error.InvalidAccel,
+                        error.BindFailed, error.CreateSessionFailed => error.HotkeyConflict,
+                        else => err,
+                    };
+                    log.print("[hotkey] '{s}' = {s} registered (portal)", .{ spec.id, spec.accel });
+                    return .{ .ok = true };
+                },
+                .unregister => |id| {
+                    _ = p.unregister(id);
+                    return .{ .ok = true };
+                },
+            }
+        }
+
         /// config.hotkeys 的展示文本（"Ctrl+Alt+N"——与 Windows 的 accel 格式一致）。
         var accel_text_buf: [64]u8 = undefined;
         fn accelTextOf(hk: Config.Hotkey) []const u8 {
@@ -6222,6 +6319,8 @@ fn Backend(comptime config: Config) type {
         }
 
         fn runHotkeyOp(self: *Self, op: system_api.HotkeyOp, alloc: std.mem.Allocator) !system_api.Result {
+            // v0.3.10 D1：Wayland 会话走 portal manager（同事件面，X11 语义逐字一致）
+            if (self.hotkeys_portal) |p| return runHotkeyOpPortal(p, op, alloc);
             const m = self.hotkeys orelse return error.HotkeyNotAvailable;
             switch (op) {
                 .list => {
@@ -6999,6 +7098,11 @@ fn Backend(comptime config: Config) type {
                 c.webkit_web_context_register_uri_scheme(wc, name_z.ptr, Self.onProtocolRequest, self, null);
                 log.print("[proto] scheme '{s}' registered", .{p.name});
             }
+            // v0.3.10 C2：isolation 隔离 iframe 的独立 scheme（随机 origin）
+            if (self.iso_url != null) {
+                c.webkit_web_context_register_uri_scheme(wc, "ziltiso", Self.onProtocolRequest, self, null);
+                log.print("[iso] scheme 'ziltiso' registered", .{});
+            }
         }
 
         fn onProtocolRequest(request: [*c]c.WebKitURISchemeRequest, user_data: c.gpointer) callconv(.c) void {
@@ -7011,6 +7115,16 @@ fn Backend(comptime config: Config) type {
             const uri = if (uri_ptr != null) std.mem.span(uri_ptr) else "";
             const sep = std.mem.indexOf(u8, uri, "://") orelse return self.finishProtocolError(request, 400, "bad uri");
             const name = uri[0..sep];
+            // v0.3.10 C2：isolation 隔离 iframe 页面（内嵌 WebCrypto 封装器）
+            if (std.mem.eql(u8, name, "ziltiso") and config.isolation != null and self.iso_url != null) {
+                const html = iso_mod.iframeHtml(self.allocator, config.isolation.?.key_hex) catch return self.finishProtocolError(request, 500, "iso html");
+                defer self.allocator.free(html);
+                return self.finishProtocol(request, .{
+                    .content_type = "text/html; charset=utf-8",
+                    .body = html,
+                    .owned = true,
+                });
+            }
             const p = protocol.find(config.protocols, name) orelse {
                 log.print("[proto] '{s}' 未注册 <- {s}", .{ name, uri });
                 return self.finishProtocolError(request, 404, "unknown protocol");
@@ -7135,7 +7249,8 @@ fn Backend(comptime config: Config) type {
             defer arena.deinit();
             const ctx = self.context(arena.allocator(), w.id);
 
-            var decoded = try ipc.decode(self.allocator, raw);
+            // v0.3.10 C2：isolation 启用时解封 sealed invoke
+            var decoded = if (self.iso_key) |k| try ipc.decodeIsolated(self.allocator, raw, k) else try ipc.decode(self.allocator, raw);
             defer decoded.deinit();
 
             const enforce_acl = config.security.capabilities.len != 0;
@@ -7143,7 +7258,33 @@ fn Backend(comptime config: Config) type {
 
             switch (decoded.msg) {
                 .invoke => |inv| {
-                    log.print("[ipc] invoke {s} (id={d}, window={d})", .{ inv.method, inv.id, w.id });
+                    log.print("[ipc] invoke {s} (id={d}, window={d}, sealed={s})", .{ inv.method, inv.id, w.id, boolStr(inv.seal != null) });
+                    // v0.3.10 C2：isolation 启用时——明文 invoke 拒绝（伪造防护），
+                    // 签名不符/重放拒绝（IsoTampered）
+                    if (self.iso_key != null) {
+                        const ok_seal = blk2: {
+                            const seal = inv.seal orelse break :blk2 false;
+                            break :blk2 iso_mod.verifyJson(&self.iso_cache, self.iso_key.?, seal.nonce_hex, inv.method, inv.args_json, seal.sig_hex);
+                        };
+                        if (!ok_seal) {
+                            const err_name: []const u8 = if (inv.seal == null) "IsolationRequired" else "IsoTampered";
+                            log.print("[iso] invoke rejected ({s}) id={d} method={s} args={s} nonce={s} sig={s}", .{
+                                err_name,                inv.id,
+                                inv.method,              inv.args_json,
+                                if (inv.seal) |sl| sl.nonce_hex else "",
+                                if (inv.seal) |sl| sl.sig_hex else "",
+                            });
+                            const rej = try ipc.encodeReject(self.allocator, inv.id, err_name);
+                            defer self.allocator.free(rej);
+                            self.deliverAlloc(sink.view, rej);
+                            const id_json = std.fmt.allocPrint(self.allocator, "{d}", .{inv.id}) catch return;
+                            defer self.allocator.free(id_json);
+                            const ev = std.fmt.allocPrint(self.allocator, "{{\"id\":{s}}}", .{id_json}) catch return;
+                            defer self.allocator.free(ev);
+                            self.emitRawToWindow(w.id, "__zilt.isoRejected", ev);
+                            return;
+                        }
+                    }
 
                     // 框架内部：冒烟结果回传（不经过应用命令表，也不受 ACL 约束）
                     if (std.mem.eql(u8, inv.method, "__zilt.linuxSmoke")) {
@@ -7340,6 +7481,11 @@ fn Backend(comptime config: Config) type {
                 const uri_raw = if (req != null) c.webkit_uri_request_get_uri(req) else null;
                 if (uri_raw == null) return 0;
                 const url = std.mem.span(uri_raw);
+                // v0.3.10 C2：isolation 隔离 iframe 的导航（ziltiso://<random>/）放行
+                if (self.iso_url != null and std.mem.startsWith(u8, url, "ziltiso://")) {
+                    c.webkit_policy_decision_use(d);
+                    return 1;
+                }
                 const policy = navigationPolicyFor(url);
                 const redirected = c.webkit_navigation_action_is_redirect(action) != 0;
                 if (jsonStr(self.allocator, url)) |uj| {

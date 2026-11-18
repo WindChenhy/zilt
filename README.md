@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.9（窗口效果与键盘对称——tint/圆角偏好 + Linux 窗口级 KeyBindings）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.10（安全专项——isolation pattern 密封 IPC + Wayland portal 快捷键）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -186,6 +186,32 @@ v0.3.9 新增（2026-11-18，窗口效果与键盘对称——二轮差距刷新
   掩码语义）+ post terminate PASS；**实测记录**：X 层按键注入（XSendEvent 与
   XTestFakeKeyEvent）在 Xvfb+WebKitGTK 下稳定段错（环境限制），与 v0.3.3 Escape
   同测试深度——真实按键路径由单测保证
+
+v0.3.10 新增（2026-11-18，安全专项——二轮差距刷新第三批）：
+
+- **isolation pattern（C2，对齐 Tauri isolation 防伪造语义）**：`Config.isolation = .{ .key_hex }`
+  （32 字节 hex）——invoke 经**随机 origin 隔离 iframe**（`ziltiso://<session-random>/`，
+  独立 scheme + decide-policy 放行）的签名服务：主页面 postMessage → 持钥 iframe →
+  **纯 JS HMAC-SHA256**（无 WebCrypto——`crypto.subtle` 在自定义 scheme iframe 不保证
+  secure context，实测驱动选型）→ `{n, s}` sealed 形态 → Zig 侧验签 + **nonce 防重放**
+  （512 槽环形缓存）→ 分发；**明文 invoke 一律拒绝**（`IsolationRequired` +
+  `__zilt.isoRejected` 事件；伪造/篡改 `IsoTampered`）。**签名用规范化 JSON**
+  （对象键排序递归——`jsc_value_to_json` 不保留键序的实测发现，跨引擎签名唯一可靠基础；
+  页侧 canon 与 Zig canonicalize 同构，undefined 属性丢弃对齐结构化克隆语义）。
+  **node 跨实现 E2E**：真实生成的 iframe 页脚本在 node mock 环境执行（ready ping →
+  seal → 签名与 node crypto HMAC 逐字一致 + 篡改敏感）。**密封链路即全套冒烟链路**
+  ——Windows 59 项 / Linux 83 项全部检查经密封 IPC 完成 = 最强 E2E
+- **Wayland portal 全局快捷键（D1，对齐 Wails portal 后端）**：Wayland 会话
+  （WAYLAND_DISPLAY 有值且 GDK_BACKEND≠x11——WSLg 同时设两者，显式 x11 排除）的
+  hotkey op 改走 `org.freedesktop.portal.GlobalShortcuts`（CreateSession →
+  BindShortcuts 整表重绑 → Activated → hotkey 事件，GVariant 文本构造经
+  g_variant_parse）；X11/CI 保持 XGrabKey 分支逐字不变。会话判定 / portal 触发器
+  格式（`Ctrl+Alt+N`→`<Control><Alt>n`）/ BindShortcuts 文本构造 全部单测；
+  真 Wayland 会话端到端待桌面环境手动验证（对齐 v0.2.5 模式）
+- **验收**：Windows 单测全绿（+isolation seal/verify/重放/规范化/canonicalize 键序）
+  + 冒烟 **59 项 exit 0**（新增 c-iso 明文伪造必拒断言）；Linux 单测全绿
+  （+portal 会话判定/触发器/BindShortcuts 文本/matchKeyBinding）+ 冒烟 **83/83**
+  + post terminate PASS
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 

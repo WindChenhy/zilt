@@ -11,6 +11,7 @@
 const std = @import("std");
 const log = @import("../../log.zig");
 const ipc = @import("../../ipc.zig");
+const iso_mod = @import("../../isolation.zig");
 const updater = @import("../../updater.zig");
 const Config = @import("../../config.zig").Config;
 const com = @import("com.zig");
@@ -91,6 +92,7 @@ const WM_ZILT_PROC: win32.UINT = win32.WM_APP + 12; // 子进程 worker → UI �
 const WM_ZILT_EVAL: win32.UINT = win32.WM_APP + 13; // 子 webview eval（延后到回调外执行）
 const WM_ZILT_HTTP_CHUNK: win32.UINT = win32.WM_APP + 14; // v0.1.20 流式下载分块
 const WM_ZILT_HTTP_PROGRESS: win32.UINT = win32.WM_APP + 21; // v0.3.8 E6 上传进度（20=binary 已占）
+var iso_seed: std.atomic.Value(u64) = .init(0x49534F); // v0.3.10 isolation 会话随机种子
 const WM_ZILT_FSWATCH: win32.UINT = win32.WM_APP + 15; // v0.1.22 目录监视事件
 const WM_ZILT_FSCHUNK: win32.UINT = win32.WM_APP + 16; // v0.1.22 文件流式读取分块
 const WM_CLIPBOARDUPDATE: win32.UINT = 0x031D;
@@ -321,7 +323,8 @@ pub fn run(comptime config: Config) !void {
         // 路径式 `/__proto/<name>/` 仍然可用。
         if (env_opts) |opts_ptr| {
             if (config.protocols.len > 0) {
-                opts_ptr.setCustomSchemes(alloc, config.protocols, originOf(config.url)) catch |err| {
+                const iso_extra: []const []const u8 = if (config.isolation != null) &.{"ziltiso"} else &.{};
+                opts_ptr.setCustomSchemes(alloc, config.protocols, originOf(config.url), iso_extra) catch |err| {
                     log.print("[scheme] register failed: {s} (path-style protocols still work)", .{@errorName(err)});
                 };
             }
@@ -1332,11 +1335,30 @@ fn Backend(comptime config: Config) type {
         /// 启动/第二实例转发的深链接载荷（导航完成后发 deepLink 事件）
         pending_launch: ?deep_link.Launch = null,
         launch_emitted: bool = false,
+        /// v0.3.10 C2：isolation（随机 origin 的隔离 iframe URL + 解封密钥）
+        iso_url: ?[]u8 = null,
+        iso_key: ?iso_mod.Key = null,
+        iso_cache: iso_mod.ReplayCache = .{},
 
         // ---- 初始化 ----
 
         fn init(self: *Self, class_u8: []const u8) !void {
             self.class_u8 = try self.allocator.dupe(u8, class_u8);
+            // v0.3.10 C2：isolation 会话随机段（ziltiso://<random>/ —— iframe origin 每进程不同）
+            if (config.isolation) |iso| {
+                self.iso_key = iso_mod.keyFromHex(iso.key_hex) catch |err| blk: {
+                    log.print("[iso] key parse failed: {s} — isolation disabled", .{@errorName(err)});
+                    break :blk null;
+                };
+                if (self.iso_key != null) {
+                    var hex: [16]u8 = undefined;
+                    // 会话随机段：时间 ^ 栈地址 ^ 进程内计数（origin 区分用途，非密钥）
+                    const rnd: u64 = win32.GetTickCount64() ^ (@as(u64, @intFromPtr(&hex)) +% 0x9E3779B97F4A7C15) ^ iso_seed.fetchAdd(1, .monotonic);
+                    _ = iso_mod.sessionRandom(&hex, rnd);
+                    self.iso_url = std.fmt.allocPrint(self.allocator, "ziltiso://{s}/", .{hex}) catch null;
+                    if (self.iso_url) |u| log.print("[iso] enabled (isolation origin {s})", .{u});
+                }
+            }
             self.class_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, class_u8);
 
             // 图标按目标尺寸创建：托盘/标题栏用小图标，Alt-Tab/任务栏用大图标。
@@ -1846,6 +1868,13 @@ fn Backend(comptime config: Config) type {
                         const hr4 = webview.addWebResourceRequestedFilter(scheme_filter_w.ptr, wv2.WEB_RESOURCE_CONTEXT_ALL);
                         log.print("[webview] AddWebResourceRequestedFilter({s}) hr=0x{x}", .{ scheme_filter, @as(u32, @bitCast(hr4)) });
                     }
+                    // v0.3.10 C2：isolation 隔离 iframe 的独立 scheme filter
+                    if (self.iso_url != null) {
+                        const iso_filter_w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, "ziltiso://*") catch return;
+                        defer self.allocator.free(iso_filter_w);
+                        const hr5 = webview.addWebResourceRequestedFilter(iso_filter_w.ptr, wv2.WEB_RESOURCE_CONTEXT_ALL);
+                        log.print("[webview] AddWebResourceRequestedFilter(ziltiso://*) hr=0x{x}", .{@as(u32, @bitCast(hr5))});
+                    }
                 }
             }
 
@@ -1881,6 +1910,16 @@ fn Backend(comptime config: Config) type {
             // v0.1.21：原型冻结标记（runtime 末尾据此冻结 window.zilt 与内建原型）
             if (config.security.freeze_prototype) {
                 self.injectScript(w, webview, "window.__ZILT_FREEZE__ = true;");
+            }
+
+            // v0.3.10 C2：isolation 标记（先于 runtime——invoke 双形态读它）
+            if (self.iso_url) |u| {
+                const iso_js = std.fmt.allocPrint(self.allocator, "window.__ZILT_ISO__='{s}';", .{u}) catch null;
+                if (iso_js) |sc| {
+                    self.injectScript(w, webview, sc);
+                    self.allocator.free(sc);
+                }
+                log.print("[iso] __ZILT_ISO__ injected", .{});
             }
 
             // 注入 zilt 运行时（window.zilt：invoke/emit/on + __reload）
@@ -2223,11 +2262,29 @@ fn Backend(comptime config: Config) type {
             // v0.1.11：只有声明了 capability 清单才强制（未声明保持 v0.1.7 兼容）。
             const enforce_acl = config.security.capabilities.len != 0;
 
-            var decoded = ipc.decode(self.allocator, raw_u8) catch return;
+            // v0.3.10 C2：isolation 启用时解封 sealed invoke
+            var decoded = (if (self.iso_key) |k| ipc.decodeIsolated(self.allocator, raw_u8, k) else ipc.decode(self.allocator, raw_u8)) catch return;
             defer decoded.deinit();
             switch (decoded.msg) {
                 .invoke => |inv| {
-                    log.print("[ipc] invoke {s} (id={d}, window={d})", .{ inv.method, inv.id, w.id });
+                    log.print("[ipc] invoke {s} (id={d}, window={d}, sealed={s})", .{ inv.method, inv.id, w.id, if (inv.seal != null) "true" else "false" });
+
+                    // v0.3.10 C2：isolation 启用时——明文 invoke 拒绝（伪造防护），
+                    // 签名不符/重放拒绝（IsoTampered）
+                    if (self.iso_key != null) {
+                        const ok_seal = blk2: {
+                            const seal = inv.seal orelse break :blk2 false;
+                            break :blk2 iso_mod.verifyJson(&self.iso_cache, self.iso_key.?, seal.nonce_hex, inv.method, inv.args_json, seal.sig_hex);
+                        };
+                        if (!ok_seal) {
+                            const err_name: []const u8 = if (inv.seal == null) "IsolationRequired" else "IsoTampered";
+                            log.print("[iso] invoke rejected ({s}) id={d} method={s}", .{ err_name, inv.id, inv.method });
+                            const rej = ipc.encodeReject(self.allocator, inv.id, err_name) catch return;
+                            sendJsonTo(w, rej, sender);
+                            w.emitEventPayload("__zilt.isoRejected", .{ .id = inv.id });
+                            return;
+                        }
+                    }
 
                     // 框架内置：自定义标题栏拖动（runtime_js 的 data-zilt-drag-region）
                     if (std.mem.eql(u8, inv.method, "__zilt.startDragging")) {
@@ -4992,6 +5049,18 @@ fn Backend(comptime config: Config) type {
             // 应用 origin 不同，不会进 sameOrigin 分支。**必须经已注册名门控**，
             // 否则 https 等内置 scheme 也会被解析并误拦。
             if (protocol.schemeNameOf(uri_u8)) |scheme_name| {
+                // v0.3.10 C2：isolation 隔离 iframe 页面（ziltiso://<random>/，先于协议门控）
+                if (std.mem.eql(u8, scheme_name, "ziltiso") and self.iso_url != null and config.isolation != null) {
+                    const html = iso_mod.iframeHtml(self.allocator, config.isolation.?.key_hex) catch return;
+                    defer self.allocator.free(html);
+                    self.writeProtocolResponse(args, .{
+                        .content_type = "text/html; charset=utf-8",
+                        .body = html,
+                        .owned = true,
+                    }, uri_u8, false);
+                    log.print("[iso] served isolation iframe page <- {s}", .{uri_u8});
+                    return;
+                }
                 if (protocol.find(config.protocols, scheme_name) != null) {
                     if (protocol.parseSchemeRoute(uri_u8)) |route| {
                         if (self.serveProtocolRoute(route, uri_u8, args, true)) return;

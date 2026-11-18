@@ -4,6 +4,9 @@
 const std = @import("std");
 const zilt = @import("zilt");
 
+/// v0.3.10 C2：isolation 演示密钥（64 字符 hex = 32 字节；生产应用应自行生成并保守）
+pub const iso_key_hex = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
 pub const commands = @import("commands.zig");
 pub const events = @import("events.zig");
 

@@ -150,20 +150,26 @@ pub const EnvironmentOptions = extern struct {
         alloc: std.mem.Allocator,
         protocols: []const @import("../../protocol.zig").Protocol,
         app_origin: []const u8,
+        extra_names: []const []const u8,
     ) !void {
         _ = app_origin; // v0.3.2 实测：AllowedOrigins 用通配 "*"（精确 origin 匹配
         // 不解决 https 页面 fetch 的 CORS 判定；见 protocol.zig 文档化限制）
-        if (protocols.len == 0) return;
+        if (protocols.len == 0 and extra_names.len == 0) return;
         const part = try self.ensureOptions4(alloc);
-        const regs = try alloc.alloc(*custom_scheme.SchemeRegistration, protocols.len);
+        // v0.3.10 C2：extra_names（isolation 的 "ziltiso"）与应用协议一并注册
+        const regs = try alloc.alloc(*custom_scheme.SchemeRegistration, protocols.len + extra_names.len);
         var written: usize = 0;
         errdefer {
             for (regs[0..written]) |reg| reg.dropRef();
             alloc.free(regs);
         }
-        for (protocols, 0..) |p, i| {
-            regs[i] = try custom_scheme.SchemeRegistration.create(alloc, p.name, &.{"*"});
-            written = i + 1;
+        for (protocols) |p| {
+            regs[written] = try custom_scheme.SchemeRegistration.create(alloc, p.name, &.{"*"});
+            written += 1;
+        }
+        for (extra_names) |name| {
+            regs[written] = try custom_scheme.SchemeRegistration.create(alloc, name, &.{"*"});
+            written += 1;
         }
         const hr = part.lpVtbl.SetCustomSchemeRegistrations(part, @intCast(regs.len), @ptrCast(regs.ptr));
         // COM 契约：Set 已对每项 AddRef 保留自己的拷贝 → caller 引用即刻归还
@@ -433,7 +439,7 @@ test "v0.3.2: setCustomSchemes 注册 + QI 分片往返 + 释放无泄漏" {
         .{ .name = "media", .handle = undefined },
         .{ .name = "app-data", .handle = undefined },
     };
-    try obj.setCustomSchemes(alloc, &protocols, "https://zilt.app");
+    try obj.setCustomSchemes(alloc, &protocols, "https://zilt.app", &.{});
 
     try std.testing.expectEqual(com.S_OK, obj.lpVtbl.QueryInterface(obj, &custom_scheme.IID_ICoreWebView2EnvironmentOptions4, &out));
     const part: *custom_scheme.Options4Part = @ptrCast(@alignCast(out.?));
@@ -458,7 +464,7 @@ test "v0.3.2: setCustomSchemes 注册 + QI 分片往返 + 释放无泄漏" {
 
     // 非法 scheme 名在注册前即报错（不产生半注册状态）
     const bad = [_]proto_mod.Protocol{.{ .name = "Bad_Name", .handle = undefined }};
-    try std.testing.expectError(error.InvalidSchemeName, obj.setCustomSchemes(alloc, &bad, "https://zilt.app"));
+    try std.testing.expectError(error.InvalidSchemeName, obj.setCustomSchemes(alloc, &bad, "https://zilt.app", &.{}));
 
     try std.testing.expectEqual(@as(u32, 1), obj.refs); // 只剩 caller 引用
     try std.testing.expect(obj.opts4 != null); // 分片仍在（随 owner 释放）

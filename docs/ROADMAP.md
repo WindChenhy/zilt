@@ -485,7 +485,32 @@
       - **范围说明**：浏览器端 runtime 传输 shim（二阶段）——协议层已被 python
         E2E 完整覆盖
       - **验收**：Windows/Linux 单测全绿；Linux 冒烟 79/79 + headless/server E2E
-- [x] **v0.3.9 窗口效果与键盘对称**（2026-11-18；二轮差距刷新第二批）：
+- [x] **v0.3.10 安全专项**（2026-11-18；二轮差距刷新第三批）：
+      - **C2 isolation pattern**：isolation.zig（keyFromHex/HMAC-SHA256 签名/
+        verifyJson + ReplayCache 512 槽防重放/canonicalize 规范化/iframeHtml 纯 JS 页面）
+        + config.Isolation + 双平台接线（随机 origin ziltiso:// scheme 注册与服务 +
+        decide-policy 放行（Linux）/真 scheme 分支拦截（Windows）+ runtime 双形态
+        invoke + 明文 invoke 门禁（IsolationRequired/IsoTampered + __zilt.isoRejected））
+        —— **选型实测记录**：AES-256-GCM（WebCrypto）方案因 `crypto.subtle` 依赖
+        secure context（自定义 scheme iframe 不保证）改定纯 JS HMAC-SHA256（伪造防护
+        等价，机密性不在威胁模型内）；**jsc_value_to_json 不保留键序**（页签 {"a":2,"b":3}
+        → 桥送 {"b":3,"a":2}，node 对照实证）→ 签名改用规范化 JSON（两侧同构）；
+        页侧 canon 丢 undefined 属性（对齐结构化克隆语义——{"exe_args":undefined}
+        页侧/桥侧不一致的实证修复）；**node 跨实现 E2E**（.zilt-probe/iso_page_e2e.mjs：
+        真实 iframe 页脚本 mock 执行 + node crypto HMAC 对照 + 篡改敏感）；
+        demo 常开 isolation → **全套冒烟即密封链路 E2E**（Windows 59 项含 c-iso
+        明文伪造必拒 / Linux 83 项含 iso 检查）+ server E2E 回归
+      - **D1 Wayland portal 快捷键**：portal_hotkey.zig——isWaylandSession
+        （WAYLAND_DISPLAY + **GDK_BACKEND=x11 显式排除**——WSLg 同时设两者的实测陷阱，
+        Xvfb/CI 保持 XGrabKey）+ portalTrigger（Ctrl+Alt+N → <Control><Alt>n）+
+        bindText（BindShortcuts 的 GVariant 文本构造，g_variant_parse 消费）+
+        Portal GDBus 编排（CreateSession/BindShortcuts 整表重绑/Activated → hotkey 事件，
+        logind extern 模式）；backend runHotkeyOp 双管理器分派 + runHotkeyOpPortal
+        （list/register/unregister 同事件面）；真 Wayland 会话端到端待手动验证
+        （v0.2.5 模式）；单测锁定会话判定/触发器/文本构造/shortcut id 校验
+      - **验收**：Windows 单测全绿 + 冒烟 **59 项 exit 0**（密封链路 + c-iso）；
+        Linux 单测全绿 + 冒烟 **83/83** + post terminate PASS；server E2E 不受影响
+      - 后续规划（v0.3.8–v0.3.13，二轮差距刷新 2026-11-17——对标 Wails v3.1.0 /
       - **A12 效果参数（Windows）**：theme.zig 增 CornerPreference（DWMWCP_*，
         DWMWA_WINDOW_CORNER_PREFERENCE 33）+ AccentPolicy/WindowCompositionAttribData
         （extern struct 对齐 winuser 私有头）+ parseTint（"RRGGBB"/"AARRGGBB" →
@@ -551,7 +576,7 @@
         **v0.3.8** IPC/协议收尾（B8 协议 POST body 读取 + C1L Linux 二进制 IPC +
         C3 绑定参数名 + E6 上传进度）✅ → **v0.3.9** 窗口对称（A12 tint/cornerPreference +
         A4L Linux KeyBindings）✅ → **v0.3.10** 安全（C2 isolation pattern +
-        D1 Wayland portal 快捷键）→ **v0.3.11** 分发（E1b external_bin sidecar +
+        D1 Wayland portal 快捷键）✅ → **v0.3.11** 分发（E1b external_bin sidecar +
         E2 fixed 运行时 E2E + E4 交叉编译 pack + F2 模板 TS 变体）→
         **v0.3.12** CompositionController 专项（A11，失败回退 HWND）→
         **v0.3.13** server 模式二阶段（F1b 浏览器端 runtime shim）

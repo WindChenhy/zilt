@@ -16,6 +16,12 @@ pub const Asset = struct {
     pub const Encoding = enum { identity, gzip };
 };
 
+/// v0.3.10 C2：isolation pattern 密钥（见 Config.isolation）
+pub const Isolation = struct {
+    /// 32 字节 AES-256-GCM 密钥（64 字符 hex）
+    key_hex: []const u8,
+};
+
 pub const Config = struct {
     /// 命令命名空间：`pub fn 名字(ctx: Context, args: struct{...}) !结果`（JS→Zig 调用）
     commands: type,
@@ -65,6 +71,10 @@ pub const Config = struct {
     dev: Dev = .{},
     /// CSP / 导航白名单 / capability ACL / 远程内容边界（v0.1.8 + v0.1.11）
     security: @import("security.zig").Options = .{},
+    /// v0.3.10 C2：isolation pattern（对齐 Tauri isolation——invoke 经随机 origin
+    /// 隔离 iframe 的 WebCrypto AES-256-GCM 密封，Zig 侧解密分发；明文 invoke 拒绝）。
+    /// null = 不启用（明文 IPC）。key 为 64 字符 hex（32 字节；应用自行生成并保守）。
+    isolation: ?Isolation = null,
     /// WebView 引擎选项：事件面、Settings、下载、权限、渲染进程恢复（v0.1.9/v0.1.10）
     webview: @import("webview.zig").Options = .{},
     /// WebView2 环境选项：UA / 语言 / 代理 / 浏览器参数 / 运行时通道（v0.1.10）

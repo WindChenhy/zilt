@@ -1101,6 +1101,20 @@ function runSecondWindowProbe() {
     check('exp2', ok, `create=${JSON.stringify(w).slice(0, 40)} state ok=${ok}`);
   } catch (e) { check('exp2', false, String(e.message || e)); }
 
+  // ---- v0.3.10 C2：isolation——明文伪造 invoke 必拒 ----
+  try {
+    const isIso = !!window.__ZILT_ISO__;
+    const rejected = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve('timeout'), 3000);
+      Z().on('__zilt.isoRejected', (p) => {
+        clearTimeout(timer);
+        resolve(p && p.id === 424242 ? 'rejected' : 'other');
+      });
+      window.webkit.messageHandlers.zilt.postMessage({ zilt: 1, kind: 'invoke', id: 424242, method: 'greet', args: { name: 'forged' } });
+    });
+    check('iso', isIso && rejected === 'rejected', `iso=${isIso} rejected=${rejected}`);
+  } catch (e) { check('iso', false, String(e.message || e)); }
+
   // ---- v0.3.9 A4L：窗口级 KeyBindings（创建解析 + 匹配 + 事件派发链路；
   //      X 层注入在 Xvfb+WebKit 下段错为环境限制——真实 key-press 路径由
   //      matchKeyBinding 单测与 GTK key-press 语义保证）----

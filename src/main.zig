@@ -58,6 +58,10 @@ pub fn main() !void {
         .clipboard_change_event = true,
         // v0.3.5：DPAPI 加密 store（往返语义不变——get 自动解密；c-storage 断言兼容）
         .store_encrypted = true,
+        // v0.3.10 C2：isolation pattern——invoke 经随机 origin 隔离 iframe 的
+        // WebCrypto AES-256-GCM 密封（Zig 侧解密分发；明文 invoke 拒绝）。
+        // 全部冒烟检查即在密封链路上跑 = 最强 E2E；demo 密钥仅测试用。
+        .isolation = .{ .key_hex = app.iso_key_hex },
         .drag_formats = &.{"ZiltDemoFormat"},
         // 系统能力（Windows）
         // 图标：项目未指定 → 使用内置 Zig 官方图标（窗口/托盘/exe 资源）
