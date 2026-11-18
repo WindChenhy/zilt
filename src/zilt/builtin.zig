@@ -998,6 +998,32 @@ fn pathCmd(ctx: ipc.Context, a: Args) ![]u8 {
         return std.json.Stringify.valueAlloc(alloc, joined, .{});
     }
 
+    // v0.3.11 E1b：external_bin sidecar 解析（<exe 目录>/<name>[.exe] + 存在性检查）。
+    // build install / NSIS / deb / AppDir 都把 sidecar 落在 exe 旁（同布局）。
+    if (eql(u8, a.action, "sidecar")) {
+        const name = a.path orelse return error.MissingPath;
+        if (std.fs.path.isAbsolute(name) or std.mem.indexOf(u8, name, "..") != null or
+            std.mem.indexOfScalar(u8, name, '/') != null or std.mem.indexOfScalar(u8, name, '\\') != null)
+        {
+            return std.json.Stringify.valueAlloc(alloc, .{ .path = "", .exists = false }, .{});
+        }
+        var io = std.Io.Threaded.init(alloc, .{});
+        defer io.deinit();
+        const exe = std.process.executablePathAlloc(io.io(), alloc) catch {
+            return std.json.Stringify.valueAlloc(alloc, .{ .path = "", .exists = false }, .{});
+        };
+        defer alloc.free(exe);
+        const dir = std.fs.path.dirname(exe) orelse "";
+        const ext: []const u8 = if (@import("builtin").os.tag == .windows) ".exe" else "";
+        const full = try std.fmt.allocPrint(alloc, "{s}{s}{s}{s}", .{ dir, std.fs.path.sep_str, name, ext });
+        var exists = false;
+        var rdir = std.Io.Dir.cwd();
+        if (rdir.statFile(io.io(), full, .{})) |_| {
+            exists = true;
+        } else |_| {}
+        return std.json.Stringify.valueAlloc(alloc, .{ .path = full, .exists = exists }, .{});
+    }
+
     // v0.3.4：侧车资源解析（<exe 目录>/resources/<rel> + 存在性检查）。
     // 安装器/便携包把 resources/ 放在 exe 旁边（build install 与 NSIS 同布局）。
     if (eql(u8, a.action, "resource")) {

@@ -14,7 +14,23 @@ const Io = std.Io;
 
 const alloc = std.heap.page_allocator;
 
-pub const templates_available = [_][]const u8{ "vanilla", "vue", "react", "svelte", "solid", "preact", "htmx", "angular" };
+pub const templates_available = [_][]const u8{ "vanilla", "vue", "react", "svelte", "solid", "preact", "htmx", "angular", "vue-ts", "react-ts", "svelte-ts", "preact-ts" };
+
+/// v0.3.11 F2：TS 变体 = 基础模板（vendored 框架复用）+ TS overlay
+/// （templates/<variant>/frontend 覆盖式叠加：src/*.ts、tsconfig.json、package.json
+/// 加 typecheck 步骤）。返回 null = 非变体（直接用同名目录）。
+pub fn tsVariantBase(template: []const u8) ?[]const u8 {
+    const map = [_]struct { variant: []const u8, base: []const u8 }{
+        .{ .variant = "vue-ts", .base = "vue" },
+        .{ .variant = "react-ts", .base = "react" },
+        .{ .variant = "svelte-ts", .base = "svelte" },
+        .{ .variant = "preact-ts", .base = "preact" },
+    };
+    for (map) |e| {
+        if (std.mem.eql(u8, template, e.variant)) return e.base;
+    }
+    return null;
+}
 
 /// 工具进程的 Io（Threaded 惰性创建；本工具只做同步目录/文件操作）。
 var g_threaded: Io.Threaded = undefined;
@@ -92,8 +108,16 @@ pub fn scaffold(template: []const u8, name: []const u8, dest: ?[]const u8) !void
     try copyTree("templates/_common", dest_dir, true);
 
     // 3) 模板前端 + 模板专属 project.zig（frontend 段按模板差异）
-    const tmpl_root = try join2("templates", template);
-    try copyTree(try join2(tmpl_root, "frontend"), try join2(dest_dir, "frontend"), true);
+    // v0.3.11 F2：TS 变体 = 基础前端（vendored 框架复用）+ overlay 覆盖
+    // （templates/<variant>/ 只放 TS 专属文件：src/*.ts、tsconfig、package.json）
+    var tmpl_root = try join2("templates", template);
+    if (tsVariantBase(template)) |base| {
+        tmpl_root = try join2("templates", base);
+        try copyTree(try join2(tmpl_root, "frontend"), try join2(dest_dir, "frontend"), true);
+        try copyTree(try join2("templates", template), try join2(dest_dir, "frontend"), true);
+    } else {
+        try copyTree(try join2(tmpl_root, "frontend"), try join2(dest_dir, "frontend"), true);
+    }
     {
         const pz_data = try readFile(try join2(tmpl_root, "project.zig.tmpl"));
         defer alloc.free(pz_data);

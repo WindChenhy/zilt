@@ -29,14 +29,16 @@ const ColumnBytesFn = *const fn (stmt: StmtHandle, i: SqlInt) callconv(.c) SqlIn
 const ColumnNameFn = *const fn (stmt: StmtHandle, i: SqlInt) callconv(.c) ?[*:0]const u8;
 const BindIntFn = *const fn (stmt: StmtHandle, i: SqlInt, v: i64) callconv(.c) SqlInt;
 const BindDoubleFn = *const fn (stmt: StmtHandle, i: SqlInt, v: f64) callconv(.c) SqlInt;
-const BindTextFn = *const fn (stmt: StmtHandle, i: SqlInt, v: [*]const u8, n: SqlInt, destructor: ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) SqlInt;
+const BindTextFn = *const fn (stmt: StmtHandle, i: SqlInt, v: [*]const u8, n: SqlInt, destructor: ?*align(1) const fn (?*anyopaque) callconv(.c) void) callconv(.c) SqlInt;
 const BindNullFn = *const fn (stmt: StmtHandle, i: SqlInt) callconv(.c) SqlInt;
 const ChangesFn = *const fn (db: SqlHandle) callconv(.c) SqlInt;
 const LastInsertRowidFn = *const fn (db: SqlHandle) callconv(.c) i64;
 const ErrMsgFn = *const fn (db: SqlHandle) callconv(.c) ?[*:0]const u8;
 
-/// SQLITE_TRANSIENT：sqlite 自拷贝绑定串
-const transient: ?*const fn (?*anyopaque) callconv(.c) void =
+/// SQLITE_TRANSIENT：sqlite 自拷贝绑定串（哨兵 = (usize)-1）。
+/// **align(1)**：aarch64 的指针 @ptrFromInt 要求对齐（x86_64 无此检查），
+/// 哨兵值本质是整型标记 → 用 align(1) 指针类型承载，调用点 @ptrCast 回对齐类型。
+const transient_aligned: ?*align(1) const fn (?*anyopaque) callconv(.c) void =
     @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
 
 pub const Lib = struct {
@@ -169,7 +171,7 @@ pub fn run(
         const rc: SqlInt = switch (p.kind) {
             .text => blk: {
                 const t = p.text orelse "";
-                break :blk db.lib.bind_text(stmt, idx, t.ptr, @intCast(t.len), transient);
+                break :blk db.lib.bind_text(stmt, idx, t.ptr, @intCast(t.len), transient_aligned);
             },
             .int => db.lib.bind_int(stmt, idx, p.int),
             .real => db.lib.bind_double(stmt, idx, p.real),

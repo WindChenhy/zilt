@@ -216,10 +216,20 @@ pub fn main() !void {
         break :blk v;
     };
     const mime_line = try std.fmt.allocPrint(alloc, "xdg-mime default {s} x-scheme-handler/{s} || true", .{ desktop_name, scheme });
+    // v0.3.11 E1b：external_bin sidecar 收集（源 exe 旁 <name>[.exe]；deb/AppDir 共用）
+    const src_dir = std.fs.path.dirname(exe_path orelse "") orelse "";
+    var sidecar_bytes: std.ArrayListUnmanaged(pack_formats.ExtraFile) = .empty;
+    inline for (app_meta.external_bin) |sc_name| {
+        const ext: []const u8 = if (@import("builtin").os.tag == .windows) ".exe" else "";
+        const src_sc = try pathJoin(alloc, src_dir, try std.fmt.allocPrint(alloc, "{s}{s}", .{ sc_name, ext }));
+        const sc_b = readFileAlloc(alloc, src_sc, 512 * 1024 * 1024) catch continue; // 缺失跳过
+        try sidecar_bytes.append(alloc, .{ .name = try std.fmt.allocPrint(alloc, "{s}{s}", .{ sc_name, ext }), .bytes = sc_b });
+    }
     const deb = try pack_formats.buildDebOpt(alloc, meta, exe_bytes.?, .{
         .depends = &.{ "libgtk-3-0", "libwebkit2gtk-4.1-0", "libsqlite3-0" },
         .postinst_lines = &.{mime_line},
         .icon_png = icon_png,
+        .extra_files = sidecar_bytes.items,
     });
     const deb_out = try pathJoin(alloc, out_dir, try std.fmt.allocPrint(alloc, "{s}_{s}_amd64.deb", .{ pkg, meta.version }));
     if (!writeFile(alloc, deb_out, deb, 0o644)) return error.WriteFailed;
@@ -236,6 +246,12 @@ pub fn main() !void {
     if (!writeFile(alloc, try pathJoin(alloc, app_dir, "AppRun"), apprun_filled, 0o755)) return error.WriteFailed;
     const app_bin = try pathJoin(alloc, app_dir, try std.fmt.allocPrint(alloc, "usr/bin/{s}", .{exe_base}));
     if (!writeFile(alloc, app_bin, exe_bytes.?, 0o755)) return error.WriteFailed;
+
+    // v0.3.11 E1b：sidecar → AppDir usr/bin 同名（与 deb 的 extra_files 同源）
+    for (sidecar_bytes.items) |sc| {
+        const dst_sc = try pathJoin(alloc, app_dir, try std.fmt.allocPrint(alloc, "usr/bin/{s}", .{sc.name}));
+        if (!writeFile(alloc, dst_sc, sc.bytes, 0o755)) return error.WriteFailed;
+    }
 
     // 桌面项：与 deb 同一生成器（v0.2.2 的 desktop_entry）
     const desktop_text = try desktop_entry.content(alloc, .{

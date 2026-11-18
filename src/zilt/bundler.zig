@@ -120,6 +120,8 @@ pub const InstallerConfig = struct {
     /// v0.3.4：侧车资源目录（相对项目根；null/空 = 不打包）。生成
     /// SetOutPath + File /r 片段（resources 子目录布局与 build install 一致）。
     resources: ?[]const u8 = null,
+    /// v0.3.11 E1b：external_bin sidecar 名单（exe 旁同名安装）。
+    sidecars: []const []const u8 = &.{},
     // ---- v0.1.15 安装器增强 ----
     /// per-machine 安装（Program Files + HKLM + 需要管理员）；默认 per-user
     per_machine: bool = false,
@@ -215,6 +217,7 @@ pub fn generateNsis(alloc: std.mem.Allocator, cfg: InstallerConfig) ![]u8 {
         \\{UPGRADE_CHECK}
         \\  SetOutPath "$INSTDIR"
         \\  File "{EXE}"
+        \\{SIDECAR_INSTALL}
         \\  WriteUninstaller "$INSTDIR\Uninstall.exe"
         \\  CreateDirectory "$SMPROGRAMS\${APP_NAME}"
         \\  CreateShortCut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
@@ -299,7 +302,25 @@ pub fn generateNsis(alloc: std.mem.Allocator, cfg: InstallerConfig) ![]u8 {
                 );
             } else "";
             cur = try repStep(alloc, cur, "{RESOURCES_INSTALL}", resources_block);
-            cur = try repStep(alloc, cur, "{RES_DIR}", cfg.resources orelse "");
+            alloc.free(resources_block);
+
+            // v0.3.11 E1b：sidecar（{SIDECAR_INSTALL}；空名单 → 空片段）。
+            // 文件源 = exe 所在目录（{SIDECAR_DIR} 由 bundle 工具以 exe 目录替换）。
+            {
+                var sc: std.ArrayListUnmanaged(u8) = .empty;
+                for (cfg.sidecars) |sc_name| {
+                    const ext: []const u8 = if (@import("builtin").os.tag == .windows) ".exe" else "";
+                    const line = try std.fmt.allocPrint(
+                        alloc,
+                        "  File \"/oname={s}{s}\" \"{{SIDECAR_DIR}}\\{s}{s}\"\n",
+                        .{ sc_name, ext, sc_name, ext },
+                    );
+                    try sc.appendSlice(alloc, line);
+                    alloc.free(line);
+                }
+                cur = try repStep(alloc, cur, "{SIDECAR_INSTALL}", sc.items);
+                sc.deinit(alloc);
+            }
         }
 
         const assoc_uninstall = try buildAssocUninstall(alloc, cfg);

@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.10（安全专项——isolation pattern 密封 IPC + Wayland portal 快捷键）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.11（分发收尾——external_bin sidecar / fixed 运行时 E2E / 交叉编译矩阵 / TS 模板）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -212,6 +212,28 @@ v0.3.10 新增（2026-11-18，安全专项——二轮差距刷新第三批）�
   + 冒烟 **59 项 exit 0**（新增 c-iso 明文伪造必拒断言）；Linux 单测全绿
   （+portal 会话判定/触发器/BindShortcuts 文本/matchKeyBinding）+ 冒烟 **83/83**
   + post terminate PASS
+
+v0.3.11 新增（2026-11-18，分发收尾——二轮差距刷新第四批）：
+
+- **external_bin sidecar（E1b）**：`project.external_bin`（约定
+  `bin/<name>-<triple>[.exe]`，triple 由构建 target 推导）——build install 落 exe 旁
+  （缺失静默跳过）、NSIS `{SIDECAR_INSTALL}`（File /oname= 同名安装）、deb
+  `extra_files`（usr/bin 同目录）、AppDir usr/bin；运行时
+  `__zilt.path {action:'sidecar'}`（防穿越 + Windows .exe 后缀）——c-sidecar 检查
+- **fixed 运行时 E2E（E2）**：`ZILT_WEBVIEW2_BROWSER_DIR` 覆盖钩子（E2E/debug 用）+
+  `scripts/e2e_fixed_runtime.ps1`——缺失 fixed 目录 → 启动失败 **不回退 Evergreen**
+  （stderr 含 WebView2RuntimeNotFound）；正向路径支持 `ZILT_E2E_FIXED_RT` 真运行时冒烟
+- **交叉编译 pack（E4）**：pack 工具保持 HOST 目标（交叉时打包 TARGET 的 exe——
+  工具跟随 query 会产出跑不起来的交叉工具，实测修正）；矩阵：deb/AppDir/AppImage
+  打包随 target 交叉，NSIS/MSI/MSIX 声明仅 Windows 目标；**已知限制**：aarch64 交叉
+  止于 GTK 链接（需目标 sysroot 库——GUI 交叉的通用前提，Tauri/Wails 同要求）
+- **TS 模板变体（F2）**：vue-ts / react-ts / svelte-ts / preact-ts——overlay 机制
+  （基础模板 vendored 框架复用 + `templates/<variant>/` 仅 TS 专属文件：src/*.ts(x)、
+  tsconfig、package.json 加 typecheck 步骤）；**E2E 实测**：vue-ts init → gen →
+  `vue-tsc --noEmit && vite build` 类型检查构建 ✓ → exe 运行资产 200
+- **验收**：Windows 单测全绿 + 冒烟 **60 项**（新增 c-sidecar；仅 clip 桌面剪贴板
+  占用环境问题）+ e2e_fixed_runtime PASS；Linux 单测全绿 + 冒烟 **83/83** +
+  post terminate PASS
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 

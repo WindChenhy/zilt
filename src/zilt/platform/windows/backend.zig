@@ -283,7 +283,14 @@ pub fn run(comptime config: Config) !void {
     }
 
     // v0.1.10：运行时通道 / 固定版本目录 / UA / 语言 / 代理 / 浏览器参数。
-    var runtime = try loader.findRuntimeWithOptions(alloc, config.environment);
+    // v0.3.11 E2：E2E/debug 钩子——env 覆盖 fixed 目录（缺失时不回退 Evergreen，
+    // findRuntimeWithOptions 直接报错——负向 E2E 断言该行为）
+    var loader_opts = config.environment;
+    if (win32.getEnvUtf8(alloc, "ZILT_WEBVIEW2_BROWSER_DIR")) |v| {
+        loader_opts.browser_directory = v;
+        log.print("[loader] browser_directory overridden by env (fixed E2E)", .{});
+    }
+    var runtime = try loader.findRuntimeWithOptions(alloc, loader_opts);
     // v0.1.17：存一份到 backend —— 数据分区要按需另建 Environment
     backend.runtime = runtime;
     log.print("[loader] runtime version: {s} (channel={s})", .{ runtime.version, @tagName(config.environment.channel) });

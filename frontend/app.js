@@ -1144,6 +1144,17 @@ async function runChecks() {
       if (!ok) window.zilt.log('warn', 'c-iso note: iso=' + isIso + ' rejected=' + rejected);
     } catch (e) { setCheck('c-iso', false, String(e.message || e)); window.zilt.log('warn', 'c-iso error: ' + String(e.message || e)); }
 
+    // 60. v0.3.11 E1b：external_bin sidecar（path.sidecar 解析 + 防穿越；demo 未声明
+    //     sidecar → exists=false 是预期；非法名拒绝）
+    try {
+      const r1 = await window.zilt.invoke('__zilt.path', { action: 'sidecar', path: 'demo-tool' });
+      const r2 = await window.zilt.invoke('__zilt.path', { action: 'sidecar', path: '../evil' });
+      const ok = typeof r1.path === 'string' && r1.path.endsWith('demo-tool' + (navigator.platform.indexOf('Win') >= 0 ? '.exe' : '')) &&
+        r1.exists === false && r2.exists === false && r2.path === '';
+      setCheck('c-sidecar', ok, ok ? 'sidecar resolve ok (exists=false expected, traversal rejected)' : `r1=${JSON.stringify(r1)} r2=${JSON.stringify(r2)}`);
+      if (!ok) window.zilt.log('warn', 'c-sidecar note: ' + JSON.stringify({ r1, r2 }).slice(0, 140));
+    } catch (e) { setCheck('c-sidecar', false, String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
@@ -1207,6 +1218,7 @@ async function runChecks() {
       postbody: $('c-postbody').className === 'pass',
       upload: $('c-upload').className === 'pass',
       iso: $('c-iso').className === 'pass',
+      sidecar: $('c-sidecar').className === 'pass',
     });
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });

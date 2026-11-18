@@ -485,7 +485,34 @@
       - **范围说明**：浏览器端 runtime 传输 shim（二阶段）——协议层已被 python
         E2E 完整覆盖
       - **验收**：Windows/Linux 单测全绿；Linux 冒烟 79/79 + headless/server E2E
-- [x] **v0.3.10 安全专项**（2026-11-18；二轮差距刷新第三批）：
+- [x] **v0.3.11 分发收尾**（2026-11-18；二轮差距刷新第四批）：
+      - **E1b external_bin sidecar**：project.external_bin（bin/<name>-<triple>[.exe]
+        约定，triple 由构建 target 推导）→ build install 落 exe 旁（缺失跳过）→
+        NSIS {SIDECAR_INSTALL}（bundler 增 sidecars 字段 + bundle 工具 {SIDECAR_DIR}
+        = exe 目录替换）→ deb DebOptions.extra_files（pack_formats.ExtraFile，
+        data.tar usr/bin 条目）→ AppDir usr/bin 复制；运行时 __zilt.path sidecar
+        动作（防穿越 + .exe 后缀）——c-sidecar 冒烟检查（解析 + exists=false +
+        非法名拒绝）
+      - **E2 fixed 运行时 E2E**：ZILT_WEBVIEW2_BROWSER_DIR env 覆盖钩子（loader_opts）+
+        scripts/e2e_fixed_runtime.ps1——缺失 fixed 目录 → 启动失败不回退 Evergreen
+        （stderr error trace 含 WebView2RuntimeNotFound；**注意**：该错误走 stderr
+        而非 zilt.log——E2E 断言源实测修正）；正向路径 ZILT_E2E_FIXED_RT 真运行时冒烟
+      - **E4 交叉编译 pack**：pack_linux 工具改 HOST 目标（b.graph.host——交叉时打包
+        TARGET exe；工具跟随 query 会产出跑不起来的 aarch64 工具——**实测修正**；
+        0.17 的 Compile step 要求 root module 有已知 target，裸省略不行）+ aarch64
+        交叉的 sqlite transient 哨兵 **align(1) 指针**修正（@ptrFromInt 对齐检查）；
+        **已知限制**：aarch64 交叉止于 GTK 链接（host pkg-config 的 x86_64 .so 与
+        目标架构不符——需 aarch64 sysroot，GUI 交叉通用前提）；矩阵文档化
+        （deb/AppDir/AppImage 随 target 交叉；NSIS/MSI/MSIX 仅 Windows 目标）
+      - **F2 TS 模板变体**：init.zig tsVariantBase 映射（vue-ts→vue 等四对）——
+        overlay 机制（基础 vendored 复用 + templates/<variant>/ 只放 TS 专属文件，
+        避免 vendored 框架重复）；**实测坑**：overlay 目录层级（模板根直接放文件）
+        与覆盖时序（base copy → overlay copy → 不得再跑 base copy——初版三连复制
+        把 overlay 覆盖回退）；vue-ts E2E：init → gen（绑定先行，否则 vue-tsc 报
+        TS2307）→ 类型检查构建 ✓ → exe 运行资产 200
+      - **验收**：Windows 单测全绿 + 冒烟 **60 项**（+c-sidecar）+ e2e_fixed_runtime
+        PASS；Linux 单测全绿 + 冒烟 **83/83** + post terminate PASS
+      - 后续规划（v0.3.8–v0.3.13，二轮差距刷新 2026-11-17——对标 Wails v3.1.0 /
       - **C2 isolation pattern**：isolation.zig（keyFromHex/HMAC-SHA256 签名/
         verifyJson + ReplayCache 512 槽防重放/canonicalize 规范化/iframeHtml 纯 JS 页面）
         + config.Isolation + 双平台接线（随机 origin ziltiso:// scheme 注册与服务 +
@@ -577,7 +604,7 @@
         C3 绑定参数名 + E6 上传进度）✅ → **v0.3.9** 窗口对称（A12 tint/cornerPreference +
         A4L Linux KeyBindings）✅ → **v0.3.10** 安全（C2 isolation pattern +
         D1 Wayland portal 快捷键）✅ → **v0.3.11** 分发（E1b external_bin sidecar +
-        E2 fixed 运行时 E2E + E4 交叉编译 pack + F2 模板 TS 变体）→
+        E2 fixed 运行时 E2E + E4 交叉编译 pack + F2 模板 TS 变体）✅ →
         **v0.3.12** CompositionController 专项（A11，失败回退 HWND）→
         **v0.3.13** server 模式二阶段（F1b 浏览器端 runtime shim）
       - 明确推后（v0.4+/Phase 4）：macOS 全栈、iOS/Android、浏览器扩展、WML、GPU 信息、

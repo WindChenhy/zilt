@@ -5,7 +5,7 @@ pub const app_name = "Zilt";
 pub const publisher = "Zilt";
 /// 运行时版本在 `src/zilt/version.zig`（zilt 模块内）；两处必须一致，
 /// build.zig 顶部有编译期断言强制校验（不一致直接编译失败）。
-pub const version = "0.3.10";
+pub const version = "0.3.11";
 pub const app_id = "app.zilt.desktop";
 pub const exe_name = "zilt-app.exe";
 
@@ -20,6 +20,13 @@ pub const icon: ?[]const u8 = null;
 pub const resources = [_][]const u8{
     "resources",
 };
+
+// v0.3.11 E1b：external_bin sidecar——按 target-triple 解析的外部二进制。
+// 约定：<项目根>/bin/<name>-<triple>[.exe]（triple 如 x86_64-linux-gnu /
+// x86_64-windows-gnu）；安装/打包时落在 exe 旁边（<name>[.exe]）。
+// 运行时经 `window.zilt.path.sidecar(name)` 解析；spawn 走 process op
+// （argv[0] 用绝对路径，ACL 声明 `shell:<name>`）。
+pub const external_bin = [_][]const u8{};
 
 pub const frontend = .{
     // 前端工程目录（package.json 所在处；build_command 的 cwd）

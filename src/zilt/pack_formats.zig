@@ -362,6 +362,9 @@ fn appendArMember(alloc: std.mem.Allocator, out: *std.ArrayList(u8), name: []con
 }
 
 /// v0.2.4：deb 增强选项（Linux 打包；无依赖需求时用 buildDeb 简版）。
+/// v0.3.11 E1b：sidecar 等额外 data 文件（usr/bin 同目录分发）
+pub const ExtraFile = struct { name: []const u8, bytes: []const u8 };
+
 pub const DebOptions = struct {
     /// Depends: 逗号连接（如 libgtk-3-0、libwebkit2gtk-4.1-0）
     depends: []const []const u8 = &.{},
@@ -371,6 +374,9 @@ pub const DebOptions = struct {
     postrm_lines: []const []const u8 = &.{},
     /// hicolor 图标 PNG（256px；null = 不带图标）
     icon_png: ?[]const u8 = null,
+    /// v0.3.11 E1b：external_bin sidecar（name → usr/bin/<name> 同目录分发；
+    /// 内容 = exe 旁已装好的同名文件字节）
+    extra_files: []const ExtraFile = &.{},
 };
 
 /// 生成 .deb（control.tar.gz + data.tar.gz + debian-binary → ar 容器）。
@@ -459,6 +465,12 @@ pub fn buildDebOpt(alloc: std.mem.Allocator, meta: PackMeta, exe_bytes: []const 
     try data_entries.append(alloc, .{ .name = "./usr/", .mode = 0o755, .typeflag = '5' });
     try data_entries.append(alloc, .{ .name = "./usr/bin/", .mode = 0o755, .typeflag = '5' });
     try data_entries.append(alloc, .{ .name = exe_entry, .mode = 0o755, .data = exe_bytes });
+    // v0.3.11 E1b：external_bin sidecar（usr/bin 同目录分发）
+    for (opts.extra_files) |ef| {
+        const ef_entry = try std.fmt.allocPrint(alloc, "./usr/bin/{s}", .{ef.name});
+        defer alloc.free(ef_entry);
+        try data_entries.append(alloc, .{ .name = ef_entry, .mode = 0o755, .data = ef.bytes });
+    }
     try data_entries.append(alloc, .{ .name = "./usr/share/", .mode = 0o755, .typeflag = '5' });
     try data_entries.append(alloc, .{ .name = "./usr/share/applications/", .mode = 0o755, .typeflag = '5' });
     const desktop_entry = try std.fmt.allocPrint(alloc, "./usr/share/applications/{s}.desktop", .{pkg});

@@ -11,6 +11,20 @@ const bundler = zilt.bundler;
 const meta = @import("app_meta");
 const signtool_locator = @import("signtool_locate.zig");
 
+/// 简单占位符替换（与 bundler.repStep 同语义；bundle 工具本地实现）
+fn repStep(alloc: std.mem.Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var rest = haystack;
+    while (std.mem.indexOf(u8, rest, needle)) |at| {
+        try out.appendSlice(alloc, rest[0..at]);
+        try out.appendSlice(alloc, replacement);
+        rest = rest[at + needle.len ..];
+    }
+    try out.appendSlice(alloc, rest);
+    return out.toOwnedSlice(alloc);
+}
+
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
     const win32 = zilt.platform_windows.win32;
@@ -125,10 +139,21 @@ pub fn main() !void {
         .file_exts = file_exts,
         // v0.3.4：侧车资源（project.resources 首项；build install 同布局）
         .resources = if (app_meta.resources.len > 0) app_meta.resources[0] else null,
+        // v0.3.11 E1b：external_bin sidecar 名单
+        .sidecars = &app_meta.external_bin,
     });
     // makensis 以 UTF-8 BOM 识别编码（脚本含非 ASCII 注释）
+    // v0.3.11 E1b：{SIDECAR_DIR} = exe 所在目录（sidecar 与 exe 同目录分发）
+    const sidecar_dir = std.fs.path.dirname(exe_abs) orelse ".";
+    var sidecar_dir_esc = try alloc.dupe(u8, sidecar_dir);
+    for (sidecar_dir_esc) |*ch| {
+        if (ch.* == '$') ch.* = '_';
+    }
+    defer alloc.free(sidecar_dir_esc);
+    const script_sub = try repStep(alloc, script, "{SIDECAR_DIR}", sidecar_dir_esc);
+    defer alloc.free(script_sub);
     const bom = "\xEF\xBB\xBF";
-    const script_bom = try std.fmt.allocPrint(alloc, "{s}{s}", .{ bom, script });
+    const script_bom = try std.fmt.allocPrint(alloc, "{s}{s}", .{ bom, script_sub });
     defer alloc.free(script_bom);
     try writeFileW(alloc, nsi_path, script_bom);
     log.print("[bundle] nsis script: {s}", .{nsi_path});

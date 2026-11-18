@@ -411,6 +411,27 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // ---- v0.3.11 E1b：external_bin sidecar → exe 旁（<name>[.exe]）----
+    // 源文件约定 bin/<name>-<triple>[.exe]（triple 由 target 推导）；缺失静默跳过。
+    {
+        const sidecar_triple = blk: {
+            const os_tag = @tagName(target.result.os.tag);
+            const arch_tag = @tagName(target.result.cpu.arch);
+            break :blk std.fmt.allocPrint(b.allocator, "{s}-{s}-gnu", .{ arch_tag, os_tag }) catch "";
+        };
+        for (project.external_bin) |name| {
+            const ext: []const u8 = if (target.result.os.tag == .windows) ".exe" else "";
+            const src_name = std.fmt.allocPrint(b.allocator, "bin/{s}-{s}{s}", .{ name, sidecar_triple, ext }) catch continue;
+            var dir = std.Io.Dir.cwd();
+            var io_sidecar = std.Io.Threaded.init(b.allocator, .{});
+            defer io_sidecar.deinit();
+            _ = dir.statFile(io_sidecar.io(), src_name, .{}) catch continue; // 缺失跳过
+            const dst_name = std.fmt.allocPrint(b.allocator, "{s}{s}", .{ name, ext }) catch continue;
+            const inst = b.addInstallFileWithDir(.{ .cwd_relative = src_name }, .{ .custom = "bin" }, dst_name);
+            b.getInstallStep().dependOn(&inst.step);
+        }
+    }
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run the demo app");
@@ -728,7 +749,9 @@ pub fn build(b: *std.Build) void {
         // zilt-pack-linux 需要 libc（std.c.getenv / Child）。
         const pack_linux_mod = b.createModule(.{
             .root_source_file = b.path("src/pack_linux.zig"),
-            .target = target,
+            // v0.3.11 E4：pack 工具保持 HOST 目标（交叉编译时打包 TARGET 的 exe——
+            // 工具若跟随 query 会在交叉场景产出一个跑不起来的 aarch64 工具）
+            .target = b.graph.host,
             .optimize = optimize,
             // 直接路径引用 pack_formats/msix/app_meta（纯模块，不带 GTK 绑定）
         });
