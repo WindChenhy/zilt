@@ -69,6 +69,8 @@ pub const Args = struct {
     user_agent: ?[]const u8 = null,
     /// v0.3.2：无痕窗口（window.create({incognito}) / webviews.create({incognito})）
     incognito: ?bool = null,
+    /// v0.3.12 A11：组合模式（CompositionController + DComp）
+    composition: ?bool = null,
     /// v0.3.4：updater.skipVersion 的版本串
     version_str: ?[]const u8 = null,
     /// v0.3.6：SharedBuffer 二进制 IPC（__zilt.binary.request 的载荷字节数）
@@ -373,6 +375,7 @@ fn windowCmd(ctx: ipc.Context, a: Args) ![]u8 {
             .decorations = a.decorations orelse true,
             // v0.3.2：无痕窗口
             .incognito = a.incognito orelse false,
+            .composition = a.composition orelse false,
             // v0.3.3：窗口体验包 II
             .mask = a.mask,
             .hide_on_focus_lost = a.hide_on_focus_lost orelse false,

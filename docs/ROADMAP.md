@@ -485,7 +485,39 @@
       - **范围说明**：浏览器端 runtime 传输 shim（二阶段）——协议层已被 python
         E2E 完整覆盖
       - **验收**：Windows/Linux 单测全绿；Linux 冒烟 79/79 + headless/server E2E
-- [x] **v0.3.11 分发收尾**（2026-11-18；二轮差距刷新第四批）：
+- [~] **v0.3.12 CompositionController 专项**（2026-11-19；二轮差距刷新第五批——
+      ABI/装配/回退全链落地，渲染管线为已知问题）：
+      - **ABI 绑定（官方 WebView2.h 逐一核对）**：webview2.zig 增
+        ICoreWebView2CompositionController（11 槽 + CC2/CC3/CC4 尾随槽并入 16–19）+
+        ICoreWebView2Settings9（IsNonClientRegionSupportEnabled flat 37/38——
+        Settings1–8 自有方法数逐一枚举推算）+ IIDs（CC {3DF9B733-…}/CC4
+        {7C367B9B-…}/Settings9 {0528A73B-…}/Handler {02FAB84B-…}）+ 鼠标/非客户区枚举；
+        **修正 v0.3.2 误记**：CreateCoreWebView2CompositionControllerWithOptions 为
+        官方 3 参（E_POINTER 实测修正——4 参签名把 handler 传进了错误槽位）
+      - **DComp 绑定（dcomp.zig）**：SDK dcomp.h DECLARE_INTERFACE_IID_ 段核对——
+        Device {C37EA93A-…} Commit(3)/CreateTargetForHwnd(6)/CreateVisual(7)、
+        Target {EACDD04C-…} SetRoot(3)、Visual {4D93059D-…} SetContent(11)/AddVisual(12)；
+        DCompositionCreateDevice（dcomp.dll 动态加载，dxgi_device=null 引擎自建）
+      - **组合窗口链路（backend）**：window.create({composition}) → dispatch →
+        beginCompositionController → CompositionControllerCompletedHandler（Invoke 收 CC）
+        → onCompositionControllerReady（DComp 装配 + Settings9 + QI 实测 + driver
+        attach controller=null）→ **QI 实测记录**：组合对象实现
+        ICoreWebView2Controller（0x0 ✓）与 CC4（0x0 ✓）、**不**实现 ICoreWebView2 直取
+        （0x80004002）——webview 经 controller.getCoreWebView2() 取；鼠标转发
+        （WM_LBUTTONDOWN 等 10 消息 → SendMouseInput；**WM_MOUSELEAVE 与既有托盘
+        处理重复**，从组合 case 移除）+ WM_NCHITTEST CC4 原生 hit-test（HTCAPTION/
+        HTMINBUTTON/HTMAXBUTTON/HTCLOSE——win32 常量补齐）+ state().composition +
+        releaseWindowCom 有序拆除；driver attach 的 controller 参数改可选
+        （retain/destroy/zoom/parentWindow 全守卫）
+      - **已知问题（渲染管线段错误）**：装配/Settings9/导航全部成功后 WebView2 渲染
+        管线段错误（EmbeddedBrowserWebView.dll 内部；about:blank 复现；putIsVisible
+        前置、有序拆除 SetRoot(null)+Commit+controller.Close 均不缓解）——本版组合
+        选项按降级文化走 HWND 渲染（c-comp 断言回退链）；渲染修复为后续专项
+        （排查方向：DComp 设备与浏览器合成器共享、visual 树的 sizing、官方样例
+        WebView2APISample ViewComponent.cpp 逐行 diff）
+      - **验收**：Windows 单测全绿 + 冒烟 61 项（c-comp 断言组合请求→探测→回退全链；
+        clip 两项为外部剪贴板占用环境问题）+ Linux 单测全绿 + 冒烟 83/83
+      - 后续规划（v0.3.8–v0.3.13，二轮差距刷新 2026-11-17——对标 Wails v3.1.0 /
       - **E1b external_bin sidecar**：project.external_bin（bin/<name>-<triple>[.exe]
         约定，triple 由构建 target 推导）→ build install 落 exe 旁（缺失跳过）→
         NSIS {SIDECAR_INSTALL}（bundler 增 sidecars 字段 + bundle 工具 {SIDECAR_DIR}
@@ -605,7 +637,7 @@
         A4L Linux KeyBindings）✅ → **v0.3.10** 安全（C2 isolation pattern +
         D1 Wayland portal 快捷键）✅ → **v0.3.11** 分发（E1b external_bin sidecar +
         E2 fixed 运行时 E2E + E4 交叉编译 pack + F2 模板 TS 变体）✅ →
-        **v0.3.12** CompositionController 专项（A11，失败回退 HWND）→
+        **v0.3.12** CompositionController 专项（A11）[~] 渲染已知问题 →
         **v0.3.13** server 模式二阶段（F1b 浏览器端 runtime shim）
       - 明确推后（v0.4+/Phase 4）：macOS 全栈、iOS/Android、浏览器扩展、WML、GPU 信息、
         CLI 自更新、Tauri cli 插件（参数解析）、upload 断点续传（E6 stretch）

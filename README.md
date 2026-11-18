@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.11（分发收尾——external_bin sidecar / fixed 运行时 E2E / 交叉编译矩阵 / TS 模板）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.12（CompositionController 管线落地——ABI 核对/装配/回退，渲染修复为已知问题）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -234,6 +234,31 @@ v0.3.11 新增（2026-11-18，分发收尾——二轮差距刷新第四批）�
 - **验收**：Windows 单测全绿 + 冒烟 **60 项**（新增 c-sidecar；仅 clip 桌面剪贴板
   占用环境问题）+ e2e_fixed_runtime PASS；Linux 单测全绿 + 冒烟 **83/83** +
   post terminate PASS
+
+v0.3.12 新增（2026-11-19，CompositionController 专项——二轮差距刷新第五批）：
+
+- **CompositionController 管线（A11，Windows）**：官方 WebView2.h 逐一核对的 ABI 绑定——
+  `Environment10::CreateCoreWebView2CompositionControllerWithOptions`（slot 22；**修正
+  v0.3.2 误记的 4 参签名为官方 3 参**——E_POINTER 实测驱动）+
+  `ICoreWebView2CompositionController`（RootVisualTarget/SendMouseInput/SendPointerInput/
+  Cursor，11 槽）+ CC2 AutomationProvider + CC3 Drag* + **CC4 NonClientRegion**
+  （GetNonClientRegionAtPoint/QueryNonClientRegion/Changed 订阅，16–19 槽）+
+  **Settings9::IsNonClientRegionSupportEnabled**（flat 38）+ **DComp 绑定**
+  （dcomp.dll：Device Commit(3)/CreateTargetForHwnd(6)/CreateVisual(7)、Target SetRoot(3)、
+  Visual SetContent(11)/AddVisual(12)，IIDs 取自 DECLARE_INTERFACE_IID_ 段）
+- **组合窗口链路**：`window.create({composition: true})` → Environment10 探测 →
+  CC 创建（CompositionControllerCompletedHandler）→ DComp 视觉树装配 → Settings9
+  非客户区支持 → **QI 实测**：组合对象实现 ICoreWebView2Controller（非 ICoreWebView2
+  直取——QI 探针实证）→ webview 经 controller.getCoreWebView2()；鼠标输入转发
+  （WM_* → SendMouseInput，kind/虚拟键映射）+ WM_NCHITTEST → CC4 原生 hit-test
+  （app-region: drag → HTCAPTION/按钮位）+ state().composition + 窗口销毁的有序拆除
+- **已知问题（渲染管线）**：CC 创建/DComp 装配/Settings9 全部成功后，页面导航阶段
+  WebView2 渲染管线段错误（EmbeddedBrowserWebView.dll 内部；about:blank 复现；
+  putIsVisible 前置、有序拆除 SetRoot(null)+Commit+Close 均不缓解——诊断笔记
+  ROADMAP v0.3.12）。**本版组合选项按降级文化走 HWND 渲染**（窗口存活/IPC 全正常），
+  渲染修复列为后续专项；c-comp 检查断言回退路径
+- **验收**：Windows 单测全绿 + 冒烟 **61 项**（新增 c-comp 断言组合请求 → 探测 →
+  回退全链 + state.composition=false）；Linux 不涉及（组合为 Windows 面）
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 

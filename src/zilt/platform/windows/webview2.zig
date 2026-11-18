@@ -35,6 +35,52 @@ pub const IID_ICoreWebView2WebResourceResponse: com.GUID = .parse("{AAFCC94F-FA2
 
 pub const IID_EnvironmentCompletedHandler: com.GUID = .parse("{4E8A3389-C9D8-4BD2-B6B5-124FEE6CC14D}");
 pub const IID_ControllerCompletedHandler: com.GUID = .parse("{6C4819F3-C9B7-4260-8127-C9F5BDE7F68C}");
+// v0.3.12 A11：CompositionController ABI（官方 WebView2.h 逐一核对：
+// Environment10 slot 22 的 CreateCoreWebView2CompositionControllerWithOptions +
+// CC 基接口（RootVisualTarget/SendMouseInput/SendPointerInput/Cursor）+ CC2
+// AutomationProvider + CC3 Drag* + CC4（GetNonClientRegionAtPoint/
+// QueryNonClientRegion/NonClientRegionChanged）+ Settings9
+// IsNonClientRegionSupportEnabled（flat 38））
+pub const IID_CompositionControllerCompletedHandler: com.GUID = .parse("{02FAB84B-1428-4FB7-AD45-1B2E64736184}");
+pub const IID_ICoreWebView2CompositionController: com.GUID = .parse("{3DF9B733-B9AE-4A15-86B4-EB9EE9826469}");
+pub const IID_ICoreWebView2CompositionController4: com.GUID = .parse("{7C367B9B-3D2B-450F-9E58-D61A20F486AA}");
+pub const IID_ICoreWebView2Settings9: com.GUID = .parse("{0528A73B-E92D-49F4-927A-E547DDDAA37D}");
+
+/// 鼠标事件类型（COREWEBVIEW2_MOUSE_EVENT_KIND）
+pub const MOUSE_EVENT_KIND = struct {
+    pub const horizontal_wheel: u32 = 526;
+    pub const left_button_double_click: u32 = 515;
+    pub const left_button_down: u32 = 513;
+    pub const left_button_up: u32 = 514;
+    pub const leave: u32 = 675;
+    pub const middle_button_double_click: u32 = 521;
+    pub const middle_button_down: u32 = 519;
+    pub const middle_button_up: u32 = 520;
+    pub const move: u32 = 516;
+    pub const right_button_double_click: u32 = 518;
+    pub const right_button_down: u32 = 517;
+    pub const right_button_up: u32 = 524;
+};
+/// 虚拟键（COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS）
+pub const MOUSE_EVENT_VIRTUAL_KEYS = struct {
+    pub const none: u32 = 0;
+    pub const left_button: u32 = 0x1;
+    pub const right_button: u32 = 0x2;
+    pub const shift: u32 = 0x4;
+    pub const control: u32 = 0x8;
+    pub const middle_button: u32 = 0x10;
+};
+/// 非客户区类型（COREWEBVIEW2_NON_CLIENT_REGION_KIND）
+pub const NON_CLIENT_REGION_KIND = struct {
+    pub const nowhere: u32 = 0;
+    pub const client: u32 = 1;
+    pub const caption: u32 = 2;
+    pub const minimize: u32 = 8;
+    pub const maximize: u32 = 9;
+    pub const close: u32 = 20;
+};
+
+pub const POINT = extern struct { x: c_long, y: c_long };
 pub const IID_ExecuteScriptCompletedHandler: com.GUID = .parse("{49511172-CC67-4BCA-9923-137112F4C4CC}");
 pub const IID_WebMessageReceivedEventHandler: com.GUID = .parse("{57213F19-00E6-49FA-8E07-898EA01ECBD2}");
 pub const IID_WebResourceRequestedEventHandler: com.GUID = .parse("{AB00B74C-15F1-4646-80E8-E76341D25D71}");
@@ -110,7 +156,8 @@ pub const ICoreWebView2Environment10 = extern struct {
         base: [20]?*const anyopaque, // QI..CreateContextMenuItem（槽 0–19）
         CreateCoreWebView2ControllerOptions: *const fn (*ICoreWebView2Environment10, *?*ICoreWebView2ControllerOptions) callconv(.c) HRESULT, // 20
         CreateCoreWebView2ControllerWithOptions: *const fn (*ICoreWebView2Environment10, win32.HWND, ?*ICoreWebView2ControllerOptions, *anyopaque) callconv(.c) HRESULT, // 21
-        CreateCoreWebView2CompositionControllerWithOptions: *const fn (*ICoreWebView2Environment10, win32.HWND, ?*ICoreWebView2ControllerOptions, ?*anyopaque, *anyopaque) callconv(.c) HRESULT, // 22
+        // 官方签名 3 参（ParentWindow/options/handler）——v0.3.2 误记 4 参（E_POINTER 实测修正）
+        CreateCoreWebView2CompositionControllerWithOptions: *const fn (*ICoreWebView2Environment10, win32.HWND, ?*ICoreWebView2ControllerOptions, *anyopaque) callconv(.c) HRESULT, // 22
     };
 
     /// QI 失败（老运行时 < 1.0.1722）返回 null——调用方回退普通 controller。
@@ -134,6 +181,16 @@ pub const ICoreWebView2Environment10 = extern struct {
 
     pub fn createControllerWithOptions(self: *ICoreWebView2Environment10, parent: win32.HWND, options: ?*ICoreWebView2ControllerOptions, handler: *anyopaque) HRESULT {
         return self.lpVtbl.CreateCoreWebView2ControllerWithOptions(self, parent, options, handler);
+    }
+
+    /// v0.3.12 A11：组合 controller（slot 22；env_options = null → 继承环境默认）
+    pub fn createCompositionControllerWithOptions(
+        self: *ICoreWebView2Environment10,
+        parent: win32.HWND,
+        options: ?*ICoreWebView2ControllerOptions,
+        handler: *anyopaque,
+    ) HRESULT {
+        return self.lpVtbl.CreateCoreWebView2CompositionControllerWithOptions(self, parent, options, handler);
     }
 };
 
@@ -742,3 +799,108 @@ pub const ICoreWebView2NavigationCompletedEventArgs = extern struct {
 pub fn freeCoString(s: ?win32.LPWSTR) void {
     win32.CoTaskMemFree(@ptrCast(s));
 }
+
+// ============================== v0.3.12 A11：Composition ==============================
+
+/// ICoreWebView2CompositionController（官方 WebView2.h 方法序逐字核对：
+/// 3–10 = CC 自身（RootVisualTarget/SendMouseInput/SendPointerInput/Cursor），
+/// 11 = CC2 AutomationProvider，12–15 = CC3 Drag*，16–19 = CC4 NonClientRegion）
+pub const ICoreWebView2CompositionController = extern struct {
+    lpVtbl: *const VTable,
+
+    pub const VTable = extern struct {
+        QueryInterface: *const fn (*ICoreWebView2CompositionController, *const com.GUID, *?*anyopaque) callconv(.c) HRESULT,
+        AddRef: *const fn (*ICoreWebView2CompositionController) callconv(.c) u32,
+        Release: *const fn (*ICoreWebView2CompositionController) callconv(.c) u32,
+        get_RootVisualTarget: *const fn (*ICoreWebView2CompositionController, *?*anyopaque) callconv(.c) HRESULT, // 3
+        put_RootVisualTarget: *const fn (*ICoreWebView2CompositionController, ?*anyopaque) callconv(.c) HRESULT, // 4
+        SendMouseInput: *const fn (*ICoreWebView2CompositionController, u32, u32, u32, POINT) callconv(.c) HRESULT, // 5
+        SendPointerInput: *const fn (*ICoreWebView2CompositionController, u32, *anyopaque) callconv(.c) HRESULT, // 6
+        get_Cursor: *const fn (*ICoreWebView2CompositionController, *win32.HCURSOR) callconv(.c) HRESULT, // 7
+        get_SystemCursorId: *const fn (*ICoreWebView2CompositionController, *u32) callconv(.c) HRESULT, // 8
+        add_CursorChanged: *const fn (*ICoreWebView2CompositionController, *anyopaque, *EventRegistrationToken) callconv(.c) HRESULT, // 9
+        remove_CursorChanged: *const fn (*ICoreWebView2CompositionController, EventRegistrationToken) callconv(.c) HRESULT, // 10
+        get_AutomationProvider: *const fn (*ICoreWebView2CompositionController, *?*anyopaque) callconv(.c) HRESULT, // 11（CC2）
+        DragEnter: *const fn (*ICoreWebView2CompositionController, *anyopaque, u32, POINT, *u32) callconv(.c) HRESULT, // 12（CC3）
+        DragLeave: *const fn (*ICoreWebView2CompositionController) callconv(.c) HRESULT, // 13
+        DragOver: *const fn (*ICoreWebView2CompositionController, u32, POINT, *u32) callconv(.c) HRESULT, // 14
+        Drop: *const fn (*ICoreWebView2CompositionController, *anyopaque, u32, POINT, *u32) callconv(.c) HRESULT, // 15
+        GetNonClientRegionAtPoint: *const fn (*ICoreWebView2CompositionController4, POINT, *u32) callconv(.c) HRESULT, // 16（CC4）
+        QueryNonClientRegion: *const fn (*ICoreWebView2CompositionController4, u32, *?*anyopaque) callconv(.c) HRESULT, // 17
+        add_NonClientRegionChanged: *const fn (*ICoreWebView2CompositionController4, *anyopaque, *EventRegistrationToken) callconv(.c) HRESULT, // 18
+        remove_NonClientRegionChanged: *const fn (*ICoreWebView2CompositionController4, EventRegistrationToken) callconv(.c) HRESULT, // 19
+    };
+
+    pub fn release(self: *ICoreWebView2CompositionController) void {
+        _ = self.lpVtbl.Release(self);
+    }
+
+    /// QI ICoreWebView2（组合模式下取 webview——官方样例路径）
+    pub fn getWebView(self: *ICoreWebView2CompositionController) ?*ICoreWebView2 {
+        var out: ?*anyopaque = null;
+        const hr = self.lpVtbl.QueryInterface(self, &IID_ICoreWebView2, &out);
+        if (com.failed(hr)) return null;
+        return @ptrCast(@alignCast(out.?));
+    }
+
+    /// QI ICoreWebView2Controller（实测组合对象实现了 Controller——webview 从
+    /// controller.getCoreWebView2() 取；QI 探测 0x0 实证）
+    pub fn getController(self: *ICoreWebView2CompositionController) ?*ICoreWebView2Controller {
+        var out: ?*anyopaque = null;
+        const hr = self.lpVtbl.QueryInterface(self, &IID_ICoreWebView2Controller, &out);
+        if (com.failed(hr)) return null;
+        return @ptrCast(@alignCast(out.?));
+    }
+
+    /// QI CC4（NonClientRegion 面；老运行时返回 null——能力降级）
+    pub fn getCC4(self: *ICoreWebView2CompositionController) ?*ICoreWebView2CompositionController4 {
+        var out: ?*anyopaque = null;
+        const hr = self.lpVtbl.QueryInterface(self, &IID_ICoreWebView2CompositionController4, &out);
+        if (com.failed(hr)) return null;
+        return @ptrCast(@alignCast(out.?));
+    }
+
+    pub fn sendMouseInput(self: *ICoreWebView2CompositionController, kind: u32, keys: u32, mouse_data: u32, pt: POINT) HRESULT {
+        return self.lpVtbl.SendMouseInput(self, kind, keys, mouse_data, pt);
+    }
+
+    pub fn putRootVisualTarget(self: *ICoreWebView2CompositionController, target: ?*anyopaque) HRESULT {
+        return self.lpVtbl.put_RootVisualTarget(self, target);
+    }
+};
+
+pub const ICoreWebView2CompositionController4 = extern struct {
+    lpVtbl: *const ICoreWebView2CompositionController.VTable,
+
+    pub fn release(self: *ICoreWebView2CompositionController4) void {
+        _ = self.lpVtbl.Release(@ptrCast(self));
+    }
+
+    pub fn getNonClientRegionAtPoint(self: *ICoreWebView2CompositionController4, pt: POINT) HRESULT {
+        var kind: u32 = 0;
+        const hr = self.lpVtbl.GetNonClientRegionAtPoint(self, pt, &kind);
+        return hr;
+    }
+};
+
+/// Settings9（IsNonClientRegionSupportEnabled get/put——flat 37/38）
+pub const ICoreWebView2Settings9 = extern struct {
+    lpVtbl: *const VTable,
+
+    pub const VTable = extern struct {
+        base: [37]?*const anyopaque, // QI..Settings8 末槽（flat 0–36）
+        get_IsNonClientRegionSupportEnabled: *const fn (*ICoreWebView2Settings9, *i32) callconv(.c) HRESULT, // 37
+        put_IsNonClientRegionSupportEnabled: *const fn (*ICoreWebView2Settings9, i32) callconv(.c) HRESULT, // 38
+    };
+
+    pub fn fromSettings(settings: *ICoreWebView2Settings) ?*ICoreWebView2Settings9 {
+        var out: ?*anyopaque = null;
+        const hr = settings.lpVtbl.QueryInterface(settings, &IID_ICoreWebView2Settings9, &out);
+        if (com.failed(hr)) return null;
+        return @ptrCast(@alignCast(out.?));
+    }
+
+    pub fn putIsNonClientRegionSupportEnabled(self: *ICoreWebView2Settings9, enabled: bool) HRESULT {
+        return self.lpVtbl.put_IsNonClientRegionSupportEnabled(self, if (enabled) 1 else 0);
+    }
+};

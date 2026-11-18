@@ -161,6 +161,9 @@ pub const WindowOptions = struct {
     /// v0.3.2：无痕窗口（Win：InPrivate controller；Linux：ephemeral data manager）。
     /// Cookie/localStorage/缓存不落盘，窗口关闭即消失。
     incognito: bool = false,
+    /// v0.3.12 A11：组合模式（CompositionController + DComp 视觉树；老运行时/
+    /// DComp 失败自动回退 HWND 模式）。与无痕互斥时无痕优先（同 incognito 分派序）。
+    composition: bool = false,
     // ---- v0.3.3：窗口体验包 II ----
     /// 窗口形状 mask（PNG 资产路径，alpha>阈值 → 区域外不响应/不渲染）。
     /// Win：SetWindowRgn；Linux：input+shape region。

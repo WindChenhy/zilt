@@ -138,14 +138,16 @@ pub const Callbacks = struct {
     recover: *const fn (context: *anyopaque) void,
 };
 
-pub fn attach(alloc: Allocator, webview: *wv2.ICoreWebView2, controller: *wv2.ICoreWebView2Controller, options: shared.Options, context: *anyopaque, callbacks: Callbacks) !*Driver {
+pub fn attach(alloc: Allocator, webview: *wv2.ICoreWebView2, controller: ?*wv2.ICoreWebView2Controller, options: shared.Options, context: *anyopaque, callbacks: Callbacks) !*Driver {
+    // v0.3.12 A11：controller 可为 null（CompositionController 模式——CC 不实现
+    // Controller；bounds/visibility/zoom 由 DComp 视觉树接管，相关请求降级）
     if (@sizeOf(usize) != 8) @compileError("WebView2 base bindings require 64-bit Windows");
     try validateOrigin(options.origin);
     if (options.downloads.save_directory) |dir| try validateDirectory(dir);
     const d = try alloc.create(Driver);
     d.* = .{ .allocator = alloc, .arena = std.heap.ArenaAllocator.init(alloc), .webview = webview, .controller = controller, .options = options, .context = context, .callbacks = callbacks };
     retain(webview);
-    retain(controller);
+    if (controller) |c| retain(c);
     errdefer d.destroy();
     const a = d.arena.allocator();
     d.options.origin = try a.dupe(u8, options.origin);
@@ -178,7 +180,7 @@ pub const Driver = struct {
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
     webview: *wv2.ICoreWebView2,
-    controller: *wv2.ICoreWebView2Controller,
+    controller: ?*wv2.ICoreWebView2Controller,
     webview4: ?*WebView4 = null,
     options: shared.Options,
     context: *anyopaque,
@@ -203,7 +205,7 @@ pub const Driver = struct {
         self.refs -= 1;
         if (self.refs != 0) return;
         if (self.webview4) |w| release(w);
-        release(self.controller);
+        if (self.controller) |c| release(c);
         release(self.webview);
         self.arena.deinit();
         self.allocator.destroy(self);
@@ -329,7 +331,7 @@ pub const Driver = struct {
             // may occur in that loop, so never call main afterwards unless alive.
             var hwnd: win32.HWND = null;
             var allowed = false;
-            if (com.succeeded(self.controller.lpVtbl.get_ParentWindow(self.controller, &hwnd)) and hwnd != null) {
+            if (self.controller != null and com.succeeded(self.controller.?.lpVtbl.get_ParentWindow(self.controller.?, &hwnd)) and hwnd != null) {
                 allowed = win32.MessageBoxW(hwnd, p.message.ptr, std.unicode.utf8ToUtf16LeStringLiteral("Website permission"), win32.MB_YESNO | 0x20 | 0x100) == win32.IDYES;
             }
             allowed = allowed and self.alive;
@@ -369,11 +371,13 @@ pub const Driver = struct {
             .stop => try check(w.lpVtbl.Stop(w)),
             .zoom => |factor| {
                 if (!std.math.isFinite(factor) or factor <= 0) return error.InvalidZoom;
-                try check(self.controller.lpVtbl.put_ZoomFactor(self.controller, factor));
+                const c = self.controller orelse return error.CompositionModeNoController;
+                try check(c.lpVtbl.put_ZoomFactor(c, factor));
             },
             .get_zoom => {
+                const c = self.controller orelse return error.CompositionModeNoController;
                 var factor: f64 = 0;
-                try check(self.controller.lpVtbl.get_ZoomFactor(self.controller, &factor));
+                try check(c.lpVtbl.get_ZoomFactor(c, &factor));
                 return try std.json.Stringify.valueAlloc(self.allocator, .{ .factor = factor }, .{});
             },
             .history => {

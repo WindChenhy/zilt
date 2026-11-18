@@ -121,6 +121,10 @@ pub const NOTIFY_FOR_THIS_SESSION: DWORD = 0;
 pub const WM_THEMECHANGED: UINT = 0x031A;
 pub const WM_APP: UINT = 0x8000;
 pub const HTCAPTION: usize = 2;
+pub const HTMINBUTTON: usize = 8;
+pub const HTMAXBUTTON: usize = 9;
+pub const HTCLOSE: usize = 20;
+
 
 // 窗口控制
 pub const SW_MINIMIZE: i32 = 6;
@@ -170,8 +174,6 @@ pub const NIF_ICON: UINT = 0x00000002;
 pub const NIF_TIP: UINT = 0x00000004;
 pub const NIF_INFO: UINT = 0x00000010;
 pub const NIIF_INFO: DWORD = 0x00000001;
-pub const WM_LBUTTONUP: UINT = 0x0202;
-pub const WM_RBUTTONUP: UINT = 0x0205;
 pub const IDI_APPLICATION: usize = 32512;
 pub const ERROR_ALREADY_EXISTS: DWORD = 183;
 
@@ -751,6 +753,16 @@ pub const IDC_HELP: usize = 32651;
 
 pub const WM_SETCURSOR: UINT = 0x0020;
 pub const WM_MOUSEMOVE: UINT = 0x0200;
+pub const WM_LBUTTONDOWN: UINT = 0x0201;
+pub const WM_LBUTTONUP: UINT = 0x0202;
+pub const WM_LBUTTONDBLCLK: UINT = 0x0203;
+pub const WM_RBUTTONDOWN: UINT = 0x0204;
+pub const WM_RBUTTONUP: UINT = 0x0205;
+pub const WM_RBUTTONDBLCLK: UINT = 0x0206;
+pub const WM_MBUTTONDOWN: UINT = 0x0207;
+pub const WM_MBUTTONUP: UINT = 0x0208;
+pub const WM_MBUTTONDBLCLK: UINT = 0x0209;
+pub const WM_MOUSEWHEEL: UINT = 0x020A;
 pub const WM_MOUSELEAVE: UINT = 0x02A3;
 pub const WM_WINDOWPOSCHANGING: UINT = 0x0046;
 pub const WM_GETICON: UINT = 0x007F;
