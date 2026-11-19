@@ -1176,10 +1176,66 @@ async function runChecks() {
       if (!ok) window.zilt.log('warn', 'c-comp note: ' + note);
     } catch (e) { setCheck('c-comp', false, String(e.message || e)); window.zilt.log('warn', 'c-comp error: ' + String(e.message || e)); }
 
+    // 62. v0.3.14 G1–G8/G11：窗口 API 收尾——探针窗口上全量往返
+    //     （创建 {maximized, zoom} → center → setResizable → setDecorations →
+    //     toggleMaximize×2 → setScreen → list → destroy 强制销毁）
+    try {
+      const w = await window.zilt.window.create({
+        title: 'win3 probe', label: 'win3-' + Date.now(), width: 420, height: 320,
+        maximized: true, zoom: 1.25, url: 'about:blank',
+      });
+      let ok = false;
+      let note = 'create=' + JSON.stringify(w).slice(0, 40);
+      if (w && typeof w.id === 'number') {
+        const id = w.id;
+        const st0 = await window.zilt.window.state(id);
+        const stZoomed = st0 && st0.zoomed === true;
+        await window.zilt.window.center(id);
+        await window.zilt.window.setResizable(false, id);
+        const st1 = await window.zilt.window.state(id);
+        const rsOff = st1 && st1.resizable === false;
+        await window.zilt.window.setResizable(true, id);
+        const st2 = await window.zilt.window.state(id);
+        const rsOn = st2 && st2.resizable === true;
+        await window.zilt.window.setDecorations(false, id);
+        const st3 = await window.zilt.window.state(id);
+        const dcOff = st3 && st3.decorated === false;
+        await window.zilt.window.setDecorations(true, id);
+        const st4 = await window.zilt.window.state(id);
+        const dcOn = st4 && st4.decorated === true;
+        await window.zilt.window.toggleMaximize(id);
+        const st5 = await window.zilt.window.state(id);
+        const tg1 = st5 && st5.zoomed === false;
+        await window.zilt.window.toggleMaximize(id);
+        const st6 = await window.zilt.window.state(id);
+        const tg2 = st6 && st6.zoomed === true;
+        await window.zilt.window.setScreen(0, id);
+        const st7 = await window.zilt.window.state(id);
+        const scr = st7 && st7.monitor === 0;
+        const list = await window.zilt.window.list();
+        const listed = Array.isArray(list) && list.some((e) => e.id === id);
+        const destroyed = await new Promise((resolve) => {
+          const timer = setTimeout(() => resolve(false), 3000);
+          const off = window.zilt.on('windowDestroyed', (p) => {
+            if (p.id === id) { clearTimeout(timer); off(); resolve(true); }
+          });
+          window.zilt.window.destroy(id).catch(() => {});
+        });
+        ok = stZoomed && rsOff && rsOn && dcOff && dcOn && tg1 && tg2 && scr && listed && destroyed;
+        note += ' zoomed=' + stZoomed + ' rs=' + rsOff + '/' + rsOn + ' deco=' + dcOff + '/' + dcOn +
+          ' tg=' + tg1 + '/' + tg2 + ' scr=' + scr + ' list=' + listed + ' destroyed=' + destroyed;
+      }
+      setCheck('c-win3', ok, ok ? 'window api ok (maximized/zoom create + center/resizable/decorations/toggleMaximize/setScreen/list/destroy)' : note);
+      if (!ok) window.zilt.log('warn', 'c-win3 note: ' + note);
+    } catch (e) { setCheck('c-win3', false, String(e.message || e)); window.zilt.log('warn', 'c-win3 error: ' + String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
-    // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）
-    window.zilt.emit('smokeResult', {
+    // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）。
+    // v0.3.14：appquit=true 表示「全部通过后由 window.zilt.app.quit(0) 收尾」——
+    // Zig 侧收到该标记不再自行退出，app.quit 的正常退出路径即被 E2E 覆盖
+    //（quit 失败 → 进程不退 → 冒烟安全网 exit 124 → 失败）。
+    const smokeFlags = {
       greet: $('c-greet').className === 'pass',
       add: $('c-add').className === 'pass',
       fail: $('c-fail').className === 'pass',
@@ -1241,7 +1297,15 @@ async function runChecks() {
       iso: $('c-iso').className === 'pass',
       sidecar: $('c-sidecar').className === 'pass',
       comp: $('c-comp').className === 'pass',
-    });
+      win3: $('c-win3').className === 'pass',
+      appquit: !!window.zilt.app,
+    };
+    window.zilt.emit('smokeResult', smokeFlags);
+    // v0.3.14 G5：全部通过 → app.quit 收尾（进程正常退出码 0）。
+    // app.quit 不可用或失败 → 依赖 Zig 侧 ZILT_SMOKE_EXIT 退出路径不受影响。
+    if (window.zilt.app && Object.values(smokeFlags).every((v) => v === true)) {
+      setTimeout(() => { window.zilt.app.quit(0).catch(() => {}); }, 300);
+    }
   } catch (e) {
     window.zilt.emit('smokeResult', { fatal: String(e) });
   }

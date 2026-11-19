@@ -155,6 +155,37 @@ const scheme_host = "app";
 /// v0.2.1 Linux 冒烟脚本（只测已实现能力；见 smoke.js 顶部说明）。
 const smoke_script = @embedFile("smoke.js");
 
+/// v0.3.14 G26：缩放快捷键 polyfill（runtime 之后、应用脚本之前注入）。
+/// WebKitGTK 没有 WebView2 的 IsZoomControlEnabled 对等 API；对齐 Tauri
+/// `zoomHotkeysEnabled` 的 Linux 手法——Ctrl/Cmd ±/0 → window.zilt.webview.zoom。
+const zoom_hotkey_polyfill =
+    \\(function(){
+    \\  if (!window.zilt || !window.zilt.webview) return;
+    \\  window.addEventListener('keydown', function(e){
+    \\    if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+    \\    var k = e.key;
+    \\    if (k !== '+' && k !== '=' && k !== '-' && k !== '0') return;
+    \\    e.preventDefault();
+    \\    window.zilt.webview.getZoom().then(function(z){
+    \\      var t = (typeof z === 'number' && z > 0) ? z : 1;
+    \\      if (k === '+' || k === '=') t = Math.min(t * 1.2, 10);
+    \\      else if (k === '-') t = Math.max(t / 1.2, 0.2);
+    \\      else t = 1;
+    \\      return window.zilt.webview.zoom(t);
+    \\    }).catch(function(){});
+    \\  }, true);
+    \\})();
+;
+
+test "zoom polyfill: 快捷键面覆盖 +/=/-/0 且走 runtime zoom 通道" {
+    const t = std.testing;
+    try t.expect(std.mem.indexOf(u8, zoom_hotkey_polyfill, "getZoom") != null);
+    try t.expect(std.mem.indexOf(u8, zoom_hotkey_polyfill, "zilt.webview.zoom") != null);
+    for ([_][]const u8{ "'+'", "'='", "'-'", "'0'" }) |key| {
+        try t.expect(std.mem.indexOf(u8, zoom_hotkey_polyfill, key) != null);
+    }
+}
+
 /// G_SOURCE_REMOVE：idle 回调返回它表示「执行一次后移除」。
 const G_SOURCE_REMOVE: c.gboolean = 0;
 
@@ -1562,6 +1593,9 @@ fn Backend(comptime config: Config) type {
                 }
             }
             self.addUserScriptTo(scripts, ucm, ipc.runtime_js);
+            // v0.3.14 G26：缩放控件 polyfill（WebKitGTK 无 IsZoomControlEnabled 对等；
+            // 对齐 Tauri zoomHotkeysEnabled 的 Linux 手法——Ctrl/Cmd ±/0 → zoom 请求）
+            self.addUserScriptTo(scripts, ucm, zoom_hotkey_polyfill);
             for (config.init_scripts) |script| self.addUserScriptTo(scripts, ucm, script);
             if (self.smoke) {
                 self.addUserScriptTo(scripts, ucm, smoke_script);
@@ -2056,6 +2090,15 @@ fn Backend(comptime config: Config) type {
 
             c.gtk_widget_show_all(win);
             if (opts.visible) c.gtk_window_present(win_typed);
+            // v0.3.14：创建即最大化（Wails StartState.Maximised / Tauri maximized；
+            // show 之后应用——GTK 的 maximize 在映射后生效）
+            if (opts.maximized) c.gtk_window_maximize(win_typed);
+            // v0.3.14 G11：初始缩放（Wails Zoom 选项；WebKit 级 zoom level）
+            if (opts.zoom) |z| {
+                if (z > 0.25 and z < 4.0 and st.view != null) {
+                    c.webkit_web_view_set_zoom_level(@ptrCast(st.view), z);
+                }
+            }
             // v0.3.0：焦点轮询（见 WinState.focus_timer 注释）
             st.focus_timer = c.g_timeout_add(200, Self.focusPollTick, st);
 
@@ -2236,6 +2279,9 @@ fn Backend(comptime config: Config) type {
             const widget: [*c]c.GtkWidget = @ptrCast(win);
 
             switch (cmd) {
+                // v0.3.14：list 在 builtin dispatch 就走 window_query_fn（LIST_ALL
+                // 哨兵），不会到达这里
+                .list => return false,
                 .set_title => |t| {
                     const z = dupeZ(self.allocator, t) catch return false;
                     defer self.allocator.free(z);
@@ -2325,6 +2371,69 @@ fn Backend(comptime config: Config) type {
                 },
                 .button_state => return false, // GTK3 无 per-button API（文档化）
                 .move_debounce => return false, // Linux 未接线（文档化）
+                // ---- v0.3.14：窗口 API 收尾（对齐 Wails/Tauri；GTK 等价实现）----
+                // center：居中到最近显示器工作区（gdk_monitor_get_workarea）
+                .center => {
+                    const display = c.gdk_display_get_default() orelse return false;
+                    const gdk_win = c.gtk_widget_get_window(widget);
+                    const monitor = if (gdk_win != null)
+                        c.gdk_display_get_monitor_at_window(display, gdk_win)
+                    else
+                        c.gdk_display_get_primary_monitor(display);
+                    if (monitor == null) return false;
+                    var wa: c.GdkRectangle = undefined;
+                    c.gdk_monitor_get_workarea(monitor, &wa);
+                    var ww: c.gint = 0;
+                    var wh: c.gint = 0;
+                    c.gtk_window_get_size(win, &ww, &wh);
+                    const x = wa.x + @divTrunc(wa.width - ww, 2);
+                    const y = wa.y + @divTrunc(wa.height - wh, 2);
+                    c.gtk_window_move(win, x, y);
+                    st.geom_x = x;
+                    st.geom_y = y;
+                    return true;
+                },
+                // toggleMaximize：最大化/还原切换
+                .toggle_maximize => {
+                    if (c.gtk_window_is_maximized(win) != 0) c.gtk_window_unmaximize(win) else c.gtk_window_maximize(win);
+                    return true;
+                },
+                // setResizable / setDecorations（GTK 原生 API）
+                .resizable => |on| {
+                    c.gtk_window_set_resizable(win, @intFromBool(on));
+                    return true;
+                },
+                .decorated => |on| {
+                    c.gtk_window_set_decorated(win, @intFromBool(on));
+                    return true;
+                },
+                // destroy：强制销毁（绕过 delete-event 请求链；对齐 Tauri destroy()）
+                // GTK3 无 gtk_window_destroy（GTK4 才有）——用 gtk_widget_destroy
+                .destroy_win => {
+                    c.gtk_widget_destroy(widget);
+                    return true;
+                },
+                // setScreen：移动到目标显示器工作区（gdk_display 枚举序，与
+                // system.info('monitors') 一致）
+                .set_screen => |index| {
+                    const display2 = c.gdk_display_get_default() orelse return false;
+                    const n = c.gdk_display_get_n_monitors(display2);
+                    if (index >= @as(u32, @intCast(n))) return false;
+                    const monitor = c.gdk_display_get_monitor(display2, @intCast(index)) orelse return false;
+                    var wa: c.GdkRectangle = undefined;
+                    c.gdk_monitor_get_workarea(monitor, &wa);
+                    var ww: c.gint = 0;
+                    var wh: c.gint = 0;
+                    c.gtk_window_get_size(win, &ww, &wh);
+                    const width = @min(ww, wa.width);
+                    const height = @min(wh, wa.height);
+                    const x = wa.x + @divTrunc(wa.width - width, 2);
+                    const y = wa.y + @divTrunc(wa.height - height, 2);
+                    c.gtk_window_move(win, x, y);
+                    st.geom_x = x;
+                    st.geom_y = y;
+                    return true;
+                },
                 .start_dragging => {
                     // 无鼠标事件上下文也能拖：取指针根坐标 + GLib 当前事件时间戳
                     const display = c.gdk_display_get_default() orelse return false;
@@ -2473,7 +2582,27 @@ fn Backend(comptime config: Config) type {
         /// style/ex_style 等 Win32 概念在 Linux 恒为 0/false）。
         fn windowQueryEntry(backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator) ?[]u8 {
             const self: *Self = @ptrCast(@alignCast(backend));
+            // v0.3.14 G7：LIST_ALL 哨兵 → 全部存活窗口状态数组（Wails GetAll 对齐；
+            // 注册表在销毁时即摘除，条目均为存活窗口）
+            if (window_id == ipc.WINDOW_LIST_ALL) {
+                var out: std.ArrayList(u8) = .empty;
+                out.appendSlice(alloc, "[") catch return null;
+                var first = true;
+                for (self.windows.items) |it| {
+                    if (!first) out.appendSlice(alloc, ",") catch return null;
+                    first = false;
+                    const one = self.windowStateJson(it, alloc) orelse return null;
+                    out.appendSlice(alloc, one) catch return null;
+                }
+                out.appendSlice(alloc, "]") catch return null;
+                return out.items;
+            }
             const st = self.windowById(window_id) orelse return null;
+            return self.windowStateJson(st, alloc);
+        }
+
+        /// v0.3.14：单窗口状态 JSON（query / list 共用；新增 resizable/decorated）。
+        fn windowStateJson(_: *Self, st: *WinState, alloc: std.mem.Allocator) ?[]u8 {
             const win = st.win;
             const widget: [*c]c.GtkWidget = @ptrCast(win);
 
@@ -2490,7 +2619,7 @@ fn Backend(comptime config: Config) type {
             }
 
             return std.fmt.allocPrint(alloc,
-                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":0,"ex_style":0,"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":false,"overlay":{s},"incognito":{s},"monitor":{d},"transparent":{s},"background_color":{d},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d}}}
+                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":0,"ex_style":0,"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":false,"overlay":{s},"incognito":{s},"monitor":{d},"transparent":{s},"background_color":{d},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d},"resizable":{s},"decorated":{s}}}
             , .{
                 st.id,
                 x,
@@ -2530,6 +2659,9 @@ fn Backend(comptime config: Config) type {
                 st.max_width,
                 st.max_height,
                 st.child_webviews.items.len,
+                // v0.3.14：GTK 属性直读
+                boolStr(c.gtk_window_get_resizable(win) != 0),
+                boolStr(c.gtk_window_get_decorated(win) != 0),
             }) catch null;
         }
 
@@ -4164,12 +4296,36 @@ fn Backend(comptime config: Config) type {
                         boolStr(can_fwd),
                     });
                 },
-                .devtools => {
+                .devtools => |op| {
                     if (!config.webview.settings.devtools) return error.DevToolsDisabled;
                     const settings = c.webkit_web_view_get_settings(view);
                     if (settings == null) return error.WebViewCallFailed;
                     c.webkit_settings_set_enable_developer_extras(settings, 1);
-                    c.webkit_web_inspector_show(c.webkit_web_view_get_inspector(view));
+                    const inspector = c.webkit_web_view_get_inspector(view);
+                    if (inspector == null) return error.WebViewCallFailed;
+                    // v0.3.14 G10：open/close/state（WebKitGTK inspector 全支持）
+                    switch (op) {
+                        .open => {
+                            c.webkit_web_inspector_show(inspector);
+                            return try alloc.dupe(u8, "{}");
+                        },
+                        .close => {
+                            c.webkit_web_inspector_close(inspector);
+                            return try alloc.dupe(u8, "{}");
+                        },
+                        .state => {
+                            const is_open = c.webkit_web_inspector_is_attached(inspector);
+                            return try std.fmt.allocPrint(alloc, "{{\"open\":{s}}}", .{boolStr(is_open != 0)});
+                        },
+                    }
+                },
+                // v0.3.14 G9：加载 HTML 字符串（webkit_web_view_load_html；
+                // base_uri 用应用 app_url——相对资源仍按应用 origin 解析）
+                .load_html => |html| {
+                    const z = try dupeZ(self.allocator, html);
+                    defer self.allocator.free(z);
+                    c.webkit_web_view_load_html(@ptrCast(view), z.ptr, w.app_url.ptr);
+                    return try alloc.dupe(u8, "{}");
                 },
                 .set_user_agent => |ua| {
                     const settings = c.webkit_web_view_get_settings(view);
@@ -8074,6 +8230,13 @@ fn Backend(comptime config: Config) type {
                 st.label,
                 st.child_webviews.items.len,
             });
+            // v0.3.14：windowDestroyed 事件对齐 Windows 契约（发给其余存活窗口；
+            // destroy 回调内直接 evaluate 会被丢弃——走 emitWindowEvent 的 idle 封送。
+            // 级联子窗口由其自身 onDestroy 重入补发）
+            for (self.windows.items) |other| {
+                if (other.id == closed_id) continue;
+                self.emitWindowEvent(other, "windowDestroyed", &.{.{ .name = "id", .value = closed_id }});
+            }
             // 先落盘窗口状态（destroy 期间控件仍在，几何可查）
             self.saveWindowState(st);
             self.freeWindowState(st);
@@ -8449,6 +8612,19 @@ fn Backend(comptime config: Config) type {
         fn onDeleteEvent(_: [*c]c.GtkWidget, _: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
             const st: *WinState = @ptrCast(@alignCast(user_data orelse return 0));
             if (!st.close_requested_event) return 0; // 默认销毁
+            // v0.3.14 G6：Zig 侧取消钩子（comptime 门控；true = 取消关闭）
+            if (comptime ipc.closeRequestHooked(config.events)) {
+                const hook_payload = std.fmt.allocPrint(st.backend.allocator, "{{\"id\":{d}}}", .{st.id}) catch null;
+                if (hook_payload) |hp| {
+                    defer st.backend.allocator.free(hp);
+                    if (ipc.closeRequestCancelled(config.events, st.backend.context(st.backend.allocator, st.id), hp)) |cancelled| {
+                        if (cancelled) {
+                            log.print("[window] close cancelled by Zig hook (window #{d})", .{st.id});
+                            return 1; // 拦截：不销毁
+                        }
+                    }
+                }
+            }
             log.print("[window] close requested (window #{d})", .{st.id});
             st.backend.emitWindowEvent(st, "windowCloseRequested", &.{
                 .{ .name = "id", .value = st.id },

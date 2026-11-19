@@ -99,6 +99,9 @@ pub const Cookies = union(enum) {
     clear: struct { origin: ?[]const u8 = null },
 };
 
+/// v0.3.14：DevTools 操作（对齐 Tauri open/close_devtools + Wails OpenDevTools）。
+pub const DevToolsOp = enum { open, close, state };
+
 pub const Request = union(enum) {
     reload,
     stop,
@@ -108,9 +111,14 @@ pub const Request = union(enum) {
     history,
     back,
     forward,
+    /// v0.3.14：devtools 显隐与状态。close 仅 Linux 可用（WebKitGTK inspector）；
+    /// Windows 的 DevTools 窗口无关闭 API（返回 DevToolsCloseUnsupported，文档化）。
+    devtools: DevToolsOp,
+    /// v0.3.14：加载 HTML 字符串（Wails SetHTML 语义 / NavigateToString）。
+    /// 立即导航替换当前文档；历史策略随引擎默认。
+    load_html: []const u8,
     /// Opens native print UI; completion acknowledges opening, not print outcome.
     print: enum { browser, system },
-    devtools,
     clear_storage: ClearStorage,
     cookies: Cookies,
     /// Result is the evaluated JSON value, undefined => null. Non-JSON values

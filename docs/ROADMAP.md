@@ -508,6 +508,35 @@
       - **验收**：Windows 冒烟 **61 项 exit 0** + browser E2E ALL PASSED + python WS
         E2E 两次 ALL PASSED；Linux 单测全绿 + 冒烟 83/83 + dev-headless
         （HEALTH/MCP_STDIO/HEADLESS_E2E=PASS）
+- [x] **v0.3.14 窗口 API 收尾**（2026-11-20；三轮差距刷新第一批，对标 Wails v3.1.0 +
+      Tauri 2.12.5，总表见 v0.3.x-PLAN §0.5）：
+      - **窗口收尾（G1–G8/G11）**：center（工作区居中）/ create({maximized})（状态恢复
+        之后应用——显式选项优先）/ setResizable + setDecorations（Win style 位 +
+        SWP_FRAMECHANGED / GTK 原生属性；state() 增 resizable/decorated 直读）/ destroy
+        （Win DestroyWindow、GTK gtk_widget_destroy——GTK3 无 gtk_window_destroy）/
+        toggleMaximize / setScreen（collectMonitors 枚举序与 fullscreenOnMonitor 一致，
+        工作区居中放置）/ window.list（window_query_fn 的 WINDOW_LIST_ALL 哨兵 →
+        全窗状态数组）/ create({zoom})（Win controller 就绪 put_ZoomFactor；GTK
+        webkit_web_view_set_zoom_level）
+      - **应用面（G5）**：`__zilt.app` builtin——quit(code)（ctx.quit 既有基建）+
+        restart（std.process.spawn 0.17 Io API，stdio 全 ignore，spawn 自身后 quit(0)）
+      - **G6 Zig 侧取消钩子**：ipc.closeRequestHooked/closeRequestCancelled（comptime
+        探测 events 命名空间 windowCloseRequested 的 bool 返回）；Win WM_CLOSE 与
+        GTK delete-event 两路接线（true=取消，日志 + return 拦截）；emitEventPayload
+        对已决事件跳过 dispatchEvent（避免双触发）；启用/不启用/返回值三态单测
+      - **webview 面（G9/G10）**：Request.devtools 拆 DevToolsOp{open,close,state} +
+        load_html；Win devtools_opened 跟踪（无关闭/查询 API → close 返回
+        DevToolsCloseUnsupported 文档化）、load_html 走 NavigateToString（槽 6 既有
+        绑定）；GTK inspector show/close/is_attached 全支持 + load_html（base_uri=
+        app_url）
+      - **Linux 补齐**：**windowDestroyed 事件**（此前 GTK 销毁不 emit——实测 win3
+        冒烟暴露；onDestroy 发给其余存活窗口，emitWindowEvent idle 封送）+ 缩放
+        polyfill（G26：Ctrl/Cmd ±/0 → zilt.webview.zoom，user script 注入，单测锁内容）
+      - **验收**：Windows 冒烟 **62 项**（c-win3 探针窗口全量往返 + appquit 流——
+        全过后 app.quit(0) 收尾；quit 链路经临时禁用失败自退的对照实验验证 exit 0）
+        + 单测全绿；Linux 冒烟 **84/84**（win3 GTK 全量往返）+ post terminate PASS；
+        双平台单测全绿。**实测记录**：clip/clipmulti 失败为本机既有桌面剪贴板占用
+        环境问题（zilt-keep.log 同样存在，非本版回归）
       - 后续规划（v0.3.8–v0.3.13，二轮差距刷新 2026-11-17——对标 Wails v3.1.0 /（2026-11-19；二轮差距刷新第五批——
       ABI/装配/回退全链落地，渲染管线为已知问题）：
       - **ABI 绑定（官方 WebView2.h 逐一核对）**：webview2.zig 增

@@ -1167,6 +1167,49 @@ function runSecondWindowProbe() {
       `upload ${r.status} parts=${parts.length} prog=${progress.length} last=${last}`);
   } catch (e) { check('upload', false, String(e.message || e)); }
 
+  // ---- v0.3.14：窗口 API 收尾（GTK 路径：setResizable/setDecorations/center/
+  //      setScreen/list/destroy 全量往返。maximized/zoomed 断言不适用——Xvfb 无 WM，
+  //      maximize 是 WM 协作语义）----
+  try {
+    const w = await Z().window.create({ title: 'win3', label: 'win3-' + Date.now(), width: 320, height: 200, url: '/second.html' });
+    let ok = false;
+    let note = '';
+    if (w && typeof w.id === 'number') {
+      const id = w.id;
+      await Z().window.setResizable(false, id);
+      const st1 = await Z().window.state(id);
+      const rsOff = st1 && st1.resizable === false;
+      await Z().window.setResizable(true, id);
+      const st2 = await Z().window.state(id);
+      const rsOn = st2 && st2.resizable === true;
+      await Z().window.setDecorations(false, id);
+      const st3 = await Z().window.state(id);
+      const dcOff = st3 && st3.decorated === false;
+      await Z().window.setDecorations(true, id);
+      const st4 = await Z().window.state(id);
+      const dcOn = st4 && st4.decorated === true;
+      await Z().window.center(id);
+      const st5 = await Z().window.state(id);
+      const centered = st5 && typeof st5.x === 'number' && typeof st5.y === 'number';
+      await Z().window.setScreen(0, id);
+      const st6 = await Z().window.state(id);
+      const scr = st6 && st6.monitor === 0;
+      const list = await Z().window.list();
+      const listed = Array.isArray(list) && list.some((e) => e.id === id);
+      await Z().window.toggleMaximize(id).catch(() => {});
+      const destroyed = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(false), 3000);
+        const off = Z().on('windowDestroyed', (p) => {
+          if (p.id === id) { clearTimeout(timer); off(); resolve(true); }
+        });
+        Z().window.destroy(id).catch(() => {});
+      });
+      ok = rsOff && rsOn && dcOff && dcOn && centered && scr && listed && destroyed;
+      note = `rs=${rsOff}/${rsOn} deco=${dcOff}/${dcOn} center=${centered} scr=${scr} list=${listed} destroyed=${destroyed}`;
+    } else note = 'create=' + JSON.stringify(w);
+    check('win3', ok, note);
+  } catch (e) { check('win3', false, String(e.message || e)); }
+
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {
     await Z().invoke('__zilt.linuxSmoke', {

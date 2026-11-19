@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.13（server 模式二阶段——浏览器端 runtime shim，真实浏览器 E2E）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.14（窗口 API 收尾——三轮差距刷新第一批）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -259,6 +259,36 @@ v0.3.12 新增（2026-11-19，CompositionController 专项——二轮差距刷�
   渲染修复列为后续专项；c-comp 检查断言回退路径
 - **验收**：Windows 单测全绿 + 冒烟 **61 项**（新增 c-comp 断言组合请求 → 探测 →
   回退全链 + state.composition=false）；Linux 不涉及（组合为 Windows 面）
+
+v0.3.14 新增（2026-11-20，窗口 API 收尾——三轮差距刷新第一批）：
+
+> 三轮差距刷新基线 git 98214f0；对标 Wails v3.1.0 + Tauri 2.12.5（WindowConfig 62 字段 +
+> Window 方法 86 个逐项比对）。三轮总表与 v0.3.14–v0.3.18 切片见 v0.3.x-PLAN §0.5。
+
+- **窗口 API 收尾（G1–G8/G11，双平台同接）**：`window.center()`（工作区居中）、
+  `window.create({maximized})`（创建即最大化）、运行时 `setResizable`/`setDecorations`
+  （Win style 位 / GTK 原生属性；state() 增 resizable/decorated 直读）、`destroy`（强制
+  销毁——Win DestroyWindow / GTK widget_destroy，绕过关闭请求链）、`toggleMaximize`、
+  `setScreen(index)`（移窗到指定显示器工作区）、`window.list()`（全部存活窗口状态数组，
+  Wails GetAll 对齐）、`window.create({zoom})`（初始缩放，controller 就绪后应用）
+- **应用级 quit/restart（G5）**：`window.zilt.app.quit(code)` / `app.restart()`——
+  Wails application.Quit / Tauri App::exit 对齐；restart 复用 executablePathAlloc 解析
+  （与 sidecar/resource 同模式）spawn 自身后正常 quit
+- **Zig 侧可取消事件钩子（G6，C4）**：事件命名空间把 `windowCloseRequested` 声明为返回
+  `bool` 即启用——true = 取消关闭（对齐 Wails `e.Cancel()` / Tauri `prevent_close()`）；
+  comptime 门控（未启用零开销），启用时关闭链路先决、emitEventPayload 跳过重复派发
+- **webview 面收尾（G9/G10）**：`webview.loadHTML(html)`（Win NavigateToString /
+  GTK load_html，base_uri=应用 origin）+ devtools open/close/state 三态（Win 打开状态
+  内部跟踪、无关闭 API 文档化；GTK inspector 全支持）
+- **Linux 补齐**：windowDestroyed 事件（此前 GTK 销毁不发事件——对齐 Windows 契约，
+  发给其余存活窗口）+ 缩放快捷键 polyfill（G26——WebKitGTK 无 IsZoomControlEnabled
+  对等；Ctrl/Cmd ±/0 → zoom，Tauri 同手法，runtime 后注入）
+- **验收**：Windows 冒烟 **62 项**（新增 c-win3——探针窗口全量往返：maximized/center/
+  resizable/decorations/toggleMaximize×2/setScreen/list/destroy；**appquit 流**——全部
+  通过后经 window.zilt.app.quit(0) 正常退出，app.quit 由此获得 E2E 覆盖，quit 失败 →
+  冒烟安全网 exit 124）+ 单测全绿（+closeRequestHooked/cancelled 语义、窗口收尾动作
+  映射、devtools/loadHTML 映射）；Linux 冒烟 **84/84**（新增 win3 GTK 路径全量往返 +
+  windowDestroyed 事件）+ post terminate PASS；clip 两项为既有桌面剪贴板占用环境问题
 
 v0.3.13 新增（2026-11-19，server 模式二阶段——二轮差距刷新收口）：
 

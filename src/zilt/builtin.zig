@@ -71,6 +71,10 @@ pub const Args = struct {
     incognito: ?bool = null,
     /// v0.3.12 A11：组合模式（CompositionController + DComp）
     composition: ?bool = null,
+    /// v0.3.14：创建即最大化（window.create({maximized})）
+    maximized: ?bool = null,
+    /// v0.3.14：setScreen 目标显示器索引（window.setScreen(index)）
+    screen: ?u32 = null,
     /// v0.3.4：updater.skipVersion 的版本串
     version_str: ?[]const u8 = null,
     /// v0.3.6：SharedBuffer 二进制 IPC（__zilt.binary.request 的载荷字节数）
@@ -188,6 +192,8 @@ pub fn dispatch(ctx: ipc.Context, method: []const u8, args_json: []const u8) !?[
     defer parsed.deinit();
     const a = parsed.value;
     if (std.mem.eql(u8, method, "__zilt.window")) return try windowCmd(ctx, a);
+    // v0.3.14 G5：应用级 quit/restart（Wails application.Quit / Tauri App::exit）
+    if (std.mem.eql(u8, method, "__zilt.app")) return try appCmd(ctx, a);
     if (std.mem.eql(u8, method, "__zilt.eval")) return try evalCmd(ctx, a);
     if (std.mem.eql(u8, method, "__zilt.webview")) return try webviewCmd(ctx, a);
     if (std.mem.eql(u8, method, "__zilt.clipboard")) return try clipboardCmd(ctx, a);
@@ -346,6 +352,15 @@ pub fn windowCmdFromArgs(a: Args, current_window: u32) !ipc.WindowCmd {
         .maximizable = a.maximizable,
     } };
     if (eql(u8, a.action, "setMoveDebounce")) return .{ .move_debounce = a.move_debounce_ms orelse 0 };
+    // ---- v0.3.14：窗口 API 收尾（对齐 Wails Center/ToggleMaximise/SetResizable/SetFrameless/...
+    //      与 Tauri center/toggleMaximize/setResizable/setDecorations/destroy/setScreen）----
+    if (eql(u8, a.action, "center")) return .center;
+    if (eql(u8, a.action, "toggleMaximize")) return .toggle_maximize;
+    if (eql(u8, a.action, "setResizable")) return .{ .resizable = a.enabled orelse true };
+    if (eql(u8, a.action, "setDecorations")) return .{ .decorated = a.enabled orelse true };
+    if (eql(u8, a.action, "destroy")) return .destroy_win;
+    if (eql(u8, a.action, "setScreen")) return .{ .set_screen = a.screen orelse 0 };
+    if (eql(u8, a.action, "list")) return .list;
     _ = current_window;
     return error.UnknownWindowAction;
 }
@@ -360,6 +375,9 @@ fn windowCmd(ctx: ipc.Context, a: Args) ![]u8 {
             .url = a.url,
             .x = a.x,
             .y = a.y,
+            // v0.3.14：创建即最大化 + 初始缩放（Wails StartState/Zoom 对齐）
+            .maximized = a.maximized orelse false,
+            .zoom = a.zoom,
             .label = a.label,
             .parent = a.parent,
             .modal = a.modal orelse false,
@@ -402,11 +420,50 @@ fn windowCmd(ctx: ipc.Context, a: Args) ![]u8 {
             const q = ctx.window_query_fn orelse return error.WindowNotAvailable;
             return q(ctx.backend, target, ctx.allocator) orelse error.WindowNotAvailable;
         },
+        // v0.3.14 G7：全部存活窗口状态快照（query 通道的 LIST_ALL 哨兵）
+        .list => {
+            const q = ctx.window_query_fn orelse return error.WindowNotAvailable;
+            return q(ctx.backend, ipc.WINDOW_LIST_ALL, ctx.allocator) orelse error.WindowNotAvailable;
+        },
         else => {},
     }
     const f = ctx.window_fn orelse return error.WindowNotAvailable;
     const success = f(ctx.backend, target, cmd);
     return ctx.allocator.dupe(u8, if (success) "true" else "false");
+}
+
+// ---------------------------------------------------------------------------
+// v0.3.14 G5：应用级 quit / restart（Wails application.Quit / Tauri App::exit/restart）
+// ---------------------------------------------------------------------------
+
+fn appCmd(ctx: ipc.Context, a: Args) ![]u8 {
+    if (std.mem.eql(u8, a.action, "quit")) {
+        // code 默认 0；与 ZILT_SMOKE_EXIT 的退出码契约一致（通过 = 0）
+        ctx.quit(@intCast(a.code orelse 0));
+        return ok(ctx);
+    }
+    if (std.mem.eql(u8, a.action, "restart")) {
+        // 对齐更新器接力语义：spawn 自身 exe（分离进程）后正常 quit。
+        // executablePathAlloc 是内核解析的当前可执行路径，无需依赖 argv[0]
+        // （与 path.zig sidecar/resource 同一解析模式）。
+        var io = std.Io.Threaded.init(ctx.allocator, .{});
+        defer io.deinit();
+        const exe = std.process.executablePathAlloc(io.io(), ctx.allocator) catch return error.RestartUnavailable;
+        defer ctx.allocator.free(exe);
+        // std.process.spawn（0.17 Io API，跨平台）：stdio 全 Ignore，新进程
+        // 不继承本进程的控制台/管道。生产环境无 Job 对象、子进程独立存活；
+        // dev 编排的 Job 整树清理属开发期语义（更新器接力 breakaway 同理）。
+        var child = std.process.spawn(io.io(), .{
+            .argv = &.{exe},
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        }) catch return error.RestartUnavailable;
+        _ = &child;
+        ctx.quit(0);
+        return ok(ctx);
+    }
+    return error.UnknownAppAction;
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +523,12 @@ pub fn requestFromArgs(a: Args) !webview.Request {
     if (eql(u8, a.action, "history")) return .history;
     if (eql(u8, a.action, "back")) return .back;
     if (eql(u8, a.action, "forward")) return .forward;
-    if (eql(u8, a.action, "devtools")) return .devtools;
+    if (eql(u8, a.action, "devtools")) return .{ .devtools = .open };
+    // v0.3.14：devtools 关闭与状态（close 仅 Linux；Windows 文档化不支持）
+    if (eql(u8, a.action, "closeDevtools")) return .{ .devtools = .close };
+    if (eql(u8, a.action, "getDevtoolsState")) return .{ .devtools = .state };
+    // v0.3.14：加载 HTML 字符串（Wails SetHTML 对齐）
+    if (eql(u8, a.action, "loadHTML")) return .{ .load_html = a.html orelse return error.MissingHtml };
     if (eql(u8, a.action, "print")) return .{ .print = if (a.kind != null and eql(u8, a.kind.?, "system")) .system else .browser };
     if (eql(u8, a.action, "cancelDownload")) return .{ .cancel_download = a.download_id orelse return error.MissingDownloadId };
     if (eql(u8, a.action, "zoom")) return .{ .zoom = a.zoom orelse return error.MissingZoom };
@@ -1292,4 +1354,52 @@ test "v0.3.3: window.create 选项透传（体验包 II 字段进 WindowOptions�
     const a = Args{ .action = "create" };
     try testing.expect(a.hide_on_focus_lost == null);
     try testing.expectEqual(@as(?u32, null), a.move_debounce_ms);
+}
+
+test "v0.3.14: 窗口收尾动作映射（center/toggle/resizable/decorated/destroy/screen/list）" {
+    const testing = std.testing;
+    const tag = std.meta.activeTag;
+    try testing.expectEqual(ipc.WindowCmd.center, tag(try windowCmdFromArgs(.{ .action = "center" }, 1)));
+    try testing.expectEqual(ipc.WindowCmd.toggle_maximize, tag(try windowCmdFromArgs(.{ .action = "toggleMaximize" }, 1)));
+    const rs = try windowCmdFromArgs(.{ .action = "setResizable", .enabled = false }, 1);
+    try testing.expect(rs.resizable == false);
+    const rs_dflt = try windowCmdFromArgs(.{ .action = "setResizable" }, 1);
+    try testing.expect(rs_dflt.resizable == true);
+    const dc = try windowCmdFromArgs(.{ .action = "setDecorations", .enabled = false }, 1);
+    try testing.expect(dc.decorated == false);
+    try testing.expectEqual(ipc.WindowCmd.destroy_win, tag(try windowCmdFromArgs(.{ .action = "destroy" }, 1)));
+    const sc = try windowCmdFromArgs(.{ .action = "setScreen", .screen = 2 }, 1);
+    try testing.expectEqual(@as(u32, 2), sc.set_screen);
+    const sc_dflt = try windowCmdFromArgs(.{ .action = "setScreen" }, 1);
+    try testing.expectEqual(@as(u32, 0), sc_dflt.set_screen);
+    try testing.expectEqual(ipc.WindowCmd.list, tag(try windowCmdFromArgs(.{ .action = "list" }, 1)));
+    // 未知动作仍报错
+    try testing.expectError(error.UnknownWindowAction, windowCmdFromArgs(.{ .action = "explode" }, 1));
+}
+
+test "v0.3.14: webview request 映射（devtools 枚举 + loadHTML）" {
+    const testing = std.testing;
+    try testing.expectEqual(webview.DevToolsOp.open, (try requestFromArgs(.{ .action = "devtools" })).devtools);
+    try testing.expectEqual(webview.DevToolsOp.close, (try requestFromArgs(.{ .action = "closeDevtools" })).devtools);
+    try testing.expectEqual(webview.DevToolsOp.state, (try requestFromArgs(.{ .action = "getDevtoolsState" })).devtools);
+    const lh = try requestFromArgs(.{ .action = "loadHTML", .html = "<h1>hi</h1>" });
+    try testing.expectEqualStrings("<h1>hi</h1>", lh.load_html);
+    try testing.expectError(error.MissingHtml, requestFromArgs(.{ .action = "loadHTML" }));
+}
+
+test "v0.3.14: app builtin 动作名未知时明确报错" {
+    const testing = std.testing;
+    var dummy: u8 = 0;
+    const ctx = ipc.Context{
+        .allocator = testing.allocator,
+        .msg_allocator = testing.allocator,
+        .backend = @ptrCast(&dummy),
+        .emit_fn = struct {
+            fn f(_: *anyopaque, _: u32, _: []const u8) void {}
+        }.f,
+        .quit_fn = struct {
+            fn f(_: *anyopaque, _: u8) void {}
+        }.f,
+    };
+    try testing.expectError(error.UnknownAppAction, appCmd(ctx, .{ .action = "explode" }));
 }

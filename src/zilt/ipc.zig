@@ -123,6 +123,10 @@ pub const WindowOptions = struct {
     /// 初始位置（null = 系统默认）
     x: ?i32 = null,
     y: ?i32 = null,
+    /// v0.3.14：创建即最大化（Wails StartState.Maximised / Tauri maximized）
+    maximized: bool = false,
+    /// v0.3.14：初始缩放（1.0 = 100%；Wails Zoom 选项；创建完成后应用）
+    zoom: ?f64 = null,
     /// 创建时是否可见（false = 隐藏创建，后续 show）
     visible: bool = true,
     /// 是否可调整大小
@@ -292,7 +296,25 @@ pub const WindowCmd = union(enum) {
     button_state: struct { closable: ?bool, minimizable: ?bool, maximizable: ?bool },
     /// windowMoved 去抖毫秒（运行时修改；0 = 关闭去抖）
     move_debounce: u32,
+    // ---- v0.3.14：窗口 API 收尾（对齐 Wails/Tauri）----
+    /// 居中到最近显示器工作区（Wails Center / Tauri center）
+    center,
+    /// 最大化切换（Wails ToggleMaximise / Tauri toggleMaximize）
+    toggle_maximize,
+    /// 运行时可缩放开关（Wails SetResizable / Tauri setResizable）
+    resizable: bool,
+    /// 运行时标题栏/边框开关（Wails SetFrameless / Tauri setDecorations）
+    decorated: bool,
+    /// 强制销毁（绕过 closeRequested 请求链；对齐 Tauri destroy）
+    destroy_win,
+    /// 移动窗口到指定显示器（保持尺寸；Wails SetScreen）
+    set_screen: u32,
+    /// 全部存活窗口的状态快照数组（Wails GetAll / Tauri getAll）
+    list,
 };
+
+/// window_query_fn 的哨兵：请求全部存活窗口的状态数组（list 语义；state 用具体 id）。
+pub const WINDOW_LIST_ALL: u32 = 0xFFFF_FFFF;
 
 // ---------------------------------------------------------------------------
 // Context
@@ -923,6 +945,93 @@ pub fn dispatchEvent(comptime Events: type, ctx: Context, name: []const u8, payl
     return false;
 }
 
+/// v0.3.14 G6：windowCloseRequested 的 **Zig 侧取消钩子**（对齐 Wails `e.Cancel()` /
+/// Tauri `prevent_close()`）。事件命名空间把 `windowCloseRequested` 声明为返回
+/// `bool` 即启用：**true = 取消关闭（窗口保留）**，false = 走默认链路
+/// （`close_requested_event` 配置时仍会询问前端）。返回 void 的声明维持原语义
+/// （仅通知，不拦截）。comptime 门控：未启用时后端零开销。
+pub fn closeRequestHooked(comptime Events: type) bool {
+    inline for (@typeInfo(Events).@"struct".decl_names) |ename| {
+        if (std.mem.eql(u8, ename, "windowCloseRequested")) {
+            const info = @typeInfo(@TypeOf(@field(Events, ename)));
+            if (info == .@"fn") {
+                const ret = info.@"fn".return_type orelse void;
+                return ret == bool;
+            }
+        }
+    }
+    return false;
+}
+
+/// 调用 bool 钩子并返回其结果；未启用时触发 void 事件（默认链路）并返回 null。
+/// 启用时调用即代表「Zig 侧已处理」——后端不应再对该事件做 dispatchEvent
+/// （避免同一次请求触发两次处理器）。
+pub fn closeRequestCancelled(comptime Events: type, ctx: Context, payload_json: []const u8) ?bool {
+    if (comptime !closeRequestHooked(Events)) {
+        _ = dispatchEvent(Events, ctx, "windowCloseRequested", payload_json);
+        return null;
+    }
+    inline for (@typeInfo(Events).@"struct".decl_names) |ename| {
+        if (std.mem.eql(u8, ename, "windowCloseRequested")) {
+            const f = @field(Events, ename);
+            const info = @typeInfo(@TypeOf(f)).@"fn";
+            const PT = if (info.param_types.len == 2) info.param_types[1].? else void;
+            if (PT == void) {
+                if (info.param_types.len == 2) {
+                    if (@typeInfo(info.return_type.?) == .error_union) return f(ctx, {}) catch false;
+                    return f(ctx, {});
+                }
+                if (@typeInfo(info.return_type.?) == .error_union) return f(ctx) catch false;
+                return f(ctx);
+            } else {
+                var parsed = std.json.parseFromSlice(PT, ctx.allocator, payload_json, .{ .ignore_unknown_fields = true }) catch return null;
+                defer parsed.deinit();
+                if (@typeInfo(info.return_type.?) == .error_union) return f(ctx, parsed.value) catch false;
+                return f(ctx, parsed.value);
+            }
+        }
+    }
+    return null;
+}
+
+test "closeRequestHooked: bool 声明启用、void 声明不启用" {
+    const BoolEvents = struct {
+        pub fn windowCloseRequested(ctx: Context, payload: struct { id: u32 }) bool {
+            _ = ctx;
+            return payload.id == 7;
+        }
+    };
+    const VoidEvents = struct {
+        pub fn windowCloseRequested(ctx: Context, payload: struct { id: u32 }) void {
+            _ = ctx;
+            _ = payload;
+        }
+    };
+    const Empty = struct {};
+    try testing.expect(closeRequestHooked(BoolEvents));
+    try testing.expect(!closeRequestHooked(VoidEvents));
+    try testing.expect(!closeRequestHooked(Empty));
+}
+
+test "closeRequestCancelled: bool 钩子返回其结果" {
+    var dummy: u8 = 0;
+    const BoolEvents = struct {
+        pub fn windowCloseRequested(ctx: Context, payload: struct { id: u32 }) bool {
+            _ = ctx;
+            return payload.id == 7;
+        }
+    };
+    const ctx = Context{
+        .allocator = testing.allocator,
+        .msg_allocator = testing.allocator,
+        .backend = @ptrCast(&dummy),
+        .emit_fn = testEmit,
+        .quit_fn = testQuit,
+    };
+    try testing.expectEqual(true, closeRequestCancelled(BoolEvents, ctx, "{\"id\":7}").?);
+    try testing.expectEqual(false, closeRequestCancelled(BoolEvents, ctx, "{\"id\":1}").?);
+}
+
 // ---------------------------------------------------------------------------
 // 注入到页面的运行时（window.zilt）——命令无关，纯静态
 // ---------------------------------------------------------------------------
@@ -1147,6 +1256,20 @@ const runtime_js_head =
     \\        closable: opts?.closable, minimizable: opts?.minimizable, maximizable: opts?.maximizable, window_id: id,
     \\      }),
     \\      setMoveDebounce: (ms, id) => winApi('setMoveDebounce', { move_debounce_ms: ms ?? 0, window_id: id }),
+    \\      // v0.3.14：窗口 API 收尾（对齐 Wails Center/ToggleMaximise/SetResizable/SetFrameless
+    \\      // 与 Tauri center/toggleMaximize/setResizable/setDecorations/destroy/setScreen/getAll）
+    \\      center: (id) => winApi('center', { window_id: id }),
+    \\      toggleMaximize: (id) => winApi('toggleMaximize', { window_id: id }),
+    \\      setResizable: (on, id) => winApi('setResizable', { enabled: on !== false, window_id: id }),
+    \\      setDecorations: (on, id) => winApi('setDecorations', { enabled: on !== false, window_id: id }),
+    \\      destroy: (id) => winApi('destroy', { window_id: id }),
+    \\      setScreen: (index, id) => winApi('setScreen', { screen: index ?? 0, window_id: id }),
+    \\      list: () => winApi('list', {}),
+    \\    },
+    \\    // v0.3.14 G5：应用级退出与重启（Wails application.Quit / Tauri App::exit）
+    \\    app: {
+    \\      quit: (code) => builtin('__zilt.app', { action: 'quit', code: code ?? 0 }),
+    \\      restart: () => builtin('__zilt.app', { action: 'restart' }),
     \\    },
     \\    // v0.1.9: eval returns a Promise resolved by __zilt.evalResult
     \\    eval: (script) => new Promise((resolve, reject) => {
@@ -1167,6 +1290,11 @@ const runtime_js_head =
     \\      back: () => builtin('__zilt.webview', { action: 'back' }),
     \\      forward: () => builtin('__zilt.webview', { action: 'forward' }),
     \\      devtools: () => builtin('__zilt.webview', { action: 'devtools' }),
+    \\      // v0.3.14：devtools 关闭/状态（close 仅 Linux；Windows 返回不支持错误）
+    \\      // 与 loadHTML（加载 HTML 字符串，Wails SetHTML 对齐）
+    \\      closeDevtools: () => builtin('__zilt.webview', { action: 'closeDevtools' }),
+    \\      getDevtoolsState: () => builtin('__zilt.webview', { action: 'getDevtoolsState' }),
+    \\      loadHTML: (html) => builtin('__zilt.webview', { action: 'loadHTML', html }),
     \\      print: (kind) => builtin('__zilt.webview', { action: 'print', kind: kind ?? 'browser' }),
     \\      cancelDownload: (id) => builtin('__zilt.webview', { action: 'cancelDownload', download_id: id }),
     \\      clearStorage: () => builtin('__zilt.webview', { action: 'clearStorage' }),

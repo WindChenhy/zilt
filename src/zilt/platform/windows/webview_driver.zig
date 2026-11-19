@@ -182,6 +182,8 @@ pub const Driver = struct {
     webview: *wv2.ICoreWebView2,
     controller: ?*wv2.ICoreWebView2Controller,
     webview4: ?*WebView4 = null,
+    /// v0.3.14：DevTools 窗口打开状态（OpenDevToolsWindow 成功即置位；无关闭 API）
+    devtools_opened: bool = false,
     options: shared.Options,
     context: *anyopaque,
     callbacks: Callbacks,
@@ -389,9 +391,26 @@ pub const Driver = struct {
             },
             .back => try check(w.lpVtbl.GoBack(w)),
             .forward => try check(w.lpVtbl.GoForward(w)),
-            .devtools => {
-                if (!self.options.settings.devtools) return error.DevToolsDisabled;
-                try check(w.lpVtbl.OpenDevToolsWindow(w));
+            .devtools => |op| switch (op) {
+                .open => {
+                    if (!self.options.settings.devtools) return error.DevToolsDisabled;
+                    try check(w.lpVtbl.OpenDevToolsWindow(w));
+                    // v0.3.14：打开成功即置位（WebView2 无查询/关闭 API——
+                    // 窗口由用户手关，close 返回 DevToolsCloseUnsupported）
+                    self.devtools_opened = true;
+                },
+                .close => return error.DevToolsCloseUnsupported,
+                .state => {
+                    if (!self.options.settings.devtools) return error.DevToolsDisabled;
+                    return try std.json.Stringify.valueAlloc(self.allocator, .{ .open = self.devtools_opened }, .{});
+                },
+            },
+            // v0.3.14 G9：加载 HTML 字符串（NavigateToString；槽 6）
+            .load_html => |html| {
+                const wide = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, html);
+                defer self.allocator.free(wide);
+                try check(w.lpVtbl.NavigateToString(w, wide.ptr));
+                return try self.allocator.dupe(u8, "{}");
             },
             .print => |kind| {
                 const w16 = try query(WebView16, w, &iid_webview16);

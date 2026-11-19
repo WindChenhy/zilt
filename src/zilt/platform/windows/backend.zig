@@ -1161,6 +1161,8 @@ fn Backend(comptime config: Config) type {
             background_color: ?u32 = null,
             transparent: bool = false,
             close_requested_events: bool = false,
+            /// v0.3.14：初始缩放（controller 就绪后应用一次；null = 不设置）
+            zoom: ?f64 = null,
             icon_big: win32.HICON = null,
             icon_small: win32.HICON = null,
             owns_icons: bool = false,
@@ -1231,7 +1233,12 @@ fn Backend(comptime config: Config) type {
                 const b = self.backend;
                 const payload_json = std.json.Stringify.valueAlloc(b.allocator, payload, .{}) catch return;
                 defer b.allocator.free(payload_json);
-                _ = ipc.dispatchEvent(config.events, b.makeContextWith(self, b.allocator), name, payload_json);
+                // v0.3.14 G6：bool 返回的 windowCloseRequested 钩子已在关闭链路
+                // 先决（closeRequestCancelled），此处跳过重复派发；其余事件照常。
+                const skip_dispatch = comptime ipc.closeRequestHooked(config.events);
+                if (!skip_dispatch or !std.mem.eql(u8, name, "windowCloseRequested")) {
+                    _ = ipc.dispatchEvent(config.events, b.makeContextWith(self, b.allocator), name, payload_json);
+                }
                 // v0.1.11：声明了 capability 清单时，Zig→JS 事件同样受
                 // receive_events 约束（框架内部 "__" 事件不受限）。
                 if (config.security.capabilities.len != 0 and !std.mem.startsWith(u8, name, "__") and
@@ -1571,6 +1578,7 @@ fn Backend(comptime config: Config) type {
                 .background_color = opts.background_color,
                 .transparent = opts.transparent,
                 .close_requested_events = ipc.resolveCloseRequested(opts.close_requested_event, config.close_requested_event),
+                .zoom = opts.zoom,
                 .proxy = proxy,
                 .overlay = opts.titlebar_overlay,
                 .user_agent = user_agent,
@@ -1705,6 +1713,11 @@ fn Backend(comptime config: Config) type {
                 w.id, title, url, opts.decorations, opts.transparent, opts.always_on_top, !opts.skip_taskbar, opts.visible,
             });
             self.restoreWindowState(w);
+            // v0.3.14：创建即最大化（Wails StartState.Maximised / Tauri maximized）。
+            // 在状态恢复之后应用——显式选项优先于持久化布局。
+            if (opts.maximized) {
+                _ = win32.ShowWindow(w.hwnd, win32.SW_MAXIMIZE);
+            }
             return w;
         }
 
@@ -1843,6 +1856,13 @@ fn Backend(comptime config: Config) type {
 
             _ = controller.putIsVisible(1);
             w.updateBounds();
+            // v0.3.14 G11：初始缩放（Wails Zoom 选项；controller 级 put_ZoomFactor）
+            if (w.zoom) |z| {
+                if (z > 0.25 and z < 4.0) {
+                    _ = controller.lpVtbl.put_ZoomFactor(controller, z);
+                    log.print("[webview] initial zoom {d:.2} (window #{d})", .{ z, w.id });
+                }
+            }
 
             const wv_result = controller.getCoreWebView2();
             if (com.failed(wv_result.hr) or wv_result.webview == null) {
@@ -4577,6 +4597,9 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
 
         fn applyWindowCmd(self: *Self, w: *Window, cmd: ipc.WindowCmd) bool {
             switch (cmd) {
+                // v0.3.14：list 在 builtin dispatch 就走 window_query_fn（LIST_ALL
+                // 哨兵），不会到达这里
+                .list => return false,
                 .set_title => |t| {
                     const tw = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, t) catch return false;
                     defer self.allocator.free(tw);
@@ -4653,6 +4676,75 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
                 // v0.3.3：运行时 move 去抖
                 .move_debounce => |ms| {
                     w.move_debounce_ms = ms;
+                    return true;
+                },
+                // ---- v0.3.14：窗口 API 收尾（对齐 Wails/Tauri）----
+                // center：居中到最近显示器工作区（工作区几何与 system.info('monitors') 同源）
+                .center => {
+                    var rc: win32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+                    _ = win32.GetWindowRect(w.hwnd, &rc);
+                    const cur_w: i32 = rc.right - rc.left;
+                    const cur_h: i32 = rc.bottom - rc.top;
+                    const monitors = win_sysinfo.collectMonitors(self.allocator) catch return false;
+                    defer self.allocator.free(monitors);
+                    const idx = win_sysinfo.monitorIndexOf(w.hwnd) orelse return false;
+                    if (idx >= monitors.len) return false;
+                    const m = monitors[idx];
+                    const wx: i32 = m.work_x;
+                    const wy: i32 = m.work_y;
+                    const ww: i32 = @intCast(m.work_width);
+                    const wh: i32 = @intCast(m.work_height);
+                    const x = wx + @divTrunc(ww - cur_w, 2);
+                    const y = wy + @divTrunc(wh - cur_h, 2);
+                    _ = win32.SetWindowPos(w.hwnd, null, x, y, 0, 0, win32.SWP_NOSIZE | win32.SWP_NOZORDER);
+                    return true;
+                },
+                // toggleMaximize：最大化/还原切换
+                .toggle_maximize => {
+                    _ = win32.ShowWindow(w.hwnd, if (win32.IsZoomed(w.hwnd) != 0) win32.SW_RESTORE else win32.SW_MAXIMIZE);
+                    return true;
+                },
+                // setResizable：WS_THICKFRAME style 位开关 + 框架重算
+                .resizable => |on| {
+                    const style: win32.DWORD = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_STYLE));
+                    const new_style: win32.DWORD = if (on) style | win32.WS_THICKFRAME else style & ~win32.WS_THICKFRAME;
+                    if (new_style != style) {
+                        _ = win32.SetWindowLongW(w.hwnd, win32.GWL_STYLE, @bitCast(new_style));
+                        _ = win32.SetWindowPos(w.hwnd, null, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOZORDER | win32.SWP_FRAMECHANGED);
+                    }
+                    return true;
+                },
+                // setDecorations：标题栏/边框 style 位开关（客户区 webview 随 WM_SIZE 铺满）
+                .decorated => |on| {
+                    const style: win32.DWORD = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_STYLE));
+                    const deco: win32.DWORD = win32.WS_CAPTION | win32.WS_THICKFRAME | win32.WS_MINIMIZEBOX | win32.WS_MAXIMIZEBOX | win32.WS_SYSMENU;
+                    const new_style: win32.DWORD = if (on) style | deco else style & ~deco;
+                    if (new_style != style) {
+                        _ = win32.SetWindowLongW(w.hwnd, win32.GWL_STYLE, @bitCast(new_style));
+                        _ = win32.SetWindowPos(w.hwnd, null, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOZORDER | win32.SWP_FRAMECHANGED);
+                    }
+                    return true;
+                },
+                // destroy：强制销毁（绕过 WM_CLOSE 请求链；与 .close 同语义，
+                // 对齐 Tauri destroy() —— close 链是用户点击 X 的 WM_CLOSE 路径）
+                .destroy_win => {
+                    _ = win32.DestroyWindow(w.hwnd);
+                    return true;
+                },
+                // setScreen：移动到目标显示器工作区（保持尺寸、夹取不出屏；
+                // 显示器顺序与 fullscreenOnMonitor 一致——collectMonitors 枚举序）
+                .set_screen => |index| {
+                    const monitors = win_sysinfo.collectMonitors(self.allocator) catch return false;
+                    defer self.allocator.free(monitors);
+                    if (index >= monitors.len) return false;
+                    const m = monitors[index];
+                    var rc: win32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+                    _ = win32.GetWindowRect(w.hwnd, &rc);
+                    const width = @min(rc.right - rc.left, @as(i32, @intCast(m.work_width)));
+                    const height = @min(rc.bottom - rc.top, @as(i32, @intCast(m.work_height)));
+                    const x = m.work_x + @divTrunc(@as(i32, @intCast(m.work_width)) - width, 2);
+                    const y = m.work_y + @divTrunc(@as(i32, @intCast(m.work_height)) - height, 2);
+                    _ = win32.SetWindowPos(w.hwnd, null, x, y, width, height, win32.SWP_NOZORDER);
                     return true;
                 },
                 .always_on_top => |on| {
@@ -4931,16 +5023,38 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
         }
 
         /// v0.1.18：窗口状态快照（JSON）。必须在 UI 线程调用（读 Win32 状态）。
+        /// v0.3.14：window_id = ipc.WINDOW_LIST_ALL → 全部存活窗口的状态数组
+        /// （Wails GetAll / Tauri getAll 对齐）；新增 resizable/decorated 字段。
         fn runWindowQuery(backend_ptr: *anyopaque, window_id: u32, alloc: std.mem.Allocator) ?[]u8 {
             const self: *Self = @ptrCast(@alignCast(backend_ptr));
+            if (window_id == ipc.WINDOW_LIST_ALL) {
+                var out: std.ArrayList(u8) = .empty;
+                out.appendSlice(alloc, "[") catch return null;
+                var first = true;
+                for (self.windows.items) |it| {
+                    if (!it.alive) continue;
+                    if (!first) out.appendSlice(alloc, ",") catch return null;
+                    first = false;
+                    const one = self.windowStateJson(it, alloc) orelse return null;
+                    out.appendSlice(alloc, one) catch return null;
+                }
+                out.appendSlice(alloc, "]") catch return null;
+                return out.items;
+            }
             const w = self.windowById(if (window_id == 0) 1 else window_id) orelse return null;
             if (!w.alive) return null;
+            return self.windowStateJson(w, alloc);
+        }
+
+        /// 单窗口状态 JSON（runWindowQuery / list 共用）。
+        fn windowStateJson(self: *Self, w: *Window, alloc: std.mem.Allocator) ?[]u8 {
+            _ = self;
             var rc: win32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
             _ = win32.GetWindowRect(w.hwnd, &rc);
             const style: u32 = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_STYLE));
             const ex: u32 = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_EXSTYLE));
             return std.fmt.allocPrint(alloc,
-                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":{d},"ex_style":{d},"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":{s},"overlay":{s},"incognito":{s},"composition":{s},"monitor":{d},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d}}}
+                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":{d},"ex_style":{d},"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":{s},"overlay":{s},"incognito":{s},"composition":{s},"monitor":{d},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d},"resizable":{s},"decorated":{s}}}
             , .{
                 w.id,
                 rc.left,
@@ -4969,6 +5083,9 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
                 w.max_width orelse 0,
                 w.max_height orelse 0,
                 w.child_webviews.items.len,
+                // v0.3.14：从 style 位推导（WS_THICKFRAME=可缩放；WS_CAPTION=有标题栏）
+                boolStr(style & win32.WS_THICKFRAME != 0),
+                boolStr(style & win32.WS_CAPTION != 0),
             }) catch null;
         }
 
@@ -6091,6 +6208,19 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
                                 _ = win32.ShowWindow(hwnd, win32.SW_HIDE);
                                 log.print("[tray] window hidden to tray", .{});
                                 return 0;
+                            }
+                            // v0.3.14 G6：Zig 侧取消钩子（comptime 门控；true = 取消关闭）
+                            if (comptime ipc.closeRequestHooked(config.events)) {
+                                const hook_payload = std.fmt.allocPrint(b.allocator, "{{\"id\":{d}}}", .{w.id}) catch null;
+                                if (hook_payload) |hp| {
+                                    defer b.allocator.free(hp);
+                                    if (ipc.closeRequestCancelled(config.events, b.makeContextWith(w, b.allocator), hp)) |cancelled| {
+                                        if (cancelled) {
+                                            log.print("[window] close cancelled by Zig hook (window #{d})", .{w.id});
+                                            return 0;
+                                        }
+                                    }
+                                }
                             }
                             if (w.close_requested_events) {
                                 log.print("[window] close requested (window #{d})", .{w.id});
