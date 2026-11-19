@@ -554,6 +554,27 @@
         fluentOverlay 官方 SDK 无 COM 接口 → 文档化移除
       - **验收**：Windows 冒烟 **64 项**（c-pdf/c-acc 全过）+ 单测全绿；Linux 冒烟
         **85/85**（pdfskip）+ post terminate PASS；clip 既有环境问题
+- [x] **v0.3.16 托盘/任务栏/屏幕细化 + 单实例加固**（2026-11-20；三轮差距刷新第三批）：
+      - **G17 托盘暗色图标**：tray.setDarkIcon（运行时 op）+ themeChanged 自动换发
+        （emitThemeAll 内 setIcon 按主题分派；暗色未设置回退亮色图标）
+      - **G18 任务栏文本徽标**：taskbar.badge（taskbar.Badge{text,bg,fg}）——
+        win32.zig 增 GDI 面（CreateCompatibleDC/CreateDIBSection/CreateBitmap/
+        SelectObject/DrawTextW/SetTextColor/SetBkMode/GetStockObject/
+        CreateIconIndirect）+ makeBadgeIcon 渲染（32×32 top-down DIB 圆底 +
+        DEFAULT_GUI_FONT 文本）+ Taskbar.last_badge_icon 即时销毁防泄漏
+      - **G19 屏幕细化**：system.cursorPosition（Win GetCursorPos / GTK
+        gdk_device_get_position）+ Monitor.rotation（DEVMODEW 自声明 220 字节
+        布局单测 + EnumDisplaySettingsW；GDK3 无 API → 0 文档化）
+      - **G20 Linux GPU policy**：environment.gpu_policy（never → 禁加速合成；
+        auto + /proc/driver/nvidia → WEBKIT_DISABLE_DMABUF_RENDERER=1）——
+        setenv extern + Io 读 proc，单测锁往返/安全探测
+      - **G21 Linux sticky**：window.setAllWorkspaces → gtk_window_stick/unstick；
+        Windows no-op true 文档化
+      - **G22 单实例密封**：single_instance.sealPayload/openPayload（HMAC-SHA256 +
+        16B nonce；"zilt1|n|s|p" 线格式）+ Config.single_instance_key + 启动转发/
+        onCopyData 两路接线（明文/篡改/非法密钥拒绝）
+      - **验收**：Windows 冒烟 **65 项**（c-sys2）+ 单测全绿；Linux 冒烟 **86/86**
+        （curs）+ post terminate PASS；clip 既有环境问题
       - 后续规划（v0.3.8–v0.3.13，二轮差距刷新 2026-11-17——对标 Wails v3.1.0 /（2026-11-19；二轮差距刷新第五批——
       ABI/装配/回退全链落地，渲染管线为已知问题）：
       - **ABI 绑定（官方 WebView2.h 逐一核对）**：webview2.zig 增

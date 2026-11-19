@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.15（打印与 WebView 开关面——三轮差距刷新第二批）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.16（托盘/任务栏/屏幕细化 + 单实例加固——三轮差距刷新第三批）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -259,6 +259,35 @@ v0.3.12 新增（2026-11-19，CompositionController 专项——二轮差距刷�
   渲染修复列为后续专项；c-comp 检查断言回退路径
 - **验收**：Windows 单测全绿 + 冒烟 **61 项**（新增 c-comp 断言组合请求 → 探测 →
   回退全链 + state.composition=false）；Linux 不涉及（组合为 Windows 面）
+
+v0.3.16 新增（2026-11-20，托盘/任务栏/屏幕细化 + 单实例加固——三轮差距刷新第三批）：
+
+- **托盘暗色模式图标（G17）**：`tray.setDarkIcon(path)`（null = 恢复亮色同图标，
+  Wails SetDarkModeIcon 对齐）——当前为暗色主题立即换发；`windowThemeChanged`
+  （WM_SETTINGCHANGE ImmersiveColorSet）时后端自动随主题换发
+- **任务栏文本徽标（G18）**：`taskbar.badge(text, {bg, fg})`（1–4 字符；空串清除，
+  Wails Dock SetBadge/SetCustomBadge 对齐）——32×32 32bpp DIB 圆形底（Windows 红
+  默认）+ GDI 文本（DEFAULT_GUI_FONT + DrawTextW 居中）→ CreateIconIndirect →
+  SetOverlayIcon；上一枚 HICON 即时销毁防泄漏。Linux Unity-only → 文档化
+- **屏幕细化（G19）**：`system.cursorPosition()`（全局光标屏幕坐标，Win GetCursorPos /
+  GTK gdk_device_get_position）+ monitors 增 `rotation`（Win DEVMODE
+  dmDisplayOrientation 经 EnumDisplaySettingsW，DEVMODEW 220 字节布局单测锁定；
+  GDK3 无旋转 API → 恒 0 文档化）
+- **Linux GPU policy（G20）**：`environment.gpu_policy`（always/on_demand/never，
+  Wails WebviewGpuPolicy 对齐）——never → WebKit 初始化前 `WEBKIT_DISABLE_COMPOSITING_
+  MODE=1`（软件合成）；**auto + NVIDIA 探测**（/proc/driver/nvidia）→ 自动
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1`（Wails 同款空白窗修复）；Windows 忽略
+- **Linux 全工作区可见（G21）**：`window.setAllWorkspaces(bool)` → gtk_window_stick/
+  unstick（Tauri visibleOnAllWorkspaces 对齐）；Windows 无原生对等 → no-op true
+- **单实例数据密封（G22）**：`Config.single_instance_key`（64 字符 hex；Wails
+  SingleInstanceOptions.EncryptionKey 对齐，复用 isolation 的 HMAC-SHA256 基建）——
+  WM_COPYDATA 载荷升级 `zilt1|<nonce>|<hmac>|<payload>` 密封形态，明文/篡改一律拒绝
+  （本机任意进程可 SendMessage 伪造启动参数的攻击面收口）；seal/open/篡改/明文/
+  非法密钥五组单测
+- **验收**：Windows 冒烟 **65 项**（c-sys2：cursorPosition 往返 + rotation 字段 +
+  badge/night-tray/all-workspaces op 链）+ 单测全绿（+DEVMODEW 布局、seal/open 五组）；
+  Linux 冒烟 **86/86**（curs：cursorPosition + rotation + stick 往返）+ GPU policy
+  单测 + post terminate PASS；clip 既有环境问题
 
 v0.3.15 新增（2026-11-20，打印与 WebView 开关面——三轮差距刷新第二批）：
 

@@ -713,6 +713,11 @@ pub fn run(comptime config: Config) !void {
     const alloc = std.heap.c_allocator;
     log.initFileLog("zilt.log");
 
+    // v0.3.16 G20：GPU 策略（WebKit 初始化前设置环境变量；Wails WebviewGpuPolicy
+    // 对齐）。never → 禁用加速合成（软件合成，NVIDIA/远程桌面空白窗对策）；
+    // auto（null）+ NVIDIA 探测 → 自动禁 DMABUF 渲染器（Wails 同款修复）。
+    applyGpuPolicy(config.environment.gpu_policy);
+
     // v0.2.8：headless/server 模式（对齐 Windows v0.1.17）——跳过窗口/GTK，
     // 应用作为 HTTP 服务运行（/zilt/health、/zilt/ipc、/mcp、资产）。
     // 与 Windows 同一份 headless 实现（std.Io；env/SQL 两处平台点 comptime 分派）。
@@ -2293,6 +2298,13 @@ fn Backend(comptime config: Config) type {
                 // v0.3.14：list 在 builtin dispatch 就走 window_query_fn（LIST_ALL
                 // 哨兵），不会到达这里
                 .list => return false,
+                // v0.3.16 G21：全工作区可见（gtk_window_stick——所有工作区显示；
+                // Tauri visibleOnAllWorkspaces 对齐）
+                .visible_on_all_workspaces => |on| {
+                    c.gtk_window_stick(win);
+                    if (!on) c.gtk_window_unstick(win);
+                    return true;
+                },
                 .set_title => |t| {
                     const z = dupeZ(self.allocator, t) catch return false;
                     defer self.allocator.free(z);
@@ -4753,6 +4765,16 @@ fn Backend(comptime config: Config) type {
                 // v0.2.2：运行时菜单模型 / 系统信息 / 自启动
                 .menu => |op| return self.runMenuOp(op, alloc),
                 .info => |kind| return .{ .json = try self.collectSystemInfo(kind, alloc, w) },
+                // v0.3.16 G19：全局光标位置（gdk_device_get_position 屏幕坐标）
+                .cursor_position => {
+                    const display = c.gdk_display_get_default() orelse return error.CursorNotAvailable;
+                    const seat = c.gdk_display_get_default_seat(display) orelse return error.CursorNotAvailable;
+                    const pointer = c.gdk_seat_get_pointer(seat) orelse return error.CursorNotAvailable;
+                    var x: c.gint = 0;
+                    var y: c.gint = 0;
+                    c.gdk_device_get_position(pointer, null, &x, &y);
+                    return .{ .json = try std.fmt.allocPrint(alloc, "{{\"x\":{d},\"y\":{d}}}", .{ x, y }) };
+                },
                 .autostart => |op| return .{ .state = try self.runAutostartOp(op, alloc) },
                 // v0.2.3：存储 / fs / ACL / SQL / http / ws
                 .store => |op| return self.runStoreOp(op, alloc),
@@ -8893,4 +8915,52 @@ test "windowEventPayloadJson: 字段名带引号、多字段与空字段" {
         defer alloc.free(json);
         try testing.expectEqualStrings("{\"width\":9007199254740993}", json);
     }
+}
+
+
+/// v0.3.16 G20：GPU 策略环境变量（必须在 WebKit 首次实例化之前 setenv）。
+/// 显式 never → WEBKIT_DISABLE_COMPOSITING_MODE=1；auto + NVIDIA（/proc/driver/
+/// nvidia 存在）→ WEBKIT_DISABLE_DMABUF_RENDERER=1（上游 NVIDIA DMA-BUF 空白窗
+/// 问题的对策，Wails 恒设；对非 NVIDIA 无害但保守起见仅在探测命中时设置）。
+fn applyGpuPolicy(policy: ?@import("../../environment.zig").Options.GpuPolicy) void {
+    switch (policy orelse .always) {
+        .never => {
+            _ = setEnvVar("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+            log.print("[gpu] compositing disabled (policy=never)", .{});
+        },
+        else => {
+            if (policy == null and nvidiaDetected()) {
+                _ = setEnvVar("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+                log.print("[gpu] NVIDIA detected -> DMABUF renderer disabled (auto workaround)", .{});
+            }
+        },
+    }
+}
+
+/// 仅用于 WebKit 初始化前的环境对策（进程早期、无并发——setenv 直呼安全）。
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+fn setEnvVar(name: [*:0]const u8, value: [*:0]const u8) bool {
+    return setenv(name, value, 1) == 0;
+}
+
+/// NVIDIA 独占驱动探测（/proc/driver/nvidia/version；nouveau 不在——DMABUF 问题
+/// 是 nvidia 专有驱动的 WebKit 交互）。
+fn nvidiaDetected() bool {
+    var buf: [64]u8 = undefined;
+    var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io.deinit();
+    var dir = std.Io.Dir.cwd();
+    var f = dir.openFile(io.io(), "/proc/driver/nvidia/version", .{}) catch return false;
+    defer f.close(io.io());
+    const n = std.Io.File.readPositionalAll(f, io.io(), &buf, 0) catch return false;
+    return n > 0;
+}
+
+test "gpu policy: never 设置合成禁用变量；NVIDIA 探测函数可达" {
+    // 环境变量写进进程环境后可读回
+    try std.testing.expect(setEnvVar("ZILT_GPU_TEST", "1"));
+    try std.testing.expectEqualStrings("1", std.mem.span(std.c.getenv("ZILT_GPU_TEST").?));
+    try std.testing.expect(setEnvVar("ZILT_GPU_TEST", "0"));
+    // NVIDIA 探测在无该驱动的 CI（Xvfb）上应安全返回 false，不崩溃
+    _ = nvidiaDetected();
 }

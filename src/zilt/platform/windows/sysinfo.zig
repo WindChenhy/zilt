@@ -187,6 +187,22 @@ fn enumProc(hmon: HMONITOR, hdc: ?*anyopaque, rect: *win32.RECT, data: isize) ca
     };
     if (GetMonitorInfoW(hmon, &mi) == 0) return 1;
 
+    // v0.3.16 G19：屏幕旋转（DEVMODE dmDisplayOrientation；EnumDisplaySettingsW
+    // 按设备名查询当前显示模式）。失败保持 0（非旋转屏的常态值）。
+    const rotation: u16 = blk: {
+        var dm = std.mem.zeroes(DEVMODEW);
+        dm.dmSize = @sizeOf(DEVMODEW);
+        if (EnumDisplaySettingsW(&mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) != 0) {
+            break :blk switch (dm.dmDisplayOrientation) {
+                1 => 90, // DMDO_90
+                2 => 180, // DMDO_180
+                3 => 270, // DMDO_270
+                else => 0,
+            };
+        }
+        break :blk 0;
+    };
+
     // 该显示器上任意窗口的 DPI 需要 hwnd；无窗口时用 96（100%）作为基线，
     // 后端在窗口创建后会用 GetDpiForWindow 校正当前显示器条目。
     const dpi: u32 = 96;
@@ -203,8 +219,54 @@ fn enumProc(hmon: HMONITOR, hdc: ?*anyopaque, rect: *win32.RECT, data: isize) ca
         .work_height = @intCast(mi.rcWork.bottom - mi.rcWork.top),
         .dpi = dpi,
         .scale = sysinfo.scaleFromDpi(dpi),
+        .rotation = rotation,
     }) catch return 0;
     return 1;
+}
+
+/// DEVMODEW（winuser.h）——只用于 EnumDisplaySettingsW 的旋转字段读取；
+/// 布局按 64 位 Windows SDK 逐字段核对（union/对齐保留为显式 padding 字段）。
+const DEVMODEW = extern struct {
+    dmDeviceName: [32]u16,
+    dmSpecVersion: u16,
+    dmDriverVersion: u16,
+    dmSize: u16,
+    dmDriverExtra: u16,
+    dmFields: u32,
+    dmPositionX: i32,
+    dmPositionY: i32,
+    dmDisplayOrientation: u32,
+    dmDisplayFixedOutput: u32,
+    dmColor: i16,
+    dmDuplex: i16,
+    dmYResolution: i16,
+    dmTTOption: i16,
+    dmCollate: i16,
+    dmFormName: [32]u16,
+    dmLogPixels: u16,
+    dmBitsPerPel: u32,
+    dmPelsWidth: u32,
+    dmPelsHeight: u32,
+    dmDisplayFlags: u32,
+    dmDisplayFrequency: u32,
+    dmICMMethod: u32,
+    dmICMIntent: u32,
+    dmMediaType: u32,
+    dmDitherType: u32,
+    dmReserved1: u32,
+    dmReserved2: u32,
+    dmPanningWidth: u32,
+    dmPanningHeight: u32,
+};
+const ENUM_CURRENT_SETTINGS: u32 = 0xFFFF_FFFF; // (DWORD)-1
+extern "user32" fn EnumDisplaySettingsW(lpszDeviceName: [*]const u16, iModeNum: u32, lpDevMode: *DEVMODEW) callconv(.c) i32;
+
+test "DEVMODEW size matches Win64 SDK layout (220 bytes)" {
+    // winuser.h DEVMODEW x64：dmDeviceName[32]WCHAR=64 + WORD×4=8 + DWORD=4 +
+    // union(POINTL+2 DWORD)=16 + SHORT×5=10 + dmFormName[32]WCHAR=64 + WORD=2 +
+    // DWORD×12=48 → 220（GetSystemMetrics 同源结构；EnumDisplaySettings 要求
+    // dmSize=完整尺寸）
+    try std.testing.expectEqual(@as(usize, 220), @sizeOf(DEVMODEW));
 }
 
 /// 枚举全部显示器。调用方负责 `alloc.free(list)`（元素内无堆分配）。

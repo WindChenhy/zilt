@@ -56,6 +56,9 @@ pub const TrayOp = union(enum) {
     set_tooltip: []const u8,
     /// null = 恢复默认图标
     set_icon: ?[]const u8,
+    /// v0.3.16 G17：暗色模式托盘图标（Wails SetDarkModeIcon 对齐）。null = 恢复
+    /// 与亮色同图标。主题切换（themeChanged）时后端自动换发。
+    set_dark_icon: ?[]const u8,
     set_click: struct {
         left: ClickAction = .toggle_window,
         middle: ClickAction = .none,
@@ -257,6 +260,8 @@ pub const Request = union(enum) {
     hotkey: HotkeyOp,
     taskbar: taskbar.Request,
     info: InfoKind,
+    /// v0.3.16 G19：全局光标位置（屏幕坐标；Wails/Tauri cursor_position 对齐）
+    cursor_position,
     shell: shell.Target,
     /// 管理员重启（提权拉起当前 exe）；payload = 额外参数
     admin_restart: ?[]const u8,

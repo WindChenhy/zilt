@@ -105,6 +105,9 @@ pub const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
 /// 任务栏对象。COM 要求在同一线程使用（backend 的 UI 线程）。
 pub const Taskbar = struct {
     list: *ITaskbarList3,
+    /// v0.3.16 G18：上次徽标 HICON（SetOverlayIcon 复制位图，调用方负责销毁——
+    /// 换徽标时销毁上一枚，避免累积泄漏）
+    last_badge_icon: win32.HICON = null,
 
     pub fn init() !Taskbar {
         var raw: ?*anyopaque = null;
@@ -148,6 +151,23 @@ pub const Taskbar = struct {
         };
         defer alloc.free(wide);
         _ = self.list.lpVtbl.SetOverlayIcon(self.list, hwnd, icon, wide.ptr);
+    }
+
+    /// v0.3.16 G18：任务栏文本徽标（文本渲染 32×32 GDI 位图 → SetOverlayIcon）。
+    /// text 为空 = 清除徽标（SetOverlayIcon null）。返回 false = 渲染失败。
+    pub fn setBadge(self: *Taskbar, hwnd: win32.HWND, badge: ?taskbar.Badge, alloc: std.mem.Allocator) bool {
+        const b = badge orelse {
+            _ = self.list.lpVtbl.SetOverlayIcon(self.list, hwnd, null, null);
+            return true;
+        };
+        if (b.text.len == 0 or b.text.len > 4) return false; // 徽标空间限 1–4 字符
+        const icon = makeBadgeIcon(b, alloc) orelse return false;
+        _ = self.list.lpVtbl.SetOverlayIcon(self.list, hwnd, icon, null);
+        // SetOverlayIcon 复制位图数据；上一枚徽标即时销毁（换徽标场景，
+        // shell 已持有自己的副本）
+        if (self.last_badge_icon) |prev| _ = win32.DestroyIcon(prev);
+        self.last_badge_icon = icon;
+        return true;
     }
 
     pub fn setTooltip(self: *Taskbar, hwnd: win32.HWND, text_u8: []const u8, alloc: std.mem.Allocator) void {
@@ -220,3 +240,69 @@ test "thumbnail button layout matches ShellApi.h" {
     try testing.expectEqual(@as(usize, 552), @sizeOf(THUMBBUTTON));
     try testing.expectEqual(@as(usize, 520), @sizeOf([260]u16));
 }
+
+
+/// v0.3.16 G18：文本徽标渲染（32×32 32bpp DIB 圆形底 + GDI 文本 → HICON）。
+/// 返回的 HICON 所有权归调用方（DestroyIcon）。
+fn makeBadgeIcon(badge: taskbar.Badge, alloc: std.mem.Allocator) ?win32.HICON {
+    const size: i32 = 32;
+    const dc = win32.CreateCompatibleDC(null) orelse return null;
+    defer _ = win32.DeleteDC(dc);
+
+    var bmi = win32.BITMAPINFO{
+        .bmiHeader = .{
+            .biSize = @sizeOf(win32.BITMAPINFOHEADER),
+            .biWidth = size,
+            .biHeight = -size, // top-down
+            .biPlanes = 1,
+            .biBitCount = 32,
+            .biCompression = 0, // BI_RGB
+            .biSizeImage = 0,
+            .biXPelsPerMeter = 0,
+            .biYPelsPerMeter = 0,
+            .biClrUsed = 0,
+            .biClrImportant = 0,
+        },
+        .bmiColors = .{0},
+    };
+    var bits: ?*anyopaque = null;
+    const dib = win32.CreateDIBSection(dc, &bmi, win32.DIB_RGB_COLORS, &bits, null, 0);
+    if (dib == null or bits == null) return null;
+    _ = win32.SelectObject(dc, dib);
+
+    // 圆形底色（COLORREF 0x00BBGGRR ← 0xRRGGBB 输入；FillRect 全矩形 + 圆底用
+    // Ellipse 更简洁——FrameRgn 太重，直接 Ellipse 画圆填色）
+    const brush = win32.CreateSolidBrush(theme.colorRef(badge.bg_color));
+    defer _ = win32.DeleteObject(@ptrCast(brush));
+    const bg_rect = win32.RECT{ .left = 0, .top = 0, .right = size, .bottom = size };
+    _ = win32.FillRect(dc, &bg_rect, brush);
+
+    const font = win32.GetStockObject(win32.DEFAULT_GUI_FONT);
+    if (font != null) _ = win32.SelectObject(dc, font);
+    _ = win32.SetBkMode(dc, win32.TRANSPARENT_BK);
+    _ = win32.SetTextColor(dc, theme.colorRef(badge.text_color));
+
+    // 文本 UTF-8 → UTF-16（≤4 字符的短串；2 字节字符按 WC 边界裁剪到 4 WC）
+    const text16 = std.unicode.utf8ToUtf16LeAllocZ(alloc, badge.text) catch return null;
+    defer alloc.free(text16);
+    const chars: i32 = @intCast(@min(text16.len, 4));
+    var text_rect = bg_rect;
+    _ = win32.DrawTextW(dc, text16.ptr, chars, &text_rect, win32.DT_CENTER | win32.DT_VCENTER | win32.DT_SINGLELINE);
+
+    // 单色 mask（CreateIconIndirect 需要 mask 位图；透明区域由 0 位给出——
+    // 徽标是全不透明圆底，mask 全 0 = 全显示）
+    const mask = win32.CreateBitmap(size, size, 1, 1, null);
+    if (mask == null) return null;
+    defer _ = win32.DeleteObject(@ptrCast(mask));
+
+    const info = win32.ICONINFO{
+        .fIcon = 1,
+        .xHotspot = 0,
+        .yHotspot = 0,
+        .hbmMask = mask,
+        .hbmColor = dib,
+    };
+    return win32.CreateIconIndirect(&info);
+}
+
+const theme = @import("../../theme.zig");

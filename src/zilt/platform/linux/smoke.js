@@ -1210,6 +1210,19 @@ function runSecondWindowProbe() {
     check('win3', ok, note);
   } catch (e) { check('win3', false, String(e.message || e)); }
 
+  // ---- v0.3.16 G19/G21：全局光标位置 + monitors rotation 字段 + sticky/stick
+  //      往返（GTK 路径）+ 单实例/徽标为 Windows 面（文档化不测）----
+  try {
+    const cur = await Z().system.cursorPosition();
+    const mons = await Z().system.monitors();
+    const arr = Array.isArray(mons) ? mons : (mons && mons.monitors) || [];
+    const rot = arr.length > 0 && typeof arr[0].rotation === 'number';
+    const stick = await Z().window.setAllWorkspaces(true);
+    const unstick = await Z().window.setAllWorkspaces(false);
+    check('curs', !!cur && typeof cur.x === 'number' && rot && stick === true && unstick === true,
+      `cur=${JSON.stringify(cur)} rot=${rot} stick=${stick}/${unstick}`);
+  } catch (e) { check('curs', false, String(e.message || e)); }
+
   // ---- v0.3.15：printToPdf/settingsProbe 平台差异文档化（WebKitGTK 无 PDF 导出
   //      API；Settings3/6 对等无——手势走 WebKitSettings 创建期，探针返回 null）----
   try {

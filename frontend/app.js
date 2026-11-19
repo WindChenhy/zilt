@@ -1256,6 +1256,25 @@ async function runChecks() {
       if (!ok) window.zilt.log('warn', 'c-acc note: ' + JSON.stringify(pr).slice(0, 160));
     } catch (e) { setCheck('c-acc', false, String(e.message || e)); window.zilt.log('warn', 'c-acc error: ' + String(e.message || e)); }
 
+    // 65. v0.3.16：屏幕细化（cursorPosition/rotation）+ 任务栏徽标 + 托盘暗色
+    //     图标 + 全工作区（Windows 主断言；Linux 侧单独 curs 检查）
+    try {
+      const cur = await window.zilt.system.cursorPosition();
+      const mons = await window.zilt.system.monitors();
+      const arr = Array.isArray(mons) ? mons : (mons && mons.monitors) || [];
+      const rot = arr.length > 0 && typeof arr[0].rotation === 'number';
+      const badge = await window.zilt.taskbar.badge('42');
+      const badgeClear = await window.zilt.taskbar.badge('');
+      const dark = await window.zilt.tray.setDarkIcon(null);
+      const aws1 = await window.zilt.window.setAllWorkspaces(true);
+      const aws2 = await window.zilt.window.setAllWorkspaces(false);
+      const ok = !!cur && typeof cur.x === 'number' && typeof cur.y === 'number' && rot &&
+        badge === true && badgeClear === true && dark === true && aws1 === true && aws2 === true;
+      setCheck('c-sys2', ok, ok ? 'sys ok (cursorPosition + rotation + badge/night-tray/all-workspaces ops)' :
+        `cur=${JSON.stringify(cur)} rot=${rot} badge=${badge}/${badgeClear} dark=${dark} aws=${aws1}/${aws2}`);
+      if (!ok) window.zilt.log('warn', 'c-sys2 note: cur=' + JSON.stringify(cur) + ' rot=' + rot + ' badge=' + badge + '/' + badgeClear + ' dark=' + dark + ' aws=' + aws1 + '/' + aws2);
+    } catch (e) { setCheck('c-sys2', false, String(e.message || e)); window.zilt.log('warn', 'c-sys2 error: ' + String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）。
@@ -1327,6 +1346,7 @@ async function runChecks() {
       win3: $('c-win3').className === 'pass',
       pdf: $('c-pdf').className === 'pass',
       acc: $('c-acc').className === 'pass',
+      sys2: $('c-sys2').className === 'pass',
       appquit: !!window.zilt.app,
     };
     window.zilt.emit('smokeResult', smokeFlags);

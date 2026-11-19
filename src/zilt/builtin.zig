@@ -75,6 +75,9 @@ pub const Args = struct {
     maximized: ?bool = null,
     /// v0.3.14：setScreen 目标显示器索引（window.setScreen(index)）
     screen: ?u32 = null,
+    /// v0.3.16 G18：任务栏徽标配色（0xRRGGBB；bg=底色 fg=文字色）
+    bg_color: ?u32 = null,
+    fg_color: ?u32 = null,
     /// v0.3.4：updater.skipVersion 的版本串
     version_str: ?[]const u8 = null,
     /// v0.3.6：SharedBuffer 二进制 IPC（__zilt.binary.request 的载荷字节数）
@@ -361,6 +364,8 @@ pub fn windowCmdFromArgs(a: Args, current_window: u32) !ipc.WindowCmd {
     if (eql(u8, a.action, "destroy")) return .destroy_win;
     if (eql(u8, a.action, "setScreen")) return .{ .set_screen = a.screen orelse 0 };
     if (eql(u8, a.action, "list")) return .list;
+    // v0.3.16 G21：全工作区可见（Tauri visibleOnAllWorkspaces；GTK sticky）
+    if (eql(u8, a.action, "setAllWorkspaces")) return .{ .visible_on_all_workspaces = a.enabled orelse true };
     _ = current_window;
     return error.UnknownWindowAction;
 }
@@ -728,6 +733,8 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
             .middle = clickActionFromName(a.click_middle),
             .double = clickActionFromName(a.click_double),
         } } };
+        // v0.3.16 G17：暗色模式托盘图标（null = 恢复同亮色）
+        if (eql(u8, a.action, "setDarkIcon")) return .{ .tray = .{ .set_dark_icon = a.icon } };
         return error.UnknownTrayAction;
     }
 
@@ -759,6 +766,10 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
             .timeout_ms = 0,
             .tray_only = a.enabled orelse true,
         } } };
+        // v0.3.16 G18：任务栏文本徽标（空文本 = 清除；Wails SetBadge 对齐）
+        if (eql(u8, a.action, "badge")) return .{ .taskbar = .{ .badge = if (a.text) |t|
+            (if (t.len == 0) null else .{ .text = t, .bg_color = a.bg_color orelse 0xE81123, .text_color = a.fg_color orelse 0xFFFFFF })
+        else null } };
         return error.UnknownTaskbarAction;
     }
 
@@ -772,6 +783,8 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
             return .{ .info = kind };
         }
         if (eql(u8, a.action, "adminRestart")) return .{ .admin_restart = a.exe_args };
+        // v0.3.16 G19：全局光标位置（Wails/Tauri cursor_position 对齐）
+        if (eql(u8, a.action, "cursorPosition")) return .cursor_position;
         return error.UnknownSystemAction;
     }
 

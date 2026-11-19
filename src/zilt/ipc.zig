@@ -311,6 +311,9 @@ pub const WindowCmd = union(enum) {
     set_screen: u32,
     /// 全部存活窗口的状态快照数组（Wails GetAll / Tauri getAll）
     list,
+    /// v0.3.16 G21：全工作区可见（Tauri visibleOnAllWorkspaces；GTK sticky）。
+    /// Windows 无原生对等（虚拟桌面 API 语义不同）→ no-op true 文档化。
+    visible_on_all_workspaces: bool,
 };
 
 /// window_query_fn 的哨兵：请求全部存活窗口的状态数组（list 语义；state 用具体 id）。
@@ -1267,6 +1270,8 @@ const runtime_js_head =
     \\      destroy: (id) => winApi('destroy', { window_id: id }),
     \\      setScreen: (index, id) => winApi('setScreen', { screen: index ?? 0, window_id: id }),
     \\      list: () => winApi('list', {}),
+    \\      // v0.3.16 G21：全工作区可见（Linux gtk_window_stick；Windows no-op 文档化）
+    \\      setAllWorkspaces: (on, id) => winApi('setAllWorkspaces', { enabled: on !== false, window_id: id }),
     \\    },
     \\    // v0.3.14 G5：应用级退出与重启（Wails application.Quit / Tauri App::exit）
     \\    app: {
@@ -1371,6 +1376,8 @@ const runtime_js_head =
     \\    tray: {
     \\      setTooltip: (tooltip) => builtin('__zilt.tray', { action: 'setTooltip', tooltip }),
     \\      setIcon: (icon) => builtin('__zilt.tray', { action: 'setIcon', icon }),
+    \\      // v0.3.16 G17：暗色模式托盘图标（null = 恢复亮色图标；主题切换自动换发）
+    \\      setDarkIcon: (icon) => builtin('__zilt.tray', { action: 'setDarkIcon', icon: icon ?? null }),
     \\      setClick: (opts) => builtin('__zilt.tray', Object.assign({ action: 'setClick' }, opts ?? {})),
     \\    },
     \\    hotkey: {
@@ -1385,12 +1392,19 @@ const runtime_js_head =
     \\      clearOverlay: () => builtin('__zilt.taskbar', { action: 'overlay' }),
     \\      tooltip: (text) => builtin('__zilt.taskbar', { action: 'tooltip', text }),
     \\      flash: (count) => builtin('__zilt.taskbar', { action: 'flash', count: count ?? 3 }),
+    \\      // v0.3.16 G18：任务栏文本徽标（1–4 字符；空串清除；Windows 实装，
+    \\      // Linux Unity-only 文档化）
+    \\      badge: (text, opts) => builtin('__zilt.taskbar', {
+    \\        action: 'badge', text: text ?? '', bg_color: opts?.bg, fg_color: opts?.fg,
+    \\      }),
     \\    },
     \\    // v0.1.14: system info / shell / autostart / appearance
     \\    system: {
     \\      info: (kind) => builtin('__zilt.system', { action: 'info', kind: kind ?? 'all' }),
     \\      os: () => builtin('__zilt.system', { action: 'info', kind: 'os' }),
     \\      monitors: () => builtin('__zilt.system', { action: 'info', kind: 'monitors' }),
+    \\      // v0.3.16 G19：全局光标位置（屏幕坐标）
+    \\      cursorPosition: () => builtin('__zilt.system', { action: 'cursorPosition' }),
     \\      adminRestart: (args) => builtin('__zilt.system', { action: 'adminRestart', exe_args: args }),
     \\    },
     \\    shell: {

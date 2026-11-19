@@ -60,6 +60,9 @@ pub const Request = union(enum) {
     tooltip: []const u8,
     flash: Flash,
     thumb_buttons: []const Button,
+    /// v0.3.16 G18：任务栏文本徽标（Wails Dock SetBadge 对齐——文本渲染成
+    /// overlay 图标）。null = 清除徽标。
+    badge: ?Badge,
 
     pub const Overlay = struct {
         /// 资产路径（.ico）或 null 清除叠加图标
@@ -67,6 +70,14 @@ pub const Request = union(enum) {
         /// 无障碍描述（屏幕阅读器朗读）
         description: []const u8 = "",
     };
+};
+
+/// v0.3.16 G18：文本徽标（32×32 圆形底 + 居中文本；Windows 红/白默认）。
+pub const Badge = struct {
+    text: []const u8,
+    /// 0xRRGGBB
+    bg_color: u32 = 0xE81123,
+    text_color: u32 = 0xFFFFFF,
 };
 
 const testing = std.testing;

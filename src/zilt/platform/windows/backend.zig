@@ -153,8 +153,21 @@ pub fn run(comptime config: Config) !void {
         if (guard == null) {
             const payload = deep_link.payloadOfArgs(alloc, args) catch "";
             defer if (payload.len > 0) alloc.free(payload);
-            const forwarded = forwardToRunning(alloc, class_u8, payload);
-            log.print("[single-instance] another instance is running (args forwarded={}) -> exit({d})", .{ forwarded, single_instance.SECOND_INSTANCE_EXIT_CODE });
+            // v0.3.16 G22：配置密封密钥时载荷升级为 HMAC 密封形态
+            const wire_payload: []const u8 = blk: {
+                if (config.single_instance_key) |key_hex| {
+                    if (payload.len > 0) {
+                        var nonce: [16]u8 = undefined;
+                        std.crypto.random.bytes(&nonce);
+                        break :blk single_instance.sealPayload(alloc, key_hex, payload, nonce) catch payload;
+                    }
+                    break :blk payload;
+                }
+                break :blk payload;
+            };
+            defer if (config.single_instance_key != null and wire_payload.ptr != payload.ptr) alloc.free(wire_payload);
+            const forwarded = forwardToRunning(alloc, class_u8, wire_payload);
+            log.print("[single-instance] another instance is running (args forwarded={} sealed={}) -> exit({d})", .{ forwarded, config.single_instance_key != null, single_instance.SECOND_INSTANCE_EXIT_CODE });
             std.process.exit(single_instance.SECOND_INSTANCE_EXIT_CODE);
         }
     }
@@ -1305,6 +1318,8 @@ fn Backend(comptime config: Config) type {
         tray_popup: ?menu_runtime.Built = null,
         /// v0.1.18：托盘 hover 状态（TrackMouseEvent 只需登记一次）
         tray_hovering: bool = false,
+        /// v0.3.16 G17：暗色模式托盘图标（setDarkIcon 运行时 op；主题切换换发）
+        tray_dark_icon: win32.HICON = null,
         tray_click_left: shared_system.ClickAction = .toggle_window,
         tray_click_middle: shared_system.ClickAction = .none,
         tray_click_double: shared_system.ClickAction = .toggle_window,
@@ -2660,6 +2675,12 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
                     return .{ .ok = supported };
                 },
                 .info => |kind| return .{ .json = try self.collectSystemInfo(kind, alloc, w) },
+                // v0.3.16 G19：全局光标位置（GetCursorPos 屏幕坐标）
+                .cursor_position => {
+                    var pt = win32.POINT{ .x = 0, .y = 0 };
+                    if (win32.GetCursorPos(&pt) == 0) return error.CursorNotAvailable;
+                    return .{ .json = try std.fmt.allocPrint(alloc, "{{\"x\":{d},\"y\":{d}}}", .{ pt.x, pt.y }) };
+                },
                 .shell => |target| {
                     try sys_integration.open(alloc, target);
                     return .{ .ok = true };
@@ -4017,6 +4038,25 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
                     self.tray_click_double = cfg.double;
                     log.print("[tray] click behavior updated", .{});
                 },
+                // v0.3.16 G17：暗色模式托盘图标（null = 恢复亮色同图标；当前为
+                // 暗色主题时立即换发）
+                .set_dark_icon => |path| {
+                    if (self.tray) |*t| {
+                        if (self.tray_dark_icon) |prev| _ = win32.DestroyIcon(prev);
+                        self.tray_dark_icon = null;
+                        if (path) |p| {
+                            const px: u32 = @intCast(win32.GetSystemMetrics(win32.SM_CXSMICON));
+                            self.tray_dark_icon = self.makeIcon(p, px, px);
+                        }
+                        if (!appsUseLightTheme()) {
+                            const icon = self.tray_dark_icon orelse self.tray_icon;
+                            const ok = t.setIcon(icon);
+                            log.print("[tray] dark icon applied immediately (ok={})", .{ok});
+                        } else {
+                            log.print("[tray] dark icon prepared (light theme active)", .{});
+                        }
+                    }
+                },
             }
         }
 
@@ -4108,6 +4148,12 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
                 },
                 .tooltip => |text| {
                     tb.setTooltip(w.hwnd, text, alloc);
+                },
+                // v0.3.16 G18：任务栏文本徽标（GDI 渲染 → SetOverlayIcon；空文本清除）
+                .badge => |maybe| {
+                    const ok = tb.setBadge(w.hwnd, maybe, alloc);
+                    log.print("[taskbar] badge {s} (ok={})", .{ if (maybe) |b| b.text else "(clear)", ok });
+                    if (!ok) return false;
                 },
                 .thumb_buttons => |buttons| {
                     var icons = std.mem.zeroes([7]win32.HICON);
@@ -4600,6 +4646,9 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
                 // v0.3.14：list 在 builtin dispatch 就走 window_query_fn（LIST_ALL
                 // 哨兵），不会到达这里
                 .list => return false,
+                // v0.3.16 G21：全工作区可见——Windows 无原生对等（虚拟桌面 API 语义
+                // 不同且 Tauri 亦不支持）→ no-op true 文档化
+                .visible_on_all_workspaces => return true,
                 .set_title => |t| {
                     const tw = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, t) catch return false;
                     defer self.allocator.free(tw);
@@ -5204,6 +5253,13 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
             for (self.windows.items) |w| {
                 if (w.alive) w.emitEventPayload("windowThemeChanged", .{ .id = w.id, .theme = theme });
             }
+            // v0.3.16 G17：托盘图标随主题换发（dark_icon 未设置则恒用亮色图标）
+            if (self.tray) |*t| {
+                const want_dark = !appsUseLightTheme();
+                const icon = if (want_dark and self.tray_dark_icon != null) self.tray_dark_icon.? else self.tray_icon;
+                const ok = t.setIcon(icon);
+                log.print("[tray] theme icon swap -> {s} (ok={})", .{ theme, ok });
+            }
         }
 
         fn emitPendingLaunch(self: *Self) void {
@@ -5220,7 +5276,18 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
 
         fn onCopyData(self: *Self, payload: []const u8) void {
             const scheme = if (config.deep_link) |dl| dl.scheme else "zilt";
-            var launch = deep_link.parsePayload(self.allocator, payload, scheme) catch return;
+            // v0.3.16 G22：启用密封密钥时先验封（HMAC 失败/明文一律丢弃）
+            const wire_payload: []const u8 = blk: {
+                if (config.single_instance_key) |key_hex| {
+                    break :blk single_instance.openPayload(self.allocator, key_hex, payload) orelse {
+                        log.print("[single-instance] untrusted payload dropped", .{});
+                        return;
+                    };
+                }
+                break :blk payload;
+            };
+            defer if (config.single_instance_key != null and wire_payload.ptr != payload.ptr) self.allocator.free(wire_payload);
+            var launch = deep_link.parsePayload(self.allocator, wire_payload, scheme) catch return;
             defer launch.deinit(self.allocator);
             if (launch.isEmpty()) {
                 if (self.focusedWindow()) |w| {

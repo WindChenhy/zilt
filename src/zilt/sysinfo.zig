@@ -39,6 +39,9 @@ pub const Monitor = struct {
     scale: f64 = 1.0,
     /// v0.3.2：调用窗口所在显示器（system.info('monitors') 时按 windowId 标记）
     current: bool = false,
+    /// v0.3.16 G19：屏幕旋转（0/90/180/270；DEVMODE dmDisplayOrientation）。
+    /// Linux GDK3 无旋转查询 API → 恒 0（文档化）。
+    rotation: u16 = 0,
 };
 
 /// 由 major/minor/build 推断产品名（Win11 起始 build 22000）。
@@ -87,8 +90,8 @@ pub fn monitorsToJson(alloc: Allocator, monitors: []const Monitor) ![]u8 {
         const chunk = try std.fmt.allocPrint(
             alloc,
             "{{\"index\":{d},\"primary\":{},\"current\":{},\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d}," ++
-                "\"workX\":{d},\"workY\":{d},\"workWidth\":{d},\"workHeight\":{d},\"dpi\":{d},\"scale\":{d:.2}}}",
-            .{ m.index, m.primary, m.current, m.x, m.y, m.width, m.height, m.work_x, m.work_y, m.work_width, m.work_height, m.dpi, m.scale },
+                "\"workX\":{d},\"workY\":{d},\"workWidth\":{d},\"workHeight\":{d},\"dpi\":{d},\"scale\":{d:.2},\"rotation\":{d}}}",
+            .{ m.index, m.primary, m.current, m.x, m.y, m.width, m.height, m.work_x, m.work_y, m.work_width, m.work_height, m.dpi, m.scale, m.rotation },
         );
         defer alloc.free(chunk);
         try out.appendSlice(alloc, chunk);

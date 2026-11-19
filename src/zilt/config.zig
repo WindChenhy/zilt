@@ -105,6 +105,10 @@ pub const Config = struct {
     close_to_tray: bool = false,
     /// 单实例保护（第二实例以退出码 5 立即退出）
     single_instance: bool = false,
+    /// v0.3.16 G22：单实例第二实例数据密封密钥（64 字符 hex = 32 字节；Wails
+    /// SingleInstanceOptions.EncryptionKey 对齐，HMAC-SHA256 基建）。设置后
+    /// WM_COPYDATA 载荷升级为 {n,s,p} 密封形态、明文一律拒绝；null = 明文（兼容）。
+    single_instance_key: ?[]const u8 = null,
     /// 自动更新器（ed25519 验签）
     update: ?Update = null,
     /// 窗口/托盘默认图标（资产路径，如 "/app.ico"；null = 内置 Zig 官方图标）

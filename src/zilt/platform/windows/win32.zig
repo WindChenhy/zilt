@@ -933,3 +933,45 @@ pub extern "kernel32" fn ReadDirectoryChangesW(
     lpCompletionRoutine: ?*anyopaque,
 ) callconv(.c) BOOL;
 pub extern "kernel32" fn CancelIoEx(hFile: HANDLE, lpOverlapped: ?*anyopaque) callconv(.c) BOOL;
+
+// ---------------------------------------------------------------------------
+// v0.3.16 G18：任务栏文本徽标（内存位图 + GDI 文本渲染 → CreateIconIndirect）
+// ---------------------------------------------------------------------------
+
+pub const BITMAPINFOHEADER = extern struct {
+    biSize: u32,
+    biWidth: i32,
+    biHeight: i32,
+    biPlanes: u16,
+    biBitCount: u16,
+    biCompression: u32,
+    biSizeImage: u32,
+    biXPelsPerMeter: i32,
+    biYPelsPerMeter: i32,
+    biClrUsed: u32,
+    biClrImportant: u32,
+};
+
+pub const BITMAPINFO = extern struct {
+    bmiHeader: BITMAPINFOHEADER,
+    bmiColors: [1]u32 align(4),
+};
+
+pub extern "gdi32" fn CreateCompatibleDC(hdc: HDC) callconv(.c) HDC;
+pub extern "gdi32" fn DeleteDC(hdc: HDC) callconv(.c) BOOL;
+pub extern "gdi32" fn CreateDIBSection(hdc: HDC, pbmi: *const BITMAPINFO, usage: u32, ppvBits: *?*anyopaque, hSection: ?*anyopaque, offset: u32) callconv(.c) HBITMAP;
+pub extern "gdi32" fn CreateBitmap(width: i32, height: i32, planes: u32, bits_pixel: u32, bits: ?*const anyopaque) callconv(.c) HBITMAP;
+pub extern "gdi32" fn SelectObject(hdc: HDC, hgdiobj: HGDIOBJ) callconv(.c) HGDIOBJ;
+pub extern "gdi32" fn SetTextColor(hdc: HDC, color: u32) callconv(.c) u32;
+pub extern "gdi32" fn SetBkMode(hdc: HDC, mode: i32) callconv(.c) i32;
+pub extern "gdi32" fn GetStockObject(i: i32) callconv(.c) HGDIOBJ;
+pub extern "user32" fn DrawTextW(hdc: HDC, text: [*]const u16, cch: i32, lprc: *RECT, format: u32) callconv(.c) i32;
+pub extern "user32" fn CreateIconIndirect(iconinfo: *const ICONINFO) callconv(.c) HICON;
+
+pub const HGDIOBJ = ?*anyopaque;
+pub const DIB_RGB_COLORS: u32 = 0;
+pub const TRANSPARENT_BK: i32 = 1;
+pub const DT_CENTER: u32 = 0x1;
+pub const DT_VCENTER: u32 = 0x4;
+pub const DT_SINGLELINE: u32 = 0x20;
+pub const DEFAULT_GUI_FONT: i32 = 17;
