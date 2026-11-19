@@ -7,7 +7,7 @@ const builtin = @import("builtin");
 pub const NavigationPolicy = enum { allow, external, deny };
 pub const NewWindowPolicy = enum { deny, external, new_window };
 pub const PermissionPolicy = enum { allow, deny, ask };
-pub const PermissionKind = enum { camera, microphone, location, clipboard, notifications, unknown };
+pub const PermissionKind = enum { camera, microphone, location, clipboard, notifications, other_sensors, unknown };
 
 pub const Permissions = struct {
     camera: PermissionPolicy = .ask,
@@ -15,6 +15,8 @@ pub const Permissions = struct {
     location: PermissionPolicy = .ask,
     clipboard: PermissionPolicy = .ask,
     notifications: PermissionPolicy = .ask,
+    /// v0.3.15 G27：OtherSensors（COREWEBVIEW2_PERMISSION_KIND_OTHER_SENSORS=5）。
+    other_sensors: PermissionPolicy = .deny,
     unknown: PermissionPolicy = .deny,
 
     pub fn policy(self: Permissions, kind: PermissionKind) PermissionPolicy {
@@ -39,6 +41,13 @@ pub const Settings = struct {
     /// v0.3.2：密码保存（Win：Profile6 IsPasswordAutosaveEnabled；Linux 无 API）。
     /// 默认关（保守安全面：桌面壳应用通常不需要）。
     password_autosave: bool = false,
+    /// v0.3.15 G13：浏览器加速键（Win：Settings3 AreBrowserAcceleratorKeysEnabled
+    /// ——Ctrl+F 等交还页面用 false；Linux 无 API 文档化）。默认开（浏览器语义）。
+    browser_accelerators: bool = true,
+    /// v0.3.15 G14：前进/后退滑动手势（Win：Settings6 IsSwipeNavigationEnabled；
+    /// Linux：WebKitSettings enable-back-forward-navigation-gestures）。默认关
+    /// （WebView2 引擎默认语义；桌面壳应用通常不需要——Wails EnableSwipeGestures 同 opt-in）。
+    swipe_gestures: bool = false,
 };
 
 pub const Downloads = struct {
@@ -131,6 +140,16 @@ pub const Request = union(enum) {
     /// v0.1.24：运行时改本窗口 UA（下次导航生效；空串 = 恢复引擎默认）
     set_user_agent: []const u8,
     cancel_download: u64,
+    /// v0.3.15 G12：静默导出 PDF（Wails/Tauri 均无此 API——Zilt 领先项）。
+    /// Win：ICoreWebView2_7::PrintToPdf（槽 80，SDK 1.0.3124.44 核对）+ 引擎默认
+    /// 打印设置（A4 纵向）；完成经 handler 回报 is_successful。**异步**：本请求
+    /// 立即返回 `{}`，结果经 `webviewPdf` 事件带回（rid 匹配）。
+    /// Linux 无 PDF 导出 API（WebKitGTK 仅打印对话框）→ PdfNotSupported 文档化。
+    print_to_pdf: struct { path: []const u8, rid: i64 = 0 },
+    /// v0.3.15：Settings3/6 开关 ABI 往返探针（读 → 反转 → 验证 → 恢复 → 验证）。
+    /// 返回 {"accelerators":{before,after,restored},"swipe":{...}}；Linux 无对应
+    /// API → {"accelerators":null,"swipe":null}。冒烟 c-acc 用。
+    settings_probe,
 };
 
 pub const Event = struct {
@@ -151,7 +170,11 @@ test "settings and permission defaults" {
     const o: Options = .{};
     try std.testing.expectEqual(builtin.mode == .debug, o.settings.devtools);
     try std.testing.expect(!o.settings.host_objects);
+    // v0.3.15：新开关默认值（浏览器语义：加速键开、手势关）
+    try std.testing.expect(o.settings.browser_accelerators);
+    try std.testing.expect(!o.settings.swipe_gestures);
     try std.testing.expectEqual(PermissionPolicy.deny, o.permissions.policy(.unknown));
+    try std.testing.expectEqual(PermissionPolicy.deny, o.permissions.policy(.other_sensors));
     inline for (.{ PermissionKind.camera, .microphone, .location, .clipboard, .notifications }) |kind| {
         try std.testing.expectEqual(PermissionPolicy.ask, o.permissions.policy(kind));
     }

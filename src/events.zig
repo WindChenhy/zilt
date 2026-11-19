@@ -135,6 +135,9 @@ pub fn smokeResult(ctx: Context, payload: struct {
     comp: bool = false,
     // v0.3.14：窗口 API 收尾（c-win3）+ app.quit 收尾标记
     win3: bool = false,
+    // v0.3.15：printToPdf（c-pdf）+ Settings3/6 开关面（c-acc）
+    pdf: bool = false,
+    acc: bool = false,
     appquit: bool = false,
     fatal: ?[]const u8 = null,
 }) void {
@@ -148,10 +151,10 @@ pub fn smokeResult(ctx: Context, payload: struct {
             payload.traycheck and payload.taskbar and payload.hotkey and payload.sysinfo and payload.appearance and payload.autostart and payload.storage and payload.peripheral and payload.services and payload.http and payload.ws and payload.webviews and payload.proc and payload.partition and payload.wincontrol and payload.fsops and payload.channel and payload.initupd and payload.http2 and payload.wss and payload.zigev and payload.acl2 and payload.fs2 and
             payload.cdp and payload.shot and payload.hdrs and payload.find and payload.proxy and payload.overlay and payload.proto and payload.ua and
             payload.scheme and payload.privacy and payload.monitor and payload.exp2 and payload.res and payload.dpapi and payload.binipc and
-            payload.postbody and payload.upload and payload.iso and payload.sidecar and payload.comp and payload.win3;
+            payload.postbody and payload.upload and payload.iso and payload.sidecar and payload.comp and payload.win3 and payload.pdf and payload.acc;
         appquit = payload.appquit;
         if (ok) {
-            zilt.log.print("[smoke] ALL CHECKS PASSED (62 checks: core-10 + window-api/eval/webview-api/capability/clipboard-multi/notification/acl/spa + tray-check/taskbar/hotkey/sysinfo/appearance/autostart + store/fs + path/log/state + services + http + ws + webviews + proc + partition + wincontrol + fsops + channel + initupd + http2 + wss + zigev + acl2 + fs2 + cdp + shot + hdrs + find + proxy + overlay + proto + ua + scheme/privacy/monitor/exp2/res/dpapi/binipc/postbody/upload/iso/sidecar/comp/win3 + appquit)", .{});
+            zilt.log.print("[smoke] ALL CHECKS PASSED (64 checks: core-10 + window-api/eval/webview-api/capability/clipboard-multi/notification/acl/spa + tray-check/taskbar/hotkey/sysinfo/appearance/autostart + store/fs + path/log/state + services + http + ws + webviews + proc + partition + wincontrol + fsops + channel + initupd + http2 + wss + zigev + acl2 + fs2 + cdp + shot + hdrs + find + proxy + overlay + proto + ua + scheme/privacy/monitor/exp2/res/dpapi/binipc/postbody/upload/iso/sidecar/comp/win3/pdf/acc + appquit)", .{});
         } else {
             zilt.log.print("[smoke] FAILED greet={} add={} fail={} user={} event={} mode={} clip={} win={} range={} winevent={} windowapi={} eval={} webview={} capability={} clipmulti={} notification={}", .{
                 payload.greet, payload.add, payload.fail, payload.user, payload.event, payload.mode, payload.clip,
@@ -163,9 +166,9 @@ pub fn smokeResult(ctx: Context, payload: struct {
                 payload.appearance, payload.autostart, payload.storage, payload.peripheral, payload.services,
                 payload.http, payload.ws, payload.webviews, payload.proc, payload.partition, payload.wincontrol, payload.fsops, payload.channel, payload.initupd, payload.http2, payload.wss, payload.zigev, payload.acl2, payload.fs2,
             });
-            zilt.log.print("[smoke] FAILED(3) cdp={} shot={} hdrs={} find={} proxy={} overlay={} proto={} ua={} scheme={} privacy={} monitor={} exp2={} res={} dpapi={} binipc={} postbody={} upload={} iso={} sidecar={} comp={} win3={}", .{
+            zilt.log.print("[smoke] FAILED(3) cdp={} shot={} hdrs={} find={} proxy={} overlay={} proto={} ua={} scheme={} privacy={} monitor={} exp2={} res={} dpapi={} binipc={} postbody={} upload={} iso={} sidecar={} comp={} win3={} pdf={} acc={}", .{
                 payload.cdp, payload.shot, payload.hdrs, payload.find, payload.proxy, payload.overlay, payload.proto, payload.ua,
-                payload.scheme, payload.privacy, payload.monitor, payload.exp2, payload.res, payload.dpapi, payload.binipc, payload.postbody, payload.upload, payload.iso, payload.sidecar, payload.comp, payload.win3,
+                payload.scheme, payload.privacy, payload.monitor, payload.exp2, payload.res, payload.dpapi, payload.binipc, payload.postbody, payload.upload, payload.iso, payload.sidecar, payload.comp, payload.win3, payload.pdf, payload.acc,
             });
         }
     }

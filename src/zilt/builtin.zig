@@ -529,6 +529,13 @@ pub fn requestFromArgs(a: Args) !webview.Request {
     if (eql(u8, a.action, "getDevtoolsState")) return .{ .devtools = .state };
     // v0.3.14：加载 HTML 字符串（Wails SetHTML 对齐）
     if (eql(u8, a.action, "loadHTML")) return .{ .load_html = a.html orelse return error.MissingHtml };
+    // v0.3.15 G12：静默导出 PDF（Windows ICoreWebView2_7::PrintToPdf；Linux 文档化）
+    if (eql(u8, a.action, "printToPdf")) return .{ .print_to_pdf = .{
+        .path = a.path orelse return error.MissingPath,
+        .rid = a.rid orelse 0,
+    } };
+    // v0.3.15：Settings3/6 开关 ABI 往返探针（冒烟 c-acc）
+    if (eql(u8, a.action, "settingsProbe")) return .settings_probe;
     if (eql(u8, a.action, "print")) return .{ .print = if (a.kind != null and eql(u8, a.kind.?, "system")) .system else .browser };
     if (eql(u8, a.action, "cancelDownload")) return .{ .cancel_download = a.download_id orelse return error.MissingDownloadId };
     if (eql(u8, a.action, "zoom")) return .{ .zoom = a.zoom orelse return error.MissingZoom };
@@ -1385,6 +1392,15 @@ test "v0.3.14: webview request 映射（devtools 枚举 + loadHTML）" {
     const lh = try requestFromArgs(.{ .action = "loadHTML", .html = "<h1>hi</h1>" });
     try testing.expectEqualStrings("<h1>hi</h1>", lh.load_html);
     try testing.expectError(error.MissingHtml, requestFromArgs(.{ .action = "loadHTML" }));
+}
+
+test "v0.3.15: webview request 映射（printToPdf/settingsProbe）" {
+    const testing = std.testing;
+    const pt = try requestFromArgs(.{ .action = "printToPdf", .path = "C:\\tmp\\a.pdf", .rid = 7 });
+    try testing.expectEqualStrings("C:\\tmp\\a.pdf", pt.print_to_pdf.path);
+    try testing.expectEqual(@as(i64, 7), pt.print_to_pdf.rid);
+    try testing.expectError(error.MissingPath, requestFromArgs(.{ .action = "printToPdf" }));
+    try testing.expectEqual(@as(std.meta.Tag(webview.Request), .settings_probe), std.meta.activeTag(try requestFromArgs(.{ .action = "settingsProbe" })));
 }
 
 test "v0.3.14: app builtin 动作名未知时明确报错" {

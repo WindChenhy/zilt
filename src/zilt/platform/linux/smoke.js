@@ -1210,6 +1210,16 @@ function runSecondWindowProbe() {
     check('win3', ok, note);
   } catch (e) { check('win3', false, String(e.message || e)); }
 
+  // ---- v0.3.15：printToPdf/settingsProbe 平台差异文档化（WebKitGTK 无 PDF 导出
+  //      API；Settings3/6 对等无——手势走 WebKitSettings 创建期，探针返回 null）----
+  try {
+    let pdfErr = '';
+    try { await Z().webview.printToPdf('/tmp/zilt-smoke.pdf'); } catch (e) { pdfErr = String(e.message || e); }
+    const probe = await Z().webview.settingsProbe();
+    check('pdfskip', pdfErr.length > 0 && probe && probe.accelerators === null && probe.swipe === null,
+      `pdfErr=${pdfErr.slice(0, 60)} probe=${JSON.stringify(probe)}`);
+  } catch (e) { check('pdfskip', false, String(e.message || e)); }
+
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {
     await Z().invoke('__zilt.linuxSmoke', {

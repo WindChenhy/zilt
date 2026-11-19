@@ -537,6 +537,23 @@
         + 单测全绿；Linux 冒烟 **84/84**（win3 GTK 全量往返）+ post terminate PASS；
         双平台单测全绿。**实测记录**：clip/clipmulti 失败为本机既有桌面剪贴板占用
         环境问题（zilt-keep.log 同样存在，非本版回归）
+- [x] **v0.3.15 打印与 WebView 开关面**（2026-11-20；三轮差距刷新第二批）：
+      - **G12 printToPdf（Windows 实装，Wails/Tauri 均无 → Zilt 领先项）**：
+        ICoreWebView2_7::PrintToPdf（槽 80 / IID 79c24d83，官方 SDK 1.0.3124.44
+        WebView2.h 核对——NuGet 提取 + python vtable 全表解析）+ 引擎默认打印设置 +
+        PdfHandler（Invoke(hr, is_successful)）→ webviewPdf 事件；requestFromArgs
+        printToPdf/settingsProbe 映射单测。Linux PdfNotSupported 文档化（pdfskip）
+      - **G13/G14 Settings3/6 开关**：browser_accelerators（默认开——Tauri
+        disabled_webview_shortcuts 反向）/ swipe_gestures（默认关——Wails
+        EnableSwipeGestures opt-in 同语义）；settingsProbe 探针（读→反转→验证→恢复
+        →验证）冒烟 c-acc；Linux 手势走 WebKitSettings enable-back-forward-navigation-
+        gestures（创建期），探针 null 文档化
+      - **G27 OtherSensors**：PermissionKind.other_sensors（native 5）+ 默认 deny +
+        Linux 询问框文案
+      - **范围修正**：G15 tabbed backdrop 已有（v0.1.14 Backdrop.tabbed）；G16
+        fluentOverlay 官方 SDK 无 COM 接口 → 文档化移除
+      - **验收**：Windows 冒烟 **64 项**（c-pdf/c-acc 全过）+ 单测全绿；Linux 冒烟
+        **85/85**（pdfskip）+ post terminate PASS；clip 既有环境问题
       - 后续规划（v0.3.8–v0.3.13，二轮差距刷新 2026-11-17——对标 Wails v3.1.0 /（2026-11-19；二轮差距刷新第五批——
       ABI/装配/回退全链落地，渲染管线为已知问题）：
       - **ABI 绑定（官方 WebView2.h 逐一核对）**：webview2.zig 增

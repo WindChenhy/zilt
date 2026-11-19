@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.14（窗口 API 收尾——三轮差距刷新第一批）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.15（打印与 WebView 开关面——三轮差距刷新第二批）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -259,6 +259,32 @@ v0.3.12 新增（2026-11-19，CompositionController 专项——二轮差距刷�
   渲染修复列为后续专项；c-comp 检查断言回退路径
 - **验收**：Windows 单测全绿 + 冒烟 **61 项**（新增 c-comp 断言组合请求 → 探测 →
   回退全链 + state.composition=false）；Linux 不涉及（组合为 Windows 面）
+
+v0.3.15 新增（2026-11-20，打印与 WebView 开关面——三轮差距刷新第二批）：
+
+- **printToPdf（G12，Windows 实装）**：`webview.printToPdf(absPath)` → Promise——
+  `ICoreWebView2_7::PrintToPdf`（**槽 80 / IID 79c24d83…，官方 SDK 1.0.3124.44
+  WebView2.h 逐一核对**；NuGet 提取沿用 v0.3.2 方法；vtable 全表 81 槽 python 解析
+  实证）+ `printSettings=null` 引擎默认（A4 纵向）+ PrintToPdfCompletedHandler
+  （Invoke(hr, is_successful)）→ `webviewPdf {rid, ok}` 事件回传。**Wails/Tauri 均无
+  此 API**（wry#707/1317 未实现）——Zilt 领先项。Linux 无 PDF 导出 API →
+  PdfNotSupported 文档化（Linux 冒烟 pdfskip 断言）
+- **Settings3/6 开关面（G13/G14）**：`webview.settings.browser_accelerators`（默认开，
+  Ctrl+F 等交还页面用 false——Tauri disabled_webview_shortcuts 反向）/ `swipe_gestures`
+  （默认关，Wails EnableSwipeGestures 同 opt-in）——Win Settings3/6（槽位与 IID 同上
+  核对）+ **settingsProbe 探针**（读→反转→验证→恢复→验证的 ABI 往返，冒烟 c-acc）；
+  Linux 手势走 WebKitSettings enable-back-forward-navigation-gestures（创建期），
+  加速键/探针 null 文档化
+- **OtherSensors 权限类（G27）**：`PermissionKind.other_sensors`（native 5）+
+  `permissions.other_sensors` 策略（默认 deny）；Linux ask 询问框文案补齐
+- **范围修正**：G15 tabbed backdrop 复核发现 **v0.1.14 已有**（Backdrop.tabbed =
+  DWMWA_SYSTEMBACKDROP_TYPE=4，fromName 接受 tabbed/mica-alt）；G16 fluentOverlay
+  滚动条在官方 SDK（1.0.3124.44）**无 COM 接口**（grep 无 FluentOverlay）→ 文档化
+  移除，不做
+- **验收**：Windows 冒烟 **64 项**（c-pdf 真实导出 + fs 存在性/清理；c-acc
+  accelerators true→false→true + swipe false→true→false 往返）+ 单测全绿（+printToPdf/
+  settingsProbe 映射、settings 默认值）；Linux 冒烟 **85/85**（pdfskip）+ post
+  terminate PASS；clip 两项为既有环境问题
 
 v0.3.14 新增（2026-11-20，窗口 API 收尾——三轮差距刷新第一批）：
 

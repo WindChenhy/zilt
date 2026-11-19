@@ -1229,6 +1229,33 @@ async function runChecks() {
       if (!ok) window.zilt.log('warn', 'c-win3 note: ' + note);
     } catch (e) { setCheck('c-win3', false, String(e.message || e)); window.zilt.log('warn', 'c-win3 error: ' + String(e.message || e)); }
 
+    // 63. v0.3.15 G12：printToPdf——写 appData 临时 PDF（引擎默认 A4 纵向），
+    //     webviewPdf 事件回传 + fs 存在性断言 + 清理
+    try {
+      const roots = await window.zilt.fs.roots();
+      const appData = roots && (roots.appData || roots.appCache);
+      if (!appData) throw new Error('no appData root');
+      const name = 'smoke_pdf_' + Date.now() + '.pdf';
+      const abs = await window.zilt.path.join(appData, name);
+      const r = await window.zilt.webview.printToPdf(abs);
+      const exists = await window.zilt.fs.exists(name);
+      await window.zilt.fs.remove(name).catch(() => {});
+      const ok = !!r && r.ok === true && exists === true;
+      setCheck('c-pdf', ok, ok ? 'printToPdf ok (webviewPdf ok=true + file written + cleaned)' : `r=${JSON.stringify(r)} exists=${exists}`);
+      if (!ok) window.zilt.log('warn', 'c-pdf note: r=' + JSON.stringify(r) + ' exists=' + exists);
+    } catch (e) { setCheck('c-pdf', false, String(e.message || e)); window.zilt.log('warn', 'c-pdf error: ' + String(e.message || e)); }
+
+    // 64. v0.3.15 G13/G14：Settings3/6 开关面——ABI 往返探针（读→反转→验证→恢复）
+    try {
+      const pr = await window.zilt.webview.settingsProbe();
+      const a = pr && pr.accelerators;
+      const s = pr && pr.swipe;
+      const ok = !!a && a.before === true && a.after === false && a.restored === true &&
+        !!s && s.before === false && s.after === true && s.restored === false;
+      setCheck('c-acc', ok, ok ? 'settings ok (accelerators true→false→true, swipe false→true→false)' : `pr=${JSON.stringify(pr).slice(0, 140)}`);
+      if (!ok) window.zilt.log('warn', 'c-acc note: ' + JSON.stringify(pr).slice(0, 160));
+    } catch (e) { setCheck('c-acc', false, String(e.message || e)); window.zilt.log('warn', 'c-acc error: ' + String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）。
@@ -1298,6 +1325,8 @@ async function runChecks() {
       sidecar: $('c-sidecar').className === 'pass',
       comp: $('c-comp').className === 'pass',
       win3: $('c-win3').className === 'pass',
+      pdf: $('c-pdf').className === 'pass',
+      acc: $('c-acc').className === 'pass',
       appquit: !!window.zilt.app,
     };
     window.zilt.emit('smokeResult', smokeFlags);

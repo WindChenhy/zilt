@@ -1982,6 +1982,17 @@ fn Backend(comptime config: Config) type {
             const view: [*c]c.WebKitWebView = @ptrCast(view_widget);
             st.view = view;
             sink.view = view;
+            // v0.3.15 G14：前进/后退滑动手势（WebKitSettings 原生 API——
+            // Windows 走 Settings6 IsSwipeNavigationEnabled，默认关对齐）
+            if (config.webview.settings.swipe_gestures) {
+                const wsettings = c.webkit_web_view_get_settings(view);
+                if (wsettings != null) {
+                    c.webkit_settings_set_enable_back_forward_navigation_gestures(wsettings, 1);
+                    log.print("[settings] swipe_gestures=true (back-forward gestures)", .{});
+                }
+            }
+            // v0.3.15 G13：browser_accelerators——WebKitGTK 无对应 API（加速键由
+            // WM/GTK 消费），文档化 skip
             // 主 WebView 作为 main child：随窗口内容区自动伸缩
             c.gtk_container_add(@ptrCast(overlay), view_widget);
 
@@ -4327,6 +4338,13 @@ fn Backend(comptime config: Config) type {
                     c.webkit_web_view_load_html(@ptrCast(view), z.ptr, w.app_url.ptr);
                     return try alloc.dupe(u8, "{}");
                 },
+                // v0.3.15 G12：printToPdf——WebKitGTK 无 PDF 导出 API（仅打印
+                // 对话框；与上游 wry 同限制）→ 明确错误文档化
+                .print_to_pdf => return error.PdfNotSupported,
+                // v0.3.15：Settings3/6 探针——WebKitGTK 无 AreBrowserAcceleratorKeys
+                // / IsSwipeNavigationEnabled 对等（手势经 WebKitSettings 创建期设置）
+                // → null 文档化
+                .settings_probe => return try alloc.dupe(u8, "{\"accelerators\":null,\"swipe\":null}"),
                 .set_user_agent => |ua| {
                     const settings = c.webkit_web_view_get_settings(view);
                     if (settings == null) return error.WebViewCallFailed;
@@ -7789,6 +7807,7 @@ fn Backend(comptime config: Config) type {
                 .location => "access your location",
                 .clipboard => "read the clipboard",
                 .notifications => "show notifications",
+                .other_sensors => "access device sensors",
                 .unknown => "access a device capability",
             };
             const parent: [*c]c.GtkWindow = @ptrCast(w.win);

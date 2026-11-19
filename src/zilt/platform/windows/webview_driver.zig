@@ -117,6 +117,19 @@ const iid_webview4: com.GUID = .parse("20d02d59-6df2-42dc-bd06-f98a694b1302");
 // Header 64491: 21 Settings slots, then user agent get/put.
 const Settings2 = Interface(extern struct { base: [21]Slot, get_UserAgent: GetString, put_UserAgent: PutString });
 const iid_settings2: com.GUID = .parse("ee9a0f68-f46c-4e32-ac23-ef8cac224d2a");
+// v0.3.15 G13（SDK 1.0.3124.44 WebView2.h 核对）：Settings2 21 槽 + UA 2 槽 →
+// Settings3 AreBrowserAcceleratorKeysEnabled（槽 23,24）。
+const Settings3 = Interface(extern struct { base: [23]Slot, get_AreBrowserAcceleratorKeysEnabled: GetInt, put_AreBrowserAcceleratorKeysEnabled: PutInt });
+const iid_settings3: com.GUID = .parse("fdb5ab74-af33-4854-84f0-0a631deb5eba");
+// v0.3.15 G14（同上核对）：Settings4 双属性 4 槽（25–28）+ Settings5 IsPinchZoomEnabled
+// 2 槽（29,30）→ Settings6 IsSwipeNavigationEnabled（槽 31,32）。
+const Settings6 = Interface(extern struct { base: [31]Slot, get_IsSwipeNavigationEnabled: GetInt, put_IsSwipeNavigationEnabled: PutInt });
+const iid_settings6: com.GUID = .parse("11cb3acd-9bc8-43b8-83bf-f40753714f87");
+// v0.3.15 G12（同上核对）：ICoreWebView2_7 = base chain（61+7+5+4+2+1+1 = 81 槽，
+// vtable 全表 81 实测）→ PrintToPdf（槽 80 全表 = 自有槽 0），签名
+// (LPCWSTR ResultFilePath, ICoreWebView2PrintSettings*, ICoreWebView2PrintToPdfCompletedHandler*)。
+const WebView7 = Interface(extern struct { base: [80]Slot, PrintToPdf: *const fn (*anyopaque, W, ?*anyopaque, *anyopaque) callconv(.c) HRESULT });
+const iid_webview7: com.GUID = .parse("79c24d83-09a3-45ae-9418-487f32a58740");
 // Header 18395. Inherited slot counts through _15:
 // 61+7+5+4+2+1+1+7+9+2+3+3+1+3+4 = 113.
 const WebView16 = Interface(extern struct { base: [113]Slot, Print: Slot, ShowPrintUI: PutInt, PrintToPdfStream: Slot });
@@ -273,6 +286,16 @@ pub const Driver = struct {
             defer self.allocator.free(wide);
             try check(s2.lpVtbl.put_UserAgent(s2, wide.ptr));
         }
+        // v0.3.15 G13/G14：Settings3 浏览器加速键 + Settings6 滑动手势。
+        // QI 失败（老运行时）仅跳过——降级文化与 Profile6 一致。
+        if (query(Settings3, s, &iid_settings3)) |s3| {
+            defer release(s3);
+            _ = s3.lpVtbl.put_AreBrowserAcceleratorKeysEnabled(s3, @intFromBool(o.browser_accelerators));
+        } else |_| {}
+        if (query(Settings6, s, &iid_settings6)) |s6| {
+            defer release(s6);
+            _ = s6.lpVtbl.put_IsSwipeNavigationEnabled(s6, @intFromBool(o.swipe_gestures));
+        } else |_| {}
         // v0.3.2：Profile6 autofill / password autosave（Profile 级设置）。
         // Profile6 需 WebView2 运行时 1.0.1661+——QI 失败仅跳过，不视为致命
         // （与 transparent 依赖 Controller2 的降级策略一致）。
@@ -411,6 +434,46 @@ pub const Driver = struct {
                 defer self.allocator.free(wide);
                 try check(w.lpVtbl.NavigateToString(w, wide.ptr));
                 return try self.allocator.dupe(u8, "{}");
+            },
+            // v0.3.15 G12：静默导出 PDF（ICoreWebView2_7::PrintToPdf，槽 80；
+            // printSettings=null = 引擎默认 A4 纵向）。异步——结果经 webviewPdf
+            // 事件回传（rid 匹配），本请求立即返回 {}。
+            .print_to_pdf => |req| {
+                if (req.path.len == 0) return error.MissingPath;
+                const p = try validatePdfPath(self.allocator, req.path);
+                defer self.allocator.free(p);
+                const wv7 = try query(WebView7, w, &iid_webview7);
+                defer release(wv7);
+                const handler = try PdfHandler.create(self.allocator, self, req.rid);
+                defer handler.dropRef();
+                const wide = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, p);
+                defer self.allocator.free(wide);
+                try check(wv7.lpVtbl.PrintToPdf(wv7, wide.ptr, null, @ptrCast(handler)));
+                return try self.allocator.dupe(u8, "{}");
+            },
+            // v0.3.15：Settings3/6 开关 ABI 往返探针（读→反转→验证→恢复→验证）。
+            // 老运行时 QI 失败 → 对应字段 null。
+            .settings_probe => {
+                var settings: ?*wv2.ICoreWebView2Settings = null;
+                try check(w.lpVtbl.get_Settings(w, &settings));
+                const s = settings orelse return error.WebViewCallFailed;
+                defer release(s);
+                var accel: ?[]const u8 = null;
+                var swipe: ?[]const u8 = null;
+                if (query(Settings3, s, &iid_settings3)) |s3| {
+                    defer release(s3);
+                    accel = try probeToggle(s3, s3.lpVtbl.get_AreBrowserAcceleratorKeysEnabled, s3.lpVtbl.put_AreBrowserAcceleratorKeysEnabled, self.allocator);
+                } else |_| {}
+                if (query(Settings6, s, &iid_settings6)) |s6| {
+                    defer release(s6);
+                    swipe = try probeToggle(s6, s6.lpVtbl.get_IsSwipeNavigationEnabled, s6.lpVtbl.put_IsSwipeNavigationEnabled, self.allocator);
+                } else |_| {}
+                defer if (accel) |a| self.allocator.free(a);
+                defer if (swipe) |sw| self.allocator.free(sw);
+                return try std.fmt.allocPrint(self.allocator, "{{\"accelerators\":{s},\"swipe\":{s}}}", .{
+                    accel orelse "null",
+                    swipe orelse "null",
+                });
             },
             .print => |kind| {
                 const w16 = try query(WebView16, w, &iid_webview16);
@@ -792,6 +855,69 @@ const CdpHandler = struct {
     }
 };
 
+/// v0.3.15 G12：PrintToPdf 完成回调（ICoreWebView2PrintToPdfCompletedHandler，
+/// Invoke(hr, is_successful)）。结果以 `webviewPdf` 事件回主机（rid 匹配）。
+const PdfHandler = struct {
+    iface: Interface(VTable) = .{ .lpVtbl = &vtable },
+    allocator: Allocator,
+    refs: u32 = 1,
+    driver: ?*Driver,
+    rid: i64,
+
+    const VTable = extern struct {
+        base: U,
+        Invoke: *const fn (*anyopaque, HRESULT, i32) callconv(.c) HRESULT,
+    };
+    const vtable = VTable{
+        .base = .{ .QueryInterface = qi, .AddRef = addRef, .Release = subRef },
+        .Invoke = invoke,
+    };
+
+    fn create(a: Allocator, d: *Driver, rid: i64) !*PdfHandler {
+        const h = try a.create(PdfHandler);
+        h.* = .{ .allocator = a, .driver = d, .rid = rid };
+        return h;
+    }
+    fn from(raw: *anyopaque) *PdfHandler {
+        const iface: *Interface(VTable) = @ptrCast(@alignCast(raw));
+        return @fieldParentPtr("iface", iface);
+    }
+    fn qi(raw: *anyopaque, iid: *const com.GUID, out: *?*anyopaque) callconv(.c) HRESULT {
+        out.* = null;
+        if (!iid.eql(com.IID_IUnknown) and !iid.eql(iid_print_pdf_completed)) return com.E_NOINTERFACE;
+        out.* = raw;
+        _ = addRef(raw);
+        return com.S_OK;
+    }
+    fn addRef(raw: *anyopaque) callconv(.c) u32 {
+        return @atomicRmw(u32, &from(raw).refs, .Add, 1, .monotonic) + 1;
+    }
+    fn subRef(raw: *anyopaque) callconv(.c) u32 {
+        const h = from(raw);
+        const n = @atomicRmw(u32, &h.refs, .Sub, 1, .acq_rel) - 1;
+        if (n == 0) h.allocator.destroy(h);
+        return n;
+    }
+    fn dropRef(h: *PdfHandler) void {
+        _ = subRef(&h.iface);
+    }
+
+    fn invoke(raw: *anyopaque, hr: HRESULT, is_successful: i32) callconv(.c) HRESULT {
+        const h = from(raw);
+        _ = addRef(raw);
+        defer h.dropRef();
+        const d = h.driver orelse return com.S_OK;
+        if (!d.alive) return com.S_OK;
+        const ok = com.succeeded(hr) and is_successful != 0;
+        const payload = std.fmt.allocPrint(d.allocator, "{{\"rid\":{d},\"ok\":{s}}}", .{ h.rid, if (ok) "true" else "false" }) catch return com.S_OK;
+        defer d.allocator.free(payload);
+        d.callbacks.emit(d.context, "webviewPdf", payload);
+        return com.S_OK;
+    }
+};
+
+const iid_print_pdf_completed: com.GUID = .parse("ccf1ef04-fd8e-4d5f-b2de-0983e41b8c36");
+
 const PermissionPrompt = struct {    allocator: Allocator,
     args: *PermissionArgs,
     deferral: *Deferral,
@@ -1065,6 +1191,7 @@ fn permissionKind(native: i32) shared.PermissionKind {
         2 => .camera,
         3 => .location,
         4 => .notifications,
+        5 => .other_sensors, // v0.3.15 G27（COREWEBVIEW2_PERMISSION_KIND_OTHER_SENSORS）
         6 => .clipboard,
         else => .unknown,
     };
@@ -1075,6 +1202,30 @@ fn validateOrigin(origin: []const u8) !void {
 }
 fn validateDirectory(dir: []const u8) !void {
     if (!std.fs.path.isAbsoluteWindows(dir) or std.mem.indexOfScalar(u8, dir, 0) != null) return error.InvalidDownloadDirectory;
+}
+
+/// v0.3.15 G12：PDF 输出路径校验（绝对路径 + 无 NUL；目录存在性由引擎回报——
+/// PrintToPdf 对缺失目录返回失败 handler）。
+fn validatePdfPath(a: Allocator, path: []const u8) ![]u8 {
+    if (!std.fs.path.isAbsoluteWindows(path) or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPdfPath;
+    return try a.dupe(u8, path);
+}
+
+/// v0.3.15：Settings3/6 探针往返（读 → 反转 → 验证 → 恢复 → 验证）。
+fn probeToggle(obj: anytype, get_fn: anytype, put_fn: anytype, alloc: Allocator) ![]u8 {
+    var before: i32 = 0;
+    try check(get_fn(obj, &before));
+    try check(put_fn(obj, if (before != 0) 0 else 1));
+    var after: i32 = 0;
+    try check(get_fn(obj, &after));
+    try check(put_fn(obj, before));
+    var restored: i32 = 0;
+    try check(get_fn(obj, &restored));
+    return std.fmt.allocPrint(alloc, "{{\"before\":{s},\"after\":{s},\"restored\":{s}}}", .{
+        if (before != 0) "true" else "false",
+        if (after != 0) "true" else "false",
+        if (restored != 0) "true" else "false",
+    });
 }
 fn downloadPath(a: Allocator, dir: []const u8, suggested: []const u8, id: u64) ![]u8 {
     try validateDirectory(dir);

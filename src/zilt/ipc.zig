@@ -1050,8 +1050,10 @@ const runtime_js_head =
     \\  let channelSeq = 0;
     \\  let cdpSeq = 0;
     \\  let binarySeq = 0;
+    \\  let pdfSeq = 0;
     \\  const webviewEvalWaiters = new Map();
     \\  const cdpWaiters = new Map();
+    \\  const pdfWaiters = new Map();
     \\  // SQL 参数编码：原生值 → Zig 侧 {kind:'text'|'int'|'real'|'nul', ...}
     \\  const ziltSqlParam = (v) => {
     \\    if (v === null || v === undefined) return { kind: 'nul' };
@@ -1295,6 +1297,15 @@ const runtime_js_head =
     \\      closeDevtools: () => builtin('__zilt.webview', { action: 'closeDevtools' }),
     \\      getDevtoolsState: () => builtin('__zilt.webview', { action: 'getDevtoolsState' }),
     \\      loadHTML: (html) => builtin('__zilt.webview', { action: 'loadHTML', html }),
+    \\      // v0.3.15 G12：静默导出 PDF（Windows 实装；Linux PdfNotSupported）。
+    \\      // 异步——结果经 webviewPdf 事件带回（rid 匹配）
+    \\      printToPdf: (path) => new Promise((resolve, reject) => {
+    \\        const rid = ++pdfSeq;
+    \\        pdfWaiters.set(rid, { resolve, reject });
+    \\        builtin('__zilt.webview', { action: 'printToPdf', path, rid }).catch((e) => { pdfWaiters.delete(rid); reject(e); });
+    \\      }),
+    \\      // v0.3.15：Settings3/6 开关 ABI 往返探针（Windows 实测往返；Linux null）
+    \\      settingsProbe: () => builtin('__zilt.webview', { action: 'settingsProbe' }),
     \\      print: (kind) => builtin('__zilt.webview', { action: 'print', kind: kind ?? 'browser' }),
     \\      cancelDownload: (id) => builtin('__zilt.webview', { action: 'cancelDownload', download_id: id }),
     \\      clearStorage: () => builtin('__zilt.webview', { action: 'clearStorage' }),
@@ -1694,6 +1705,13 @@ const runtime_js_tail =
     \\    if (!wait) return;
     \\    cdpWaiters.delete(p.rid);
     \\    if (p.ok) wait.resolve(p.result); else wait.reject(new Error(p.error || 'cdp failed'));
+    \\  });
+    \\  // v0.3.15 G12：printToPdf 完成回传（rid 匹配）
+    \\  window.zilt.on('webviewPdf', (p) => {
+    \\    const wait = pdfWaiters.get(p && p.rid);
+    \\    if (!wait) return;
+    \\    pdfWaiters.delete(p.rid);
+    \\    if (p.ok) wait.resolve(p); else wait.reject(new Error('pdf export failed'));
     \\  });
     \\  window.zilt.on('__zilt.evalResult', (p) => {
     \\    const w = evalWaiters.get(p.id);
