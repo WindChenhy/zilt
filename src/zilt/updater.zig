@@ -118,9 +118,18 @@ pub fn accepts(manifest_channel: []const u8, wanted: UpdateChannel) bool {
     return false;
 }
 
+/// v0.3.16 G23：下载进度回调（字节级；~10Hz 节流由回调方负责）。
+pub const Progress = struct {
+    ctx: *anyopaque,
+    cb: *const fn (ctx: *anyopaque, written: u64, total: u64) void,
+};
+
 pub const Fetcher = struct {
     ctx: *anyopaque,
     fetchFn: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, url: []const u8) anyerror![]u8,
+    /// v0.3.16 G23：流式下载 + 字节进度（null = 用 fetchFn 整体拉取，无进度）。
+    streamFn: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, url: []const u8, progress: ?Progress) anyerror![]u8 = null,
+    progress: ?Progress = null,
 };
 
 /// 检查更新：取 manifest → 比较 → 返回新版本 manifest；已是最新返回 null。
@@ -164,11 +173,18 @@ pub fn checkForUpdate(arena: std.mem.Allocator, fetcher: Fetcher, manifest_url: 
 }
 
 /// 下载并验签安装包（返回包字节；调用方负责释放）。
+/// streamFn 存在时走流式下载（字节进度回调 ~每块一次）。
 pub fn downloadAndVerify(alloc: std.mem.Allocator, fetcher: Fetcher, m: Manifest, public_key: [32]u8) UpdateError![]u8 {
-    const artifact = fetcher.fetchFn(fetcher.ctx, alloc, m.url) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.ManifestInvalid,
-    };
+    const artifact = if (fetcher.streamFn) |stream|
+        stream(fetcher.ctx, alloc, m.url, fetcher.progress) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.ManifestInvalid,
+        }
+    else
+        fetcher.fetchFn(fetcher.ctx, alloc, m.url) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.ManifestInvalid,
+        };
     errdefer alloc.free(artifact);
 
     // sha256 比对（大小写不敏感）

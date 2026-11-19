@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.16（托盘/任务栏/屏幕细化 + 单实例加固——三轮差距刷新第三批）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.17（更新器/分发收尾 + 二进制通道——三轮差距刷新第四批）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -259,6 +259,31 @@ v0.3.12 新增（2026-11-19，CompositionController 专项——二轮差距刷�
   渲染修复列为后续专项；c-comp 检查断言回退路径
 - **验收**：Windows 单测全绿 + 冒烟 **61 项**（新增 c-comp 断言组合请求 → 探测 →
   回退全链 + state.composition=false）；Linux 不涉及（组合为 Windows 面）
+
+v0.3.17 新增（2026-11-20，更新器/分发收尾 + 二进制通道——三轮差距刷新第四批）：
+
+- **更新器字节级下载进度（G23）**：`updateDownloadProgress {written, total}` 事件
+  （~10Hz 节流 + 终值补发）——Fetcher 增 `streamFn`（流式下载，64KB 分块 +
+  Content-Length 总量）+ `progress` 回调；Windows `httpFetchStreaming`（手动
+  request/receiveHead/readSliceShort 短读循环——v0.3.8 的 upload 进度同款节流）；
+  Linux updater 保持整体拉取（soup 无进度面，文档化）
+- **更新器周期检查（G23）**：`Config.update.check_interval_min`（分钟）——
+  Windows SetTimer(id 6) → WM_TIMER 重跑 updaterFlow 后台线程（check → download →
+  stage 全链 + 事件）
+- **deb/AppDir resources 分发收尾（G24）**：pack Linux 递归收集 exe 旁
+  `resources/**`（libc readdir——Io walker 递归句柄 BADF 实测回退；arena 段内
+  回收破坏 tar 条目名实测——dir_rel 切片直指 rf.rel 零分配规避）→ deb
+  `usr/bin/resources/**`（dir+file tar 条目）+ AppDir/AppImage 同布局；
+  **PACK_E2E PASS + deb tar 条目实测**（demo/manifest.json + demo/readme.txt）
+- **二进制通道（G25）**：`channel.create({binary: true})`——帧带 **FNV-1a32
+  校验和**（JS `Math.imul` 实现——普通乘法 2^53 精度丢失实测修正 + 公开测试向量
+  单测）；Zig→JS `ctx.channelSendBinary`（base64 帧 → JS 解回 Uint8Array，验和
+  不符 onclose('checksum')）；JS→Zig `ch.send(Uint8Array)` → 事件 channelUp
+  （events 命名空间 `channelUp(ctx, {id, seq, data_b64, sum})` 接收，事件通道
+  天然经 ACL + isolation 密封）；demo 回显链路 16KB 逐字节比对（c-bchan）
+- **验收**：Windows 冒烟 **66 项**（c-bchan 全链过）+ 单测全绿（+FNV 向量/
+  往返/非法输入、seal 结构）；Linux 冒烟 **86/86** + PACK_E2E PASS + post
+  terminate PASS；clip 既有环境问题
 
 v0.3.16 新增（2026-11-20，托盘/任务栏/屏幕细化 + 单实例加固——三轮差距刷新第三批）：
 

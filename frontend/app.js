@@ -1275,6 +1275,39 @@ async function runChecks() {
       if (!ok) window.zilt.log('warn', 'c-sys2 note: cur=' + JSON.stringify(cur) + ' rot=' + rot + ' badge=' + badge + '/' + badgeClear + ' dark=' + dark + ' aws=' + aws1 + '/' + aws2);
     } catch (e) { setCheck('c-sys2', false, String(e.message || e)); window.zilt.log('warn', 'c-sys2 error: ' + String(e.message || e)); }
 
+    // 66. v0.3.16 G25：二进制通道——16KB Uint8Array send → Zig channelUp 回显
+    //     （验和 + channelSendBinary）→ JS binary onmessage 验收逐字节比对
+    try {
+      const size = 16 * 1024;
+      const payload = new Uint8Array(size);
+      for (let i = 0; i < size; i++) payload[i] = (i * 7 + 13) & 0xFF;
+      const frames = [];
+      let closedErr = null;
+      const ch = window.zilt.channel.create({
+        binary: true,
+        onmessage: (bytes, seq) => frames.push({ bytes, seq }),
+        onclose: (err) => { closedErr = err; },
+      });
+      ch.send(payload);
+      let got = false;
+      for (let t = 0; t < 40 && !got; t++) {
+        await sleep(100);
+        if (frames.length > 0) {
+          const b = frames[0].bytes;
+          got = b.length === size && frames[0].seq === 0;
+          if (got) {
+            for (let i = 0; i < size; i++) {
+              if (b[i] !== payload[i]) { got = false; break; }
+            }
+          }
+        }
+      }
+      ch.close();
+      const ok = got && closedErr == null;
+      setCheck('c-bchan', ok, ok ? 'binary channel ok (16KB send→echo→verify, checksum pass)' : `frames=${frames.length} got=${got} closed=${closedErr}`);
+      if (!ok) window.zilt.log('warn', 'c-bchan note: frames=' + frames.length + ' got=' + got + ' closed=' + closedErr);
+    } catch (e) { setCheck('c-bchan', false, String(e.message || e)); window.zilt.log('warn', 'c-bchan error: ' + String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）。
@@ -1347,6 +1380,7 @@ async function runChecks() {
       pdf: $('c-pdf').className === 'pass',
       acc: $('c-acc').className === 'pass',
       sys2: $('c-sys2').className === 'pass',
+      bchan: $('c-bchan').className === 'pass',
       appquit: !!window.zilt.app,
     };
     window.zilt.emit('smokeResult', smokeFlags);

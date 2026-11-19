@@ -365,6 +365,9 @@ fn appendArMember(alloc: std.mem.Allocator, out: *std.ArrayList(u8), name: []con
 /// v0.3.11 E1b：sidecar 等额外 data 文件（usr/bin 同目录分发）
 pub const ExtraFile = struct { name: []const u8, bytes: []const u8 };
 
+/// v0.3.16 G24：resources（exe 旁 resources/** 递归收集；'/' 分隔相对路径）。
+pub const ResFile = struct { rel: []const u8, bytes: []const u8 };
+
 pub const DebOptions = struct {
     /// Depends: 逗号连接（如 libgtk-3-0、libwebkit2gtk-4.1-0）
     depends: []const []const u8 = &.{},
@@ -377,6 +380,9 @@ pub const DebOptions = struct {
     /// v0.3.11 E1b：external_bin sidecar（name → usr/bin/<name> 同目录分发；
     /// 内容 = exe 旁已装好的同名文件字节）
     extra_files: []const ExtraFile = &.{},
+    /// v0.3.16 G24：resources（rel → usr/bin/resources/<rel>——与 exe 同目录，
+    /// path.resource 语义一致）
+    resources: []const ResFile = &.{},
 };
 
 /// 生成 .deb（control.tar.gz + data.tar.gz + debian-binary → ar 容器）。
@@ -470,6 +476,37 @@ pub fn buildDebOpt(alloc: std.mem.Allocator, meta: PackMeta, exe_bytes: []const 
         const ef_entry = try std.fmt.allocPrint(alloc, "./usr/bin/{s}", .{ef.name});
         defer alloc.free(ef_entry);
         try data_entries.append(alloc, .{ .name = ef_entry, .mode = 0o755, .data = ef.bytes });
+    }
+    // v0.3.16 G24：resources（usr/bin/resources/**；目录条目逐级补齐）。
+    // dir_rel 切片直接指向 rf.rel 内部（零分配零释放——arena 段内回收语义
+    // 实测会破坏条目名，见 v0.3.16 实测记录）
+    if (opts.resources.len > 0) {
+        var dirs: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (opts.resources) |rf| {
+            var idx: usize = 0;
+            while (std.mem.indexOfScalarPos(u8, rf.rel, idx, '/')) |slash| {
+                const dir_rel = rf.rel[0..slash];
+                idx = slash + 1;
+                var dup = false;
+                for (dirs.items) |d| {
+                    if (std.mem.eql(u8, d, dir_rel)) dup = true;
+                }
+                if (!dup) dirs.append(alloc, dir_rel) catch break;
+            }
+        }
+        std.mem.sort([]const u8, dirs.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lt);
+        for (dirs.items) |d| {
+            const dir_entry = try std.fmt.allocPrint(alloc, "./usr/bin/resources/{s}/", .{d});
+            try data_entries.append(alloc, .{ .name = dir_entry, .mode = 0o755, .typeflag = '5' });
+        }
+        for (opts.resources) |rf| {
+            const rf_entry = try std.fmt.allocPrint(alloc, "./usr/bin/resources/{s}", .{rf.rel});
+            try data_entries.append(alloc, .{ .name = rf_entry, .mode = 0o644, .data = rf.bytes });
+        }
     }
     try data_entries.append(alloc, .{ .name = "./usr/share/", .mode = 0o755, .typeflag = '5' });
     try data_entries.append(alloc, .{ .name = "./usr/share/applications/", .mode = 0o755, .typeflag = '5' });

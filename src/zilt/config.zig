@@ -198,5 +198,8 @@ pub const Config = struct {
         /// `releases/latest` 并解析 `zilt-manifest.json` asset 作为清单 URL
         ///（manifest_url 仍作为回退/普通模式）。用户跳过的版本存 skipped.json。
         github_repo: ?[]const u8 = null,
+        /// v0.3.16 G23：周期检查间隔（分钟；null = 仅启动时检查一次）。
+        /// 到点后台重跑 updaterFlow（check → download → stage 全链 + 事件）。
+        check_interval_min: ?u32 = null,
     };
 };

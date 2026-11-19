@@ -375,6 +375,12 @@ pub fn run(comptime config: Config) !void {
     if (config.update != null) {
         _ = win32.SetTimer(main.hwnd, 3, 10_000, null);
         log.print("[updater] health timer armed (10s)", .{});
+        // v0.3.16 G23：周期检查（分钟级；id 6 → WM_TIMER 重跑 updaterFlow 线程）
+        if (config.update.?.check_interval_min) |mins| {
+            const ms: u32 = @intCast(@as(u64, mins) * 60 * 1000);
+            _ = win32.SetTimer(main.hwnd, 6, ms, null);
+            log.print("[updater] periodic check timer armed ({d} min)", .{mins});
+        }
     }
 
     // v0.3.2：注册会话通知（锁屏/解锁事件）。失败仅日志（事件面降级，不致命）。
@@ -6362,6 +6368,18 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
                             }
                         }
                     }
+                    if (wparam == 6) {
+                        // v0.3.16 G23：周期更新检查（后台线程跑全链；与启动检查同流）
+                        if (instance) |b| {
+                            log.print("[updater] periodic check tick", .{});
+                            if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, updaterFlow, .{b})) |t| {
+                                t.detach();
+                            } else |err| {
+                                log.print("[updater] periodic thread spawn failed: {s}", .{@errorName(err)});
+                            }
+                        }
+                        return 0;
+                    }
                     if (wparam == 3) {
                         _ = win32.KillTimer(hwnd, 3);
                         const alloc_h = std.heap.page_allocator;
@@ -8775,6 +8793,60 @@ fn httpFetch(backend_ptr: *anyopaque, alloc: std.mem.Allocator, url: []const u8)
     return aw.toOwnedSlice();
 }
 
+/// v0.3.16 G23：流式下载（64KB 分块读取 + 字节进度回调 ~10Hz 节流）。
+fn httpFetchStreaming(backend_ptr: *anyopaque, alloc: std.mem.Allocator, url: []const u8, progress: ?updater.Progress) anyerror![]u8 {
+    _ = backend_ptr;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    var client: std.http.Client = .{ .allocator = alloc, .io = threaded.io() };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(url);
+    var req = try client.request(.GET, uri, .{});
+    defer req.deinit();
+    try req.sendBodiless();
+
+    var redirect_buffer: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buffer);
+    if (response.head.status != .ok) {
+        log.print("[updater] http {s} -> status {d}", .{ url, @intFromEnum(response.head.status) });
+        return error.HttpRequestFailed;
+    }
+    const total: u64 = response.head.content_length orelse 0;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var transfer_buffer: [64]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    var written: u64 = 0;
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        // readSliceShort：EOF 返回短读（ShortError 只有 ReadFailed）
+        const n = reader.readSliceShort(&buf) catch return error.HttpRequestFailed;
+        try out.appendSlice(alloc, buf[0..n]);
+        written += n;
+        if (progress) |p| p.cb(p.ctx, written, total);
+        if (n < buf.len) break;
+    }
+    if (progress) |p| p.cb(p.ctx, written, written);
+    return out.toOwnedSlice(alloc);
+}
+
+/// v0.3.16 G23：进度节流状态（updaterFlow 后台线程内构造；emit 线程安全）。
+const UpdaterProgressBox = struct {
+    ctx: ipc.Context,
+    last_emit_ms: i64 = 0,
+};
+
+fn updaterProgressCb(ptr: *anyopaque, written: u64, total: u64) void {
+    const box: *UpdaterProgressBox = @ptrCast(@alignCast(ptr));
+    const now: i64 = @intCast(win32.GetTickCount64());
+    // ~10Hz 节流（100ms）+ 终值补发（written == total 时直发）
+    if (written < total and now - box.last_emit_ms < 100) return;
+    box.last_emit_ms = now;
+    box.ctx.emit("updateDownloadProgress", .{ .written = written, .total = total });
+}
+
 /// 更新流程（后台线程）：检查 → 下载 → 验签 → 提取替换 → 事件 + 日志。
 fn updaterFlow(self: anytype) void {
     const env = self.updater_env orelse return;
@@ -8809,9 +8881,13 @@ fn updaterFlow(self: anytype) void {
         }
     }
     if (artifact == null) {
-        // v0.3.4：下载/校验生命周期事件（细粒度字节进度需要 fetcher 回调，列后续）
         ctx.emit("updateDownloading", .{ .version = m.version });
-        artifact = updater.downloadAndVerify(self.allocator, env.fetcher, m, env.public_key) catch |err| {
+        // v0.3.16 G23：流式下载 + 字节进度（updateDownloadProgress ~10Hz；终值补发）
+        var fetcher = env.fetcher;
+        var progress_box = UpdaterProgressBox{ .ctx = ctx };
+        fetcher.streamFn = httpFetchStreaming;
+        fetcher.progress = .{ .ctx = @ptrCast(&progress_box), .cb = updaterProgressCb };
+        artifact = updater.downloadAndVerify(self.allocator, fetcher, m, env.public_key) catch |err| {
             log.print("[updater] download/verify failed: {s}", .{@errorName(err)});
             ctx.emit("updaterFailed", .{ .stage = "download", .err = @errorName(err) });
             return;

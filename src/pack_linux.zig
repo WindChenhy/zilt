@@ -225,11 +225,21 @@ pub fn main() !void {
         const sc_b = readFileAlloc(alloc, src_sc, 512 * 1024 * 1024) catch continue; // 缺失跳过
         try sidecar_bytes.append(alloc, .{ .name = try std.fmt.allocPrint(alloc, "{s}{s}", .{ sc_name, ext }), .bytes = sc_b });
     }
+    // v0.3.16 G24：resources 收集（exe 旁 resources/** 递归；deb/AppDir 同布局
+    // —— exe 相对路径解析，`path.resource` 在两种安装形态下语义一致）
+    var resource_files: std.ArrayListUnmanaged(pack_formats.ResFile) = .empty;
+    const resources_root = try pathJoin(alloc, src_dir, "resources");
+    collectResources(alloc, resources_root, "", &resource_files);
+    if (resource_files.items.len > 0) {
+        std.debug.print("[pack] resources: {d} file(s)\n", .{resource_files.items.len});
+    }
+
     const deb = try pack_formats.buildDebOpt(alloc, meta, exe_bytes.?, .{
         .depends = &.{ "libgtk-3-0", "libwebkit2gtk-4.1-0", "libsqlite3-0" },
         .postinst_lines = &.{mime_line},
         .icon_png = icon_png,
         .extra_files = sidecar_bytes.items,
+        .resources = resource_files.items,
     });
     const deb_out = try pathJoin(alloc, out_dir, try std.fmt.allocPrint(alloc, "{s}_{s}_amd64.deb", .{ pkg, meta.version }));
     if (!writeFile(alloc, deb_out, deb, 0o644)) return error.WriteFailed;
@@ -251,6 +261,14 @@ pub fn main() !void {
     for (sidecar_bytes.items) |sc| {
         const dst_sc = try pathJoin(alloc, app_dir, try std.fmt.allocPrint(alloc, "usr/bin/{s}", .{sc.name}));
         if (!writeFile(alloc, dst_sc, sc.bytes, 0o755)) return error.WriteFailed;
+    }
+
+    // v0.3.16 G24：resources → AppDir usr/bin/resources/**（与 deb 同布局）
+    for (resource_files.items) |rf| {
+        const dst_full = try pathJoin(alloc, app_dir, try std.fmt.allocPrint(alloc, "usr/bin/resources/{s}", .{rf.rel}));
+        const dst_parent = std.fs.path.dirname(dst_full) orelse continue;
+        mkDirs(alloc, dst_parent);
+        if (!writeFile(alloc, dst_full, rf.bytes, 0o644)) return error.WriteFailed;
     }
 
     // 桌面项：与 deb 同一生成器（v0.2.2 的 desktop_entry）
@@ -343,3 +361,46 @@ pub fn main() !void {
     if (!writeFile(alloc, spec_out, spec, 0o644)) return error.WriteFailed;
     std.debug.print("[pack] spec -> {s}（rpmbuild -bb 可构建）\n", .{spec_out});
 }
+
+
+/// v0.3.16 G24：递归收集 `<root>/**` → ResFile{rel, bytes}（'/' 分隔相对路径；
+/// root 不存在 = 静默空集——模板项目未声明 resources 时零开销）。
+fn collectResources(alloc: Allocator, root: []const u8, rel: []const u8, out: *std.ArrayListUnmanaged(pack_formats.ResFile)) void {
+    const full = if (rel.len == 0) root else pathJoin(alloc, root, rel) catch return;
+    // libc opendir/readdir（与工具其余 std.c 风格一致；Io walker 的句柄语义在
+    // 递归场景实测 BADF——本工具不做 async，直呼 libc 最稳）
+    const z = alloc.allocSentinel(u8, full.len, 0) catch return;
+    defer alloc.free(z);
+    @memcpy(z, full);
+    const dir = std.c.opendir(z.ptr) orelse return;
+    defer _ = std.c.closedir(dir);
+    while (true) {
+        const entry = std.c.readdir(dir) orelse break;
+        const d: *posixDirent = @ptrCast(@alignCast(entry));
+        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&d.d_name)), 0);
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        const child_rel = if (rel.len == 0)
+            (alloc.dupe(u8, name) catch continue)
+        else
+            (pathJoin(alloc, rel, name) catch continue);
+        switch (d.d_type) {
+            4 => collectResources(alloc, root, child_rel, out), // DT_DIR
+            8, 10 => { // DT_REG / DT_LNK
+                const child_full = pathJoin(alloc, root, child_rel) catch continue;
+                const bytes = readFileAlloc(alloc, child_full, 64 * 1024 * 1024) orelse continue;
+                out.append(alloc, .{ .rel = child_rel, .bytes = bytes }) catch return;
+            },
+            else => {},
+        }
+    }
+}
+
+/// glibc readdir 返回的 dirent 布局（x86_64 上即 dirent64；d_type 在
+/// d_reclen 后，d_name 以 NUL 结尾）
+const posixDirent = extern struct {
+    d_ino: u64,
+    d_off: i64,
+    d_reclen: u16,
+    d_type: u8,
+    d_name: [256]u8,
+};

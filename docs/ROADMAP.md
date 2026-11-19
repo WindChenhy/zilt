@@ -575,6 +575,21 @@
         onCopyData 两路接线（明文/篡改/非法密钥拒绝）
       - **验收**：Windows 冒烟 **65 项**（c-sys2）+ 单测全绿；Linux 冒烟 **86/86**
         （curs）+ post terminate PASS；clip 既有环境问题
+- [x] **v0.3.17 更新器/分发收尾 + 二进制通道**（2026-11-20；三轮差距刷新第四批）：
+      - **G23 更新器进度 + 周期检查**：Fetcher.streamFn/progress（updater.zig）+
+        Windows httpFetchStreaming（短读循环 + GetTickCount64 节流）+
+        updateDownloadProgress 事件；Config.update.check_interval_min → SetTimer(6)
+        → WM_TIMER 重跑 updaterFlow
+      - **G24 deb/AppDir resources**：pack_linux collectResources（libc readdir——
+        Io walker 递归 BADF 实测回退）+ buildDebOpt resources 选项（dir+file tar
+        条目）；**arena 段内回收破坏 tar 条目名实测** → dir_rel 切片直指 rf.rel
+        零分配；deb tar 条目 + PACK_E2E PASS 实测
+      - **G25 二进制通道**：channelChecksum（FNV-1a32，公开向量单测）+
+        channelDecodeBase64 + Context.channelSendBinary + runtime JS binary 模式
+        （Math.imul——浮点乘 2^53 精度丢失实测修正）+ JS→Zig 经事件 channelUp；
+        demo 回显 16KB 全链（c-bchan）
+      - **验收**：Windows 冒烟 **66 项**（c-bchan）+ 单测全绿；Linux 冒烟
+        **86/86** + PACK_E2E PASS + post terminate PASS
       - 后续规划（v0.3.8–v0.3.13，二轮差距刷新 2026-11-17——对标 Wails v3.1.0 /（2026-11-19；二轮差距刷新第五批——
       ABI/装配/回退全链落地，渲染管线为已知问题）：
       - **ABI 绑定（官方 WebView2.h 逐一核对）**：webview2.zig 增

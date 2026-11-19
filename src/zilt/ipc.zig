@@ -627,6 +627,21 @@ pub const Context = struct {
         self.channelSendJson(id, seq, json);
     }
 
+    /// v0.3.16 G25：二进制帧推送（bytes → base64 + FNV-1a32 校验和；JS 侧
+    /// binary 模式解回 Uint8Array 并验和）。单帧 ≤64KB（调用方分块）。
+    pub fn channelSendBinary(self: Context, id: u32, seq: u32, bytes: []const u8) void {
+        const enc = std.base64.standard.Encoder;
+        const b64_len = enc.calcSize(bytes.len);
+        const b64 = self.msg_allocator.alloc(u8, b64_len) catch return;
+        defer self.msg_allocator.free(b64);
+        _ = enc.encode(b64, bytes);
+        const payload = std.fmt.allocPrint(self.msg_allocator, "{{\"id\":{d},\"seq\":{d},\"bin\":\"{s}\",\"sum\":{d}}}", .{
+            id, seq, b64, channelChecksum(bytes),
+        }) catch return;
+        defer self.msg_allocator.free(payload);
+        self.emitJsonTo(self.window_id, "__zilt.channel", payload);
+    }
+
     pub fn channelClose(self: Context, id: u32, err: ?[]const u8) void {
         const err_json = if (err) |e|
             (std.json.Stringify.valueAlloc(self.msg_allocator, e, .{}) catch return)
@@ -647,6 +662,50 @@ pub const Context = struct {
 // ---------------------------------------------------------------------------
 // 编码（Zig → JS）
 // ---------------------------------------------------------------------------
+
+/// v0.3.16 G25：通道二进制帧校验和（FNV-1a 32 位——JS 侧同构实现，纯函数）。
+pub fn channelChecksum(bytes: []const u8) u32 {
+    var h: u32 = 0x811C9DC5;
+    for (bytes) |b| {
+        h ^= b;
+        h = h *% 0x01000193;
+    }
+    return h;
+}
+
+/// v0.3.16 G25：base64 → 字节（channelUp 帧解码；非法输入返回 null）。
+pub fn channelDecodeBase64(alloc: std.mem.Allocator, b64: []const u8) ?[]u8 {
+    const dec = std.base64.standard.Decoder;
+    const n = dec.calcSizeForSlice(b64) catch return null;
+    const out = alloc.alloc(u8, n) catch return null;
+    dec.decode(out, b64) catch {
+        alloc.free(out);
+        return null;
+    };
+    return out;
+}
+
+test "channel checksum: FNV-1a32 已知值 + JS 同构语义" {
+    try std.testing.expectEqual(@as(u32, 0x811C9DC5), channelChecksum(""));
+    // FNV-1a("a") = 0xE40C292C（公开测试向量）
+    try std.testing.expectEqual(@as(u32, 0xE40C292C), channelChecksum("a"));
+    // FNV-1a("foobar") = 0xBF9CF968（公开测试向量）
+    try std.testing.expectEqual(@as(u32, 0xBF9CF968), channelChecksum("foobar"));
+}
+
+test "channel binary decode: 往返 + 校验和 + 非法输入" {
+    const alloc = std.testing.allocator;
+    const payload = "binary payload with non-ascii bytes 255 0 7";
+    const enc = std.base64.standard.Encoder;
+    const b64 = try alloc.alloc(u8, enc.calcSize(payload.len));
+    defer alloc.free(b64);
+    _ = enc.encode(b64, payload);
+    const decoded = channelDecodeBase64(alloc, b64) orelse return error.TestExpectedEqual;
+    defer alloc.free(decoded);
+    try std.testing.expectEqualSlices(u8, payload, decoded);
+    try std.testing.expectEqual(channelChecksum(payload), channelChecksum(decoded));
+    try std.testing.expect(channelDecodeBase64(alloc, "!!not-base64!!") == null);
+}
 
 /// JSON 字符串字面量转义（覆盖 " \ 与控制字符；输入按 UTF-8 原样透传）。
 fn jsonEscape(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
@@ -1448,7 +1507,18 @@ const runtime_js_head =
     \\    },
     \\    // v0.1.19：流式通道（对齐 Tauri Channel 的最小语义）。Zig 侧用
     \\    // ctx.channelSend(id, seq, data) / ctx.channelClose(id, err) 推送。
+    \\    // v0.3.16 G25：binary 模式——帧带 FNV-1a32 校验和；Zig→JS 解回
+    \\    // Uint8Array（验和不符 onclose('checksum')）；JS→Zig 经事件 channelUp
+    \\    // （应用 events 命名空间声明 channelUp 处理器接收 base64 帧）。
     \\    channel: {
+    \\      fnv1a32: (bytes) => {
+    \\        let h = 0x811C9DC5;
+    \\        for (let i = 0; i < bytes.length; i++) {
+    \\          h ^= bytes[i];
+    \\          h = Math.imul(h, 0x01000193) >>> 0;
+    \\        }
+    \\        return h >>> 0;
+    \\      },
     \\      create: (opts) => {
     \\        const o = opts ?? {};
     \\        const id = ++channelSeq;
@@ -1457,11 +1527,38 @@ const runtime_js_head =
     \\          if (p.done) {
     \\            off();
     \\            if (typeof o.onclose === 'function') o.onclose(p.err == null ? null : p.err);
+    \\          } else if (o.binary === true && p.bin !== undefined) {
+    \\            if (typeof o.onmessage !== 'function') return;
+    \\            try {
+    \\              const raw = atob(p.bin);
+    \\              const bytes = new Uint8Array(raw.length);
+    \\              for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    \\              if (window.zilt.channel.fnv1a32(bytes) !== p.sum) {
+    \\                if (typeof o.onclose === 'function') o.onclose('checksum');
+    \\                return;
+    \\              }
+    \\              o.onmessage(bytes, p.seq);
+    \\            } catch (_) {
+    \\              if (typeof o.onclose === 'function') o.onclose('decode');
+    \\            }
     \\          } else if (typeof o.onmessage === 'function') {
     \\            o.onmessage(p.data, p.seq);
     \\          }
     \\        });
-    \\        return { id: id, close: () => off() };
+    \\        const send = (data) => {
+    \\          const bytes = data instanceof Uint8Array ? data : new TextEncoder().encode(String(data));
+    \\          const chunk = 0x8000;
+    \\          for (let i = 0; i < bytes.length || i === 0; i += chunk) {
+    \\            const slice = bytes.subarray(i, Math.min(i + chunk, bytes.length));
+    \\            let bin = '';
+    \\            for (let j = 0; j < slice.length; j++) bin += String.fromCharCode(slice[j]);
+    \\            window.zilt.emit('channelUp', {
+    \\              id: id, seq: Math.floor(i / chunk), data_b64: btoa(bin),
+    \\              sum: window.zilt.channel.fnv1a32(slice),
+    \\            });
+    \\          }
+    \\        };
+    \\        return { id: id, send: send, close: () => off() };
     \\      },
     \\    },
     \\    // v0.1.19：fs 全量。scope = appData（默认）/appConfig/appCache/home/desktop/
