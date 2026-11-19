@@ -956,10 +956,31 @@ const runtime_js_head =
     \\  //   Windows: window.chrome.webview.postMessage + 'message' 事件
     \\  //   Linux:   window.webkit.messageHandlers.zilt.postMessage；回程由后端
     \\  //            evaluate_javascript 调 window.__ziltDeliver(json)
+    \\  // v0.3.13 F1b：server 模式浏览器端 shim——无 chrome/webkit transport 时
+    \\  // （页面经 headless HTTP 服务 + 真浏览器加载）走 WebSocket transport：
+    \\  // post → WS text 帧（就绪前排队）；入站帧 → deliver。isolation 密封为
+    \\  // GUI 专属（浏览器端 ziltiso:// 不可导航——server 模式明文 invoke，
+    \\  // 与 POST /zilt/ipc 同语义，文档化）。
+    \\  const srvMode = !((window.chrome && window.chrome.webview) || (window.webkit && window.webkit.messageHandlers));
+    \\  let wsSock = null;
+    \\  const wsQueue = [];
+    \\  if (srvMode && location.protocol.indexOf('http') === 0) {
+    \\    const wsProto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    \\    wsSock = new WebSocket(wsProto + location.host + '/zilt/ws');
+    \\    wsSock.onmessage = (e) => { try { deliver(JSON.parse(e.data)); } catch (_) {} };
+    \\    wsSock.onopen = () => {
+    \\      while (wsQueue.length > 0 && wsSock.readyState === 1) wsSock.send(wsQueue.shift());
+    \\    };
+    \\  }
     \\  const post = (m) => {
     \\    if (window.chrome && window.chrome.webview) return window.chrome.webview.postMessage(m);
     \\    const h = window.webkit && window.webkit.messageHandlers;
     \\    if (h && h.zilt) return h.zilt.postMessage(m);
+    \\    if (srvMode && wsSock) {
+    \\      const s = JSON.stringify(m);
+    \\      if (wsSock.readyState === 1) wsSock.send(s); else wsQueue.push(s);
+    \\      return;
+    \\    }
     \\    throw new Error('zilt: no IPC transport available');
     \\  };
     \\  const deliver = (m) => {

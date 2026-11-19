@@ -485,7 +485,30 @@
       - **范围说明**：浏览器端 runtime 传输 shim（二阶段）——协议层已被 python
         E2E 完整覆盖
       - **验收**：Windows/Linux 单测全绿；Linux 冒烟 79/79 + headless/server E2E
-- [~] **v0.3.12 CompositionController 专项**（2026-11-19；二轮差距刷新第五批——
+- [x] **v0.3.13 server 模式二阶段**（2026-11-19；二轮差距刷新收口）：
+      - **F1b 浏览器端 runtime shim**：headless `/zilt/runtime.js`（runtime JS 原样）+
+        serveAsset 的 HTML 注入（`__ZILT_SERVER__` 标记 + runtime.js 引用，`<head>` 后）；
+        runtime 传输三态（chrome.webview / webkit.messageHandlers / **WS transport**——
+        无 GUI transport 且页面 http(s) 时启用；post 就绪前排队 + onopen flush；
+        入站帧 deliver）。app 页面零改动获得完整 window.zilt 面；isolation 密封为
+        GUI 专属（浏览器端 ziltiso:// 不可导航——server 模式明文 invoke 文档化）
+      - **服务端帧编码修正（RFC 6455）**：ws.zig encodeFrameServer（无掩码）——
+        v0.3.7 服务端帧复用客户端掩码编码，python E2E 兼容处理掩盖问题，**真实浏览器
+        对掩码服务端帧按协议错误关闭**（Edge 实测：session 连接即关闭、invoke 悬挂）；
+        headless 会话 3 处全部改用
+      - **会话生命周期修正**：demo 页 ticker 后台线程持有 ctx.backend 跨会话 emit——
+        页面关闭 → unregister 释放会话 → 迟到 emit 解引用已 unmap 内存段错误（实测）；
+        修复：unregister 的 pending 清理持 s.lock（与 enqueue/drain 并发）+ **会话墓地**
+        （16 槽 @splat null，cursor 环形，超出释放最旧——迟到 emit 读旧 window_id →
+        routeEvent 无匹配 → 广播/丢弃安全）
+      - **浏览器 E2E（server_browser_e2e.py）**：Edge headless + **裸 WS CDP 客户端**
+        （Runtime.evaluate awaitPromise）——HTML 注入断言 + shim 断言 + CDP 连通性
+        （1+1=2）+ **经浏览器 shim 的 greet/add 往返**；server_mode_e2e.py 回归
+        （两次）+ health OK
+      - **验收**：Windows 冒烟 **61 项 exit 0** + browser E2E ALL PASSED + python WS
+        E2E 两次 ALL PASSED；Linux 单测全绿 + 冒烟 83/83 + dev-headless
+        （HEALTH/MCP_STDIO/HEADLESS_E2E=PASS）
+      - 后续规划（v0.3.8–v0.3.13，二轮差距刷新 2026-11-17——对标 Wails v3.1.0 /（2026-11-19；二轮差距刷新第五批——
       ABI/装配/回退全链落地，渲染管线为已知问题）：
       - **ABI 绑定（官方 WebView2.h 逐一核对）**：webview2.zig 增
         ICoreWebView2CompositionController（11 槽 + CC2/CC3/CC4 尾随槽并入 16–19）+
@@ -638,6 +661,7 @@
         D1 Wayland portal 快捷键）✅ → **v0.3.11** 分发（E1b external_bin sidecar +
         E2 fixed 运行时 E2E + E4 交叉编译 pack + F2 模板 TS 变体）✅ →
         **v0.3.12** CompositionController 专项（A11）[~] 渲染已知问题 →
+        **v0.3.13** server 模式二阶段（F1b 浏览器端 shim）✅ →
         **v0.3.13** server 模式二阶段（F1b 浏览器端 runtime shim）
       - 明确推后（v0.4+/Phase 4）：macOS 全栈、iOS/Android、浏览器扩展、WML、GPU 信息、
         CLI 自更新、Tauri cli 插件（参数解析）、upload 断点续传（E6 stretch）

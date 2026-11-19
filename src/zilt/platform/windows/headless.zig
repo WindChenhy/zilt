@@ -262,10 +262,7 @@ fn runServerSession(
     const session = try alloc.create(server_session.Session);
     session.* = .{ .window_id = server_session.nextWindowId(), .alloc = alloc };
     server_session.register(session);
-    defer {
-        server_session.unregister(session);
-        alloc.destroy(session);
-    }
+    defer server_session.unregister(session); // 进墓地（迟到的跨线程 emit 安全）
     log.print("[server] session #{x} connected (total={d})", .{ session.window_id, server_session.sessionCount() });
 
     // 帧读循环：文本帧 = JSON 消息（invoke/event）；ping → pong；close → 退出
@@ -278,7 +275,7 @@ fn runServerSession(
             alloc.free(drained);
         }
         for (drained) |item| {
-            const frame = ws_mod.encodeFrame(alloc, .text, item, .{ 0, 0, 0, 0 }) catch continue;
+            const frame = ws_mod.encodeFrameServer(alloc, .text, item) catch continue;
             defer alloc.free(frame);
             out.writeAll(frame) catch return error.SessionWriteFailed;
             out.flush() catch return error.SessionWriteFailed;
@@ -296,7 +293,7 @@ fn runServerSession(
                 return;
             },
             .ping => {
-                const pong = ws_mod.encodeFrame(alloc, .pong, frame.payload, .{ 0, 0, 0, 0 }) catch continue;
+                const pong = ws_mod.encodeFrameServer(alloc, .pong, frame.payload) catch continue;
                 defer alloc.free(pong);
                 out.writeAll(pong) catch return error.SessionWriteFailed;
                 out.flush() catch return error.SessionWriteFailed;
@@ -311,7 +308,7 @@ fn runServerSession(
             log.print("[server] session #{x} dispatch failed: {s}", .{ session.window_id, @errorName(err) });
             continue;
         };
-        const frame_out = ws_mod.encodeFrame(alloc, .text, response, .{ 0, 0, 0, 0 }) catch continue;
+        const frame_out = ws_mod.encodeFrameServer(alloc, .text, response) catch continue;
         defer alloc.free(frame_out);
         out.writeAll(frame_out) catch return error.SessionWriteFailed;
         out.flush() catch return error.SessionWriteFailed;
@@ -519,6 +516,11 @@ fn handleConnection(
         }
         return;
     }
+    // v0.3.13 F1b：浏览器端 runtime shim（server 模式的 window.zilt 走 WS transport）
+    if (std.mem.eql(u8, path_only, "/zilt/runtime.js")) {
+        try respond(out, 200, "application/javascript", ipc.runtime_js);
+        return;
+    }
     if (std.mem.eql(u8, method, "GET")) {
         try serveAsset(config, alloc, out, path_only);
         return;
@@ -661,19 +663,49 @@ fn serveAsset(
             if (!std.mem.eql(u8, asset.path, cp)) continue;
             switch (asset.encoding) {
                 .identity => {
-                    try respondWith(out, 200, contentTypeOf(cp), asset.content);
+                    try servePossiblyHtml(config, alloc, out, cp, asset.content);
                     return;
                 },
                 .gzip => {
                     const raw = flateDecompressGzip(alloc, asset.content) catch continue;
                     defer alloc.free(raw);
-                    try respondWith(out, 200, contentTypeOf(cp), raw);
+                    try servePossiblyHtml(config, alloc, out, cp, raw);
                     return;
                 },
             }
         }
     }
     try respond(out, 404, "text/plain", "not found");
+}
+
+/// v0.3.13 F1b：HTML 响应注入浏览器端 bootstrap（server 模式的 runtime shim）。
+/// 注入顺序：`<head>` 之后（先于应用脚本执行——runtime 必须先就位）。
+fn servePossiblyHtml(
+    comptime config: zilt.Config,
+    alloc: std.mem.Allocator,
+    out: anytype,
+    path: []const u8,
+    content: []const u8,
+) !void {
+    _ = config;
+    const ct = contentTypeOf(path);
+    if (!std.mem.startsWith(u8, ct, "text/html")) {
+        try respondWith(out, 200, ct, content);
+        return;
+    }
+    const inject = "<script>window.__ZILT_SERVER__=1;</script>" ++
+        "<script src=\"/zilt/runtime.js\"></script>";
+    var patched: ?[]u8 = null;
+    if (std.mem.indexOf(u8, content, "<head>")) |at| {
+        const insert_at = at + "<head>".len;
+        patched = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ content[0..insert_at], inject, content[insert_at..] });
+    } else if (std.mem.indexOf(u8, content, "</body>")) |at| {
+        patched = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ content[0..at], inject, content[at..] });
+    } else {
+        patched = try std.fmt.allocPrint(alloc, "{s}{s}", .{ inject, content });
+    }
+    defer alloc.free(patched.?);
+    try respondWith(out, 200, ct, patched.?);
 }
 
 /// v0.2.0：gzip 解压统一到 inflate.zig。

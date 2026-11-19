@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.12（CompositionController 管线落地——ABI 核对/装配/回退，渲染修复为已知问题）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.13（server 模式二阶段——浏览器端 runtime shim，真实浏览器 E2E）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -259,6 +259,28 @@ v0.3.12 新增（2026-11-19，CompositionController 专项——二轮差距刷�
   渲染修复列为后续专项；c-comp 检查断言回退路径
 - **验收**：Windows 单测全绿 + 冒烟 **61 项**（新增 c-comp 断言组合请求 → 探测 →
   回退全链 + state.composition=false）；Linux 不涉及（组合为 Windows 面）
+
+v0.3.13 新增（2026-11-19，server 模式二阶段——二轮差距刷新收口）：
+
+- **浏览器端 runtime shim（F1b）**：headless 服务新增 `/zilt/runtime.js`（runtime JS
+  原样服务）+ **HTML 响应注入**（`<head>` 后注入 `__ZILT_SERVER__` 标记 +
+  runtime.js 引用——先于应用脚本执行）；runtime 传输层三态：无 chrome/webkit
+  transport 且页面为 http(s) → **WebSocket transport**（`/zilt/ws`；post 就绪前
+  排队，onopen flush；入站帧 → deliver）。app 页面**零改动**在真实浏览器经
+  server 模式获得完整 window.zilt 面（invoke/emit/on + 全部内建）
+- **服务端帧编码修正（RFC 6455）**：ws.zig 增 `encodeFrameServer`（**无掩码**）——
+  v0.3.7 的服务端帧复用客户端掩码编码，python E2E 兼容处理掩盖了问题，真实浏览器
+  对掩码服务端帧按协议错误关闭连接（Edge 实测驱动修正）；headless 会话全部改用
+- **会话生命周期修正**：demo 页 ticker 等后台线程持有 ctx.backend（会话指针）跨
+  会话生命周期 emit——页面 WS 关闭 → unregister 释放会话 → 迟到的 emit 解引用
+  已 unmap 内存段错误（实测）。修复：unregister 的 pending 清理持 s.lock（与
+  enqueue/drain 并发）+ **会话墓地**（上限 16 槽，不销毁——迟到 emit 安全广播/丢弃）
+- **浏览器 E2E（scripts/server_browser_e2e.py）**：Edge headless + CDP
+  Runtime.evaluate——HTML 注入断言 + runtime.js shim 断言 + **经浏览器 shim 的
+  greet/add WS 往返**（window.zilt.invoke → WS → dispatch → resolve）
+- **验收**：Windows 冒烟 **61 项 exit 0**（全套回归）；browser E2E ALL PASSED +
+  python WS E2E（两次）ALL PASSED + health OK；Linux 单测全绿 + 冒烟 83/83 +
+  dev-headless（HEALTH/MCP_STDIO/HEADLESS_E2E=PASS）
 
 v0.1.13–v0.1.16 新增（2026-11-08，均已实现、验证并提交）：
 

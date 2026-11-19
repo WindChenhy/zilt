@@ -94,11 +94,28 @@ pub fn register(session: *Session) void {
     sessions.append(std.heap.page_allocator, session) catch {};
 }
 
+/// 已关闭会话的墓地（上限 16；超出释放最旧）。**存在原因**：demo 页的 ticker
+/// 等后台线程持有 ctx.backend（会话指针）跨会话生命周期 emit——会话销毁后
+/// （page_allocator 已 unmap）的 emit 解引用 window_id 段错误（实测）。墓地保持
+/// 内存映射，迟到 emit 读到旧 window_id → routeEvent 无匹配 → 广播/丢弃，安全。
+var graveyard: [16]?*Session = @splat(null);
+var graveyard_cursor: usize = 0;
+
+fn graveyardPut(session: *Session) void {
+    const slot = graveyard_cursor % graveyard.len;
+    graveyard_cursor += 1;
+    if (graveyard[slot]) |old| old.alloc.destroy(old);
+    graveyard[slot] = session;
+}
+
 pub fn unregister(session: *Session) void {
     spinLock(&sessions_lock);
     defer spinUnlock(&sessions_lock);
     session.alive = false;
-    // 释放残留 pending（含列表 backing；正常路径 drain 已取走）
+    // pending 清理必须持 s.lock——enqueue（tick 等后台线程）/drain（会话线程）
+    // 与 unregister（页面 WS 关闭）并发，无锁清理在 tick+关闭并发下段错误（实测）
+    spinLock(&session.lock);
+    defer spinUnlock(&session.lock);
     for (session.pending.items) |item| session.alloc.free(item);
     session.pending.deinit(session.alloc);
     for (sessions.items, 0..) |s, i| {
@@ -107,6 +124,8 @@ pub fn unregister(session: *Session) void {
             break;
         }
     }
+    // 进墓地（不销毁——迟到的跨线程 emit 仍会读该结构）
+    graveyardPut(session);
 }
 
 /// 分配 server 窗口 id（原子递增）。

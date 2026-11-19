@@ -123,6 +123,47 @@ pub fn verifyHandshake(response: []const u8, expected_accept: []const u8) !void 
 }
 
 /// 编码一个客户端帧（必掩码）。
+/// v0.3.13 F1b：server 帧编码（**无掩码**——RFC 6455 要求服务端帧不带 mask 位；
+/// 浏览器对掩码服务端帧按协议错误关闭连接——真实浏览器 E2E 实测驱动）。
+pub fn encodeFrameServer(
+    alloc: std.mem.Allocator,
+    opcode: Opcode,
+    payload: []const u8,
+) ![]u8 {
+    const len = payload.len;
+    var header_len: usize = 2;
+    if (len >= 126 and len <= 0xFFFF) header_len += 2 else if (len > 0xFFFF) header_len += 8;
+
+    const out = try alloc.alloc(u8, header_len + len);
+    var i: usize = 0;
+
+    out[i] = 0x80 | @as(u8, @intFromEnum(opcode)); // FIN=1
+    i += 1;
+
+    if (len < 126) {
+        out[i] = @intCast(len);
+        i += 1;
+    } else if (len <= 0xFFFF) {
+        out[i] = 126;
+        i += 1;
+        out[i] = @intCast((len >> 8) & 0xFF);
+        out[i + 1] = @intCast(len & 0xFF);
+        i += 2;
+    } else {
+        out[i] = 127;
+        i += 1;
+        var shift: u6 = 56;
+        while (true) {
+            out[i] = @intCast((len >> shift) & 0xFF);
+            i += 1;
+            if (shift == 0) break;
+            shift -= 8;
+        }
+    }
+    @memcpy(out[i .. i + len], payload);
+    return out;
+}
+
 pub fn encodeFrame(
     alloc: std.mem.Allocator,
     opcode: Opcode,
