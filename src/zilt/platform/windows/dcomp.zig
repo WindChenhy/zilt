@@ -60,20 +60,31 @@ pub const Target = extern struct {
 pub const Visual = extern struct {
     lpVtbl: *const VTable,
 
+    /// **v0.3.18 修正（渲染专项实测发现）**：dcomp.h 的 C++ 接口有重载——
+    /// SetOffsetX/Y/Transform/Clip 各占 **2 个槽**（float/Vector2F、Matrix/
+    /// Transform、rect/geometry），v0.3.12 的核对漏算重载位（SetContent 误记
+    /// 11、AddVisual 误记 12——实际调用落到 SetBorderMode 报 E_INVALIDARG）。
+    /// 正确槽位以 SDK 10.0.26100.0 dcomp.h 的 C++ 声明序逐项重数：SetContent=15、
+    /// AddVisual=16。
     pub const VTable = extern struct {
         QueryInterface: *const fn (*Visual, *const com.GUID, *?*anyopaque) callconv(.c) com.HRESULT,
         AddRef: *const fn (*Visual) callconv(.c) u32,
         Release: *const fn (*Visual) callconv(.c) u32,
-        SetOffsetX: *const anyopaque, // 3
-        SetOffsetY: *const anyopaque, // 4
-        SetTransform: *const anyopaque, // 5
-        SetTransformParent: *const anyopaque, // 6
-        SetEffect: *const anyopaque, // 7
-        SetBitmapInterpolationMode: *const anyopaque, // 8
-        SetBorderMode: *const anyopaque, // 9
-        SetClip: *const anyopaque, // 10
-        SetContent: *const fn (*Visual, ?*anyopaque) callconv(.c) com.HRESULT, // 11
-        AddVisual: *const fn (*Visual, ?*Visual, ?*Visual) callconv(.c) com.HRESULT, // 12
+        SetOffsetX: *const anyopaque, // 3  SetOffsetX(float)
+        SetOffsetXV: *const anyopaque, // 4 SetOffsetX(Vector2F)
+        SetOffsetY: *const anyopaque, // 5  SetOffsetY(float)
+        SetOffsetYV: *const anyopaque, // 6 SetOffsetY(Vector2F)
+        SetTransform: *const anyopaque, // 7  SetTransform(Matrix)
+        SetTransformE: *const anyopaque, // 8 SetTransform(Transform)
+        SetTransformParent: *const anyopaque, // 9
+        SetEffect: *const anyopaque, // 10
+        SetBitmapInterpolationMode: *const anyopaque, // 11
+        SetBorderMode: *const anyopaque, // 12
+        SetClip: *const anyopaque, // 13 SetClip(rect)
+        SetClipG: *const anyopaque, // 14 SetClip(geometry)
+        SetContent: *const fn (*Visual, ?*anyopaque) callconv(.c) com.HRESULT, // 15
+        /// AddVisual(visual, insertAbove: BOOL, referenceVisual: ?*Visual)
+        AddVisual: *const fn (*Visual, ?*Visual, i32, ?*Visual) callconv(.c) com.HRESULT, // 16
     };
 
     pub fn release(self: *Visual) void {
@@ -85,6 +96,7 @@ pub const Visual = extern struct {
 var api_state: ?Api = null;
 
 pub const Api = struct {
+    createDevice2: *const fn (?*anyopaque, *const com.GUID, *?*anyopaque) callconv(.c) com.HRESULT,
     createDevice: *const fn (?*anyopaque, *const com.GUID, *?*anyopaque) callconv(.c) com.HRESULT,
 
     pub fn load() ?*const Api {
@@ -95,18 +107,27 @@ pub const Api = struct {
                     return win32.GetProcAddress(l, name);
                 }
             };
+            // 官方样例用 DCompositionCreateDevice2（AppWindow::DCompositionCreateDevice2
+            // 同款动态加载）；DCompositionCreateDevice 作回退
+            const create2 = p.get(lib, "DCompositionCreateDevice2");
             const create = p.get(lib, "DCompositionCreateDevice") orelse return null;
-            api_state = .{ .createDevice = @ptrCast(create) };
+            api_state = .{
+                .createDevice2 = @ptrCast(create2 orelse create),
+                .createDevice = @ptrCast(create),
+            };
         }
         return &api_state.?;
     }
 };
 
-/// 创建 DComp 设备（dxgi_device = null 时引擎自建后台设备——WebView2 组合样例路径）。
-pub fn createDevice(dxgi_device: ?*anyopaque) ?*Device {
+/// 创建 DComp 设备（rendering_device = null 时引擎自建后台设备）。
+/// **顺序契约（v0.3.18）**：必须在 CreateCoreWebView2CompositionController
+/// **之前**创建（官方 InitializeWebView 先建设备再建 controller；后建实测
+/// 导航段错误——渲染管线在 controller 创建时绑定 compositor）。
+pub fn createDevice(rendering_device: ?*anyopaque) ?*Device {
     const api = Api.load() orelse return null;
     var out: ?*anyopaque = null;
-    const hr = api.createDevice(dxgi_device, &IID_IDCompositionDevice, &out);
+    const hr = api.createDevice2(rendering_device, &IID_IDCompositionDevice, &out);
     if (com.failed(hr)) return null;
     return @ptrCast(@alignCast(out.?));
 }

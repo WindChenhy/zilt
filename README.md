@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.17（更新器/分发收尾 + 二进制通道——三轮差距刷新第四批）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.3.18（CompositionController 渲染专项收口——三轮差距刷新第五批）**。逐版本功能项与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -259,6 +259,31 @@ v0.3.12 新增（2026-11-19，CompositionController 专项——二轮差距刷�
   渲染修复列为后续专项；c-comp 检查断言回退路径
 - **验收**：Windows 单测全绿 + 冒烟 **61 项**（新增 c-comp 断言组合请求 → 探测 →
   回退全链 + state.composition=false）；Linux 不涉及（组合为 Windows 面）
+
+v0.3.18 新增（2026-11-20，CompositionController 渲染专项收口——三轮差距刷新第五批）：
+
+- **三项真实缺陷修复（v0.3.12 装配错误，实测驱动）**：
+  1. **IDCompositionVisual vtable 槽位修正**——dcomp.h 的 C++ 接口有重载，
+     SetOffsetX/Y/Transform/Clip 各占 2 槽，真实槽位 SetContent=15 / AddVisual=16
+     （v0.3.12 误记 11/12——AddVisual 调用落到 SetBorderMode 报 E_INVALIDARG，
+     实测暴露）；SDK 10.0.26100.0 dcomp.h C++ 声明序逐项重数
+  2. **官方双视觉层级**——WebView2APISample BuildDCompTreeUsingVisual 序列落地：
+     target.SetRoot(root) + root.AddVisual(webview, TRUE, null) +
+     put_RootVisualTarget(webview 子视觉)（v0.3.12 单视觉 + put 根视觉错误）
+  3. **put_Bounds + DComp 设备先建**——QI'd Controller put_Bounds（客户端区，
+     官方 m_controller->put_Bounds 同形；v0.3.12 从未调用 = 0×0 呈现面）+
+     DComp 设备先于 controller 创建（官方 InitializeWebView 序；设备改用
+     DCompositionCreateDevice2 动态加载）+ 有序拆除（视觉树先行 → Close）
+- **最小复现实验收口**：`ZILT_COMP_BARE=1`（零 driver 交互裸 Navigate）——
+  装配全链成功（composition ready + Settings9 hr=0x0）后 Navigate 仍段错误于
+  EmbeddedBrowserWebView.dll → **上游运行时缺陷定案**（Runtime 157.0.4341.60 +
+  本机 DComp 栈；与 Wails composition hosting 保持 experimental 一致）
+- **默认回退 + 验证入口**：默认 HWND 渲染（c-comp 断言回退路径 + state.composition=
+  false）；`ZILT_COMP_ENABLE=1` 启用修复后的真实组合管线（未来运行时修复后的
+  验证开关——装配正确性修复不依赖该开关）
+- **验收**：Windows 冒烟 **66 项**（comp 回退路径 + 其余全过）+ 单测全绿；
+  Linux 冒烟 **86/86**（组合为 Windows 面）；装配链在 ZILT_COMP_ENABLE=1 下
+  实测 composition ready（新增 cc4 探测/dcomp 序列日志）
 
 v0.3.17 新增（2026-11-20，更新器/分发收尾 + 二进制通道——三轮差距刷新第四批）：
 

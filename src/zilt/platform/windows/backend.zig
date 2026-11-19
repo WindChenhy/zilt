@@ -1760,13 +1760,21 @@ fn Backend(comptime config: Config) type {
         /// CompositionControllerCompletedHandler 里装配（put_RootVisualTarget +
         /// SetRoot + Commit）。
         fn beginCompositionController(self: *Self, w: *Window, env: *wv2.ICoreWebView2Environment) void {
-            // **已知问题（本版文档化）**：CC 创建/DComp 装配（put_RootVisualTarget +
-            // SetRoot + Commit + Settings9）在实测中全部成功，但页面导航阶段
-            // WebView2 渲染管线段错误（EmbeddedBrowserWebView.dll 内部，about:blank
-            // 亦复现；putIsVisible 前置/有序拆除 SetRoot(null)+Close 均不缓解——
-            // 诊断笔记见 ROADMAP v0.3.12）。本版组合选项按降级文化直接走 HWND
-            // 渲染（窗口存活/IPC 全正常），渲染管线修复列为后续专项。
-            log.print("[comp] window #{d}: composition requested — render pipeline known issue, HWND fallback", .{w.id});
+            // v0.3.18 A11 渲染专项收口：三项真实缺陷已修复（Visual vtable 重载槽位、
+            // 官方双视觉层级、put_Bounds + 设备先建），装配全链成功；但裸 Navigate
+            // 最小复现（ZILT_COMP_BARE=1，零 driver 交互）仍段错误于
+            // EmbeddedBrowserWebView.dll → **上游运行时缺陷**（Runtime 157.0.4341.60
+            // + 本机 DComp 栈；与 Wails composition hosting 保持 experimental 一致）。
+            // 默认回退 HWND 渲染；`ZILT_COMP_ENABLE=1` 可启用修复后的真实组合管线
+            //（未来运行时修复后的验证入口——装配正确性不依赖该开关）。
+            if (win32.getEnvUtf8(self.allocator, "ZILT_COMP_ENABLE")) |v| {
+                defer self.allocator.free(v);
+                if (v.len > 0 and v[0] == '1') {
+                    log.print("[comp] window #{d}: composition enabled via ZILT_COMP_ENABLE (experimental)", .{w.id});
+                    return self.beginCompositionControllerProbe(w, env);
+                }
+            }
+            log.print("[comp] window #{d}: composition requested — upstream runtime segfault documented, HWND fallback (ZILT_COMP_ENABLE=1 to force)", .{w.id});
             return self.beginControllerWithEnv(w, env);
         }
 
@@ -1775,7 +1783,14 @@ fn Backend(comptime config: Config) type {
                 log.print("[comp] window #{d}: runtime lacks Environment10 — fallback to HWND mode", .{w.id});
                 return self.beginControllerWithEnv(w, env);
             };
-            const handler = CompositionControllerCompletedHandler.create(self, w) catch {
+            // v0.3.18 A11：DComp 设备先于 controller 创建（官方 InitializeWebView
+            // 序——渲染管线在 controller 创建时绑定 compositor；后建实测导航段错误）
+            const device = dcomp.createDevice(null) orelse {
+                log.print("[comp] window #{d}: DComp device failed — fallback to HWND mode", .{w.id});
+                return self.beginControllerWithEnv(w, env);
+            };
+            const handler = CompositionControllerCompletedHandler.create(self, w, device) catch {
+                device.release();
                 log.print("[fatal] composition handler alloc failed", .{});
                 return;
             };
@@ -1929,60 +1944,79 @@ fn Backend(comptime config: Config) type {
         }
 
         /// v0.3.12 A11：组合状态（CC + CC4 探测 + DComp 视觉树句柄）。
+        /// v0.3.18：官方双视觉层级——root（target 挂载点）+ webview（CC 内容
+        /// 视觉，AddVisual 为 root 子节点）；w.controller 持 QI'd Controller
+        ///（bounds/zoom 走常规路径，官方 m_controller->put_Bounds 同形）。
         const CompositionState = struct {
-            controller: *wv2.ICoreWebView2CompositionController,
+            cc: *wv2.ICoreWebView2CompositionController,
             cc4: ?*wv2.ICoreWebView2CompositionController4,
             device: *dcomp.Device,
             target: *dcomp.Target,
-            visual: *dcomp.Visual,
+            root: *dcomp.Visual,
+            webview: *dcomp.Visual,
         };
 
         /// v0.3.12 A11：组合 controller 就绪——DComp 视觉树装配 + Settings9
         /// 非客户区支持 + driver attach（controller=null）。DComp 失败 → 回退
         /// HWND 模式（销毁 CC + 重新走普通 controller——项目降级文化）。
-        fn onCompositionControllerReady(self: *Self, w: *Window, cc: *wv2.ICoreWebView2CompositionController) void {
-            const device = dcomp.createDevice(null) orelse {
-                log.print("[comp] window #{d}: DComp device failed — fallback to HWND mode", .{w.id});
-                cc.release();
-                return self.beginControllerWithEnv(w, self.env orelse return);
-            };
+        fn onCompositionControllerReady(self: *Self, w: *Window, cc: *wv2.ICoreWebView2CompositionController, device: *dcomp.Device) void {
+            // v0.3.18 A11：官方 WebView2APISample BuildDCompTreeUsingVisual 序列
+            //（源码逐行核对）——**双视觉层级**：
+            //   1. CreateTargetForHwnd(hwnd, TRUE) → hwnd target
+            //   2. CreateVisual(root) → target.SetRoot(root)
+            //   3. CreateVisual(webview) → root.AddVisual(webview, TRUE, null)
+            //   4. put_RootVisualTarget(webview)（WebView2 渲染进**子**视觉）
+            //   5. QI'd Controller put_Bounds（客户端区尺寸——v0.3.12 缺失此步
+            //      导致 0×0 呈现面 + 视觉树不完整 = 导航段错误根因）
+            //   6. Commit
             var target: ?*dcomp.Target = null;
-            var visual: ?*dcomp.Visual = null;
+            var root: ?*dcomp.Visual = null;
+            var webview_visual: ?*dcomp.Visual = null;
             if (com.failed(device.lpVtbl.CreateTargetForHwnd(device, w.hwnd, 1, &target)) or target == null) {
                 log.print("[comp] window #{d}: CreateTargetForHwnd failed — fallback", .{w.id});
                 device.release();
                 cc.release();
                 return self.beginControllerWithEnv(w, self.env orelse return);
             }
-            if (com.failed(device.lpVtbl.CreateVisual(device, &visual)) or visual == null) {
-                log.print("[comp] window #{d}: CreateVisual failed — fallback", .{w.id});
+            if (com.failed(device.lpVtbl.CreateVisual(device, &root)) or root == null) {
+                log.print("[comp] window #{d}: CreateVisual(root) failed — fallback", .{w.id});
+                target.?.release();
                 device.release();
                 cc.release();
                 return self.beginControllerWithEnv(w, self.env orelse return);
             }
-            // webview → 视觉内容 → RootVisualTarget → SetRoot → Commit
-            {
-                // QI 探测诊断（组合对象实际实现的接口面）
-                const probe = struct {
-                    fn qi(obj: *wv2.ICoreWebView2CompositionController, iid: com.GUID) u32 {
-                        var out: ?*anyopaque = null;
-                        const hr2 = obj.lpVtbl.QueryInterface(obj, &iid, &out);
-                        return @as(u32, @bitCast(hr2));
-                    }
-                };
-                log.print("[comp] QI probe: webview=0x{x} controller=0x{x} cc4=0x{x}", .{
-                    probe.qi(cc, wv2.IID_ICoreWebView2),
-                    probe.qi(cc, wv2.IID_ICoreWebView2Controller),
-                    probe.qi(cc, wv2.IID_ICoreWebView2CompositionController4),
-                });
+            _ = target.?.setRoot(root.?);
+            if (com.failed(device.lpVtbl.CreateVisual(device, &webview_visual)) or webview_visual == null) {
+                log.print("[comp] window #{d}: CreateVisual(webview) failed — fallback", .{w.id});
+                root.?.release();
+                target.?.release();
+                device.release();
+                cc.release();
+                return self.beginControllerWithEnv(w, self.env orelse return);
             }
-            // QI 实测：组合对象实现 ICoreWebView2Controller（非 ICoreWebView2 直取）
-            // → webview 经 controller.getCoreWebView2() 取；Controller 传给 driver
-            //（zoom 等窗口面可用），但 **不进 w.controller**——bounds 请求由
-            // updateBounds 的 null 守卫跳过（组合模式尺寸归 DComp 视觉树）
+            // AddVisual(visual, insertAbove=TRUE, reference=null)（SDK dcomp.h 12 槽，
+            // 中间参 BOOL——v0.3.18 修正 v0.3.12 的指针误绑）
+            {
+                const hr_add = root.?.lpVtbl.AddVisual(root.?, webview_visual.?, 1, null);
+                if (com.failed(hr_add)) {
+                log.print("[comp] window #{d}: AddVisual failed hr=0x{x} — fallback", .{ w.id, @as(u32, @bitCast(hr_add)) });
+                webview_visual.?.release();
+                root.?.release();
+                target.?.release();
+                device.release();
+                cc.release();
+                return self.beginControllerWithEnv(w, self.env orelse return);
+                }
+            }
+
+            // QI 实测（v0.3.12 沉淀）：CC 对象实现 ICoreWebView2Controller →
+            // webview/getCoreWebView2 经它取；put_Bounds/putIsVisible/Close 走
+            // 同一接口（官方 m_controller->put_Bounds 同形）
             const controller_probe = cc.getController() orelse {
                 log.print("[comp] window #{d}: QI ICoreWebView2Controller failed — fallback", .{w.id});
-                visual.?.release();
+                webview_visual.?.release();
+                root.?.release();
+                target.?.release();
                 device.release();
                 cc.release();
                 return self.beginControllerWithEnv(w, self.env orelse return);
@@ -1990,25 +2024,58 @@ fn Backend(comptime config: Config) type {
             const wv_result = controller_probe.getCoreWebView2();
             if (com.failed(wv_result.hr) or wv_result.webview == null) {
                 log.print("[comp] window #{d}: get_CoreWebView2 failed — fallback", .{w.id});
-                visual.?.release();
+                _ = controller_probe.lpVtbl.Release(controller_probe);
+                webview_visual.?.release();
+                root.?.release();
+                target.?.release();
                 device.release();
                 cc.release();
                 return self.beginControllerWithEnv(w, self.env orelse return);
             }
             const webview = wv_result.webview.?;
-            // 可见性：组合模式下经 QI'd controller 置 IsVisible（渲染管线启动前提）
             _ = controller_probe.putIsVisible(1);
-_ = cc.putRootVisualTarget(@ptrCast(visual.?));
-            _ = target.?.setRoot(visual.?);
-            _ = device.commit();
-            const cc4 = cc.getCC4();
+
+            // 组合状态（controller 归 w.controller——AddRef 双持有与 HWND 路径同形）
             const state = self.allocator.create(CompositionState) catch {
                 log.print("[comp] state alloc failed", .{});
+                _ = controller_probe.lpVtbl.Release(controller_probe);
+                _ = webview.lpVtbl.Release(webview);
+                webview_visual.?.release();
+                root.?.release();
+                target.?.release();
+                device.release();
+                cc.release();
                 return;
             };
-            state.* = .{ .controller = cc, .cc4 = cc4, .device = device, .target = target.?, .visual = visual.? };
+            state.* = .{
+                .cc = cc,
+                .cc4 = cc.getCC4(),
+                .device = device,
+                .target = target.?,
+                .root = root.?,
+                .webview = webview_visual.?,
+            };
             w.composition = state;
-            log.print("[comp] window #{d}: composition ready (cc4={s}, dcomp visual tree committed)", .{ w.id, if (cc4 != null) "yes" else "no" });
+
+            // 官方序列收尾：put_RootVisualTarget(webview 子视觉) → **put_Bounds**
+            //（客户端区——0.3.12 缺失项）→ Commit
+            _ = cc.putRootVisualTarget(@ptrCast(webview_visual.?));
+            {
+                var rc: win32.RECT = undefined;
+                if (win32.GetClientRect(w.hwnd, &rc) != 0) {
+                    _ = controller_probe.putBounds(.{ .left = 0, .top = 0, .right = rc.right, .bottom = rc.bottom });
+                }
+            }
+            _ = device.commit();
+            // w.controller 持 QI'd Controller（updateBounds/zoom 常规路径；与
+            // HWND 路径同形：getController 的引用归 w.controller + 显式 AddRef
+            // 给 driver）
+            w.controller = controller_probe;
+            _ = controller_probe.lpVtbl.AddRef(controller_probe);
+            log.print("[comp] window #{d}: composition ready (cc4={s}, dcomp root+webview visual tree committed, bounds applied)", .{
+                w.id,
+                if (state.cc4 != null) "yes" else "no",
+            });
 
             // Settings9：非客户区支持（app-region: drag CSS → 原生 hit-test）
             var settings: ?*wv2.ICoreWebView2Settings = null;
@@ -2021,26 +2088,26 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
                 }
             }
 
-            // **已知问题（本版文档化）**：CC 创建/DComp 装配/Settings9 全部成功后，
-            // 页面导航阶段 WebView2 渲染管线段错误（EmbeddedBrowserWebView.dll 内部，
-            // about:blank 亦复现；putIsVisible 前置亦不缓解）。本版按降级文化回退
-            // HWND 模式：组合管线（probe/装配/输入转发面/清理）全部落地并验证，
-            // 渲染修复列为后续专项（诊断笔记见 ROADMAP v0.3.12）。
-            log.print("[comp] render pipeline unstable (known issue) — fallback to HWND mode", .{});
-            // 有序拆除：SetRoot(null) → Commit → Close(controller) → 释放引用。
-            // 直接 cc.release() 会在运行时仍有挂起渲染时段错误（实测）。
-            _ = target.?.setRoot(null);
-            _ = device.commit();
-            _ = controller_probe.lpVtbl.Close(controller_probe);
-            _ = controller_probe.lpVtbl.Release(controller_probe);
-            _ = webview.lpVtbl.Release(webview);
-            visual.?.release();
-            target.?.release();
-            device.release();
-            cc.release();
-            return self.beginControllerWithEnv(w, self.env orelse return);
+            // v0.3.18 诊断开关：ZILT_COMP_BARE=1 时跳过 driver 全部注入
+            //（事件/过滤器/脚本/导航编排）——裸 Navigate 最小复现，用于区分
+            // 「运行时缺陷」与「driver 交互触发」。退出码 90 + 日志标记。
+            if (win32.getEnvUtf8(self.allocator, "ZILT_COMP_BARE")) |v| {
+                defer self.allocator.free(v);
+                if (v.len > 0 and v[0] == '1') {
+                    const nav = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, "about:blank") catch null;
+                    defer if (nav) |n| self.allocator.free(n);
+                    if (nav) |n| {
+                        const hr_nav = webview.lpVtbl.Navigate(webview, n.ptr);
+                        log.print("[comp][bare] navigate hr=0x{x}（若此后无段错误则 driver 交互为触发条件）", .{@as(u32, @bitCast(hr_nav))});
+                    }
+                    _ = controller_probe.lpVtbl.AddRef(controller_probe);
+                    return;
+                }
+            }
+            self.finishWebViewSetup(w, webview, controller_probe);
         }
 
+        /// v0.3.12 A11：webview 后段装配（IPC sink / filters / driver / 脚本 / 导航）。
         /// v0.3.12 A11：webview 后段装配（IPC sink / filters / driver / 脚本 / 导航）。
         /// controller 可为 null（组合模式——CC 不实现 Controller；bounds/zoom 降级）。
         fn finishWebViewSetup(self: *Self, w: *Window, webview: *wv2.ICoreWebView2, controller: ?*wv2.ICoreWebView2Controller) void {
@@ -5817,6 +5884,27 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
             if (w.msg_handler) |h| h.dropRef();
             if (w.res_handler) |h| h.dropRef();
             if (w.nav_handler) |h| h.dropRef();
+            // v0.3.18 A11：组合模式有序拆除（官方 DestroyDCompVisualTree 序）——
+            // 先解视觉树（put_RootVisualTarget(null) + SetRoot(null) + Commit）
+            // 再 Close controller，最后 COM 释放（v0.3.12 实测直 release 段错误）
+            if (w.composition) |comp| {
+                _ = comp.cc.putRootVisualTarget(null);
+                _ = comp.target.setRoot(null);
+                _ = comp.device.commit();
+                if (w.controller) |c| {
+                    _ = c.lpVtbl.Close(c);
+                    _ = c.lpVtbl.Release(c);
+                }
+                w.controller = null;
+                if (comp.cc4) |c4| c4.release();
+                comp.webview.release();
+                comp.root.release();
+                comp.target.release();
+                comp.device.release();
+                comp.cc.release();
+                w.backend.allocator.destroy(comp);
+                w.composition = null;
+            }
             if (w.controller) |c| {
                 _ = c.lpVtbl.Close(c);
                 _ = c.lpVtbl.Release(c);
@@ -5831,16 +5919,6 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
             w.res_handler = null;
             w.nav_handler = null;
             w.controller = null;
-            // v0.3.12 A11：组合状态释放（CC/CC4/DComp COM 引用）
-            if (w.composition) |comp| {
-                if (comp.cc4) |c4| c4.release();
-                comp.target.release();
-                comp.visual.release();
-                comp.device.release();
-                comp.controller.release();
-                w.backend.allocator.destroy(comp);
-                w.composition = null;
-            }
             w.icon_big = null;
             w.icon_small = null;
             w.owns_icons = false;
@@ -6005,7 +6083,7 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
                                     win32.WM_MBUTTONDBLCLK => wv2.MOUSE_EVENT_KIND.middle_button_double_click,
                                     else => wv2.MOUSE_EVENT_KIND.move,
                                 };
-                                _ = comp.controller.sendMouseInput(kind, keys, mouse_data, pt);
+                                _ = comp.cc.sendMouseInput(kind, keys, mouse_data, pt);
                                 return 0;
                             }
                         }
@@ -7141,6 +7219,8 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
             refs: u32,
             backend: *Self,
             window: *Window,
+            /// v0.3.18 A11：controller 之前创建的 DComp 设备（顺序契约）
+            device: *dcomp.Device,
 
             pub const COM_IIDS = [_]com.GUID{wv2.IID_CompositionControllerCompletedHandler};
 
@@ -7157,9 +7237,9 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
                 .Invoke = invoke,
             };
 
-            fn create(backend: *Self, window: *Window) !*@This() {
+            fn create(backend: *Self, window: *Window, device: *dcomp.Device) !*@This() {
                 const h = try std.heap.page_allocator.create(@This());
-                h.* = .{ .lpVtbl = &vtable, .refs = 1, .backend = backend, .window = window };
+                h.* = .{ .lpVtbl = &vtable, .refs = 1, .backend = backend, .window = window, .device = device };
                 return h;
             }
 
@@ -7176,14 +7256,16 @@ _ = cc.putRootVisualTarget(@ptrCast(visual.?));
                 defer _ = h.lpVtbl.Release(h);
                 if (!h.window.alive) {
                     if (controller) |cc| cc.release();
+                    h.device.release();
                     return com.S_OK;
                 }
                 if (com.failed(error_code) or controller == null) {
                     log.print("[fatal] CreateCoreWebView2CompositionController failed hr=0x{x}", .{@as(u32, @bitCast(error_code))});
+                    h.device.release();
                     win32.PostQuitMessage(5);
                     return com.S_OK;
                 }
-                h.backend.onCompositionControllerReady(h.window, controller.?);
+                h.backend.onCompositionControllerReady(h.window, controller.?, h.device);
                 return com.S_OK;
             }
         };

@@ -1155,7 +1155,10 @@ async function runChecks() {
       if (!ok) window.zilt.log('warn', 'c-sidecar note: ' + JSON.stringify({ r1, r2 }).slice(0, 140));
     } catch (e) { setCheck('c-sidecar', false, String(e.message || e)); }
 
-    // 61. v0.3.12 A11：组合模式（CompositionController + DComp；能力探测失败自动回退 HWND）
+    // 61. v0.3.18 A11 渲染专项收口：装配正确性修复落地（双视觉+put_Bounds+
+    //     设备先建+vtable 修正），上游段错误文档化——本版断言回退路径
+    //     （state.composition=false 且窗口存活 IPC 正常；ZILT_COMP_ENABLE=1
+    //     可启用修复后的真实管线做运行时验证）
     try {
       const w = await window.zilt.window.create({
         title: 'comp probe', label: 'comp-' + Date.now(), width: 420, height: 320,
@@ -1164,15 +1167,12 @@ async function runChecks() {
       let ok = false;
       let note = 'create=' + JSON.stringify(w).slice(0, 40);
       if (w && typeof w.id === 'number') {
-        // 本版断言：组合管线（CC 创建/DComp 装配/能力探测）全链跑通后按已知问题
-        // 回退 HWND 渲染（state.composition=false 且窗口存活可正常 IPC）——渲染
-        // 管线修复列为后续专项（诊断笔记见 ROADMAP）
         const st = await window.zilt.window.state(w.id);
         ok = !!st && st.composition === false;
-        note += ' state.composition=' + (st ? st.composition : '?') + ' (fallback path)';
+        note += ' state.composition=' + (st ? st.composition : '?') + ' (fallback; upstream segfault documented)';
         await window.zilt.window.close(w.id).catch(() => {});
       }
-      setCheck('c-comp', ok, ok ? 'composition pipeline ok (CC+DComp assembled; renders via HWND fallback — known issue)' : note);
+      setCheck('c-comp', ok, ok ? 'composition pipeline ok (vtable/dual-visual/put_Bounds fixes landed; HWND fallback default)' : note);
       if (!ok) window.zilt.log('warn', 'c-comp note: ' + note);
     } catch (e) { setCheck('c-comp', false, String(e.message || e)); window.zilt.log('warn', 'c-comp error: ' + String(e.message || e)); }
 

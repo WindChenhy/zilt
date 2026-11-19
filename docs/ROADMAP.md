@@ -590,6 +590,24 @@
         demo 回显 16KB 全链（c-bchan）
       - **验收**：Windows 冒烟 **66 项**（c-bchan）+ 单测全绿；Linux 冒烟
         **86/86** + PACK_E2E PASS + post terminate PASS
+- [x] **v0.3.18 CompositionController 渲染专项收口**（2026-11-20；三轮差距刷新第五批）：
+      - **三项真实缺陷修复（v0.3.12 装配错误，实测驱动）**：
+        1. **IDCompositionVisual vtable 槽位**——dcomp.h C++ 接口重载
+           （SetOffsetX/Y/Transform/Clip 各 2 槽）漏算；SetContent=15/AddVisual=16
+           （误记 11/12 → AddVisual 落 SetBorderMode 报 E_INVALIDARG 实测暴露）
+        2. **官方双视觉层级**——APISample BuildDCompTreeUsingVisual 序列
+           （target.SetRoot(root) + root.AddVisual(webview, TRUE, null) +
+           put_RootVisualTarget(webview 子视觉)；v0.3.12 单视觉错误）
+        3. **put_Bounds + 设备先建**——QI'd Controller put_Bounds（客户端区；
+           v0.3.12 从未调用 = 0×0 呈现面）+ DComp 设备先于 controller 创建 +
+           DCompositionCreateDevice2 + 有序拆除（视觉树 → Close）
+      - **最小复现实验**：ZILT_COMP_BARE=1（零 driver 交互裸 Navigate）——装配
+        全链成功后 Navigate 仍段错误于 EmbeddedBrowserWebView.dll → 上游运行时
+        缺陷定案（Runtime 157.0.4341.60 + 本机 DComp 栈；Wails 同保持 experimental）
+      - **收口形态**：默认 HWND 回退（c-comp 断言）+ ZILT_COMP_ENABLE=1 启用修复
+        后管线（未来运行时验证入口）；有序拆除更新（视觉树先行 + 状态字段重排）
+      - **验收**：Windows 冒烟 **66 项** + 单测全绿；Linux 冒烟 **86/86**；
+        ZILT_COMP_ENABLE=1 实测 composition ready 全链
       - 后续规划（v0.3.8–v0.3.13，二轮差距刷新 2026-11-17——对标 Wails v3.1.0 /（2026-11-19；二轮差距刷新第五批——
       ABI/装配/回退全链落地，渲染管线为已知问题）：
       - **ABI 绑定（官方 WebView2.h 逐一核对）**：webview2.zig 增
