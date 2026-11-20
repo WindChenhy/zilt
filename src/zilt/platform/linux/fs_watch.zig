@@ -290,13 +290,29 @@ pub fn stop(w: *Watch) void {
 
 const testing = std.testing;
 
+/// 0.17 无 realpath：用 cwd 下 .zig-cache 的唯一目录做监视线（进程内自增）。
+var fswatch_test_seq: u32 = 0;
+
 test "inotify watch: added/modified 事件往返" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const io = moduleIo();
+    const n = fswatch_test_seq;
+    fswatch_test_seq += 1;
+    // 落在 /tmp（tmpfs）：inotify 在 WSL 的 9p/drvfs（/mnt/*）上不投递事件，
+    // 而 0.17 又去掉了 realpath——用绝对路径同时绕开这两个限制。
+    const root = try std.fmt.allocPrint(testing.allocator, "/tmp/zilt-fswatch-{d}-{d}", .{ std.c.getpid(), n });
     defer testing.allocator.free(root);
+    try std.Io.Dir.createDirAbsolute(io, root, .default_dir);
+    defer {
+        const tmp = std.Io.Dir.openDirAbsolute(io, "/tmp", .{}) catch null;
+        if (tmp) |d| {
+            var dd = d;
+            var it = std.mem.splitScalar(u8, root["/tmp/".len..], '/');
+            dd.deleteTree(io, it.first()) catch {};
+            dd.close(io);
+        }
+    }
 
     const Ctx = struct {
         events: std.ArrayListUnmanaged(struct { action: []const u8, path: []u8 }) = .empty,
@@ -324,11 +340,11 @@ test "inotify watch: added/modified 事件往返" {
     const f1 = try std.fmt.allocPrint(testing.allocator, "{s}/a.txt", .{root});
     defer testing.allocator.free(f1);
     {
-        var file = try std.fs.createFileAbsolute(f1, .{});
-        defer file.close();
-        try file.writeAll("hello");
+        const file = try std.Io.Dir.createFileAbsolute(io, f1, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, "hello", 0);
     }
-    std.fs.deleteFileAbsolute(f1) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, f1) catch {};
 
     // 等事件（inotify 异步；最长 3s）
     var deadline: usize = 0;
@@ -338,7 +354,7 @@ test "inotify watch: added/modified 事件往返" {
             if (std.mem.eql(u8, e.action, action_removed)) has_removed = true;
         }
         if (has_removed and ctx.events.items.len >= 3) break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        std.Io.sleep(io, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
     }
     try testing.expect(ctx.events.items.len >= 3);
     try testing.expectEqualStrings(action_added, ctx.events.items[0].action);

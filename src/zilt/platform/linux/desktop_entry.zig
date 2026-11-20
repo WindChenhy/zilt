@@ -35,7 +35,8 @@ pub const EntryOptions = struct {
 pub fn formatExec(alloc: Allocator, exe: []const u8, args: ?[]const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
-    const needs_quote = std.mem.indexOfAny(u8, exe, " \t") != null;
+    // 空格/制表符/双引号都要求整体加引号（含 " 时否则会生成非法 Exec）
+    const needs_quote = std.mem.indexOfAny(u8, exe, " \t\"") != null;
     if (needs_quote) try out.append(alloc, '"');
     for (exe) |ch| {
         if (ch == '"') try out.append(alloc, '\\');
@@ -73,7 +74,7 @@ pub fn content(alloc: Allocator, opts: EntryOptions) ![]u8 {
     try out.appendSlice(alloc, "Type=Application\n");
     try appendField(alloc, &out, "Name", opts.name);
     if (opts.comment) |cm| try appendField(alloc, &out, "Comment", cm);
-    try appendField(alloc, &out, "Exec", opts.exec);
+    try appendExecField(alloc, &out, opts.exec);
     if (opts.icon) |icon| if (icon.len > 0) try appendField(alloc, &out, "Icon", icon);
     try out.appendSlice(alloc, "Terminal=false\n");
     if (opts.mime_types.len > 0) {
@@ -87,6 +88,19 @@ pub fn content(alloc: Allocator, opts: EntryOptions) ![]u8 {
     if (opts.wmclass) |wc| if (wc.len > 0) try appendField(alloc, &out, "StartupWMClass", wc);
     if (opts.autostart) try out.appendSlice(alloc, "X-GNOME-Autostart-enabled=true\n");
     return out.toOwnedSlice(alloc);
+}
+
+/// Exec 字段：只清洗换行，**不转义 `%`**——`%u`/`%f` 是 desktop entry 规范的
+/// 字段码，写成 `%%u` 会让启动器把 "%%u" 原样当参数传给应用（v0.3.19 修复）。
+fn appendExecField(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), exec: []const u8) !void {
+    try out.appendSlice(alloc, "Exec=");
+    for (exec) |ch| {
+        switch (ch) {
+            '\n', '\r' => try out.append(alloc, ' '),
+            else => try out.append(alloc, ch),
+        }
+    }
+    try out.append(alloc, '\n');
 }
 
 fn appendField(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), key: []const u8, value: []const u8) !void {
@@ -130,9 +144,14 @@ pub fn autostartState(alloc: Allocator, text: ?[]const u8, exe: []const u8) auto
 pub fn xdgMimeDefaultArgs(alloc: Allocator, desktop_name: []const u8, mime: []const u8) ![]const []const u8 {
     const argv = try alloc.alloc([]const u8, 4);
     errdefer alloc.free(argv);
-    argv[0] = "xdg-mime";
-    argv[1] = "default";
+    // 所有权统一：四段都由调用方 free（此前 argv[0..1] 是字面量，调用方按
+    // 统一规则释放会 panic——v0.3.19 修正）
+    argv[0] = try alloc.dupe(u8, "xdg-mime");
+    errdefer alloc.free(argv[0]);
+    argv[1] = try alloc.dupe(u8, "default");
+    errdefer alloc.free(argv[1]);
     argv[2] = try alloc.dupe(u8, desktop_name);
+    errdefer alloc.free(argv[2]);
     argv[3] = try alloc.dupe(u8, mime);
     return argv;
 }
@@ -201,13 +220,17 @@ test "autostartState: enabled / disabled / exe 不匹配" {
     const a = testing.allocator;
     const exe = "/opt/My App/zilt-app";
 
-    const enabled_text = try content(a, .{ .name = "Z", .exec = try formatExec(a, exe, null), .autostart = true });
+    const exec_on = try formatExec(a, exe, null);
+    defer a.free(exec_on);
+    const enabled_text = try content(a, .{ .name = "Z", .exec = exec_on, .autostart = true });
     defer a.free(enabled_text);
     const on = autostartState(a, enabled_text, exe);
     try testing.expect(on.enabled);
     try testing.expect(on.command != null);
 
-    const off_text = try content(a, .{ .name = "Z", .exec = try formatExec(a, exe, null), .autostart = false });
+    const exec_off = try formatExec(a, exe, null);
+    defer a.free(exec_off);
+    const off_text = try content(a, .{ .name = "Z", .exec = exec_off, .autostart = false });
     defer a.free(off_text);
     // 无 X-GNOME-Autostart-enabled 行不算禁用（enabled=true 语义由文件存在性承载）
     try testing.expect(autostartState(a, off_text, exe).enabled);
@@ -249,9 +272,3 @@ test "entryFileName: 已带 .desktop 后缀不重复拼接" {
     }
 }
 
-test "entryFileName" {
-    const a = testing.allocator;
-    const n = try entryFileName(a, "app.zilt.desktop");
-    defer a.free(n);
-    try testing.expectEqualStrings("app.zilt.desktop.desktop", n);
-}

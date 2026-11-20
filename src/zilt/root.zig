@@ -70,9 +70,22 @@ test {
     _ = @import("sys.zig");
     _ = @import("platform/interface.zig");
     _ = @import("platform/mod.zig");
-    // Linux 后端的纯逻辑单测（entryPath/reasonFor）只在 linux 目标上编译：
-    // 它 @import("gtk")，而该模块由 build.zig 的 translate-c 在 linux 上生成。
-    if (builtin.os.tag == .linux) _ = @import("platform/linux/backend.zig");
+    // Linux 后端的纯逻辑单测只在 linux 目标上编译：它们 @import("gtk")，该模块由
+    // build.zig 的 translate-c 在 linux 上生成。
+    // 测试补齐（v0.3.19 审计）：此前只有 backend.zig 入图，其余 9 个模块的 33 个用例
+    // 与 Windows 侧同病——`pub const` 惰性声明不会触发测试收集。
+    if (builtin.os.tag == .linux) {
+        _ = @import("platform/linux/backend.zig");
+        _ = @import("platform/linux/deep_link.zig");
+        _ = @import("platform/linux/desktop_entry.zig");
+        _ = @import("platform/linux/fs_watch.zig");
+        _ = @import("platform/linux/gtk_compat.zig");
+        _ = @import("platform/linux/hotkey.zig");
+        _ = @import("platform/linux/portal_hotkey.zig");
+        _ = @import("platform/linux/sqlite.zig");
+        _ = @import("platform/linux/sysinfo_linux.zig");
+        _ = @import("platform/linux/window_state.zig");
+    }
     _ = @import("security.zig");
     _ = @import("asset_routes.zig");
     _ = @import("builtin.zig");

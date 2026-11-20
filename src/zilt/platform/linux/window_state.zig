@@ -138,6 +138,9 @@ pub fn load(alloc: Allocator, root: []const u8, key: []const u8) !?State {
 
 const testing = std.testing;
 
+/// 0.17 无 std.time.nanoTimestamp：用进程内自增序号保证每次运行目录唯一。
+var test_seq: u32 = 0;
+
 test "state JSON round trip and defaults" {
     const alloc = testing.allocator;
     const states = [_]State{
@@ -193,7 +196,9 @@ test "hashed key filenames isolate arbitrary keys" {
 test "save/load round trip under a private temp directory" {
     const alloc = testing.allocator;
     var buf: [128]u8 = undefined;
-    const root = try std.fmt.bufPrint(&buf, ".zig-cache/zilt-window-state-test-{d}", .{std.time.nanoTimestamp()});
+    const n = test_seq;
+    test_seq += 1;
+    const root = try std.fmt.bufPrint(&buf, ".zig-cache/zilt-window-state-test-{d}", .{n});
     const i = sharedIo();
     defer Io.Dir.cwd().deleteTree(i, root) catch {};
 

@@ -560,6 +560,9 @@ pub fn build(b: *std.Build) void {
     }
 
     // ---- 单元测试（框架 + 工具） ----
+    // v0.3.19：Linux 测试图补入 gtk_compat 等模块后，测试产物会真实引用 gtk_init
+    // （此前只有纯逻辑函数被分析，从未需要链接 GTK）——补上与 exe 相同的系统库。
+    if (is_linux) linkLinuxWebviewLibs(b, zilt_mod);
     const unit_tests = b.addTest(.{ .root_module = zilt_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");

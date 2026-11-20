@@ -97,9 +97,8 @@ pub fn isDarkThemeName(name: ?[]const u8) bool {
 
 /// 内核版本（uname release，如 "5.15.167.4-microsoft-standard-WSL2"）。
 pub fn kernelVersion(buf: []u8) []const u8 {
-    var uts: std.posix.utsname = undefined;
-    // uname 失败时留空（不致命）
-    if (std.posix.uname(&uts) != 0) return buf[0..0];
+    // 0.17：uname 直接返回 utsname（不再有返回码）
+    const uts = std.posix.uname();
     const release = std.mem.span(@as([*:0]const u8, @ptrCast(&uts.release)));
     const n = @min(release.len, buf.len);
     @memcpy(buf[0..n], release[0..n]);

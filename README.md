@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.3.19（测试体系收口——41 个从未执行的用例入图 + 4 处真实缺陷修复 + 文档校准）**。
+**当前状态：v0.3.19（测试体系收口——74 个从未执行的用例入图 + 8 处真实缺陷修复 + 文档校准）**。
 逐版本功能项与验收记录分散在三份文档：[docs/ROADMAP.md](docs/ROADMAP.md)（v0.1.0–v0.1.24）、
 [docs/v0.2-LINUX.md](docs/v0.2-LINUX.md)（v0.2.0–v0.3.1）、[docs/v0.3.x-PLAN.md](docs/v0.3.x-PLAN.md)（v0.3.2–v0.3.19）。
 
@@ -56,10 +56,11 @@ Linux 复用同一 JS API 面，差异逐版本以「文档化」条目记录（
 
 v0.3.19 新增（2026-11-20，测试体系收口——审计驱动的缺陷修复 + 文档校准）：
 
-- **41 个从未执行的用例入图**：`patch` / `png` / `ico`（跨平台）与 `app_data` / `deep_link` /
-  `dialog_ext` / `icon` / `menu_runtime` / `range` / `single_instance` / `tray` / `winhttp`（Windows）
-  此前只有 `pub const` 惰性声明，测试从未进入编译图；`tools/driver.zig` 同理。接入后 Windows 侧
-  已无「声明但未编译」的用例（剩余 43 个未进二进制的名字均为 Linux-only）
+- **74 个从未执行的用例入图**（Windows 41 + Linux 33）：Windows 侧补入 `patch` / `png` / `ico` 与
+  `app_data` / `deep_link` / `dialog_ext` / `icon` / `menu_runtime` / `range` / `single_instance` /
+  `tray` / `winhttp` + `tools/driver.zig`；Linux 侧此前只有 `backend.zig` 入图，补入
+  `deep_link` / `desktop_entry` / `fs_watch` / `gtk_compat` / `hotkey` / `portal_hotkey` / `sqlite` /
+  `sysinfo_linux` / `window_state`。根因相同：`pub const X = @import(...)` 是惰性声明，不会触发测试收集
 - **修复：差分补丁块对齐（patch）**：COPY 段向后延伸未按 4KiB 块边界收尾，一次块内改动会让
   游标相对块栅格漂移，后续块再也命中不了旧文件索引——200KB 文件改 100 字节生成约 150KB 补丁
   （应约 4KB）。延伸长度改为向下取整到块边界（到 new 末尾除外）
@@ -77,8 +78,16 @@ v0.3.19 新增（2026-11-20，测试体系收口——审计驱动的缺陷修�
 - **文档校准**：`build.zig.zon` 版本号（0.1.0 → 0.3.19）、README 平台状态/能力面更新到 0.3.19、
   新增「能力索引」与 v0.2.0–v0.2.9 章节、变更日志按版本降序重排、单测与冒烟计数修正、
   快速开始补 Linux 依赖；ROADMAP 标注记录分界；CI 文档冒烟项数（31/75 → 66/86）
-- **验收**：Windows `zig build test` **364 项（363 通过 + 1 skip：POSIX 专用）**、`zig build`
-  21/21；Linux 平台层本次无改动，沿用 v0.3.18 的冒烟 86/86 记录
+- **Linux 侧同步收口（WSL Ubuntu 22.04 + GTK3/WebKitGTK 2.50.4 实测）**：入图后又暴露并修复
+  5 处——`desktop_entry` 的 `Exec` 把 `%u` 字段码转义成 `%%u`（启动器会原样传参）、
+  `formatExec` 对含 `"` 的路径未加引号、`xdgMimeDefaultArgs` 返回字面量却被调用方释放、
+  `portal_hotkey` 的 GVariant 元组用 `}}` 收尾（应为 `})`，Wayland 下解析必失败）、
+  `fs_watch` 测试在 WSL 的 9p 挂载上收不到 inotify（改到 `/tmp` tmpfs）；另修 4 处 Zig 0.17
+  API 迁移（`realpathAlloc` 移除、`posix.uname` 无参、`std.time.nanoTimestamp` 移除、
+  回调签名），并给 Linux 测试产物补 GTK 链接
+- **验收**：Windows `zig build test` **364 项（363 通过 + 1 skip：POSIX 专用）**、`zig build` 21/21；
+  Linux（WSL Ubuntu 22.04）**280 项（279 通过 + 1 skip：Windows 专用 stageUpdate）**；
+  两平台均 0 失败、0 泄漏
 
 v0.3.18 新增（2026-11-20，CompositionController 渲染专项收口——三轮差距刷新第五批）：
 
@@ -655,7 +664,7 @@ ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=my-app zig build init
 ```sh
 zig build gen      # 生成前端 TS 绑定（frontend/bindings/zilt.ts）
 zig build run      # 启动示例应用（embedded 模式）
-zig build test    # 单元测试 364 项（363 通过 + 1 skip：POSIX 专用；框架 341 + 工具链 23）
+zig build test    # 单元测试：Windows 364 项 / Linux 280 项（各 1 skip，均为对端专用用例）
                   # 覆盖：IPC/绑定 codegen/更新器与差分补丁/打包（NSIS/WiX/MSIX/deb/AppImage）/
                   # ACL 与 isolation/fs/store/SQL/http/ws/托盘与任务栏/对话框/深链/单实例密封/
                   # 图标与 PNG 编解码/窗口模型/WebView2 ABI/加速键/系统信息/自启/...

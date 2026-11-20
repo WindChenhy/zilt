@@ -172,7 +172,8 @@ const testing = std.testing;
 
 const Fixture = struct {
     paths: []const []const u8,
-    fn exists(self: *const Fixture, _: ?*anyopaque, path: []const u8) bool {
+    fn exists(ctx: ?*anyopaque, path: []const u8) bool {
+        const self: *const Fixture = @ptrCast(@alignCast(ctx.?));
         for (self.paths) |p| {
             if (std.mem.eql(u8, p, path)) return true;
         }
@@ -181,7 +182,7 @@ const Fixture = struct {
 };
 
 test "parseArgs: scheme URL / 忽略旗标与不存在路径" {
-    const fixture = Fixture{ .paths = &.{"/tmp/real.txt"} };
+    var fixture = Fixture{ .paths = &.{"/tmp/real.txt"} };
     const args = [_][]const u8{ "--zilt-x", "zilt://open?id=7", "/tmp/missing.txt", "/tmp/real.txt", "ZILT://upper", "" };
     var l = try parseArgs(testing.allocator, &args, "zilt", @ptrCast(&fixture), Fixture.exists);
     defer l.deinit(testing.allocator);
@@ -191,7 +192,7 @@ test "parseArgs: scheme URL / 忽略旗标与不存在路径" {
 }
 
 test "parsePayload: 往返与空载荷" {
-    const fixture = Fixture{ .paths = &.{"/tmp/b"} };
+    var fixture = Fixture{ .paths = &.{"/tmp/b"} };
     const args = [_][]const u8{ "zilt://a", "/tmp/b", "--flag" };
     const payload = try payloadOfArgs(testing.allocator, &args);
     defer testing.allocator.free(payload);

@@ -95,7 +95,9 @@ pub fn bindText(
         try appendEscaped(&out, alloc, e.description);
         try out.appendSlice(alloc, "'>,'preferred_trigger':<'");
         try appendEscaped(&out, alloc, e.trigger);
-        try out.appendSlice(alloc, "'>}}");
+        // a(sa{sv}) 的元组用 () 收尾：`})`——写成 `}}` 会让 GVariant 解析失败
+        //（v0.3.10 起就有，直到 v0.3.19 的 Linux 测试图补齐才暴露）
+        try out.appendSlice(alloc, "'>})");
     }
     try out.appendSlice(alloc, "],'',{})");
     return out.toOwnedSlice(alloc);
@@ -441,9 +443,10 @@ test "v0.3.10 D1: BindShortcuts GVariant 文本构造" {
     const text = try bindText(testing.allocator, "/org/x/request/1", &entries);
     defer testing.allocator.free(text);
     // 结构形态：handle + 两项 + 空 parent + 空 options
-    try testing.expect(std.mem.startsWith(u8, text, "('org/x/request/1',["));
-    try testing.expect(std.mem.indexOf(u8, text, "('quick-note',{'description':'Ctrl+Alt+N','preferred_trigger':'<Control><Alt>n'})") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "('reload',{'description':'Ctrl+R','preferred_trigger':'<Control>r'})") != null);
+    try testing.expect(std.mem.startsWith(u8, text, "('/org/x/request/1',["));
+    // a(sa{sv})：值是 variant，故为 <'…'>（v0.3.19 修正过期断言）
+    try testing.expect(std.mem.indexOf(u8, text, "('quick-note',{'description':<'Ctrl+Alt+N'>,'preferred_trigger':<'<Control><Alt>n'>})") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "('reload',{'description':<'Ctrl+R'>,'preferred_trigger':<'<Control>r'>})") != null);
     try testing.expect(std.mem.endsWith(u8, text, "],'',{})"));
     // 单引号转义
     const esc = try bindText(testing.allocator, "/h", &.{.{ .id = "a'b", .description = "d", .trigger = "t" }});
