@@ -1217,6 +1217,8 @@ fn Backend(comptime config: Config) type {
             /// v0.4.0 H8：JS 开关（false = Settings put_IsScriptEnabled(false)，
             /// 本窗口注入 runtime 不可用——kiosk 锁定用途）
             javascript: bool = true,
+            /// v0.4.2 H17：拖出 opt-in drag source（runtime dragstart 桥标记注入）
+            drag_source: bool = false,
             // ---- v0.3.3：窗口体验包 II ----
             /// 失焦自动隐藏（托盘弹窗类窗口；WM_ACTIVATE WA_INACTIVE）
             hide_on_focus_lost: bool = false,
@@ -1612,6 +1614,7 @@ fn Backend(comptime config: Config) type {
                 // v0.4.0：H7 拖放开关 / H8 JS 开关
                 .drag_drop = opts.drag_drop,
                 .javascript = opts.javascript,
+                .drag_source = opts.drag_source,
                 .composition_requested = opts.composition,
                 .hide_on_focus_lost = opts.hide_on_focus_lost,
                 .hide_on_escape = opts.hide_on_escape,
@@ -2216,6 +2219,10 @@ fn Backend(comptime config: Config) type {
                 log.print("[iso] __ZILT_ISO__ injected", .{});
             }
 
+            // v0.4.2 H17：拖出 opt-in 标记（先于 runtime——桥按标记接线）
+            if (w.drag_source) {
+                self.injectScript(w, webview, "window.__ZILT_DRAG_SOURCE__=true;");
+            }
             // 注入 zilt 运行时（window.zilt：invoke/emit/on + __reload）
             const script_handler = IgnoreCompletedHandler(wv2.IID_AddScriptToExecuteOnDocumentCreatedCompletedHandler).create(w) catch null;
             if (script_handler) |sh| {
@@ -4793,6 +4800,16 @@ fn Backend(comptime config: Config) type {
                 // v0.3.16 G21：全工作区可见——Windows 无原生对等（虚拟桌面 API 语义
                 // 不同且 Tauri 亦不支持）→ no-op true 文档化
                 .visible_on_all_workspaces => return true,
+                // v0.4.2 H16：reparent（Tauri unstable 对齐）——SetParent 挂到目标
+                // 窗口（WebView controller 的子 HWND 随窗口层级整体迁移）+
+                // parent_id 记账（state().parent 同步）
+                .reparent => |new_parent_id| {
+                    const target = self.windowById(if (new_parent_id == 0) 1 else new_parent_id) orelse return false;
+                    if (target.id == w.id) return false;
+                    if (win32.SetParent(w.hwnd, target.hwnd) == null) return false;
+                    w.parent_id = target.id;
+                    return true;
+                },
                 .set_title => |t| {
                     const tw = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, t) catch return false;
                     defer self.allocator.free(tw);
@@ -5296,10 +5313,12 @@ fn Backend(comptime config: Config) type {
             // v0.4.0：H7 拖放开关 / H8 JS 开关（创建期记录）+ H9 边框（非客户区）/
             // 物理位置与尺寸（GetWindowRect 即物理外框）
             const tail = std.fmt.allocPrint(alloc,
-                \\"drag_drop":{s},"javascript":{s},"border_sizes":{{"left":{d},"top":{d},"right":{d},"bottom":{d}}},"physical_position":{{"x":{d},"y":{d}}},"physical_size":{{"width":{d},"height":{d}}}}}
+                \\"drag_drop":{s},"javascript":{s},"parent":{d},"border_sizes":{{"left":{d},"top":{d},"right":{d},"bottom":{d}}},"physical_position":{{"x":{d},"y":{d}}},"physical_size":{{"width":{d},"height":{d}}}}}
             , .{
                 boolStr(w.drag_drop),
                 boolStr(w.javascript),
+                // v0.4.2 H16：父窗口 id（0 = 无父；reparent 后更新）
+                @as(u32, if (w.parent_id) |p| p else 0),
                 border_left,
                 border_top,
                 border_right,

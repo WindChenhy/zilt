@@ -195,6 +195,11 @@ pub const WindowOptions = struct {
     /// 禁用 JS（Tauri with_javascript_disabled 对齐；kiosk/锁定用途）。
     /// 禁用后本窗口的 window.zilt 运行时不可用（与 Tauri 语义一致——文档化）
     javascript: bool = true,
+    /// v0.4.2 H17：拖出常驻 drag source（opt-in；默认关——v0.1.12 决策的
+    /// 可选反转）。启用后 runtime 注入 dragstart 桥（仅 uri-list 类拖拽），
+    /// 页面发起的拖拽经 `dragStartUp {files}` 事件交给应用（ctx.startDrag
+    /// 完成 OS 拖出）
+    drag_source: bool = false,
 };
 
 /// v0.2.6：per-window `close_requested_event` 的两平台合并语义——
@@ -321,6 +326,9 @@ pub const WindowCmd = union(enum) {
     /// v0.3.16 G21：全工作区可见（Tauri visibleOnAllWorkspaces；GTK sticky）。
     /// Windows 无原生对等（虚拟桌面 API 语义不同）→ no-op true 文档化。
     visible_on_all_workspaces: bool,
+    /// v0.4.2 H16：reparent（Tauri unstable 语义对齐）——把本窗口的 WebView
+    /// 挂到目标窗口（Win SetParent；GTK 容器重挂），目标 id 为新父
+    reparent: u32,
 };
 
 /// window_query_fn 的哨兵：请求全部存活窗口的状态数组（list 语义；state 用具体 id）。
@@ -668,6 +676,14 @@ pub const Context = struct {
         const payload = std.fmt.allocPrint(self.msg_allocator, "{{\"id\":{d},\"credit\":{d}}}", .{ id, n }) catch return;
         defer self.msg_allocator.free(payload);
         self.emitJsonTo(self.window_id, "__zilt.channel", payload);
+    }
+
+    /// v0.4.2 H15：计划通知（进程内 timer 调度器；OS 级 ScheduledToast 列
+    /// stretch——R3 实验顺延）。到点触发 notify + `notificationScheduled`
+    /// 事件（tag 匹配）。字符串跨线程复制，调度线程由首次 schedule 懒启动。
+    pub fn scheduleNotification(self: Context, tag: []const u8, title: []const u8, body: []const u8, delay_ms: u32) void {
+        const sched = @import("notify_sched.zig");
+        sched.schedule(self, tag, title, body, delay_ms);
     }
 
     /// 请求退出应用（在 UI 线程的命令/事件回调内调用）。
@@ -1294,6 +1310,8 @@ const runtime_js_head =
     \\        if (o.keyBindings !== undefined) o.key_bindings = o.keyBindings;
     \\        // v0.4.0: dragDrop → drag_drop（javascript 两端同名无需映射）
     \\        if (o.dragDrop !== undefined) o.drag_drop = o.dragDrop;
+    \\        // v0.4.2: dragSource → drag_source
+    \\        if (o.dragSource !== undefined) o.drag_source = o.dragSource;
     \\        return winApi('create', o);
     \\      },
     \\      close: (id) => winApi('close', { window_id: id }),
@@ -1350,6 +1368,8 @@ const runtime_js_head =
     \\      list: () => winApi('list', {}),
     \\      // v0.3.16 G21：全工作区可见（Linux gtk_window_stick；Windows no-op 文档化）
     \\      setAllWorkspaces: (on, id) => winApi('setAllWorkspaces', { enabled: on !== false, window_id: id }),
+    \\      // v0.4.2 H16：reparent（Tauri unstable 语义对齐——WebView 挂到目标窗口）
+    \\      reparent: (newParentId, id) => winApi('reparent', { parent: newParentId ?? 0, window_id: id }),
     \\    },
     \\    // v0.3.14 G5：应用级退出与重启（Wails application.Quit / Tauri App::exit）
     \\    app: {
@@ -1442,6 +1462,8 @@ const runtime_js_head =
     \\      show: (opts) => builtin('__zilt.notification', Object.assign({ action: 'show' }, opts ?? {})),
     \\      update: (opts) => builtin('__zilt.notification', Object.assign({ action: 'update' }, opts ?? {})),
     \\      status: () => builtin('__zilt.notification', { action: 'status' }),
+    \\      // v0.4.2 H15：计划通知（进程内 timer；到点 notify + notificationScheduled 事件）
+    \\      schedule: (opts) => builtin('__zilt.notification', Object.assign({ action: 'schedule' }, opts ?? {})),
     \\    },
     \\    // v0.1.13: tray / menu / hotkey / taskbar
     \\    menu: {
@@ -1954,6 +1976,23 @@ const runtime_js_tail =
     \\  }
     \\  window.zilt.on('__reload', () => window.location.reload());
     \\})();
+    \\  // v0.4.2 H17：拖出常驻 drag source（opt-in——window.__ZILT_DRAG_SOURCE__
+    \\  // 由创建期注入；仅 uri-list 类拖拽桥接为 dragStartUp 事件，文本选择不受影响）。
+    \\  // 该段位于 IIFE 之外（桥接需 document 存在；标记注入先于 runtime）。
+    \\  if (window.__ZILT_DRAG_SOURCE__ && !window.__ZILT_DRAG_SOURCE_WIRED__) {
+    \\    window.__ZILT_DRAG_SOURCE_WIRED__ = true;
+    \\    document.addEventListener('dragstart', (e) => {
+    \\      try {
+    \\        const dt = e.dataTransfer;
+    \\        if (!dt || !dt.types || !Array.prototype.includes.call(dt.types, 'text/uri-list')) return;
+    \\        const list = dt.getData('text/uri-list');
+    \\        const files = (list || '').split(/[\r\n]+/).map((s) => s.trim()).filter((s) => s && !s.startsWith('#'));
+    \\        if (files.length === 0) return;
+    \\        e.preventDefault();
+    \\        window.zilt.emit('dragStartUp', { files: files });
+    \\      } catch (_) {}
+    \\    }, true);
+    \\  }
     \\
 ;
 

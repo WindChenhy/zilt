@@ -85,6 +85,9 @@ pub const Args = struct {
     // ---- v0.4.1：H4 channel 背压窗口 / H14 断点续传 ----
     max_in_flight: ?u32 = null,
     fail_after: ?u32 = null,
+    // ---- v0.4.2：H15 计划通知 / H17 拖出 opt-in ----
+    delay_ms: ?u32 = null,
+    drag_source: ?bool = null,
     /// v0.3.4：updater.skipVersion 的版本串
     version_str: ?[]const u8 = null,
     /// v0.3.6：SharedBuffer 二进制 IPC（__zilt.binary.request 的载荷字节数）
@@ -373,6 +376,8 @@ pub fn windowCmdFromArgs(a: Args, current_window: u32) !ipc.WindowCmd {
     if (eql(u8, a.action, "list")) return .list;
     // v0.3.16 G21：全工作区可见（Tauri visibleOnAllWorkspaces；GTK sticky）
     if (eql(u8, a.action, "setAllWorkspaces")) return .{ .visible_on_all_workspaces = a.enabled orelse true };
+    // v0.4.2 H16：reparent（Tauri unstable 对齐——WebView 挂到目标窗口）
+    if (eql(u8, a.action, "reparent")) return .{ .reparent = a.parent orelse return error.MissingParent };
     _ = current_window;
     return error.UnknownWindowAction;
 }
@@ -636,6 +641,16 @@ fn dragCmd(ctx: ipc.Context, a: Args) ![]u8 {
 }
 
 fn notificationCmd(ctx: ipc.Context, a: Args) ![]u8 {
+    // v0.4.2 H15：计划通知（进程内 timer；到点 notify + notificationScheduled 事件）
+    if (std.mem.eql(u8, a.action, "schedule")) {
+        ctx.scheduleNotification(
+            a.tag orelse "scheduled",
+            a.title orelse "Zilt",
+            a.body orelse "",
+            a.delay_ms orelse 1000,
+        );
+        return ok(ctx);
+    }
     if (std.mem.eql(u8, a.action, "status")) {
         const status = try ctx.notificationStatus();
         const name = std.json.Stringify.valueAlloc(ctx.allocator, @tagName(status), .{}) catch return error.OutOfMemory;

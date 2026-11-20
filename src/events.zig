@@ -20,6 +20,16 @@ pub fn frontendLog(_: Context, payload: struct { msg: []const u8 }) void {
     zilt.log.print("[frontend] {s}", .{payload.msg});
 }
 
+/// v0.4.2 H17：页面拖拽桥（window.create({dragSource:true}) 的 runtime 注入
+/// dragstart → 事件 dragStartUp {files}）——应用声明此处理器完成 OS 拖出
+///（ctx.startDrag；uri-list 类拖拽才桥接，文本选择不受影响）。
+pub fn dragStartUp(ctx: Context, payload: struct { files: []const []const u8 }) void {
+    if (payload.files.len == 0) return;
+    ctx.startDrag(payload.files) catch |err| {
+        zilt.log.print("[drag] dragStartUp start failed: {s}", .{@errorName(err)});
+    };
+}
+
 /// v0.3.16 G25：二进制通道上行帧回显（冒烟 c-bchan）。JS `ch.send(bytes)` →
 /// 事件 channelUp（帧 {id, seq, data_b64, sum}）→ 验和 → channelSendBinary
 /// 回显 → JS binary 模式解回 Uint8Array + 验收。
@@ -167,6 +177,10 @@ pub fn smokeResult(ctx: Context, payload: struct {
     // v0.4.1：H4 channel 背压（c-bp）+ H14 断点续传（c-tus）
     bp: bool = false,
     tus: bool = false,
+    // v0.4.2：H16 reparent（c-v042）+ H15 计划通知（c-sched）+ H3 加密 store（c-secret）
+    v042: bool = false,
+    sched: bool = false,
+    secret: bool = false,
     appquit: bool = false,
     fatal: ?[]const u8 = null,
 }) void {
@@ -181,10 +195,10 @@ pub fn smokeResult(ctx: Context, payload: struct {
             payload.cdp and payload.shot and payload.hdrs and payload.find and payload.proxy and payload.overlay and payload.proto and payload.ua and
             payload.scheme and payload.privacy and payload.monitor and payload.exp2 and payload.res and payload.dpapi and payload.binipc and
             payload.postbody and payload.upload and payload.iso and payload.sidecar and payload.comp and payload.win3 and payload.pdf and payload.acc and payload.sys2 and payload.bchan and
-            payload.v04 and payload.gpu and payload.bcount and payload.bp and payload.tus;
+            payload.v04 and payload.gpu and payload.bcount and payload.bp and payload.tus and payload.v042 and payload.sched and payload.secret;
         appquit = payload.appquit;
         if (ok) {
-            zilt.log.print("[smoke] ALL CHECKS PASSED (71 checks: core-10 + window-api/eval/webview-api/capability/clipboard-multi/notification/acl/spa + tray-check/taskbar/hotkey/sysinfo/appearance/autostart + store/fs + path/log/state + services + http + ws + webviews + proc + partition + wincontrol + fsops + channel + initupd + http2 + wss + zigev + acl2 + fs2 + cdp + shot + hdrs + find + proxy + overlay + proto + ua + scheme/privacy/monitor/exp2/res/dpapi/binipc/postbody/upload/iso/sidecar/comp/win3/pdf/acc/sys2/bchan/v04/gpu/bcount/bp/tus + appquit)", .{});
+            zilt.log.print("[smoke] ALL CHECKS PASSED (74 checks: core-10 + window-api/eval/webview-api/capability/clipboard-multi/notification/acl/spa + tray-check/taskbar/hotkey/sysinfo/appearance/autostart + store/fs + path/log/state + services + http + ws + webviews + proc + partition + wincontrol + fsops + channel + initupd + http2 + wss + zigev + acl2 + fs2 + cdp + shot + hdrs + find + proxy + overlay + proto + ua + scheme/privacy/monitor/exp2/res/dpapi/binipc/postbody/upload/iso/sidecar/comp/win3/pdf/acc/sys2/bchan/v04/gpu/bcount/bp/tus/v042/sched/secret + appquit)", .{});
         } else {
             zilt.log.print("[smoke] FAILED greet={} add={} fail={} user={} event={} mode={} clip={} win={} range={} winevent={} windowapi={} eval={} webview={} capability={} clipmulti={} notification={}", .{
                 payload.greet, payload.add, payload.fail, payload.user, payload.event, payload.mode, payload.clip,
@@ -201,6 +215,7 @@ pub fn smokeResult(ctx: Context, payload: struct {
                 payload.scheme, payload.privacy, payload.monitor, payload.exp2, payload.res, payload.dpapi, payload.binipc, payload.postbody, payload.upload, payload.iso, payload.sidecar, payload.comp, payload.win3, payload.pdf, payload.acc, payload.sys2, payload.bchan,
                 payload.v04, payload.gpu, payload.bcount, payload.bp, payload.tus,
             });
+            zilt.log.print("[smoke] FAILED(4) v042={} sched={} secret={}", .{ payload.v042, payload.sched, payload.secret });
         }
     }
 

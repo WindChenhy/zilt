@@ -1297,6 +1297,37 @@ function runSecondWindowProbe() {
       `failErr=${failErr ? failErr.message + '@' + failErr.offset : 'none'} r2=${JSON.stringify(r2)}`);
   } catch (e) { check('tus', false, String(e.message || e)); }
 
+  // ---- v0.4.2：H16 reparent + H15 计划通知 + H3 加密 store（降级容错）----
+  try {
+    const pa = await Z().window.create({ visible: false, width: 300, height: 200, label: 'v042-a-' + Date.now() });
+    const pb = await Z().window.create({ visible: false, width: 300, height: 200, label: 'v042-b-' + Date.now() });
+    const okRe = pa && pa.id && pb && pb.id ? await Z().window.reparent(pa.id, pb.id) : false;
+    const stB = pb && pb.id ? await Z().window.state(pb.id) : null;
+    if (pb && pb.id) await Z().window.destroy(pb.id).catch(() => {});
+    if (pa && pa.id) await Z().window.destroy(pa.id).catch(() => {});
+    check('v042', okRe === true && !!stB && stB.parent === pa.id, `re=${okRe} parent=${stB && stB.parent} A=${pa && pa.id}`);
+  } catch (e) { check('v042', false, String(e.message || e)); }
+  try {
+    const tag = 'v042-sched-' + Date.now();
+    let fired = null;
+    const off = Z().on('notificationScheduled', (p) => { if (p && p.tag === tag) fired = p; });
+    await Z().notification.schedule({ tag: tag, title: 'v0.4.2', body: 'scheduled', delayMs: 1200 });
+    for (let t = 0; t < 50 && !fired; t++) await wait(100);
+    off();
+    check('sched', !!fired && fired.fired === true, `fired=${JSON.stringify(fired)}`);
+  } catch (e) { check('sched', false, String(e.message || e)); }
+  try {
+    await Z().store.set('v042-secret', 'keyring-value');
+    const got = await Z().store.get('v042-secret');
+    let marker = 'none';
+    try {
+      const raw = await Z().fs.read('store.json');
+      if (String(raw).indexOf('dpapi:') >= 0) marker = 'dpapi';
+      if (String(raw).indexOf('secret:') >= 0) marker = 'secret';
+    } catch (_) {}
+    check('secret', got === 'keyring-value', `got=${got} marker=${marker}（无 keyring → 明文降级，也算 PASS）`);
+  } catch (e) { check('secret', false, String(e.message || e)); }
+
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {
     await Z().invoke('__zilt.linuxSmoke', {

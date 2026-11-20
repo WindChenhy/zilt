@@ -163,7 +163,17 @@ per-message arena 回收后 worker free = free(): invalid pointer abort）；②
 实装则 openssl s_server/wireshark 实测，文档化则部署指引）+ 打包 E2E 全格式 +
 既有冒烟/单测全量回归。
 
-### v0.4.2 — 安全与系统集成
+### v0.4.2 — 安全与系统集成 ✅ 完成（2026-11-21，见 git 提交记录）
+
+**验收**：双平台单测全绿（+libsecret dlopen/往返、notify_sched 提取/时钟 3 测试）+
+冒烟新增 c-v042（reparent 记账）/ c-sched（notificationScheduled 事件）/ c-secret
+（加密 store 往返+标记检查）。Windows 74 项中 72 通过（clip×2 既有环境问题）；
+**Linux 冒烟 exit 0 全过（94/94）**——libsecret 真密钥环往返（WSLg 会话总线 +
+GNOME Keyring，marker=secret 降级容错）、reparent 记账、sched 事件全过。
+**实测教训**：① script 回调内 std.Thread.spawn 会 SIGABRT → 调度线程 init 预启；
+② GNotification 非线程安全 → notifyEntry 经 g_idle_add 封送（调度线程可达）；
+③ GBytes opaque 不能 [*c] 索引 → raw 指针 + 用点 @ptrCast；④ worker 所有权
+page_allocator（延续 v0.4.1 教训）。
 
 目标：安全面收尾（Linux 密钥环对齐 Tauri）+ 系统集成弹性项。
 

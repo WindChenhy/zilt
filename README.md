@@ -6,7 +6,11 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.4.1（网络/IPC/分发深化——H4 channel credit 背压 / H14 断点续传分块上传
+**当前状态：v0.4.2（安全与系统集成——H3 Linux 密钥环加密 store（libsecret dlopen，
+`secret:` 标记）/ H15 计划通知（进程内 timer + notificationScheduled 事件）/
+H16 reparent（WebView 移挂目标窗口，state.parent 记账）/ H17 拖出 opt-in
+（dragSource → dragStartUp 事件桥））**。
+v0.4.1（网络/IPC/分发深化——H4 channel credit 背压 / H14 断点续传分块上传
 （JSON-tus-lite，状态落盘跨重启续传）/ H12 zilt self-update / H13 NSIS+deb 安装钩子与
 Flatpak E2E 脚本 / H21 WinHTTP 看门狗语义测试 / H5 TLS 选型定案：外层反代）**。
 H9 物理像素面 / H10 数值徽标（Unity LauncherEntry 实装） / H11 GPU 信息（DXGI + DRM） /
@@ -737,7 +741,7 @@ ZILT_SIGN_PFX_BASE64=<base64> ZILT_SIGN_PASSWORD=*** zig build bundle   # CI sec
 ```
 
 GUI 冒烟测试（前端检查表 + Zig 侧 `smokeResult` 断言，日志 `ALL CHECKS PASSED` 且 exit 0；
-当前 Windows **71 项**、Linux **91 项**）：
+当前 Windows **74 项**、Linux **94 项**）：
 
 ```sh
 zig build                            # 生成 frontend/bindings/capabilities.json 并嵌入资产

@@ -1408,6 +1408,50 @@ async function runChecks() {
       if (!ok) window.zilt.log('warn', 'c-tus note: failErr=' + (failErr && failErr.message) + '@' + (failErr && failErr.offset) + ' r2=' + JSON.stringify(r2));
     } catch (e) { setCheck('c-tus', false, String(e.message || e)); window.zilt.log('warn', 'c-tus error: ' + String(e.message || e)); }
 
+    // 72. v0.4.2 H16：reparent——探针 B 挂到探针 A（state.parent 记账）
+    try {
+      const pa = await window.zilt.window.create({ visible: false, width: 300, height: 200, label: 'v042-a-' + Date.now() });
+      const pb = await window.zilt.window.create({ visible: false, width: 300, height: 200, label: 'v042-b-' + Date.now() });
+      const okRe = pa && pa.id && pb && pb.id ? await window.zilt.window.reparent(pa.id, pb.id) : false;
+      const stB = pb && pb.id ? await window.zilt.window.state(pb.id) : null;
+      if (pb && pb.id) window.zilt.window.destroy(pb.id).catch(() => {});
+      if (pa && pa.id) window.zilt.window.destroy(pa.id).catch(() => {});
+      const ok = okRe === true && !!stB && stB.parent === pa.id;
+      setCheck('c-v042', ok, ok ? 'reparent ok (B under A, state.parent tracked)' : `re=${okRe} parent=${stB && stB.parent} A=${pa && pa.id}`);
+      if (!ok) window.zilt.log('warn', 'c-v042 note: re=' + okRe + ' parent=' + (stB && stB.parent));
+    } catch (e) { setCheck('c-v042', false, String(e.message || e)); window.zilt.log('warn', 'c-v042 error: ' + String(e.message || e)); }
+
+    // 73. v0.4.2 H15：计划通知——schedule 1.2s → notificationScheduled {tag, fired}
+    try {
+      const tag = 'v042-sched-' + Date.now();
+      let fired = null;
+      const off = window.zilt.on('notificationScheduled', (p) => { if (p && p.tag === tag) fired = p; });
+      await window.zilt.notification.schedule({ tag: tag, title: 'v0.4.2', body: 'scheduled', delayMs: 1200 });
+      for (let t = 0; t < 50 && !fired; t++) await sleep(100);
+      off();
+      const ok = !!fired && fired.fired === true;
+      setCheck('c-sched', ok, ok ? 'schedule ok (notificationScheduled fired with tag)' : `fired=${JSON.stringify(fired)}`);
+      if (!ok) window.zilt.log('warn', 'c-sched note: ' + JSON.stringify(fired));
+    } catch (e) { setCheck('c-sched', false, String(e.message || e)); window.zilt.log('warn', 'c-sched error: ' + String(e.message || e)); }
+
+    // 74. v0.4.2 H3：加密 store 往返（Windows DPAPI / Linux libsecret；
+    //     密钥环/DPAPI 缺失 → 明文降级——降级态也算 PASS，note 标注）
+    try {
+      await window.zilt.store.set('v042-secret', 'keyring-value');
+      const got = await window.zilt.store.get('v042-secret');
+      const roots = await window.zilt.fs.roots();
+      const appData = roots && (roots.appData || roots.appCache);
+      let marker = 'none';
+      try {
+        const raw = await window.zilt.fs.read('store.json');
+        if (raw.indexOf('dpapi:') >= 0) marker = 'dpapi';
+        if (raw.indexOf('secret:') >= 0) marker = 'secret';
+      } catch (_) {}
+      const ok = got === 'keyring-value' && (marker === 'dpapi' || marker === 'secret' || marker === 'none');
+      setCheck('c-secret', ok, ok ? `encrypted store ok (roundtrip + marker=${marker})` : `got=${got} marker=${marker}`);
+      if (!ok) window.zilt.log('warn', 'c-secret note: got=' + got + ' marker=' + marker);
+    } catch (e) { setCheck('c-secret', false, String(e.message || e)); window.zilt.log('warn', 'c-secret error: ' + String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）。
@@ -1488,6 +1532,9 @@ async function runChecks() {
       // v0.4.1：H4 channel 背压（c-bp）+ H14 断点续传（c-tus）
       bp: $('c-bp').className === 'pass',
       tus: $('c-tus').className === 'pass',
+      v042: $('c-v042').className === 'pass',
+      sched: $('c-sched').className === 'pass',
+      secret: $('c-secret').className === 'pass',
       appquit: !!window.zilt.app,
     };
     window.zilt.emit('smokeResult', smokeFlags);

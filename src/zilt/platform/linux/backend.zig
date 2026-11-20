@@ -135,6 +135,7 @@ const deep_link = @import("deep_link.zig");
 const unity_badge = @import("unity_badge.zig");
 const launch_args = @import("../../launch_args.zig");
 const upload_resume = @import("../../upload_resume.zig");
+const libsecret = @import("libsecret.zig");
 const desktop_entry = @import("desktop_entry.zig");
 const sysinfo_linux = @import("sysinfo_linux.zig");
 const menu_model = @import("../../menu_model.zig");
@@ -840,6 +841,10 @@ pub fn run(comptime config: Config) !void {
     self.unity_bus = unity_badge.acquireSessionBus();
     log.print("[taskbar] unity session bus: {s}", .{if (self.unity_bus != null) "available" else "unavailable"});
 
+    // v0.4.2 H15：计划通知调度线程（init 启动——回调内 spawn 会 abort，实测）
+    const notify_sched = @import("../../notify_sched.zig");
+    notify_sched.startScheduler();
+
     // v0.2.2：运行时菜单模型（托盘菜单驱动）+ 托盘（libayatana 可选，缺失仅日志）
     self.initMenuModel();
     self.initTray();
@@ -1058,6 +1063,8 @@ fn Backend(comptime config: Config) type {
             /// v0.4.0 H8：JS 开关（false = WebKitSettings enable-javascript=false，
             /// 本窗口注入 runtime 不可用——kiosk 锁定用途）
             javascript: bool = true,
+            /// v0.4.2 H17：拖出 opt-in drag source（runtime dragstart 桥标记）
+            drag_source: bool = false,
             // ---- v0.3.3：窗口体验包 II ----
             hide_on_focus_lost: bool = false,
             hide_on_escape: bool = false,
@@ -1286,6 +1293,12 @@ fn Backend(comptime config: Config) type {
         /// v0.4.0 H10：Unity LauncherEntry 会话总线连接（init 一次性缓存——
         /// script 回调内 g_bus_get_sync 会重入主循环 abort，实测教训）
         unity_bus: ?*anyopaque = null,
+        /// v0.4.2 H17：下一窗口的拖出 opt-in 标记（createWindowInternal → attachIpc
+        /// 单跳传递；attachIpc 无 per-window opts 参数——经 Self 单字段传递）
+        pending_drag_source: bool = false,
+        /// v0.4.2 H3：libsecret 密钥环（config.store_encrypted 且 dlopen 成功；
+        /// null = 明文降级——与 DPAPI 缺失语义同构）
+        secret: ?libsecret.SecretLib = null,
         /// ---- v0.2.2：运行时菜单模型 / 深链 / 拖放 ----
         /// 菜单模型（与 Windows 对齐：config.tray.menu 初始化；menu.* op 可变，
         /// 变更后重建托盘菜单；每窗口菜单栏仍是 config.menu 静态树）
@@ -1639,6 +1652,11 @@ fn Backend(comptime config: Config) type {
                     self.allocator.free(sc);
                 }
             }
+            // v0.4.2 H17：拖出 opt-in 标记（先于 runtime——桥按标记接线）
+            if (self.pending_drag_source) {
+                self.addUserScriptTo(scripts, ucm, "window.__ZILT_DRAG_SOURCE__=true;");
+                self.pending_drag_source = false;
+            }
             self.addUserScriptTo(scripts, ucm, ipc.runtime_js);
             // v0.3.14 G26：缩放控件 polyfill（WebKitGTK 无 IsZoomControlEnabled 对等；
             // 对齐 Tauri zoomHotkeysEnabled 的 Linux 手法——Ctrl/Cmd ±/0 → zoom 请求）
@@ -1968,6 +1986,7 @@ fn Backend(comptime config: Config) type {
                 // v0.4.0：H7 拖放开关 / H8 JS 开关
                 .drag_drop = opts.drag_drop,
                 .javascript = opts.javascript,
+                .drag_source = opts.drag_source,
                 .key_bindings = kb_entries,
             };
 
@@ -2068,6 +2087,7 @@ fn Backend(comptime config: Config) type {
                 null,
                 0,
             );
+            self.pending_drag_source = opts.drag_source;
             self.attachIpc(sink, ucm, &st.scripts);
 
             // v0.2.7：导航策略 / 新窗口策略 / 权限请求 / 渲染进程终止——只挂主
@@ -2654,6 +2674,19 @@ fn Backend(comptime config: Config) type {
                     return true;
                 },
                 // builtin 的 state 动作在调用 window_fn 之前已走 window_query_fn
+                // v0.4.2 H16：reparent——WebView 从本窗口容器移挂目标窗口容器
+                //（Tauri unstable 语义：移动 webview 而非窗口本身）
+                .reparent => |new_parent_id| {
+                    const target = self.windowById(if (new_parent_id == 0) 1 else new_parent_id) orelse return false;
+                    if (target.id == st.id) return false;
+                    const old_box = st.box orelse return false;
+                    const view_w: [*c]c.GtkWidget = @ptrCast(st.view orelse return false);
+                    _ = c.gtk_container_remove(@ptrCast(old_box), view_w);
+                    const tbox = target.box orelse return false;
+                    c.gtk_container_add(@ptrCast(tbox), view_w);
+                    st.parent_id = target.id;
+                    return true;
+                },
                 .state => return true,
             }
             return true;
@@ -2768,10 +2801,12 @@ fn Backend(comptime config: Config) type {
             // v0.4.0：H7 拖放开关 / H8 JS 开关（创建期记录）+ H9 边框（非客户区）/
             // 物理位置与尺寸（frame extents 物理外框）
             const tail = std.fmt.allocPrint(alloc,
-                \\"drag_drop":{s},"javascript":{s},"border_sizes":{{"left":{d},"top":{d},"right":{d},"bottom":{d}}},"physical_position":{{"x":{d},"y":{d}}},"physical_size":{{"width":{d},"height":{d}}}}}
+                \\"drag_drop":{s},"javascript":{s},"parent":{d},"border_sizes":{{"left":{d},"top":{d},"right":{d},"bottom":{d}}},"physical_position":{{"x":{d},"y":{d}}},"physical_size":{{"width":{d},"height":{d}}}}}
             , .{
                 boolStr(st.drag_drop),
                 boolStr(st.javascript),
+                // v0.4.2 H16：父窗口 id（0 = 无父；reparent 后更新）
+                @as(u32, if (st.parent_id) |p| p else 0),
                 border_left,
                 border_top,
                 border_right,
@@ -3810,11 +3845,41 @@ fn Backend(comptime config: Config) type {
         }
 
         /// v0.1.6 兼容入口（ctx.notify）：无 tag 的普通通知。
-        fn notifyEntry(backend: *anyopaque, title: []const u8, body: []const u8) void {
-            const self: *Self = @ptrCast(@alignCast(backend));
-            self.sendNotification(null, title, body) catch |err| {
+        const NotifyTask = struct { self: *Self, title: []u8, body: []u8 };
+
+        fn notifyIdle(user_data: c.gpointer) callconv(.c) c.gboolean {
+            const t: *NotifyTask = @ptrCast(@alignCast(user_data orelse return 0));
+            t.self.sendNotification(null, t.title, t.body) catch |err| {
                 log.print("[notify] legacy notify failed: {s}", .{@errorName(err)});
             };
+            t.self.allocator.free(t.title);
+            t.self.allocator.free(t.body);
+            t.self.allocator.destroy(t);
+            return 0;
+        }
+
+        fn notifyEntry(backend: *anyopaque, title: []const u8, body: []const u8) void {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            // v0.4.2 H15：调度线程可达——GNotification 调用封送到主循环
+            //（g_idle_add；对齐 emit 封送模式，非主线程直呼会 abort）
+            const task = self.allocator.create(NotifyTask) catch return;
+            task.* = .{
+                .self = self,
+                .title = self.allocator.dupe(u8, title) catch {
+                    self.allocator.destroy(task);
+                    return;
+                },
+                .body = self.allocator.dupe(u8, body) catch {
+                    self.allocator.free(task.title);
+                    self.allocator.destroy(task);
+                    return;
+                },
+            };
+            if (c.g_idle_add(notifyIdle, task) == 0) {
+                self.allocator.free(task.title);
+                self.allocator.free(task.body);
+                self.allocator.destroy(task);
+            }
         }
 
         // ------------------------------------------------------------------
@@ -5357,6 +5422,15 @@ fn Backend(comptime config: Config) type {
         /// 应用数据根（storage_root）：与 window_state 同根
         /// <XDG_DATA_HOME|~/.local/share>/<app_id>。run() 早期调用一次。
         fn initStorage(self: *Self) void {
+            // v0.4.2 H3：store_encrypted → libsecret dlopen（缺失降级明文，日志）
+            if (config.store_encrypted) {
+                if (libsecret.open()) |lib| {
+                    self.secret = lib;
+                    log.print("[store] libsecret keyring enabled (encrypted store)", .{});
+                } else {
+                    log.print("[store] store_encrypted=true but libsecret unavailable -> plaintext fallback", .{});
+                }
+            }
             if (self.storage_root != null) return;
             const root = self.appDataRoot() orelse {
                 log.print("[store] app data root unavailable — store/acl/fs(appData) disabled", .{});
@@ -5401,9 +5475,29 @@ fn Backend(comptime config: Config) type {
             switch (op) {
                 .get => |key| {
                     const v = st.get(key) orelse return .{ .json = try alloc.dupe(u8, "null") };
+                    // v0.4.2 H3：`secret:` 标记 → 值在密钥环（libsecret lookup）
+                    if (std.mem.startsWith(u8, v, "secret:")) {
+                        const lib = self.secret orelse return error.KeyringUnavailable;
+                        const got = libsecret.lookupValue(&lib, alloc, key) orelse return error.KeyringUnavailable;
+                        defer alloc.free(got);
+                        return .{ .json = try std.json.Stringify.valueAlloc(alloc, got, .{}) };
+                    }
                     return .{ .json = try std.json.Stringify.valueAlloc(alloc, v, .{}) };
                 },
                 .set => |kv| {
+                    // v0.4.2 H3：加密模式 + libsecret → 值进密钥环，store.json 落标记
+                    if (self.secret) |*lib| {
+                        libsecret.storeValue(lib, alloc, config.app_id, kv.key, kv.value) catch |err| {
+                            log.print("[store] keyring store failed: {s} -> plaintext fallback", .{@errorName(err)});
+                            try st.set(kv.key, kv.value);
+                            self.persistStore();
+                            return .{ .ok = true };
+                        };
+                        try st.set(kv.key, "secret:");
+                        self.persistStore();
+                        log.print("[store] set {s} (keyring, {d} keys)", .{ kv.key, st.count() });
+                        return .{ .ok = true };
+                    }
                     try st.set(kv.key, kv.value);
                     self.persistStore();
                     log.print("[store] set {s} ({d} keys)", .{ kv.key, st.count() });
