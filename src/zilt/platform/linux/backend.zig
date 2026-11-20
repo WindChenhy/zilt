@@ -118,6 +118,7 @@ const security = @import("../../security.zig");
 const builtin_cmds = @import("../../builtin.zig");
 const log = @import("../../log.zig");
 const system_api = @import("../../system_api.zig");
+const shared_taskbar = @import("../../taskbar.zig");
 const shared_services = @import("../../services.zig");
 const updater = @import("../../updater.zig");
 const patch_mod = @import("../../patch.zig");
@@ -131,6 +132,8 @@ const gtk_compat = @import("gtk_compat.zig");
 const hotkey_mod = @import("hotkey.zig");
 const portal_hotkey = @import("portal_hotkey.zig");
 const deep_link = @import("deep_link.zig");
+const unity_badge = @import("unity_badge.zig");
+const launch_args = @import("../../launch_args.zig");
 const desktop_entry = @import("desktop_entry.zig");
 const sysinfo_linux = @import("sysinfo_linux.zig");
 const menu_model = @import("../../menu_model.zig");
@@ -310,32 +313,55 @@ fn runRestartHelperLinux(target: []const u8) void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    log.print("[updater] restart helper: spawn {s}", .{target});
-    const child = std.process.spawn(io, .{ .argv = &.{target} }) catch |e| {
-        log.print("[updater] restart helper: spawn failed: {s}", .{@errorName(e)});
-        return;
-    };
-    const id = child.id orelse return;
-    const pid: std.c.pid_t = @intCast(id);
+    // v0.4.0 L7：与 Windows runRestartHelper 同语义同日志——
+    //   * 退出码 5（单实例转交，GApplication 名释放滞后）→ 稍候重试拉起（≤5 次）
+    //   * 3s 内非 0 退出（或被信号杀死）→ rollbackToBackup + 重拉 + 观察
+    //   * 3s 内 0 退出 → 视为正常（不回滚）；存活 ≥3s → healthy
+    var attempt: u32 = 0;
+    while (attempt < 5) : (attempt += 1) {
+        log.print("[updater] restart helper: spawn {s} (attempt {d})", .{ target, attempt + 1 });
+        const child = std.process.spawn(io, .{ .argv = &.{target} }) catch |e| {
+            log.print("[updater] restart helper: spawn failed: {s}", .{@errorName(e)});
+            return;
+        };
+        const id = child.id orelse return;
+        const pid: std.c.pid_t = @intCast(id);
 
-    var observe_ms: u32 = 0;
-    while (observe_ms < 3000) : (observe_ms += 100) {
-        var status: c_int = 0;
-        const r = std.c.waitpid(pid, &status, std.c.W.NOHANG);
-        if (r == pid) {
-            // 提前退出（任何原因）→ 回滚到备份并重拉旧版
-            if (updater.rollbackToBackup(alloc, target)) {
-                log.print("[updater] target exited within 3s -> rolled back to backup", .{});
-                const old_child = std.process.spawn(io, .{ .argv = &.{target} }) catch return;
-                _ = old_child; // 健康观察由 init 接管；这里只负责拉起
-            } else {
-                log.print("[updater] target exited within 3s, no backup available", .{});
+        var observe_ms: u32 = 0;
+        var exited = false;
+        var code: u32 = 0;
+        while (observe_ms < 3000) : (observe_ms += 100) {
+            var status: c_int = 0;
+            const r = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+            if (r == pid) {
+                exited = true;
+                // waitpid 状态解码（手写位运算——std.c.W 各平台宏差异规避）：
+                // 低 7 位 = 终止信号（0 = 正常退出）；高 8 位 = 退出码
+                code = if ((status & 0x7f) == 0) @intCast((status >> 8) & 0xff) else 1;
+                break;
             }
+            _ = c.g_usleep(100_000);
+        }
+        if (!exited) {
+            log.print("[updater] target healthy after 3s", .{});
             return;
         }
-        _ = c.g_usleep(100_000);
+        if (code == 5) {
+            _ = c.g_usleep(400_000);
+            continue;
+        }
+        if (code != 0) {
+            if (updater.rollbackToBackup(alloc, target)) {
+                log.print("[updater] target exited with {d}, rolled back to backup", .{code});
+                const old_child = std.process.spawn(io, .{ .argv = &.{target} }) catch return;
+                _ = old_child; // 健康观察由 init 接管（10s cleanupOld）；这里只负责拉起
+            } else {
+                log.print("[updater] target exited with {d}, no backup available", .{code});
+            }
+        }
+        return;
     }
-    log.print("[updater] target healthy after 3s", .{});
+    log.print("[updater] restart helper: exit-5 retry attempts exhausted", .{});
 }
 
 /// 窗口事件的字段（v0.2.6：windowMoved/Resized/Focus/Blur/CloseRequested）。
@@ -808,6 +834,11 @@ pub fn run(comptime config: Config) !void {
         else => {},
     }
 
+    // v0.4.0 H10：Unity 会话总线一次性缓存（init 上下文安全；严禁在 script
+    // 回调内 acquire——g_bus_get_sync 同步 I/O 重入主循环 abort，实测）
+    self.unity_bus = unity_badge.acquireSessionBus();
+    log.print("[taskbar] unity session bus: {s}", .{if (self.unity_bus != null) "available" else "unavailable"});
+
     // v0.2.2：运行时菜单模型（托盘菜单驱动）+ 托盘（libayatana 可选，缺失仅日志）
     self.initMenuModel();
     self.initTray();
@@ -1021,6 +1052,11 @@ fn Backend(comptime config: Config) type {
             titlebar_overlay: bool = false,
             /// v0.3.2：无痕窗口（ephemeral data manager；Cookie/存储不落盘）
             incognito: bool = false,
+            /// v0.4.0 H7：拖放开关（false = 不挂 drag-dest——页面原生 drag 可用）
+            drag_drop: bool = true,
+            /// v0.4.0 H8：JS 开关（false = WebKitSettings enable-javascript=false，
+            /// 本窗口注入 runtime 不可用——kiosk 锁定用途）
+            javascript: bool = true,
             // ---- v0.3.3：窗口体验包 II ----
             hide_on_focus_lost: bool = false,
             hide_on_escape: bool = false,
@@ -1246,6 +1282,9 @@ fn Backend(comptime config: Config) type {
         app_held: bool = false,
         /// 托盘（libayatana 动态加载；null = 不可用/未配置）
         tray: ?Tray = null,
+        /// v0.4.0 H10：Unity LauncherEntry 会话总线连接（init 一次性缓存——
+        /// script 回调内 g_bus_get_sync 会重入主循环 abort，实测教训）
+        unity_bus: ?*anyopaque = null,
         /// ---- v0.2.2：运行时菜单模型 / 深链 / 拖放 ----
         /// 菜单模型（与 Windows 对齐：config.tray.menu 初始化；menu.* op 可变，
         /// 变更后重建托盘菜单；每窗口菜单栏仍是 config.menu 静态树）
@@ -1495,7 +1534,9 @@ fn Backend(comptime config: Config) type {
 
         /// 应用数据根目录（Linux 约定）：$XDG_DATA_HOME/<app_id> 或
         /// ~/.local/share/<app_id>。调用方 free。
+        /// v0.4.0 H6：config.data_dir 覆盖优先（Tauri appDirectoriesOverride 对齐）。
         fn appDataRoot(self: *Self) ?[]u8 {
+            if (config.data_dir) |d| return self.allocator.dupe(u8, d) catch null;
             if (std.c.getenv("XDG_DATA_HOME")) |xdg| {
                 const s = std.mem.span(xdg);
                 if (s.len > 0) {
@@ -1923,6 +1964,9 @@ fn Backend(comptime config: Config) type {
                 .hide_on_escape = opts.hide_on_escape,
                 .prevent_overflow = opts.prevent_overflow,
                 .titlebar_double_click = opts.titlebar_double_click,
+                // v0.4.0：H7 拖放开关 / H8 JS 开关
+                .drag_drop = opts.drag_drop,
+                .javascript = opts.javascript,
                 .key_bindings = kb_entries,
             };
 
@@ -1987,6 +2031,15 @@ fn Backend(comptime config: Config) type {
             const view: [*c]c.WebKitWebView = @ptrCast(view_widget);
             st.view = view;
             sink.view = view;
+            // v0.4.0 H8：禁用 JS（kiosk/锁定；本窗口注入 runtime 随之不可用——
+            // Tauri with_javascript_disabled 同语义。WebKitSettings enable-javascript）
+            if (!opts.javascript) {
+                const js_settings = c.webkit_web_view_get_settings(view);
+                if (js_settings != null) {
+                    c.webkit_settings_set_enable_javascript(js_settings, 0);
+                    log.print("[settings] javascript disabled (kiosk)", .{});
+                }
+            }
             // v0.3.15 G14：前进/后退滑动手势（WebKitSettings 原生 API——
             // Windows 走 Settings6 IsSwipeNavigationEnabled，默认关对齐）
             if (config.webview.settings.swipe_gestures) {
@@ -2041,19 +2094,23 @@ fn Backend(comptime config: Config) type {
             // gtk_drag_get_data 后返回 TRUE（user handler 先于 WebKit 的 class
             // handler 运行，拦截「拖入文件即导航」的默认行为）；drag-data-received
             // 解析 text/uri-list → dropFiles 事件（对齐 Windows WM_DROPFILES）。
-            const dnd_targets = [_]c.GtkTargetEntry{
-                .{ .target = @constCast("text/uri-list"), .flags = 0, .info = 0 },
-                .{ .target = @constCast("text/plain"), .flags = 0, .info = 1 },
-            };
-            c.gtk_drag_dest_set(
-                view_widget,
-                c.GTK_DEST_DEFAULT_ALL,
-                &dnd_targets,
-                dnd_targets.len,
-                c.GDK_ACTION_COPY,
-            );
-            _ = c.g_signal_connect_data(@ptrCast(view_widget), "drag-drop", @ptrCast(&Self.onDragDrop), sink, null, 0);
-            _ = c.g_signal_connect_data(@ptrCast(view_widget), "drag-data-received", @ptrCast(&Self.onDragDataReceived), sink, null, 0);
+            // v0.4.0 H7：每窗口拖放开关（false = 不挂 drag-dest——页面原生
+            // drag 事件可用，dropFiles 事件不再产生；冒烟模拟投递不走 dest）
+            if (opts.drag_drop) {
+                const dnd_targets = [_]c.GtkTargetEntry{
+                    .{ .target = @constCast("text/uri-list"), .flags = 0, .info = 0 },
+                    .{ .target = @constCast("text/plain"), .flags = 0, .info = 1 },
+                };
+                c.gtk_drag_dest_set(
+                    view_widget,
+                    c.GTK_DEST_DEFAULT_ALL,
+                    &dnd_targets,
+                    dnd_targets.len,
+                    c.GDK_ACTION_COPY,
+                );
+                _ = c.g_signal_connect_data(@ptrCast(view_widget), "drag-drop", @ptrCast(&Self.onDragDrop), sink, null, 0);
+                _ = c.g_signal_connect_data(@ptrCast(view_widget), "drag-data-received", @ptrCast(&Self.onDragDataReceived), sink, null, 0);
+            }
 
             // geometry hints（min/max；Xvfb 无 WM 不执行，真实桌面生效）
             applyGeometryHints(st, win_typed);
@@ -2641,8 +2698,28 @@ fn Backend(comptime config: Config) type {
                 iconic = (c.gdk_window_get_state(gdk_win) & c.GDK_WINDOW_STATE_ICONIFIED) != 0;
             }
 
-            return std.fmt.allocPrint(alloc,
-                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":0,"ex_style":0,"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":false,"overlay":{s},"incognito":{s},"monitor":{d},"transparent":{s},"background_color":{d},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d},"resizable":{s},"decorated":{s}}}
+            // v0.4.0 H9：物理像素面——frame extents（外框物理）+ 客户区原点；
+            // Xvfb 无 WM 时 frame == 窗口 → 边框 0（合法值）
+            var frame: c.GdkRectangle = std.mem.zeroes(c.GdkRectangle);
+            var ox: c.gint = 0;
+            var oy: c.gint = 0;
+            var scale: c.gint = 1;
+            if (c.gtk_widget_get_window(widget)) |gdk_win| {
+                c.gdk_window_get_frame_extents(gdk_win, &frame);
+                _ = c.gdk_window_get_origin(gdk_win, &ox, &oy);
+                scale = c.gdk_window_get_scale_factor(gdk_win);
+            }
+            const phys_client_w = width * scale;
+            const phys_client_h = height * scale;
+            const border_left = ox - frame.x;
+            const border_top = oy - frame.y;
+            const border_right = (frame.x + frame.width) - (ox + phys_client_w);
+            const border_bottom = (frame.y + frame.height) - (oy + phys_client_h);
+
+            // v0.4.0：格式化参数超 32 上限 → 两段拼接（head 到 decorated；tail 为
+            // v0.4.0 新增字段 drag_drop/javascript/border_sizes/physical_*）
+            const head = std.fmt.allocPrint(alloc,
+                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":0,"ex_style":0,"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":false,"overlay":{s},"incognito":{s},"monitor":{d},"transparent":{s},"background_color":{d},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d},"resizable":{s},"decorated":{s},
             , .{
                 st.id,
                 x,
@@ -2685,7 +2762,29 @@ fn Backend(comptime config: Config) type {
                 // v0.3.14：GTK 属性直读
                 boolStr(c.gtk_window_get_resizable(win) != 0),
                 boolStr(c.gtk_window_get_decorated(win) != 0),
-            }) catch null;
+            }) catch return null;
+            defer alloc.free(head);
+            // v0.4.0：H7 拖放开关 / H8 JS 开关（创建期记录）+ H9 边框（非客户区）/
+            // 物理位置与尺寸（frame extents 物理外框）
+            const tail = std.fmt.allocPrint(alloc,
+                \\"drag_drop":{s},"javascript":{s},"border_sizes":{{"left":{d},"top":{d},"right":{d},"bottom":{d}}},"physical_position":{{"x":{d},"y":{d}}},"physical_size":{{"width":{d},"height":{d}}}}}
+            , .{
+                boolStr(st.drag_drop),
+                boolStr(st.javascript),
+                border_left,
+                border_top,
+                border_right,
+                border_bottom,
+                ox,
+                oy,
+                frame.width,
+                frame.height,
+            }) catch {
+                alloc.free(head);
+                return null;
+            };
+            defer alloc.free(tail);
+            return std.fmt.allocPrint(alloc, "{s}{s}", .{ head, tail }) catch null;
         }
 
         // ------------------------------------------------------------------
@@ -3465,6 +3564,13 @@ fn Backend(comptime config: Config) type {
                 const fj = jsonStr(self.allocator, f) orelse return false;
                 defer self.allocator.free(fj);
                 payload.appendSlice(self.allocator, fj) catch return false;
+            }
+            // v0.4.0 H20：结构化参数解析随事件下发（positional/flags/subcommand）
+            if (launch.parsed) |*p| {
+                const pjson = launch_args.toJson(self.allocator, p) catch return false;
+                defer self.allocator.free(pjson);
+                payload.appendSlice(self.allocator, ",\"parsed\":") catch return false;
+                payload.appendSlice(self.allocator, pjson) catch return false;
             }
             payload.appendSlice(self.allocator, "]}") catch return false;
             self.emitRawToWindow(w.id, "deepLink", payload.items);
@@ -4792,8 +4898,33 @@ fn Backend(comptime config: Config) type {
                 },
                 .services => |op| return self.runServicesOp(op, alloc),
                 .updater => |op| return self.runUpdaterOp(op, alloc),
+                // v0.4.0 H10：Unity LauncherEntry 数值徽标（其余 taskbar op 仍 NotSupported）
+                .taskbar => |op| return self.runTaskbarOpLinux(op, alloc),
                 // 托盘运行时 op/process/appearance/... 属后续版本；NotSupported
                 // 与 Windows 的降级语义同构（platform/interface.zig 契约不受影响）
+                else => return error.NotSupported,
+            }
+        }
+
+        /// v0.4.0 H10：badge_count → Unity LauncherEntry Update 信号。
+        /// 连接来自 init 时的缓存（见 initApplication）；无会话总线（CI/Xvfb）→
+        /// NotSupported（文档化降级，与剪贴板环境问题同文化）。
+        fn runTaskbarOpLinux(self: *Self, op: shared_taskbar.Request, alloc: std.mem.Allocator) !system_api.Result {
+            switch (op) {
+                .badge_count => |n| {
+                    const conn = self.unity_bus orelse {
+                        log.print("[taskbar] unity badge_count({d}): no session bus (acquired at init) -> NotSupported", .{n});
+                        return error.NotSupported;
+                    };
+                    const id = try unity_badge.desktopId(alloc, config.app_id);
+                    defer alloc.free(id);
+                    unity_badge.emitBadgeCount(conn, alloc, id, n) catch |err| {
+                        log.print("[taskbar] unity badge_count({d}) emit failed: {s}", .{ n, @errorName(err) });
+                        return error.NotSupported;
+                    };
+                    log.print("[taskbar] unity badge_count={d} (LauncherEntry signal, app={s})", .{ n, config.app_id });
+                    return .{ .ok = true };
+                },
                 else => return error.NotSupported,
             }
         }
@@ -5021,7 +5152,60 @@ fn Backend(comptime config: Config) type {
                     defer alloc.free(mons_json);
                     return std.fmt.allocPrint(alloc, "{{\"os\":{s},\"monitors\":{s}}}", .{ os_json, mons_json });
                 },
+                // v0.4.0 H11：GPU 适配器（/sys/class/drm/card* 解析；无 DRM → 空数组）
+                .gpu => {
+                    const gpus = try self.collectGpus(alloc);
+                    defer sysinfo_linux.freeGpus(alloc, gpus);
+                    return shared_sysinfo.gpuToJson(alloc, gpus);
+                },
             }
+        }
+
+        /// v0.4.0 H11：GPU 适配器采集——card 索引 0..15 逐一 stat
+        /// /sys/class/drm/card<i>/device/{vendor,device,uevent}（不做目录枚举，
+        /// 规避 Io walker 的 readdir 限制）。WSLg 无 drm 卡 → 空数组。
+        fn collectGpus(self: *Self, alloc: std.mem.Allocator) ![]shared_sysinfo.GpuInfo {
+            _ = self;
+            var out: std.ArrayListUnmanaged(shared_sysinfo.GpuInfo) = .empty;
+            errdefer sysinfo_linux.freeGpus(alloc, out.items);
+            var i: u32 = 0;
+            while (i < 16) : (i += 1) {
+                var vendor_buf: [96]u8 = undefined;
+                const vendor_path = std.fmt.bufPrint(&vendor_buf, "/sys/class/drm/card{d}/device/vendor", .{i}) catch break;
+                const vendor_text = std.Io.Dir.cwd().readFileAlloc(sharedIo(), vendor_path, alloc, .limited(64)) catch continue;
+                defer alloc.free(vendor_text);
+                const vendor_id = sysinfo_linux.parseHexId(vendor_text) orelse continue;
+                var dev_buf: [96]u8 = undefined;
+                const device_path = std.fmt.bufPrint(&dev_buf, "/sys/class/drm/card{d}/device/device", .{i}) catch break;
+                var device_text: ?[]u8 = null;
+                defer if (device_text) |t| alloc.free(t);
+                device_text = std.Io.Dir.cwd().readFileAlloc(sharedIo(), device_path, alloc, .limited(64)) catch null;
+                const device_id = if (device_text) |t| (sysinfo_linux.parseHexId(t) orelse 0) else 0;
+                var ue_buf: [96]u8 = undefined;
+                const uevent_path = std.fmt.bufPrint(&ue_buf, "/sys/class/drm/card{d}/device/uevent", .{i}) catch break;
+                var uevent_text: ?[]u8 = null;
+                defer if (uevent_text) |t| alloc.free(t);
+                uevent_text = std.Io.Dir.cwd().readFileAlloc(sharedIo(), uevent_path, alloc, .limited(4096)) catch null;
+                const driver = if (uevent_text) |t| sysinfo_linux.driverFromUevent(t) else null;
+                const card_name = try std.fmt.allocPrint(alloc, "card{d}", .{i});
+                const name = try sysinfo_linux.gpuName(alloc, card_name, vendor_id, device_id);
+                errdefer alloc.free(name);
+                const vendor_name = shared_sysinfo.vendorFromPciId(vendor_id);
+                const vendor = if (std.mem.eql(u8, vendor_name, "unknown"))
+                    try std.fmt.allocPrint(alloc, "0x{x:0>4}", .{vendor_id})
+                else
+                    try alloc.dupe(u8, vendor_name);
+                errdefer alloc.free(vendor);
+                const driver_str = if (driver) |d| (if (d.len > 0) try alloc.dupe(u8, d) else try alloc.dupe(u8, "")) else try alloc.dupe(u8, "");
+                errdefer if (driver_str.len > 0) alloc.free(driver_str);
+                try out.append(alloc, .{
+                    .name = name,
+                    .vendor = vendor,
+                    .vram_mb = 0,
+                    .driver = driver_str,
+                });
+            }
+            return out.toOwnedSlice(alloc);
         }
 
         fn collectOsInfo(self: *Self, alloc: std.mem.Allocator) !shared_sysinfo.OsInfo {
@@ -5056,13 +5240,20 @@ fn Backend(comptime config: Config) type {
                 const mon = c.gdk_display_get_monitor(display, @intCast(i));
                 var geom: c.GdkRectangle = std.mem.zeroes(c.GdkRectangle);
                 var work: c.GdkRectangle = std.mem.zeroes(c.GdkRectangle);
-                var scale: c_int = 1;
+                // v0.4.0 L2：分数缩放——GTK4（4.14+）gdk_monitor_get_scale 返回小数；
+                // GTK3 回退整数 scale_factor（无分数 API，文档化）。comptime 分支
+                // 保证另一变体的符号不被分析（gtk3 构建无 get_scale，反之亦然）。
+                var scale_f: f64 = 1.0;
                 if (mon != null) {
                     c.gdk_monitor_get_geometry(mon, &geom);
                     c.gdk_monitor_get_workarea(mon, &work);
-                    scale = c.gdk_monitor_get_scale_factor(mon);
+                    if (comptime gtk_compat.isGtk4()) {
+                        scale_f = c.gdk_monitor_get_scale(mon);
+                    } else {
+                        scale_f = @floatFromInt(@max(1, c.gdk_monitor_get_scale_factor(mon)));
+                    }
                 }
-                const scale_abs: u32 = @intCast(@max(1, scale));
+                const dpi: u32 = @intFromFloat(@round(@max(1.0, scale_f) * 96.0));
                 out[i] = .{
                     .index = @intCast(i),
                     .primary = mon != null and mon == primary,
@@ -5074,8 +5265,8 @@ fn Backend(comptime config: Config) type {
                     .work_y = work.y,
                     .work_width = @intCast(@max(0, work.width)),
                     .work_height = @intCast(@max(0, work.height)),
-                    .dpi = scale_abs * 96,
-                    .scale = @floatFromInt(scale_abs),
+                    .dpi = dpi,
+                    .scale = scale_f,
                 };
             }
             return out;
@@ -5259,6 +5450,8 @@ fn Backend(comptime config: Config) type {
 
         fn cacheRoot(self: *Self, alloc: std.mem.Allocator) ?[]u8 {
             _ = self;
+            // v0.4.0 H6：cache_dir 覆盖
+            if (config.cache_dir) |d| return alloc.dupe(u8, d) catch null;
             if (std.c.getenv("XDG_CACHE_HOME")) |x| {
                 const sv = std.mem.span(x);
                 if (sv.len > 0) return alloc.dupe(u8, sv) catch null;
@@ -5271,6 +5464,8 @@ fn Backend(comptime config: Config) type {
 
         fn configRoot(self: *Self, alloc: std.mem.Allocator) ?[]u8 {
             _ = self;
+            // v0.4.0 H6：config_dir 覆盖
+            if (config.config_dir) |d| return alloc.dupe(u8, d) catch null;
             if (std.c.getenv("XDG_CONFIG_HOME")) |x| {
                 const sv = std.mem.span(x);
                 if (sv.len > 0) return std.fmt.allocPrint(alloc, "{s}/{s}", .{ sv, config.app_id }) catch null;

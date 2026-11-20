@@ -127,6 +127,61 @@ pub fn freeOsInfo(alloc: Allocator, info: *shared.OsInfo) void {
 }
 
 // ---------------------------------------------------------------------------
+// v0.4.0 H11：GPU（/sys/class/drm/card*/device 解析——纯函数部分）
+// ---------------------------------------------------------------------------
+
+/// uevent 文本的 DRIVER= 值（无则 null）。
+pub fn driverFromUevent(text: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "DRIVER=")) return line["DRIVER=".len..];
+    }
+    return null;
+}
+
+/// sysfs 的 hex id 文本（"0x8086\n"）→ u32。
+pub fn parseHexId(text: []const u8) ?u32 {
+    const t = std.mem.trim(u8, text, " \t\r\n");
+    if (!std.mem.startsWith(u8, t, "0x") or t.len <= 2) return null;
+    return std.fmt.parseInt(u32, t[2..], 16) catch null;
+}
+
+/// GPU 名："card0 [8086:9b41]"（vendor/device 原始 id 并入——语义名由
+/// shared_sysinfo.vendorFromPciId 给出）。
+pub fn gpuName(alloc: Allocator, card: []const u8, vendor_id: u32, device_id: u32) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s} [{x:0>4}:{x:0>4}]", .{ card, vendor_id, device_id });
+}
+
+/// 释放 backend collectGpus 的产物（name/vendor/driver 全为堆分配）。
+pub fn freeGpus(alloc: Allocator, gpus: []shared.GpuInfo) void {
+    for (gpus) |*g| {
+        alloc.free(g.name);
+        alloc.free(g.vendor);
+        if (g.driver.len > 0) alloc.free(g.driver);
+    }
+    alloc.free(gpus);
+}
+
+test "driverFromUevent / parseHexId / gpuName" {
+    const uevent = "DRIVER=pci\nMODALIAS=pci:v00008086d00009B41\n";
+    try testing.expectEqualStrings("pci", driverFromUevent(uevent).?);
+    try testing.expect(driverFromUevent("MODALIAS=x\n") == null);
+    try testing.expectEqual(@as(u32, 0x8086), parseHexId("0x8086\n").?);
+    try testing.expect(parseHexId("8086") == null);
+    try testing.expect(parseHexId("0x") == null);
+    const name = try gpuName(testing.allocator, "card0", 0x8086, 0x9b41);
+    defer testing.allocator.free(name);
+    try testing.expectEqualStrings("card0 [8086:9b41]", name);
+}
+
+test "freeGpus roundtrip" {
+    const gpus = try testing.allocator.alloc(shared.GpuInfo, 2);
+    gpus[0] = .{ .name = try testing.allocator.dupe(u8, "card0 [8086:9b41]"), .vendor = try testing.allocator.dupe(u8, "Intel"), .driver = try testing.allocator.dupe(u8, "pci") };
+    gpus[1] = .{ .name = try testing.allocator.dupe(u8, "card1"), .vendor = try testing.allocator.dupe(u8, "unknown") };
+    freeGpus(testing.allocator, gpus);
+}
+
+// ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
 

@@ -63,6 +63,10 @@ pub const Request = union(enum) {
     /// v0.3.16 G18：任务栏文本徽标（Wails Dock SetBadge 对齐——文本渲染成
     /// overlay 图标）。null = 清除徽标。
     badge: ?Badge,
+    /// v0.4.0 H10：数值徽标（Tauri set_badge_count 对齐）。Windows：数字渲染成
+    /// overlay 图标（复用文本徽标）；Linux：Unity LauncherEntry D-Bus count 属性。
+    /// 0 = 清除。
+    badge_count: i64,
 
     pub const Overlay = struct {
         /// 资产路径（.ico）或 null 清除叠加图标
@@ -79,6 +83,18 @@ pub const Badge = struct {
     bg_color: u32 = 0xE81123,
     text_color: u32 = 0xFFFFFF,
 };
+
+/// v0.4.0 H10：数值徽标 → 徽标文本。0 → null（清除）；负数取绝对值；
+/// 超过 4 位截断为 9999（文本徽标 1–4 字符的既有约束）。
+pub fn badgeCountText(count: i64, buf: []u8) ?[]const u8 {
+    const abs: u64 = if (count < 0)
+        @as(u64, @intCast(-(count + 1))) + 1
+    else
+        @intCast(count);
+    if (abs == 0) return null;
+    const capped: u64 = @min(abs, 9999);
+    return std.fmt.bufPrint(buf, "{d}", .{capped}) catch null;
+}
 
 const testing = std.testing;
 
@@ -113,4 +129,17 @@ test "button and flash defaults are usable" {
     const f = Flash{};
     try testing.expectEqual(@as(u32, 3), f.count);
     try testing.expect(f.tray_only);
+}
+
+// v0.4.0 H10：数值徽标文本
+test "badgeCountText maps counts to 1-4 digit text" {
+    var buf: [8]u8 = undefined;
+    try testing.expect(badgeCountText(0, &buf) == null);
+    try testing.expectEqualStrings("7", badgeCountText(7, &buf).?);
+    try testing.expectEqualStrings("42", badgeCountText(42, &buf).?);
+    try testing.expectEqualStrings("3", badgeCountText(-3, &buf).?);
+    try testing.expectEqualStrings("9999", badgeCountText(12_345, &buf).?);
+    try testing.expectEqualStrings("9999", badgeCountText(-12_345, &buf).?);
+    const big = badgeCountText(std.math.maxInt(i64), &buf).?;
+    try testing.expectEqualStrings("9999", big);
 }

@@ -78,6 +78,10 @@ pub const Args = struct {
     /// v0.3.16 G18：任务栏徽标配色（0xRRGGBB；bg=底色 fg=文字色）
     bg_color: ?u32 = null,
     fg_color: ?u32 = null,
+    // ---- v0.4.0：H7 拖放开关 / H8 禁用 JS / H10 数值徽标 ----
+    drag_drop: ?bool = null,
+    javascript: ?bool = null,
+    badge_count: ?i64 = null,
     /// v0.3.4：updater.skipVersion 的版本串
     version_str: ?[]const u8 = null,
     /// v0.3.6：SharedBuffer 二进制 IPC（__zilt.binary.request 的载荷字节数）
@@ -410,6 +414,9 @@ fn windowCmd(ctx: ipc.Context, a: Args) ![]u8 {
             .closable = a.closable,
             .minimizable = a.minimizable,
             .maximizable = a.maximizable,
+            // v0.4.0：H7 拖放开关 / H8 禁用 JS（两平台同接）
+            .drag_drop = a.drag_drop orelse true,
+            .javascript = a.javascript orelse true,
         };
         if (a.window_id) |_| opts.parent = a.window_id;
         const id = spawn(ctx.backend, opts);
@@ -770,6 +777,8 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
         if (eql(u8, a.action, "badge")) return .{ .taskbar = .{ .badge = if (a.text) |t|
             (if (t.len == 0) null else .{ .text = t, .bg_color = a.bg_color orelse 0xE81123, .text_color = a.fg_color orelse 0xFFFFFF })
         else null } };
+        // v0.4.0 H10：数值徽标（Tauri set_badge_count 对齐；0 = 清除）
+        if (eql(u8, a.action, "badgeCount")) return .{ .taskbar = .{ .badge_count = a.badge_count orelse 0 } };
         return error.UnknownTaskbarAction;
     }
 
@@ -778,6 +787,8 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
             const kind = if (a.kind) |k| blk: {
                 if (eql(u8, k, "os")) break :blk system_api.InfoKind.os;
                 if (eql(u8, k, "monitors")) break :blk system_api.InfoKind.monitors;
+                // v0.4.0 H11：GPU 信息（Win DXGI EnumAdapters / Linux /sys/class/drm）
+                if (eql(u8, k, "gpu")) break :blk system_api.InfoKind.gpu;
                 break :blk system_api.InfoKind.all;
             } else system_api.InfoKind.all;
             return .{ .info = kind };

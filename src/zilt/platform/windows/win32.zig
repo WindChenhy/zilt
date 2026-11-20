@@ -321,6 +321,8 @@ pub extern "user32" fn SetWindowLongW(hWnd: HWND, nIndex: i32, dwNewLong: LONG) 
 pub extern "user32" fn GetWindowLongW(hWnd: HWND, nIndex: i32) callconv(.c) LONG;
 pub extern "user32" fn GetSystemMetrics(nIndex: i32) callconv(.c) i32;
 pub extern "user32" fn GetCursorPos(lpPoint: *POINT) callconv(.c) BOOL;
+/// v0.4.0 H9：客户区原点 → 屏幕物理坐标（边框尺寸差值计算）
+pub extern "user32" fn ClientToScreen(hWnd: HWND, lpPoint: *POINT) callconv(.c) BOOL;
 pub extern "user32" fn TrackPopupMenu(hMenu: HMENU, uFlags: UINT, x: i32, y: i32, nReserved: i32, hWnd: HWND, prcRect: ?*const RECT) callconv(.c) BOOL;
 pub extern "user32" fn FindWindowW(lpClassName: ?LPCWSTR, lpWindowName: ?LPCWSTR) callconv(.c) HWND;
 pub extern "user32" fn SendMessageW(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c) LRESULT;

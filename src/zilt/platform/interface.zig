@@ -141,8 +141,11 @@ pub const linux_target_capabilities = [_]Capability{
     .packaging,
     .real_scheme,           .incognito,      .monitor_current,   .power_events,
     .window_mask,           .hide_on_focus_lost, .resize_dragging, .prevent_overflow,
+    // v0.4.0 L8：window_key_bindings 于 v0.3.9 A4L 实装（Linux 清单补齐——
+    // 此前清单与实现漂移：有单测有冒烟却未入清单）
+    .window_key_bindings,
     // v0.3.2 平台差异：background_throttling / profile_settings（autofill/password）
-    // v0.3.3 平台差异：window_key_bindings / tray_attach_window（Linux 未接线，文档化）
+    // v0.3.3 平台差异：tray_attach_window（Linux 未实装 → L6，规划 v0.4.3；文档化）
     // v0.3.6 平台差异：binary_ipc（WebView2 SharedBuffer 独占；Linux 走 base64 分块）
 };
 
@@ -220,5 +223,28 @@ test "v0.2.0: 能力矩阵自身合法（无重复、覆盖核心项）" {
     const windows_only = [_]Capability{ .taskbar, .window_material, .pe_resources, .authenticode, .msix };
     for (windows_only) |cap| {
         try testing.expect(!check.contains(&linux_target_capabilities, cap));
+    }
+}
+
+// v0.4.0 L8：清单 ⊆ 枚举全覆盖契约——Capability 枚举每个成员必须至少出现在
+// 一个平台清单里（防「实现完成但清单漏项」的漂移复发——window_key_bindings
+// 即此形态：v0.3.9 实装 + 单测 + 冒烟，清单漏了 5 个版本）。
+test "v0.4.0 L8: 能力清单覆盖全部枚举成员（防漂移契约）" {
+    const check = struct {
+        fn contains(list: []const Capability, cap: Capability) bool {
+            for (list) |item| {
+                if (item == cap) return true;
+            }
+            return false;
+        }
+    };
+    inline for (@typeInfo(Capability).@"enum".field_names) |name| {
+        const cap: Capability = @field(Capability, name);
+        const in_win = check.contains(&windows_capabilities, cap);
+        const in_linux = check.contains(&linux_target_capabilities, cap);
+        if (!in_win and !in_linux) {
+            std.debug.print("L8 drift: capability '{s}' implemented (enum member) but in NO platform list\n", .{name});
+            return error.CapabilityListDrift;
+        }
     }
 }

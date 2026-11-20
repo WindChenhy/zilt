@@ -90,6 +90,14 @@ pub const Config = struct {
     persist_window_state: bool = false,
     /// 迁移旧的 %TEMP%\zilt-app-webview2 共享数据目录（v0.1.8）
     migrate_legacy_profile: bool = false,
+    /// v0.4.0 H6：数据/配置/缓存根目录覆盖（Tauri 2.12 appDirectoriesOverride 对齐）。
+    /// null = 平台默认派生（Windows %LOCALAPPDATA%\<app_id>、%APPDATA%\<app_id>、
+    /// %LOCALAPPDATA%\<app_id>\cache；Linux $XDG_DATA_HOME、$XDG_CONFIG_HOME、
+    /// $XDG_CACHE_HOME 按各自规则拼 app_id）。data_dir 影响：store.json / ACL 落盘 /
+    /// WebView2 user data folder / 窗口状态持久化 / fs .app_data。
+    data_dir: ?[]const u8 = null,
+    config_dir: ?[]const u8 = null,
+    cache_dir: ?[]const u8 = null,
     /// 监听系统剪贴板变化并发 clipboardChanged 事件（v0.1.12）
     /// v0.3.5：store 值加密（Windows DPAPI 当前用户作用域；`dpapi:` 前缀标记）。
     /// Linux 无 DPAPI → 忽略（明文落盘，文档化；libsecret 列 v0.4+）。

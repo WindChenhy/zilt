@@ -188,6 +188,13 @@ pub const WindowOptions = struct {
     closable: ?bool = null,
     minimizable: ?bool = null,
     maximizable: ?bool = null,
+    // ---- v0.4.0 H7/H8：每窗口拖放与 JS 开关 ----
+    /// 每窗口拖放开关（Tauri dragDropEnabled 对齐；false = 不注册 OLE IDropTarget /
+    /// 不挂 drag-dest——页面原生 drag 事件可用，dropFiles 事件不再产生）
+    drag_drop: bool = true,
+    /// 禁用 JS（Tauri with_javascript_disabled 对齐；kiosk/锁定用途）。
+    /// 禁用后本窗口的 window.zilt 运行时不可用（与 Tauri 语义一致——文档化）
+    javascript: bool = true,
 };
 
 /// v0.2.6：per-window `close_requested_event` 的两平台合并语义——
@@ -1275,6 +1282,8 @@ const runtime_js_head =
     \\        if (o.titlebarDoubleClick !== undefined) o.titlebar_double_click = o.titlebarDoubleClick;
     \\        if (o.moveDebounceMs !== undefined) o.move_debounce_ms = o.moveDebounceMs;
     \\        if (o.keyBindings !== undefined) o.key_bindings = o.keyBindings;
+    \\        // v0.4.0: dragDrop → drag_drop（javascript 两端同名无需映射）
+    \\        if (o.dragDrop !== undefined) o.drag_drop = o.dragDrop;
     \\        return winApi('create', o);
     \\      },
     \\      close: (id) => winApi('close', { window_id: id }),
@@ -1456,6 +1465,9 @@ const runtime_js_head =
     \\      badge: (text, opts) => builtin('__zilt.taskbar', {
     \\        action: 'badge', text: text ?? '', bg_color: opts?.bg, fg_color: opts?.fg,
     \\      }),
+    \\      // v0.4.0 H10：数值徽标（Tauri set_badge_count 对齐；0 = 清除）。
+    \\      // Windows 渲染数字文本（makeBadgeIcon），Linux 走 Unity LauncherEntry D-Bus
+    \\      badgeCount: (n) => builtin('__zilt.taskbar', { action: 'badgeCount', count: n ?? 0 }),
     \\    },
     \\    // v0.1.14: system info / shell / autostart / appearance
     \\    system: {

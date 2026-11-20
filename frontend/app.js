@@ -1263,15 +1263,17 @@ async function runChecks() {
       const mons = await window.zilt.system.monitors();
       const arr = Array.isArray(mons) ? mons : (mons && mons.monitors) || [];
       const rot = arr.length > 0 && typeof arr[0].rotation === 'number';
+      // v0.4.0 L2：分数缩放面——scale 为 >= 1 的数值（Windows GetDpiForMonitor 派生）
+      const sc = arr.length > 0 && typeof arr[0].scale === 'number' && arr[0].scale >= 1;
       const badge = await window.zilt.taskbar.badge('42');
       const badgeClear = await window.zilt.taskbar.badge('');
       const dark = await window.zilt.tray.setDarkIcon(null);
       const aws1 = await window.zilt.window.setAllWorkspaces(true);
       const aws2 = await window.zilt.window.setAllWorkspaces(false);
-      const ok = !!cur && typeof cur.x === 'number' && typeof cur.y === 'number' && rot &&
+      const ok = !!cur && typeof cur.x === 'number' && typeof cur.y === 'number' && rot && sc &&
         badge === true && badgeClear === true && dark === true && aws1 === true && aws2 === true;
-      setCheck('c-sys2', ok, ok ? 'sys ok (cursorPosition + rotation + badge/night-tray/all-workspaces ops)' :
-        `cur=${JSON.stringify(cur)} rot=${rot} badge=${badge}/${badgeClear} dark=${dark} aws=${aws1}/${aws2}`);
+      setCheck('c-sys2', ok, ok ? 'sys ok (cursorPosition + rotation/scale + badge/night-tray/all-workspaces ops)' :
+        `cur=${JSON.stringify(cur)} rot=${rot} sc=${sc} badge=${badge}/${badgeClear} dark=${dark} aws=${aws1}/${aws2}`);
       if (!ok) window.zilt.log('warn', 'c-sys2 note: cur=' + JSON.stringify(cur) + ' rot=' + rot + ' badge=' + badge + '/' + badgeClear + ' dark=' + dark + ' aws=' + aws1 + '/' + aws2);
     } catch (e) { setCheck('c-sys2', false, String(e.message || e)); window.zilt.log('warn', 'c-sys2 error: ' + String(e.message || e)); }
 
@@ -1307,6 +1309,46 @@ async function runChecks() {
       setCheck('c-bchan', ok, ok ? 'binary channel ok (16KB send→echo→verify, checksum pass)' : `frames=${frames.length} got=${got} closed=${closedErr}`);
       if (!ok) window.zilt.log('warn', 'c-bchan note: frames=' + frames.length + ' got=' + got + ' closed=' + closedErr);
     } catch (e) { setCheck('c-bchan', false, String(e.message || e)); window.zilt.log('warn', 'c-bchan error: ' + String(e.message || e)); }
+
+    // 67. v0.4.0：H7 拖放开关 + H8 禁用 JS + H9 物理像素面（探针窗口 state 全量；
+    //     探针 JS 已禁用 → 页面惰性，不会重跑冒烟套件）
+    try {
+      const id = await window.zilt.window.create({
+        dragDrop: false, javascript: false, visible: false,
+        width: 320, height: 200, label: 'v04-probe-' + Date.now(),
+      });
+      const st = id && id.id ? await window.zilt.window.state(id.id) : null;
+      const bs = st && st.border_sizes;
+      const ps = st && st.physical_size;
+      const main = await window.zilt.window.state();
+      const ok = !!st && st.drag_drop === false && st.javascript === false &&
+        !!bs && typeof bs.left === 'number' && typeof bs.bottom === 'number' &&
+        !!ps && typeof ps.width === 'number' && ps.width > 0 &&
+        !!main && main.drag_drop === true && main.javascript === true;
+      if (id && id.id) window.zilt.window.destroy(id.id).catch(() => {});
+      setCheck('c-v04', ok, ok ? 'window v0.4.0 ok (probe dragDrop/js off + state flags + border_sizes/physical_size, main on)' :
+        `st=${JSON.stringify(st ? { dd: st.drag_drop, js: st.javascript, bs, ps } : null).slice(0, 140)} main=${!!main}`);
+      if (!ok) window.zilt.log('warn', 'c-v04 note: st=' + JSON.stringify(st).slice(0, 200));
+    } catch (e) { setCheck('c-v04', false, String(e.message || e)); window.zilt.log('warn', 'c-v04 error: ' + String(e.message || e)); }
+
+    // 68. v0.4.0 H11：GPU 信息（DXGI 适配器枚举；真机 >= 1 块）
+    try {
+      const gpus = await window.zilt.system.info('gpu');
+      const ok = Array.isArray(gpus) && gpus.length >= 1 &&
+        typeof gpus[0].name === 'string' && gpus[0].name.length > 0;
+      setCheck('c-gpu', ok, ok ? `gpu ok (${gpus.length} adapter(s), first: ${String(gpus[0].name).slice(0, 40)})` : `gpus=${JSON.stringify(gpus).slice(0, 100)}`);
+      if (!ok) window.zilt.log('warn', 'c-gpu note: ' + JSON.stringify(gpus).slice(0, 160));
+    } catch (e) { setCheck('c-gpu', false, String(e.message || e)); window.zilt.log('warn', 'c-gpu error: ' + String(e.message || e)); }
+
+    // 69. v0.4.0 H10：数值徽标（Windows 数字渲染 → SetOverlayIcon；0 清除）
+    try {
+      const set1 = await window.zilt.taskbar.badgeCount(7);
+      const set2 = await window.zilt.taskbar.badgeCount(1234);
+      const cleared = await window.zilt.taskbar.badgeCount(0);
+      const ok = set1 === true && set2 === true && cleared === true;
+      setCheck('c-bcount', ok, ok ? 'badgeCount ok (7/1234/0 roundtrip)' : `set1=${set1} set2=${set2} cleared=${cleared}`);
+      if (!ok) window.zilt.log('warn', 'c-bcount note: ' + set1 + '/' + set2 + '/' + cleared);
+    } catch (e) { setCheck('c-bcount', false, String(e.message || e)); window.zilt.log('warn', 'c-bcount error: ' + String(e.message || e)); }
 
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
@@ -1381,6 +1423,10 @@ async function runChecks() {
       acc: $('c-acc').className === 'pass',
       sys2: $('c-sys2').className === 'pass',
       bchan: $('c-bchan').className === 'pass',
+      // v0.4.0：H7/H8/H9 窗口开关与物理面（c-v04）+ H11 GPU（c-gpu）+ H10 数值徽标（c-bcount）
+      v04: $('c-v04').className === 'pass',
+      gpu: $('c-gpu').className === 'pass',
+      bcount: $('c-bcount').className === 'pass',
       appquit: !!window.zilt.app,
     };
     window.zilt.emit('smokeResult', smokeFlags);

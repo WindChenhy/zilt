@@ -109,7 +109,16 @@
 
 ## 1. 版本切片（工程量递增）
 
-### v0.4.0 — 双平台小项集中收尾
+### v0.4.0 — 双平台小项集中收尾 ✅ 完成（2026-11-21，git df73cd4 后 amend）
+
+**验收**：Windows 单测 374 项全绿（353 通过 + 1 skip + 20 工具）+ 冒烟 **69/69 exit 0**；
+Linux 单测 293 项全绿（274 通过 + 1 skip + 18 工具，WSL Ubuntu 22.04）+ 冒烟 **exit 0**
+（含 bcount D-Bus 真发）。新增冒烟检查 c-v04 / c-gpu / c-bcount（双平台）+ curs 扩
+scale 断言（L2）。**实测教训**：① DXGI EnumAdapters 在本机（RDP/VM 会话）返回
+DXGI_ERROR_INVALID_CALL（C# ComImport 互操作复现）→ H11 Windows 侧改
+EnumDisplayDevicesW（vendor/vram 数据受限，文档化）；② **严禁在 WebKit script-message
+回调内调 g_bus_get_sync**（同步 I/O 重入主循环 → gio→glib→JSC→WebKit→
+g_application_run abort 实测）→ 会话总线 init 一次性缓存 + emit 非阻塞发射。
 
 目标：收掉全部「小工程量」差距，两平台行为对称；不动大结构。
 

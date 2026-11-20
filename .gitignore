@@ -24,3 +24,4 @@ ws_echo2.log
 
 # GTK/WebKit API 探针草稿（本地验证用）
 .zilt-probe/
+.zig-cache-wsl/

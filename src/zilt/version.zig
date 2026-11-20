@@ -6,7 +6,7 @@
 //!   - 运行时 `window.zilt.version`（ipc.zig 拼接）
 //!   - MCP `serverInfo.version`
 //!   - `zilt --version` 默认值
-pub const version = "0.3.19";
+pub const version = "0.4.0";
 
 test "version 是 semver 形态（x.y.z）" {
     const std = @import("std");

@@ -6,15 +6,20 @@
 
 const std = @import("std");
 const win32 = @import("win32.zig");
+const launch_args = @import("../../launch_args.zig");
 
 pub const Launch = struct {
     url: ?[]u8 = null,
     files: [][]u8 = &.{},
+    /// v0.4.0 H20：结构化参数解析（positional/flags/subcommand；随 deepLink
+    /// 事件下发——Tauri cli 插件语义对齐。owned，deinit 释放）
+    parsed: ?launch_args.Parsed = null,
 
     pub fn deinit(self: *Launch, alloc: std.mem.Allocator) void {
         if (self.url) |u| alloc.free(u);
         for (self.files) |f| alloc.free(f);
         if (self.files.len > 0) alloc.free(self.files);
+        if (self.parsed) |*p| p.deinit(alloc);
         self.* = .{};
     }
 
@@ -46,6 +51,9 @@ pub fn parseArgs(alloc: std.mem.Allocator, args: []const []const u8, scheme: []c
         }
     }
     out.files = try files.toOwnedSlice(alloc);
+    // v0.4.0 H20：结构化解析（旗标含 `--` 前缀的原始参数——deep_link 自身
+    // 跳过它们，但 parsed 面保留完整结构供应用消费）
+    out.parsed = try launch_args.parse(alloc, args);
     return out;
 }
 
@@ -190,4 +198,18 @@ test "parsePayload: 空载荷" {
     var l = try parsePayload(testing.allocator, "", "zilt");
     defer l.deinit(testing.allocator);
     try testing.expect(l.isEmpty());
+}
+
+// v0.4.0 H20：结构化解析随 Launch 下发
+test "parseArgs: parsed 面含旗标与子命令" {
+    const args = [_][]const u8{ "open", "--id=7", "--verbose", "zilt://x" };
+    var l = try parseArgs(testing.allocator, &args, "zilt");
+    defer l.deinit(testing.allocator);
+    const p = l.parsed.?;
+    try testing.expectEqualStrings("open", p.subcommand.?);
+    try testing.expectEqual(@as(usize, 2), p.flags.len);
+    try testing.expectEqualStrings("id", p.flags[0].key);
+    const json = try launch_args.toJson(testing.allocator, &p);
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"subcommand\":\"open\"") != null);
 }

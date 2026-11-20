@@ -1217,10 +1217,12 @@ function runSecondWindowProbe() {
     const mons = await Z().system.monitors();
     const arr = Array.isArray(mons) ? mons : (mons && mons.monitors) || [];
     const rot = arr.length > 0 && typeof arr[0].rotation === 'number';
+    // v0.4.0 L2：分数缩放面——scale 为 >= 1 的数值（GTK4 小数 / GTK3 整数回退）
+    const sc = arr.length > 0 && typeof arr[0].scale === 'number' && arr[0].scale >= 1;
     const stick = await Z().window.setAllWorkspaces(true);
     const unstick = await Z().window.setAllWorkspaces(false);
-    check('curs', !!cur && typeof cur.x === 'number' && rot && stick === true && unstick === true,
-      `cur=${JSON.stringify(cur)} rot=${rot} stick=${stick}/${unstick}`);
+    check('curs', !!cur && typeof cur.x === 'number' && rot && sc && stick === true && unstick === true,
+      `cur=${JSON.stringify(cur)} rot=${rot} sc=${sc} stick=${stick}/${unstick}`);
   } catch (e) { check('curs', false, String(e.message || e)); }
 
   // ---- v0.3.15：printToPdf/settingsProbe 平台差异文档化（WebKitGTK 无 PDF 导出
@@ -1232,6 +1234,33 @@ function runSecondWindowProbe() {
     check('pdfskip', pdfErr.length > 0 && probe && probe.accelerators === null && probe.swipe === null,
       `pdfErr=${pdfErr.slice(0, 60)} probe=${JSON.stringify(probe)}`);
   } catch (e) { check('pdfskip', false, String(e.message || e)); }
+
+  // ---- v0.4.0：H7/H8 探针窗口开关 + H9 物理面（探针 JS 已禁用 → 惰性页面，
+  //      不会重跑套件）+ H11 GPU（WSLg 无 drm 卡 → [] 合法）+ H10 badgeCount
+  //      （CI/Xvfb 无会话总线 → NotSupported 文档化降级；WSLg 真发）----
+  try {
+    const pw = await Z().window.create({
+      dragDrop: false, javascript: false, visible: false,
+      width: 320, height: 200, label: 'v04-probe-' + Date.now(),
+    });
+    const st = pw && pw.id ? await Z().window.state(pw.id) : null;
+    const bs = st && st.border_sizes;
+    const ps = st && st.physical_size;
+    const ok = !!st && st.drag_drop === false && st.javascript === false &&
+      !!bs && typeof bs.left === 'number' && !!ps && typeof ps.width === 'number' && ps.width > 0;
+    if (pw && pw.id) { await Z().window.destroy(pw.id).catch(() => {}); }
+    check('v04', ok, `st=${JSON.stringify(st ? { dd: st.drag_drop, js: st.javascript, bs, ps } : null).slice(0, 140)}`);
+  } catch (e) { check('v04', false, String(e.message || e)); }
+  try {
+    const gpus = await Z().system.info('gpu');
+    check('gpu', Array.isArray(gpus), `gpus=${JSON.stringify(gpus).slice(0, 100)}`);
+  } catch (e) { check('gpu', false, String(e.message || e)); }
+  try {
+    let bc = false;
+    let bcErr = '';
+    try { bc = (await Z().taskbar.badgeCount(5)) === true; } catch (e) { bcErr = String(e.message || e); }
+    check('bcount', bc || bcErr.indexOf('NotSupported') >= 0, `bc=${bc} err=${bcErr.slice(0, 40)}`);
+  } catch (e) { check('bcount', false, String(e.message || e)); }
 
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {

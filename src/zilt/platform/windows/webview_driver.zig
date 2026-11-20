@@ -263,6 +263,16 @@ pub const Driver = struct {
         self.unpin();
     }
 
+    /// v0.4.0 H8：per-window 禁用 JS（Settings1 put_IsScriptEnabled，槽 4——
+    /// vtable 早已绑定；禁用后本窗口注入 runtime 不可用，kiosk 锁定用途）。
+    pub fn putScriptEnabled(self: *Driver, enabled: bool) !void {
+        var settings: ?*wv2.ICoreWebView2Settings = null;
+        try check(self.webview.lpVtbl.get_Settings(self.webview, &settings));
+        const s = settings orelse return error.WebViewCallFailed;
+        defer release(s);
+        try check(s.lpVtbl.put_IsScriptEnabled(s, if (enabled) 1 else 0));
+    }
+
     fn applySettings(self: *Driver) !void {
         var settings: ?*wv2.ICoreWebView2Settings = null;
         try check(self.webview.lpVtbl.get_Settings(self.webview, &settings));

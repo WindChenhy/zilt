@@ -29,8 +29,14 @@ var temp_sequence = std.atomic.Value(u64).init(0);
 /// Existing targets always win. No profiles are deleted or copied. A busy legacy
 /// profile reports MigrationInUse; cross-volume migration reports MigrationCrossVolume.
 pub fn profileDirectory(alloc: Allocator, app_id: []const u8, migrate_legacy: bool) ![]u8 {
+    return profileDirectoryWithRoot(alloc, null, app_id, migrate_legacy);
+}
+
+/// v0.4.0 H6：数据根目录覆盖版。override_root 非 null 时替代 %LOCALAPPDATA%
+///（仍拼 <app_id>/WebView2；override 由应用保证为可写绝对路径）。
+pub fn profileDirectoryWithRoot(alloc: Allocator, override_root: ?[]const u8, app_id: []const u8, migrate_legacy: bool) ![]u8 {
     try validateAppId(app_id);
-    const root = try environmentDirectory(alloc, "LOCALAPPDATA");
+    const root = if (override_root) |r| try alloc.dupe(u8, r) else try environmentDirectory(alloc, "LOCALAPPDATA");
     defer alloc.free(root);
     const target = try appPath(alloc, root, app_id, "WebView2");
     errdefer alloc.free(target);
@@ -52,10 +58,15 @@ pub fn profileDirectory(alloc: Allocator, app_id: []const u8, migrate_legacy: bo
 /// Unique CREATE_NEW temp files live beside the target; only our own temp is cleaned
 /// up on failure. Existing state remains intact until the flushed file is renamed.
 pub fn save(alloc: Allocator, app_id: []const u8, key: []const u8, state: State) !void {
+    return saveWithRoot(alloc, null, app_id, key, state);
+}
+
+/// v0.4.0 H6：数据根目录覆盖版（语义同 profileDirectoryWithRoot）。
+pub fn saveWithRoot(alloc: Allocator, override_root: ?[]const u8, app_id: []const u8, key: []const u8, state: State) !void {
     try validateAppId(app_id);
     const bytes = try serialize(alloc, state);
     defer alloc.free(bytes);
-    const root = try environmentDirectory(alloc, "LOCALAPPDATA");
+    const root = if (override_root) |r| try alloc.dupe(u8, r) else try environmentDirectory(alloc, "LOCALAPPDATA");
     defer alloc.free(root);
     const path = try statePath(alloc, root, app_id, key);
     defer alloc.free(path);
@@ -67,8 +78,13 @@ pub fn save(alloc: Allocator, app_id: []const u8, key: []const u8, state: State)
 /// InvalidState; filesystem failures remain errors. Does not create directories.
 /// Screen clamping and application of maximized/fullscreen belong to the caller.
 pub fn load(alloc: Allocator, app_id: []const u8, key: []const u8) !?State {
+    return loadWithRoot(alloc, null, app_id, key);
+}
+
+/// v0.4.0 H6：数据根目录覆盖版（语义同 profileDirectoryWithRoot）。
+pub fn loadWithRoot(alloc: Allocator, override_root: ?[]const u8, app_id: []const u8, key: []const u8) !?State {
     try validateAppId(app_id);
-    const root = try environmentDirectory(alloc, "LOCALAPPDATA");
+    const root = if (override_root) |r| try alloc.dupe(u8, r) else try environmentDirectory(alloc, "LOCALAPPDATA");
     defer alloc.free(root);
     const path = try statePath(alloc, root, app_id, key);
     defer alloc.free(path);

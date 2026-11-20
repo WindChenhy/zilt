@@ -342,3 +342,114 @@ test "monitor enumeration returns at least one display" {
     // 多显示器时也只有一个主屏；虚拟机/远程会话仍应报告主屏
     try testing.expectEqual(@as(usize, 1), primaries);
 }
+
+// ---------------------------------------------------------------------------
+// v0.4.0 H11：GPU 适配器（DXGI）
+// ---------------------------------------------------------------------------
+
+const com = @import("com.zig");
+
+/// IID_IDXGIFactory（dxgi.idl uuid(aec1fb78-5487-4f0a-b94d-9209e0d2cd69)）——
+/// 保留供 DXGI 路径（vram 数据）复核。实测教训两连：
+/// ① 凭记忆写的 IID 全错（E_NOINTERFACE）——以 winsdk-10 dxgi.idl 为准；
+/// ② IID 正确后 EnumAdapters(0) 在本机（RDP/VM 会话）仍返回
+///    DXGI_ERROR_INVALID_CALL（0x887A0001）——C# ComImport 互操作同样复现，
+///    属环境限制而非 ABI 错误 → 最终采用 EnumDisplayDevicesW（注册表层，
+///    不受会话限制；无 vram/vendor 数据，文档化）。
+const iid_dxgi_factory: com.GUID = .parse("aec1fb78-5487-4f0a-b94d-9209e0d2cd69");
+
+/// IDXGIFactory1 vtable 前缀槽（IUnknown 3 + EnumAdapters 槽 3；dxgi.h）。
+const FactoryVtbl = extern struct {
+    query_interface: *const fn (*anyopaque, *const com.GUID, *?*anyopaque) callconv(.c) i32,
+    add_ref: *const fn (*anyopaque) callconv(.c) u32,
+    release: *const fn (*anyopaque) callconv(.c) u32,
+    enum_adapters: *const fn (*anyopaque, u32, *?*anyopaque) callconv(.c) i32,
+};
+const Factory = extern struct { vtbl: *const FactoryVtbl };
+
+/// IDXGIAdapter vtable 前缀槽（IUnknown 3 + EnumOutputs 3 + GetDesc 槽 4）。
+const AdapterVtbl = extern struct {
+    query_interface: *const fn (*anyopaque, *const com.GUID, *?*anyopaque) callconv(.c) i32,
+    add_ref: *const fn (*anyopaque) callconv(.c) u32,
+    release: *const fn (*anyopaque) callconv(.c) u32,
+    enum_outputs: *const fn (*anyopaque, u32, *?*anyopaque) callconv(.c) i32,
+    get_desc: *const fn (*anyopaque, *AdapterDesc) callconv(.c) i32,
+};
+const Adapter = extern struct { vtbl: *const AdapterVtbl };
+
+/// DXGI_ADAPTER_DESC（dxgi.h；LUID 8 字节内联）。
+const AdapterDesc = extern struct {
+    description: [128]u16,
+    vendor_id: u32,
+    device_id: u32,
+    sub_sys_id: u32,
+    revision: u32,
+    dedicated_video_memory: usize,
+    dedicated_system_memory: usize,
+    shared_system_memory: usize,
+    luid_low: u32,
+    luid_high: i32,
+};
+
+/// DISPLAY_DEVICEW（wingdi.h；cb 后五个定长 UTF-16 数组）。
+const DISPLAY_DEVICEW = extern struct {
+    cb: u32 = 0,
+    device_name: [32]u16 = @splat(0),
+    device_string: [128]u16 = @splat(0),
+    state_flags: u32 = 0,
+    device_id: [128]u16 = @splat(0),
+    device_key: [128]u16 = @splat(0),
+};
+const DISPLAY_DEVICE_ATTACHED_TO_DESKTOP: u32 = 0x1;
+extern "user32" fn EnumDisplayDevicesW(device: ?[*:0]const u16, dev_num: u32, dev: *DISPLAY_DEVICEW, flags: u32) callconv(.c) i32;
+
+/// v0.4.0 H11：GPU 适配器枚举（user32 EnumDisplayDevicesW——注册表层枚举，
+/// 不受 DXGI 在 RDP 分离/无显示会话返回 DXGI_ERROR_INVALID_CALL 的限制；
+/// 实测 C# ComImport 互操作同样复现该限制）。代价：无 vram/PCI vendor 数据
+///（vendor 恒 "unknown"，文档化；DXGI 路径随真实桌面环境复核后可作增强）。
+pub fn collectGpu(alloc: std.mem.Allocator) ![]sysinfo.GpuInfo {
+    var out: std.ArrayListUnmanaged(sysinfo.GpuInfo) = .empty;
+    errdefer freeGpus(alloc, out.items);
+    var i: u32 = 0;
+    while (i < 16) : (i += 1) {
+        var dev = std.mem.zeroes(DISPLAY_DEVICEW);
+        dev.cb = @sizeOf(DISPLAY_DEVICEW);
+        if (EnumDisplayDevicesW(null, i, &dev, 0) == 0) break;
+        if (dev.state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP == 0) continue;
+        var len: usize = 0;
+        while (len < dev.device_string.len and dev.device_string[len] != 0) len += 1;
+        if (len == 0) continue;
+        const name = std.unicode.utf16LeToUtf8Alloc(alloc, dev.device_string[0..len]) catch continue;
+        errdefer alloc.free(name);
+        @import("../../log.zig").print("[gpu] adapter {d}: {s}", .{ i, name });
+        try out.append(alloc, .{
+            .name = name,
+            .vendor = try alloc.dupe(u8, "unknown"),
+            .vram_mb = 0,
+            .driver = "",
+        });
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// 释放 collectGpu 返回值（name/vendor 为堆分配，driver 恒空串）。
+pub fn freeGpus(alloc: std.mem.Allocator, gpus: []sysinfo.GpuInfo) void {
+    for (gpus) |*g| {
+        alloc.free(g.name);
+        alloc.free(g.vendor);
+    }
+    alloc.free(gpus);
+}
+
+test "collectGpu enumerates adapters with valid JSON shape" {
+    const gpus = try collectGpu(testing.allocator);
+    defer freeGpus(testing.allocator, gpus);
+    // 真机/CI 至少一块适配器；dxgi 不可用时返回空数组也合法（lenient 形状断言）
+    for (gpus) |g| {
+        try testing.expect(g.name.len > 0);
+        try testing.expect(g.vendor.len > 0);
+    }
+    const json = try sysinfo.gpuToJson(testing.allocator, gpus);
+    defer testing.allocator.free(json);
+    try testing.expect(json.len >= 2 and json[0] == '[');
+}

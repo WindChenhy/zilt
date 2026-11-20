@@ -10,17 +10,22 @@
 //! 路径存在性判断以函数注入（测试给固定表；backend 传 std.fs 探测）。
 //! 环境变量走 std.c.getenv（0.17 移除了 std.posix.getenv；本模块随 Linux 后端链接 libc）。
 const std = @import("std");
+const launch_args = @import("../../launch_args.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const Launch = struct {
     url: ?[]u8 = null,
     files: [][]u8 = &.{},
+    /// v0.4.0 H20：结构化参数解析（positional/flags/subcommand；随 deepLink
+    /// 事件下发——Tauri cli 插件语义对齐。owned，deinit 释放）
+    parsed: ?launch_args.Parsed = null,
 
     pub fn deinit(self: *Launch, alloc: Allocator) void {
         if (self.url) |u| alloc.free(u);
         for (self.files) |f| alloc.free(f);
         if (self.files.len > 0) alloc.free(self.files);
+        if (self.parsed) |*p| p.deinit(alloc);
         self.* = .{};
     }
 
@@ -66,6 +71,8 @@ pub fn parseArgs(
         }
     }
     out.files = try files.toOwnedSlice(alloc);
+    // v0.4.0 H20：结构化解析（`--` 旗标保留完整结构；url/files 分类不变）
+    out.parsed = try launch_args.parse(alloc, args);
     return out;
 }
 

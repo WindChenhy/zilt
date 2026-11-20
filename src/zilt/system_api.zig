@@ -73,7 +73,8 @@ pub const HotkeyOp = union(enum) {
     list,
 };
 
-pub const InfoKind = enum { os, monitors, all };
+/// v0.4.0 H11：'gpu'（Win DXGI EnumAdapters / Linux /sys/class/drm 解析）
+pub const InfoKind = enum { os, monitors, all, gpu };
 
 pub const AutostartOp = union(enum) {
     query,

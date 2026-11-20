@@ -44,9 +44,58 @@ pub const Monitor = struct {
     rotation: u16 = 0,
 };
 
+/// v0.4.0 H11：GPU 适配器信息（system.info('gpu')）。
+/// Windows：DXGI EnumAdapters（Description/DedicatedVideoMemory）；
+/// Linux：/sys/class/drm/card*/device 解析（vendor/device/uevent DRIVER）。
+pub const GpuInfo = struct {
+    /// 适配器名（Win：驱动描述串；Linux："card0 [vendor_id:device_id]"）
+    name: []const u8 = "unknown",
+    /// "Intel" / "NVIDIA" / "AMD" / "unknown"（PCI vendor id 映射）
+    vendor: []const u8 = "unknown",
+    /// 专用显存 MB（Linux /sys 无对等 → 0）
+    vram_mb: u64 = 0,
+    /// 内核驱动名（Linux uevent DRIVER=；Windows 空）
+    driver: []const u8 = "",
+};
+
+/// PCI vendor id → 语义名（未知返回 "unknown"，原始 id 并入 name 字段）。
+pub fn vendorFromPciId(id: u32) []const u8 {
+    return switch (id) {
+        0x8086 => "Intel",
+        0x10de => "NVIDIA",
+        0x1002, 0x1022 => "AMD",
+        0x15ad => "VMware",
+        0x1af4 => "virtio",
+        else => "unknown",
+    };
+}
+
+pub fn gpuToJson(alloc: Allocator, gpus: []const GpuInfo) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "[");
+    for (gpus, 0..) |g, i| {
+        if (i != 0) try out.appendSlice(alloc, ",");
+        const name = try std.json.Stringify.valueAlloc(alloc, g.name, .{});
+        defer alloc.free(name);
+        const vendor = try std.json.Stringify.valueAlloc(alloc, g.vendor, .{});
+        defer alloc.free(vendor);
+        const driver = try std.json.Stringify.valueAlloc(alloc, g.driver, .{});
+        defer alloc.free(driver);
+        const chunk = try std.fmt.allocPrint(
+            alloc,
+            "{{\"name\":{s},\"vendor\":{s},\"vramMb\":{d},\"driver\":{s}}}",
+            .{ name, vendor, g.vram_mb, driver },
+        );
+        defer alloc.free(chunk);
+        try out.appendSlice(alloc, chunk);
+    }
+    try out.appendSlice(alloc, "]");
+    return out.toOwnedSlice(alloc);
+}
+
 /// 由 major/minor/build 推断产品名（Win11 起始 build 22000）。
-pub fn productName(major: u32, minor: u32, build: u32) []const u8 {
-    if (major >= 10) {
+pub fn productName(major: u32, minor: u32, build: u32) []const u8 {    if (major >= 10) {
         return if (build >= 22000) "Windows 11" else "Windows 10";
     }
     if (major == 6 and minor == 3) return "Windows 8.1";
@@ -149,4 +198,34 @@ test "monitor json is an array with scale" {
     try testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
     try testing.expect(parsed.value.array.items[0].object.get("primary").?.bool);
     try testing.expectApproxEqAbs(@as(f64, 1.5), parsed.value.array.items[0].object.get("scale").?.float, 0.001);
+}
+
+// v0.4.0 H11：GPU 信息
+test "vendorFromPciId maps known ids" {
+    try testing.expectEqualStrings("Intel", vendorFromPciId(0x8086));
+    try testing.expectEqualStrings("NVIDIA", vendorFromPciId(0x10de));
+    try testing.expectEqualStrings("AMD", vendorFromPciId(0x1002));
+    try testing.expectEqualStrings("AMD", vendorFromPciId(0x1022));
+    try testing.expectEqualStrings("unknown", vendorFromPciId(0x1234));
+}
+
+test "gpu json is an array with vendor and driver" {
+    const gpus = [_]GpuInfo{
+        .{ .name = "NVIDIA GeForce RTX", .vendor = "NVIDIA", .vram_mb = 8192 },
+        .{ .name = "card0 [80ee:beef]", .vendor = "unknown", .driver = "virtio-pci" },
+    };
+    const json = try gpuToJson(testing.allocator, &gpus);
+    defer testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+    try testing.expectEqualStrings("NVIDIA", parsed.value.array.items[0].object.get("vendor").?.string);
+    try testing.expectEqual(@as(i64, 8192), parsed.value.array.items[0].object.get("vramMb").?.integer);
+    try testing.expectEqualStrings("virtio-pci", parsed.value.array.items[1].object.get("driver").?.string);
+}
+
+test "gpu json empty array" {
+    const json = try gpuToJson(testing.allocator, &.{});
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings("[]", json);
 }

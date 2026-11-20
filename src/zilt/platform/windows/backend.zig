@@ -313,7 +313,7 @@ pub fn run(comptime config: Config) !void {
         log.print("[loader] dll: {s}", .{dll_u8});
     } else |_| {}
 
-    const udf = try buildUserDataFolder(alloc, config.app_id, config.migrate_legacy_profile);
+    const udf = try buildUserDataFolder(alloc, config.data_dir, config.app_id, config.migrate_legacy_profile);
     log.print("[profile] {s}", .{udf.utf8});
     defer alloc.free(udf.utf8);
     defer alloc.free(udf.utf16);
@@ -582,8 +582,8 @@ fn forwardToRunning(alloc: std.mem.Allocator, class_name: []const u8, payload: [
 
 const UserDataFolder = struct { utf8: []u8, utf16: [:0]u16 };
 
-fn buildUserDataFolder(alloc: std.mem.Allocator, app_id: []const u8, migrate: bool) !UserDataFolder {
-    const dir = try app_data.profileDirectory(alloc, app_id, migrate);
+fn buildUserDataFolder(alloc: std.mem.Allocator, override_root: ?[]const u8, app_id: []const u8, migrate: bool) !UserDataFolder {
+    const dir = try app_data.profileDirectoryWithRoot(alloc, override_root, app_id, migrate);
     errdefer alloc.free(dir);
     return .{ .utf8 = dir, .utf16 = try std.unicode.utf8ToUtf16LeAllocZ(alloc, dir) };
 }
@@ -1212,6 +1212,11 @@ fn Backend(comptime config: Config) type {
             user_agent: ?[]u8 = null,
             /// v0.3.2：无痕窗口（InPrivate controller：Cookie/存储不落盘）
             incognito: bool = false,
+            /// v0.4.0 H7：拖放开关（false = 未注册 OLE IDropTarget/DragAcceptFiles）
+            drag_drop: bool = true,
+            /// v0.4.0 H8：JS 开关（false = Settings put_IsScriptEnabled(false)，
+            /// 本窗口注入 runtime 不可用——kiosk 锁定用途）
+            javascript: bool = true,
             // ---- v0.3.3：窗口体验包 II ----
             /// 失焦自动隐藏（托盘弹窗类窗口；WM_ACTIVATE WA_INACTIVE）
             hide_on_focus_lost: bool = false,
@@ -1604,6 +1609,9 @@ fn Backend(comptime config: Config) type {
                 .overlay = opts.titlebar_overlay,
                 .user_agent = user_agent,
                 .incognito = opts.incognito,
+                // v0.4.0：H7 拖放开关 / H8 JS 开关
+                .drag_drop = opts.drag_drop,
+                .javascript = opts.javascript,
                 .composition_requested = opts.composition,
                 .hide_on_focus_lost = opts.hide_on_focus_lost,
                 .hide_on_escape = opts.hide_on_escape,
@@ -1705,12 +1713,16 @@ fn Backend(comptime config: Config) type {
                 _ = win32.SetWindowPos(w.hwnd, win32.HWND_TOPMOST, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
             }
             // v0.1.12：OLE IDropTarget（含坐标/自定义格式）优先，失败回退 WM_DROPFILES。
-            if (win_drag.DropTarget.create(self.allocator, w.hwnd, w, Self.onDragEvent, config.drag_formats)) |target| {
-                w.drop_target = target;
-            } else |err| {
-                log.print("[drag] OLE drop target unavailable: {s} (fallback WM_DROPFILES)", .{@errorName(err)});
+            // v0.4.0 H7：每窗口拖放开关（false = 不注册 IDropTarget/不收
+            // DragAcceptFiles——页面原生 drag 事件可用）
+            if (w.drag_drop) {
+                if (win_drag.DropTarget.create(self.allocator, w.hwnd, w, Self.onDragEvent, config.drag_formats)) |target| {
+                    w.drop_target = target;
+                } else |err| {
+                    log.print("[drag] OLE drop target unavailable: {s} (fallback WM_DROPFILES)", .{@errorName(err)});
+                }
+                win32.DragAcceptFiles(w.hwnd, if (w.drop_target == null) 1 else 0);
             }
-            win32.DragAcceptFiles(w.hwnd, if (w.drop_target == null) 1 else 0);
             if (config.clipboard_change_event) {
                 if (win_clipboard.startListening(w.hwnd)) |_| {
                     w.clipboard_listening = true;
@@ -1852,7 +1864,7 @@ fn Backend(comptime config: Config) type {
                 log.print("[proxy] window #{d} failed: runtime missing", .{w.id});
                 return;
             };
-            const profile = app_data.profileDirectory(self.allocator, config.app_id, config.migrate_legacy_profile) catch {
+            const profile = app_data.profileDirectoryWithRoot(self.allocator, config.data_dir, config.app_id, config.migrate_legacy_profile) catch {
                 log.print("[proxy] window #{d} failed: profile dir", .{w.id});
                 return;
             };
@@ -2175,6 +2187,13 @@ fn Backend(comptime config: Config) type {
                 .recover = driverRecover,
             })) |driver| {
                 w.driver = driver;
+                // v0.4.0 H8：per-window 禁用 JS（kiosk/锁定；本窗口注入 runtime
+                // 随之不可用——Tauri with_javascript_disabled 同语义）
+                if (!w.javascript) {
+                    driver.putScriptEnabled(false) catch |err| {
+                        log.print("[settings] put_IsScriptEnabled(false) failed: {s}", .{@errorName(err)});
+                    };
+                }
                 log.print("[webview] driver attached (devtools={}, downloads={}, new_window={s}, recover={})", .{
                     wv_opts.settings.devtools, wv_opts.downloads.enabled, @tagName(wv_opts.new_window), wv_opts.recover_renderer,
                 });
@@ -2788,9 +2807,15 @@ fn Backend(comptime config: Config) type {
         // ---- v0.1.16：KV 存储 / 受限 fs ----
 
         fn initStorage(self: *Self) void {
-            const local = win32.getEnvUtf8(self.allocator, "LOCALAPPDATA") orelse return;
-            defer self.allocator.free(local);
-            const root = std.fmt.allocPrint(self.allocator, "{s}\\{s}", .{ local, config.app_id }) catch return;
+            // v0.4.0 H6：data_dir 覆盖（Tauri appDirectoriesOverride 对齐；
+            // store.json / ACL 落盘 / fs .app_data / .app_cache 默认根均随之）
+            const root = if (config.data_dir) |d|
+                (self.allocator.dupe(u8, d) catch return)
+            else blk: {
+                const local = win32.getEnvUtf8(self.allocator, "LOCALAPPDATA") orelse return;
+                defer self.allocator.free(local);
+                break :blk std.fmt.allocPrint(self.allocator, "{s}\\{s}", .{ local, config.app_id }) catch return;
+            };
             self.storage_root = root;
 
             self.loadAclGrants();
@@ -3087,7 +3112,7 @@ fn Backend(comptime config: Config) type {
                 log.print("[webviews] partition '{s}' failed: runtime missing", .{name});
                 return;
             };
-            const profile = app_data.profileDirectory(self.allocator, config.app_id, config.migrate_legacy_profile) catch {
+            const profile = app_data.profileDirectoryWithRoot(self.allocator, config.data_dir, config.app_id, config.migrate_legacy_profile) catch {
                 log.print("[webviews] partition '{s}' failed: profile dir", .{name});
                 return;
             };
@@ -3596,10 +3621,14 @@ fn Backend(comptime config: Config) type {
                     return alloc.dupe(u8, base) catch null;
                 },
                 .app_cache => {
+                    // v0.4.0 H6：cache_dir 覆盖
+                    if (config.cache_dir) |d| return alloc.dupe(u8, d) catch null;
                     const base = self.storage_root orelse return null;
                     return std.fmt.allocPrint(alloc, "{s}\\cache", .{base}) catch null;
                 },
                 .app_config => {
+                    // v0.4.0 H6：config_dir 覆盖
+                    if (config.config_dir) |d| return alloc.dupe(u8, d) catch null;
                     const appdata = win32.getEnvUtf8(alloc, "APPDATA") orelse return null;
                     defer alloc.free(appdata);
                     return std.fmt.allocPrint(alloc, "{s}\\{s}", .{ appdata, config.app_id }) catch null;
@@ -4228,6 +4257,16 @@ fn Backend(comptime config: Config) type {
                     log.print("[taskbar] badge {s} (ok={})", .{ if (maybe) |b| b.text else "(clear)", ok });
                     if (!ok) return false;
                 },
+                // v0.4.0 H10：数值徽标（Tauri set_badge_count 对齐——数字渲染成
+                // 1-4 位文本复用文本徽标管线；0 = 清除）
+                .badge_count => |n| {
+                    var buf: [8]u8 = undefined;
+                    const text = shared_taskbar.badgeCountText(n, &buf);
+                    const badge: ?shared_taskbar.Badge = if (text) |t| .{ .text = t } else null;
+                    const ok = tb.setBadge(w.hwnd, badge, alloc);
+                    log.print("[taskbar] badge_count {d} -> '{s}' (ok={})", .{ n, if (text) |t| t else "(clear)", ok });
+                    if (!ok) return false;
+                },
                 .thumb_buttons => |buttons| {
                     var icons = std.mem.zeroes([7]win32.HICON);
                     const n = @min(buttons.len, 7);
@@ -4263,6 +4302,12 @@ fn Backend(comptime config: Config) type {
                     const mons_json = try shared_sysinfo.monitorsToJson(alloc, monitors);
                     defer alloc.free(mons_json);
                     return std.fmt.allocPrint(alloc, "{{\"os\":{s},\"monitors\":{s}}}", .{ os_json, mons_json });
+                },
+                // v0.4.0 H11：GPU 适配器（DXGI EnumAdapters；dxgi.dll 动态加载）
+                .gpu => {
+                    const gpus = try win_sysinfo.collectGpu(alloc);
+                    defer win_sysinfo.freeGpus(alloc, gpus);
+                    return shared_sysinfo.gpuToJson(alloc, gpus);
                 },
             }
         }
@@ -4529,7 +4574,8 @@ fn Backend(comptime config: Config) type {
                 .maximized = win32.IsZoomed(w.hwnd) != 0,
                 .fullscreen = w.fullscreen,
             };
-            app_data.save(self.allocator, config.app_id, key, state) catch |err| {
+            // v0.4.0 H6：窗口状态落盘跟随 data_dir 覆盖
+            app_data.saveWithRoot(self.allocator, config.data_dir, config.app_id, key, state) catch |err| {
                 log.print("[state] save failed: {s}", .{@errorName(err)});
                 return;
             };
@@ -4538,7 +4584,7 @@ fn Backend(comptime config: Config) type {
 
         fn restoreWindowState(self: *Self, w: *Window) void {
             const key = w.state_key orelse return;
-            const state = (app_data.load(self.allocator, config.app_id, key) catch |err| {
+            const state = (app_data.loadWithRoot(self.allocator, config.data_dir, config.app_id, key) catch |err| {
                 log.print("[state] load failed: {s}", .{@errorName(err)});
                 return;
             }) orelse return;
@@ -5175,8 +5221,20 @@ fn Backend(comptime config: Config) type {
             _ = win32.GetWindowRect(w.hwnd, &rc);
             const style: u32 = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_STYLE));
             const ex: u32 = @bitCast(win32.GetWindowLongW(w.hwnd, win32.GWL_EXSTYLE));
-            return std.fmt.allocPrint(alloc,
-                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":{d},"ex_style":{d},"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":{s},"overlay":{s},"incognito":{s},"composition":{s},"monitor":{d},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d},"resizable":{s},"decorated":{s}}}
+            // v0.4.0 H9：物理像素面——外框（GetWindowRect）与客户区（GetClientRect
+            // + ClientToScreen）差值 = 非客户区边框（overlay/frameless 下为 0）
+            var client: win32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+            _ = win32.GetClientRect(w.hwnd, &client);
+            var client_origin: win32.POINT = .{ .x = 0, .y = 0 };
+            _ = win32.ClientToScreen(w.hwnd, &client_origin);
+            const border_left = client_origin.x - rc.left;
+            const border_top = client_origin.y - rc.top;
+            const border_right = rc.right - (client_origin.x + (client.right - client.left));
+            const border_bottom = rc.bottom - (client_origin.y + (client.bottom - client.top));
+            // v0.4.0：格式化参数超 32 上限 → 两段拼接（head 到 decorated；tail 为
+            // v0.4.0 新增字段 drag_drop/javascript/border_sizes/physical_*)
+            const head = std.fmt.allocPrint(alloc,
+                \\{{"id":{d},"x":{d},"y":{d},"width":{d},"height":{d},"style":{d},"ex_style":{d},"enabled":{s},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"always_on_bottom":{s},"ignore_cursor":{s},"focusable":{s},"content_protected":{s},"overlay":{s},"incognito":{s},"composition":{s},"monitor":{d},"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d},"child_webviews":{d},"resizable":{s},"decorated":{s},
             , .{
                 w.id,
                 rc.left,
@@ -5208,7 +5266,29 @@ fn Backend(comptime config: Config) type {
                 // v0.3.14：从 style 位推导（WS_THICKFRAME=可缩放；WS_CAPTION=有标题栏）
                 boolStr(style & win32.WS_THICKFRAME != 0),
                 boolStr(style & win32.WS_CAPTION != 0),
-            }) catch null;
+            }) catch return null;
+            defer alloc.free(head);
+            // v0.4.0：H7 拖放开关 / H8 JS 开关（创建期记录）+ H9 边框（非客户区）/
+            // 物理位置与尺寸（GetWindowRect 即物理外框）
+            const tail = std.fmt.allocPrint(alloc,
+                \\"drag_drop":{s},"javascript":{s},"border_sizes":{{"left":{d},"top":{d},"right":{d},"bottom":{d}}},"physical_position":{{"x":{d},"y":{d}}},"physical_size":{{"width":{d},"height":{d}}}}}
+            , .{
+                boolStr(w.drag_drop),
+                boolStr(w.javascript),
+                border_left,
+                border_top,
+                border_right,
+                border_bottom,
+                rc.left,
+                rc.top,
+                rc.right - rc.left,
+                rc.bottom - rc.top,
+            }) catch {
+                alloc.free(head);
+                return null;
+            };
+            defer alloc.free(tail);
+            return std.fmt.allocPrint(alloc, "{s}{s}", .{ head, tail }) catch null;
         }
 
         fn setClipboardText(self: *Self, w: *Window, text: []const u8) bool {
@@ -5309,7 +5389,8 @@ fn Backend(comptime config: Config) type {
 
         fn emitLaunch(self: *Self, launch: *deep_link.Launch) void {
             const w = self.mainWindow() orelse return;
-            w.emitEventPayload("deepLink", .{ .url = launch.url, .files = launch.files });
+            // v0.4.0 H20：结构化参数解析随事件下发（positional/flags/subcommand）
+            w.emitEventPayload("deepLink", .{ .url = launch.url, .files = launch.files, .parsed = launch.parsed });
         }
 
         /// 应用主题变化广播（每个窗口一条事件）。
