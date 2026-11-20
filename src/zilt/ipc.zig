@@ -660,6 +660,16 @@ pub const Context = struct {
         self.emitJsonTo(self.window_id, "__zilt.channel", payload);
     }
 
+    /// v0.4.1 H4：通道背压 credit 补充（Wails Streams 语义对齐）。JS 侧
+    /// `channel.create({maxInFlight: N})` 启用窗口：send() 返回 Promise，credit
+    /// 耗尽时挂起；应用消费完 channelUp 帧后调用本方法（通常 n=1）补充——
+    /// 窗口流动 = 端到端背压（消费方决定节奏）。未启用窗口的通道忽略 credit。
+    pub fn channelCredit(self: Context, id: u32, n: u32) void {
+        const payload = std.fmt.allocPrint(self.msg_allocator, "{{\"id\":{d},\"credit\":{d}}}", .{ id, n }) catch return;
+        defer self.msg_allocator.free(payload);
+        self.emitJsonTo(self.window_id, "__zilt.channel", payload);
+    }
+
     /// 请求退出应用（在 UI 线程的命令/事件回调内调用）。
     pub fn quit(self: Context, code: u8) void {
         self.quit_fn(self.backend, code);
@@ -1534,10 +1544,35 @@ const runtime_js_head =
     \\      create: (opts) => {
     \\        const o = opts ?? {};
     \\        const id = ++channelSeq;
+    \\        // v0.4.1 H4：credit 窗口背压（maxInFlight>0 启用；send() 返回 Promise，
+    \\        // credit 耗尽挂起，Zig ctx.channelCredit(id,n) 补充——Wails Streams
+    \\        // write-await 语义）。0 = 传统无界模式（旧行为，send 同步立即发）。
+    \\        const window0 = Math.max(0, Math.floor(Number(o.maxInFlight) || 0));
+    \\        let credit = window0;
+    \\        const pending = [];
+    \\        const pump = () => {
+    \\          while (window0 === 0 || credit > 0) {
+    \\            if (pending.length === 0) return;
+    \\            const head = pending[0];
+    \\            if (head.sent >= head.total) { pending.shift(); head.resolve(true); continue; }
+    \\            if (window0 > 0) credit -= 1;
+    \\            const i = head.sent * 0x8000;
+    \\            const slice = head.bytes.subarray(i, Math.min(i + 0x8000, head.bytes.length));
+    \\            let bin = '';
+    \\            for (let j = 0; j < slice.length; j++) bin += String.fromCharCode(slice[j]);
+    \\            window.zilt.emit('channelUp', {
+    \\              id: id, seq: head.sent, data_b64: btoa(bin),
+    \\              sum: window.zilt.channel.fnv1a32(slice),
+    \\            });
+    \\            head.sent += 1;
+    \\          }
+    \\        };
     \\        const off = window.zilt.on('__zilt.channel', (p) => {
     \\          if (!p || p.id !== id) return;
+    \\          if (p.credit !== undefined && window0 > 0) { credit += p.credit; pump(); return; }
     \\          if (p.done) {
     \\            off();
+    \\            while (pending.length > 0) pending.shift().resolve(false);
     \\            if (typeof o.onclose === 'function') o.onclose(p.err == null ? null : p.err);
     \\          } else if (o.binary === true && p.bin !== undefined) {
     \\            if (typeof o.onmessage !== 'function') return;
@@ -1557,20 +1592,13 @@ const runtime_js_head =
     \\            o.onmessage(p.data, p.seq);
     \\          }
     \\        });
-    \\        const send = (data) => {
+    \\        const send = (data) => new Promise((resolve) => {
     \\          const bytes = data instanceof Uint8Array ? data : new TextEncoder().encode(String(data));
-    \\          const chunk = 0x8000;
-    \\          for (let i = 0; i < bytes.length || i === 0; i += chunk) {
-    \\            const slice = bytes.subarray(i, Math.min(i + chunk, bytes.length));
-    \\            let bin = '';
-    \\            for (let j = 0; j < slice.length; j++) bin += String.fromCharCode(slice[j]);
-    \\            window.zilt.emit('channelUp', {
-    \\              id: id, seq: Math.floor(i / chunk), data_b64: btoa(bin),
-    \\              sum: window.zilt.channel.fnv1a32(slice),
-    \\            });
-    \\          }
-    \\        };
-    \\        return { id: id, send: send, close: () => off() };
+    \\          const total = Math.max(1, Math.ceil(bytes.length / 0x8000));
+    \\          pending.push({ bytes: bytes, sent: 0, total: total, resolve: resolve });
+    \\          pump();
+    \\        });
+    \\        return { id: id, send: send, close: () => { off(); while (pending.length > 0) pending.shift().resolve(false); } };
     \\      },
     \\    },
     \\    // v0.1.19：fs 全量。scope = appData（默认）/appConfig/appCache/home/desktop/
@@ -1717,6 +1745,35 @@ const runtime_js_head =
     \\              content_type: p.contentType ?? p.content_type,
     \\              encoding: p.encoding ?? 'text',
     \\            })),
+    \\          }).catch((e) => { off(); offProg(); reject(e); });
+    \\        });
+    \\      },
+    \\      // v0.4.1 H14：断点续传分块上传（PATCH + Upload-Offset；状态落盘
+    \\      // appData/upload-state，重启续传；failAfter 供演练中断——错误对象
+    \\      // 带已持久化 offset）。resolve {offset, total}；onProgress(written,total)
+    \\      uploadResumable: (opts) => {
+    \\        const o = opts ?? {};
+    \\        const id = ++httpSeq;
+    \\        let lastOffset = 0;
+    \\        return new Promise((resolve, reject) => {
+    \\          const offProg = window.zilt.on('httpUploadProgress', (p) => {
+    \\            if (!p || p.id !== id) return;
+    \\            lastOffset = p.written;
+    \\            if (typeof o.onProgress === 'function') o.onProgress(p.written, p.total);
+    \\          });
+    \\          const off = window.zilt.on('httpResponse', (p) => {
+    \\            if (!p || p.id !== id) return;
+    \\            off(); offProg();
+    \\            let payload = { offset: lastOffset, total: 0 };
+    \\            try { payload = JSON.parse(p.body); } catch (_) {}
+    \\            if (p.err) reject(Object.assign(new Error(p.err), { offset: payload.offset, total: payload.total }));
+    \\            else resolve(payload);
+    \\          });
+    \\          builtin('__zilt.http', {
+    \\            action: 'uploadResumable', id,
+    \\            url: o.url, path: o.path,
+    \\            chunk_size: o.chunkSize ?? 65536,
+    \\            fail_after: o.failAfter ?? 0,
     \\          }).catch((e) => { off(); offProg(); reject(e); });
     \\        });
     \\      },

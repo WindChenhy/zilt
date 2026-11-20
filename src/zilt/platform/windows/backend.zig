@@ -2872,6 +2872,31 @@ fn Backend(comptime config: Config) type {
                     log.print("[http] {s} {s} (id={d}, stream={}) dispatched", .{ job.method, job.url, job.id, job.stream });
                     return .{ .ok = true };
                 },
+                // v0.4.1 H14：断点续传分块上传（独立线程逐块 PATCH；状态落盘）
+                .upload_resumable => |req| {
+                    const w = self.mainWindow() orelse return error.NoMainWindow;
+                    if (!self.aclAllowed("http", req.url)) {
+                        log.print("[acl] http denied: {s}", .{req.url});
+                        return error.PermissionDenied;
+                    }
+                    const state_dir = if (self.storage_root) |root|
+                        std.fmt.allocPrint(std.heap.page_allocator, "{s}\\upload-state", .{root}) catch return error.OutOfMemory
+                    else
+                        return error.StorageUnavailable;
+                    const job = makeUploadJob(w.hwnd, state_dir, req) orelse {
+                        std.heap.page_allocator.free(state_dir);
+                        return error.OutOfMemory;
+                    };
+                    std.heap.page_allocator.free(state_dir); // makeUploadJob 已 dupe
+                    const t = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, resumableUploadWorker, .{job}) catch {
+                        freeUploadJob(job);
+                        log.print("[upload] spawn failed", .{});
+                        return error.HttpSpawnFailed;
+                    };
+                    t.detach();
+                    log.print("[upload] resumable dispatched (id={d}, path={s}, chunk={d}, fail_after={d})", .{ req.id, req.path, req.chunk_size, req.fail_after });
+                    return .{ .ok = true };
+                },
             }
         }
 
@@ -8088,6 +8113,239 @@ fn postHttpResult(job: *HttpJob, res: *HttpResult) void {
     if (win32.PostMessageW(job.hwnd, WM_ZILT_HTTP, 0, @bitCast(@intFromPtr(res))) == 0) {
         freeHttpResult(res);
     }
+}
+
+// ---- v0.4.1 H14：断点续传分块上传（JSON-tus-lite；状态落盘可跨重启续传）----
+
+const UploadJob = struct {
+    hwnd: win32.HWND,
+    id: i64,
+    url: []u8,
+    path: []u8,
+    state_dir: []u8,
+    chunk_size: u32,
+    fail_after: u32,
+};
+
+fn makeUploadJob(hwnd: win32.HWND, state_dir: []const u8, req: shared_system.UploadResumableReq) ?*UploadJob {
+    const a = std.heap.page_allocator;
+    const j = a.create(UploadJob) catch return null;
+    j.* = .{
+        .hwnd = hwnd,
+        .id = req.id,
+        .url = a.dupe(u8, req.url) catch {
+            a.destroy(j);
+            return null;
+        },
+        .path = a.dupe(u8, req.path) catch {
+            a.free(j.url);
+            a.destroy(j);
+            return null;
+        },
+        .state_dir = a.dupe(u8, state_dir) catch {
+            a.free(j.url);
+            a.free(j.path);
+            a.destroy(j);
+            return null;
+        },
+        .chunk_size = if (req.chunk_size == 0) 64 * 1024 else req.chunk_size,
+        .fail_after = req.fail_after,
+    };
+    return j;
+}
+
+fn freeUploadJob(job: *UploadJob) void {
+    const a = std.heap.page_allocator;
+    a.free(job.url);
+    a.free(job.path);
+    a.free(job.state_dir);
+    a.destroy(job);
+}
+
+/// 独立结果/进度投递（HttpResult/HttpProgress 复用既有 WM 通道）。
+fn postUploadResult(hwnd: win32.HWND, id: i64, status: u16, err_name: ?[]const u8, body_json: []const u8) void {
+    const a = std.heap.page_allocator;
+    const res = a.create(HttpResult) catch return;
+    res.* = .{
+        .id = id,
+        .status = status,
+        .body = a.dupe(u8, body_json) catch &[_]u8{},
+        .err = if (err_name) |e| (a.dupe(u8, e) catch null) else null,
+    };
+    if (win32.PostMessageW(hwnd, WM_ZILT_HTTP, 0, @bitCast(@intFromPtr(res))) == 0) {
+        freeHttpResult(res);
+    }
+}
+
+fn postUploadProgress(hwnd: win32.HWND, id: i64, written: u64, total: u64) void {
+    const a = std.heap.page_allocator;
+    const p = a.create(HttpProgress) catch return;
+    p.* = .{ .hwnd = hwnd, .id = id, .written = written, .total = total };
+    if (win32.PostMessageW(hwnd, WM_ZILT_HTTP_PROGRESS, 0, @bitCast(@intFromPtr(p))) == 0) {
+        freeHttpProgress(p);
+    }
+}
+
+/// 断点续传 worker（独立线程）：读文件 → 从持久化 offset 起 PATCH 分块 →
+/// 每块成功 saveState + 进度 → fail_after 演练中断 / 网络错误原样带回 →
+/// 完成清状态。响应体 `{"offset":N}` 为协议回执（文档化：不走 tus 响应头）。
+fn resumableUploadWorker(job: *UploadJob) void {
+    const a = std.heap.page_allocator;
+    defer freeUploadJob(job);
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const up_mod = @import("../../upload_resume.zig");
+
+    const data = win32.readFileAlloc(a, job.path) orelse {
+        postUploadResult(job.hwnd, job.id, 0, "FileNotFound", "{}");
+        return;
+    };
+    defer a.free(data);
+    const total: u64 = data.len;
+
+    const key = up_mod.stateKeyHex(a, job.url, job.path) catch {
+        postUploadResult(job.hwnd, job.id, 0, "OutOfMemory", "{}");
+        return;
+    };
+    defer a.free(key);
+    const spath = up_mod.statePath(a, job.state_dir, key) catch {
+        postUploadResult(job.hwnd, job.id, 0, "OutOfMemory", "{}");
+        return;
+    };
+    defer a.free(spath);
+    // 状态目录首次创建（writeFile 不建父目录）
+    {
+        const dir_w = std.unicode.utf8ToUtf16LeAllocZ(a, job.state_dir) catch return;
+        defer a.free(dir_w);
+        _ = win32.CreateDirectoryW(dir_w.ptr, null); // 已存在 → 返回 false（忽略）
+    }
+    var st = up_mod.loadState(io, a, spath, key) orelse up_mod.State{ .key = key, .offset = 0, .total = total };
+    if (st.total != total) st.offset = 0; // 文件变了 → 从头上传
+    if (st.offset > total) st.offset = 0;
+    var offset = st.offset;
+    log.print("[upload] resumable id={d}: total={d} resume-from={d} chunk={d}", .{ job.id, total, offset, job.chunk_size });
+
+    // PUT 初始化（确定性 uploadId = sha256(key)[:16]，服务端按 key 派生 →
+    // 跨重启 PATCH 复用同一 upload；已有 uid（状态文件）则跳过）
+    var uid_buf: [64]u8 = undefined;
+    var uid: []const u8 = st.upload_id;
+    if (uid.len == 0) {
+        const init_body = std.fmt.allocPrint(a, "{{\"size\":{d},\"key\":\"{s}\"}}", .{ total, key }) catch {
+            postUploadResult(job.hwnd, job.id, 0, "OutOfMemory", "{}");
+            return;
+        };
+        defer a.free(init_body);
+        const url_init = net_mod.parseUrl(job.url) catch {
+            postUploadResult(job.hwnd, job.id, 0, "InvalidUrl", "{}");
+            return;
+        };
+        var r_init = winhttp.request(a, url_init, .{
+            .method = "PUT",
+            .body = init_body,
+            .timeout_ms = 60_000,
+        }, null) catch |e| {
+            postUploadResult(job.hwnd, job.id, 0, @errorName(e), "{}");
+            return;
+        };
+        defer r_init.deinit(a);
+        if (r_init.status < 200 or r_init.status >= 300) {
+            postUploadResult(job.hwnd, job.id, r_init.status, "UploadRejected", "{}");
+            return;
+        }
+        const p_init = std.json.parseFromSlice(std.json.Value, a, r_init.body, .{}) catch {
+            postUploadResult(job.hwnd, job.id, r_init.status, "ProtocolMismatch", "{}");
+            return;
+        };
+        defer p_init.deinit();
+        const uid_opt = p_init.value.object.get("uploadId") orelse {
+            postUploadResult(job.hwnd, job.id, r_init.status, "ProtocolMismatch", "{}");
+            return;
+        };
+        if (uid_opt != .string) {
+            postUploadResult(job.hwnd, job.id, r_init.status, "ProtocolMismatch", "{}");
+            return;
+        }
+        if (uid_opt.string.len >= uid_buf.len) {
+            postUploadResult(job.hwnd, job.id, r_init.status, "ProtocolMismatch", "{}");
+            return;
+        }
+        @memcpy(uid_buf[0..uid_opt.string.len], uid_opt.string);
+        uid = uid_buf[0..uid_opt.string.len];
+    }
+
+    var sent_this_session: u32 = 0;
+    var idx: u64 = 0;
+    if (job.chunk_size > 0) idx = offset / job.chunk_size;
+    const patch_url = std.fmt.allocPrint(a, "{s}/{s}", .{ job.url, uid }) catch {
+        postUploadResult(job.hwnd, job.id, 0, "OutOfMemory", "{}");
+        return;
+    };
+    defer a.free(patch_url);
+    while (offset < total) {
+        const clen = up_mod.chunkLen(total, job.chunk_size, idx);
+        if (clen == 0) break;
+        const slice = data[@intCast(offset)..@intCast(offset + clen)];
+        var hdr_buf: [128]u8 = undefined;
+        const headers = std.fmt.bufPrint(&hdr_buf, "Upload-Offset: {d}\r\nX-Fail-After: {d}", .{ offset, job.fail_after }) catch break;
+        const url = net_mod.parseUrl(patch_url) catch {
+            postUploadResult(job.hwnd, job.id, 0, "InvalidUrl", "{}");
+            return;
+        };
+        const r = winhttp.request(a, url, .{
+            .method = "PATCH",
+            .headers = headers,
+            .body = slice,
+            .timeout_ms = 60_000,
+        }, null) catch |e| {
+            log.print("[upload] id={d} chunk {d} failed: {s} (state kept at {d})", .{ job.id, idx, @errorName(e), offset });
+            var body_buf: [64]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf, "{{\"offset\":{d},\"total\":{d}}}", .{ offset, total }) catch "{}";
+            postUploadResult(job.hwnd, job.id, 0, @errorName(e), body);
+            return;
+        };
+        var rr = r;
+        defer rr.deinit(a);
+        if (r.status < 200 or r.status >= 300) {
+            postUploadResult(job.hwnd, job.id, r.status, "UploadRejected", "{}");
+            return;
+        }
+        const parsed = std.json.parseFromSlice(std.json.Value, a, r.body, .{}) catch {
+            postUploadResult(job.hwnd, job.id, r.status, "ProtocolMismatch", "{}");
+            return;
+        };
+        defer parsed.deinit();
+        const new_off: i64 = blk: {
+            const o = parsed.value.object.get("offset") orelse break :blk -1;
+            if (o != .integer or o.integer < 0) break :blk -1;
+            break :blk o.integer;
+        };
+        if (new_off < 0 or @as(u64, @intCast(new_off)) != offset + clen) {
+            log.print("[upload] id={d} offset mismatch: got {d}, want {d}", .{ job.id, new_off, offset + clen });
+            postUploadResult(job.hwnd, job.id, r.status, "ProtocolMismatch", "{}");
+            return;
+        }
+        offset = @intCast(new_off);
+        up_mod.saveState(io, a, spath, .{ .key = key, .offset = offset, .total = total, .upload_id = uid }) catch |e| {
+            log.print("[upload] id={d} saveState failed: {s}", .{ job.id, @errorName(e) });
+        };
+        postUploadProgress(job.hwnd, job.id, offset, total);
+        sent_this_session += 1;
+        idx += 1;
+        if (job.fail_after > 0 and sent_this_session >= job.fail_after and offset < total) {
+            // 演练中断：状态保持在最后一次成功块——下次调用从此续传
+            log.print("[upload] id={d} simulated interrupt after {d} chunks (state at {d}/{d})", .{ job.id, sent_this_session, offset, total });
+            var body_buf: [64]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf, "{{\"offset\":{d},\"total\":{d}}}", .{ offset, total }) catch "{}";
+            postUploadResult(job.hwnd, job.id, 0, "InterruptedForResume", body);
+            return;
+        }
+    }
+    up_mod.clearState(io, spath);
+    log.print("[upload] id={d} complete ({d} bytes, {d} chunks this session)", .{ job.id, offset, sent_this_session });
+    var body_buf: [64]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "{{\"offset\":{d},\"total\":{d}}}", .{ offset, total }) catch "{}";
+    postUploadResult(job.hwnd, job.id, 200, null, body);
 }
 
 /// v0.1.20：WinHTTP 请求（支持 https、代理、超时、重定向策略、忽略证书、流式分块）。

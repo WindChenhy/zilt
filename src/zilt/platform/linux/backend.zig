@@ -134,6 +134,7 @@ const portal_hotkey = @import("portal_hotkey.zig");
 const deep_link = @import("deep_link.zig");
 const unity_badge = @import("unity_badge.zig");
 const launch_args = @import("../../launch_args.zig");
+const upload_resume = @import("../../upload_resume.zig");
 const desktop_entry = @import("desktop_entry.zig");
 const sysinfo_linux = @import("sysinfo_linux.zig");
 const menu_model = @import("../../menu_model.zig");
@@ -6803,13 +6804,278 @@ fn Backend(comptime config: Config) type {
         // ------------------------------------------------------------------
 
         fn runHttpOp(self: *Self, op: system_api.HttpOp, alloc: std.mem.Allocator) !system_api.Result {
-            const req = op.request;
+            const req = switch (op) {
+                .request => |r| r,
+                // v0.4.1 H14：断点续传分块上传（独立线程逐块 PATCH；状态落盘）
+                .upload_resumable => |r| return self.uploadResumableStart(r, alloc),
+            };
             // v0.1.21 对齐：http scope 走 ACL（含 URL 形式资源）
             if (!self.aclAllowed("http", req.url)) {
                 log.print("[http] denied: {s}", .{req.url});
                 return error.PermissionDenied;
             }
             return self.httpRequestStart(req, alloc);
+        }
+
+        const UploadJob = struct {
+            backend: *Self,
+            id: i64,
+            url: []u8,
+            path: []u8,
+            state_dir: []u8,
+            chunk_size: u32,
+            fail_after: u32,
+        };
+
+        /// libsoup3 同步读取（libsoup 3.0 起soup_session_send_and_read 即同步变体；
+        /// translate-c 的 capi 缺此声明——手动 extern，链接由 -lsoup-3.0 提供）。
+        extern fn soup_session_send_and_read(
+            session: *anyopaque,
+            msg: *anyopaque,
+            cancellable: ?*anyopaque,
+            err_ptr: ?*?*anyopaque,
+        ) ?*anyopaque;
+
+        fn uploadResumableStart(self: *Self, req: system_api.UploadResumableReq, alloc: std.mem.Allocator) !system_api.Result {
+            _ = alloc;
+            // job 与字符串全部用 page_allocator（worker 线程释放所有权；
+            // dispatch 的 per-message arena 会在消息处理结束时回收——实测
+            // arena 分配 + worker free = free(): invalid pointer abort）
+            const pa = std.heap.page_allocator;
+            if (!self.aclAllowed("http", req.url)) {
+                log.print("[http] denied: {s}", .{req.url});
+                return error.PermissionDenied;
+            }
+            const root = self.appDataRoot() orelse return error.StorageUnavailable;
+            defer self.allocator.free(root);
+            const state_dir = std.fmt.allocPrint(pa, "{s}/upload-state", .{root}) catch return error.OutOfMemory;
+            const job = pa.create(UploadJob) catch {
+                pa.free(state_dir);
+                return error.OutOfMemory;
+            };
+            job.* = .{
+                .backend = self,
+                .id = req.id,
+                .url = pa.dupe(u8, req.url) catch {
+                    pa.free(state_dir);
+                    pa.destroy(job);
+                    return error.OutOfMemory;
+                },
+                .path = pa.dupe(u8, req.path) catch {
+                    pa.free(state_dir);
+                    pa.free(job.url);
+                    pa.destroy(job);
+                    return error.OutOfMemory;
+                },
+                .state_dir = state_dir,
+                .chunk_size = if (req.chunk_size == 0) 64 * 1024 else req.chunk_size,
+                .fail_after = req.fail_after,
+            };
+            const t = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, resumableUploadWorker, .{job}) catch {
+                pa.free(job.url);
+                pa.free(job.path);
+                pa.free(job.state_dir);
+                pa.destroy(job);
+                return error.HttpSpawnFailed;
+            };
+            t.detach();
+            log.print("[upload] resumable dispatched (id={d}, path={s}, chunk={d}, fail_after={d})", .{ req.id, req.path, req.chunk_size, req.fail_after });
+            return .{ .ok = true };
+        }
+
+        /// v0.4.1 H14：断点续传 worker（libsoup 同步逐块 PATCH；状态落盘可跨
+        /// 重启续传；emitHttpResponse/emitHttpProgress 经 g_idle_add 封送线程安全）。
+        fn resumableUploadWorker(job: *UploadJob) void {
+            const self = job.backend;
+            const a = std.heap.page_allocator;
+            var threaded: std.Io.Threaded = .init(a, .{});
+            defer threaded.deinit();
+            const io = threaded.io();
+            defer {
+                a.free(job.url);
+                a.free(job.path);
+                a.free(job.state_dir);
+                a.destroy(job);
+            }
+
+            const data = std.Io.Dir.cwd().readFileAlloc(io, job.path, a, .limited(512 * 1024 * 1024)) catch {
+                self.emitHttpResponse(job.id, 0, "", "FileNotFound");
+                return;
+            };
+            defer a.free(data);
+            const total: u64 = data.len;
+            const key = upload_resume.stateKeyHex(a, job.url, job.path) catch {
+                self.emitHttpResponse(job.id, 0, "", "OutOfMemory");
+                return;
+            };
+            defer a.free(key);
+            const spath = upload_resume.statePath(a, job.state_dir, key) catch {
+                self.emitHttpResponse(job.id, 0, "", "OutOfMemory");
+                return;
+            };
+            defer a.free(spath);
+            // 状态目录首次创建（writeFile 不建父目录）
+            const dir_z = dupeZ(a, job.state_dir) catch return;
+            defer a.free(dir_z);
+            _ = std.c.mkdir(dir_z.ptr, 0o755); // 已存在 → EEXIST（忽略）
+            var st = upload_resume.loadState(io, a, spath, key) orelse upload_resume.State{ .key = key, .offset = 0, .total = total };
+            if (st.total != total) st.offset = 0; // 文件变了 → 从头上传
+            if (st.offset > total) st.offset = 0;
+            var offset = st.offset;
+            log.print("[upload] resumable id={d}: total={d} resume-from={d} chunk={d}", .{ job.id, total, offset, job.chunk_size });
+
+            // PUT 初始化（确定性 uploadId = sha256(key)[:16]；已有 uid 则跳过）
+            var uid_buf: [64]u8 = undefined;
+            var uid: []const u8 = st.upload_id;
+            if (uid.len == 0) {
+                const init_body = std.fmt.allocPrint(a, "{{\"size\":{d},\"key\":\"{s}\"}}", .{ total, key }) catch {
+                    self.emitHttpResponse(job.id, 0, "", "OutOfMemory");
+                    return;
+                };
+                defer a.free(init_body);
+                const url_i = dupeZ(a, job.url) catch {
+                    self.emitHttpResponse(job.id, 0, "", "OutOfMemory");
+                    return;
+                };
+                defer a.free(url_i);
+                const msg_i = c.soup_message_new("PUT", url_i.ptr) orelse {
+                    self.emitHttpResponse(job.id, 0, "", "InvalidUrl");
+                    return;
+                };
+                const bi = c.g_bytes_new(init_body.ptr, init_body.len);
+                defer c.g_bytes_unref(bi);
+                c.soup_message_set_request_body_from_bytes(msg_i, "application/json", bi);
+                const sess_i = newSoupSession(60_000, null) orelse {
+                    self.emitHttpResponse(job.id, 0, "", "SoupUnavailable");
+                    return;
+                };
+                defer c.g_object_unref(@ptrCast(sess_i));
+                var gierr: [*c]c.GError = null;
+                const gbi_raw = soup_session_send_and_read(@ptrCast(sess_i), @ptrCast(msg_i), null, @ptrCast(&gierr));
+                                if (gierr != null) {
+                    c.g_error_free(gierr);
+                    self.emitHttpResponse(job.id, 0, "", "CannotConnect");
+                    return;
+                }
+                defer if (gbi_raw) |gp| c.g_bytes_unref(@ptrCast(gp));
+                if (c.soup_message_get_status(msg_i) < 200 or c.soup_message_get_status(msg_i) >= 300) {
+                    self.emitHttpResponse(job.id, @intCast(c.soup_message_get_status(msg_i)), "", "UploadRejected");
+                    return;
+                }
+                var ilen: c.gsize = 0;
+                const iptr = if (gbi_raw) |gp| c.g_bytes_get_data(@ptrCast(gp), &ilen) else null;
+                var body_src: []const u8 = "";
+                if (iptr != null and ilen > 0) body_src = @as([*]const u8, @ptrCast(iptr.?))[0..ilen];
+                const p_init = std.json.parseFromSlice(std.json.Value, a, body_src, .{}) catch {
+                    self.emitHttpResponse(job.id, 0, "", "ProtocolMismatch");
+                    return;
+                };
+                defer p_init.deinit();
+                const uid_opt = p_init.value.object.get("uploadId") orelse {
+                    self.emitHttpResponse(job.id, 0, "", "ProtocolMismatch");
+                    return;
+                };
+                if (uid_opt != .string or uid_opt.string.len >= uid_buf.len) {
+                    self.emitHttpResponse(job.id, 0, "", "ProtocolMismatch");
+                    return;
+                }
+                @memcpy(uid_buf[0..uid_opt.string.len], uid_opt.string);
+                uid = uid_buf[0..uid_opt.string.len];
+            }
+
+            var sent_this_session: u32 = 0;
+            var idx: u64 = 0;
+            if (job.chunk_size > 0) idx = offset / job.chunk_size;
+            const patch_url = std.fmt.allocPrint(a, "{s}/{s}", .{ job.url, uid }) catch {
+                self.emitHttpResponse(job.id, 0, "", "OutOfMemory");
+                return;
+            };
+            defer a.free(patch_url);
+            while (offset < total) {
+                const clen = upload_resume.chunkLen(total, job.chunk_size, idx);
+                if (clen == 0) break;
+                const slice = data[@intCast(offset)..@intCast(offset + clen)];
+                const url_z = dupeZ(a, patch_url) catch break;
+                defer a.free(url_z);
+                const msg = c.soup_message_new("PATCH", url_z.ptr) orelse {
+                    self.emitHttpResponse(job.id, 0, "", "InvalidUrl");
+                    return;
+                };
+                var hdr_buf: [64]u8 = undefined;
+                const off_str = std.fmt.bufPrint(&hdr_buf, "{d}", .{offset}) catch break;
+                const off_z = dupeZ(a, off_str) catch break;
+                defer a.free(off_z);
+                c.soup_message_headers_append(c.soup_message_get_request_headers(msg), "Upload-Offset", off_z.ptr);
+                var fail_buf: [32]u8 = undefined;
+                const fail_str = std.fmt.bufPrint(&fail_buf, "{d}", .{job.fail_after}) catch break;
+                const fail_z = dupeZ(a, fail_str) catch break;
+                defer a.free(fail_z);
+                c.soup_message_headers_append(c.soup_message_get_request_headers(msg), "X-Fail-After", fail_z.ptr);
+                const bytes = c.g_bytes_new(slice.ptr, slice.len);
+                defer c.g_bytes_unref(bytes);
+                c.soup_message_set_request_body_from_bytes(msg, "application/octet-stream", bytes);
+                const session = newSoupSession(60_000, null) orelse {
+                    self.emitHttpResponse(job.id, 0, "", "SoupUnavailable");
+                    return;
+                };
+                defer c.g_object_unref(@ptrCast(session));
+                var gerr: [*c]c.GError = null;
+                const gbytes_raw = soup_session_send_and_read(@ptrCast(session), @ptrCast(msg), null, @ptrCast(&gerr));
+                                if (gerr != null) {
+                    const reason = a.dupe(u8, std.mem.span(gerr.*.message)) catch "";
+                    defer if (reason.len > 0) a.free(reason);
+                    log.print("[upload] id={d} chunk {d} failed: {s} (state kept at {d})", .{ job.id, idx, reason, offset });
+                    c.g_error_free(gerr);
+                    var body_buf: [64]u8 = undefined;
+                    const body = std.fmt.bufPrint(&body_buf, "{{\"offset\":{d},\"total\":{d}}}", .{ offset, total }) catch "{}";
+                    self.emitHttpResponse(job.id, 0, body, "CannotConnect");
+                    return;
+                }
+                defer if (gbytes_raw) |gp| c.g_bytes_unref(@ptrCast(gp));
+                const status = c.soup_message_get_status(msg);
+                if (status < 200 or status >= 300) {
+                    self.emitHttpResponse(job.id, @intCast(status), "", "UploadRejected");
+                    return;
+                }
+                var body_len: c.gsize = 0;
+                const body_ptr = if (gbytes_raw) |gp| c.g_bytes_get_data(@ptrCast(gp), &body_len) else null;
+                var chunk_src: []const u8 = "";
+                if (body_ptr != null and body_len > 0) chunk_src = @as([*]const u8, @ptrCast(body_ptr.?))[0..body_len];
+                const parsed = std.json.parseFromSlice(std.json.Value, a, chunk_src, .{}) catch {
+                    self.emitHttpResponse(job.id, @intCast(status), "", "ProtocolMismatch");
+                    return;
+                };
+                defer parsed.deinit();
+                const new_off: i64 = blk: {
+                    const o = parsed.value.object.get("offset") orelse break :blk -1;
+                    if (o != .integer or o.integer < 0) break :blk -1;
+                    break :blk o.integer;
+                };
+                if (new_off < 0 or @as(u64, @intCast(new_off)) != offset + clen) {
+                    log.print("[upload] id={d} offset mismatch: got {d}, want {d}", .{ job.id, new_off, offset + clen });
+                    self.emitHttpResponse(job.id, @intCast(status), "", "ProtocolMismatch");
+                    return;
+                }
+                offset = @intCast(new_off);
+                upload_resume.saveState(io, a, spath, .{ .key = key, .offset = offset, .total = total, .upload_id = uid }) catch |e| {
+                    log.print("[upload] id={d} saveState failed: {s}", .{ job.id, @errorName(e) });
+                };
+                self.emitHttpProgress(job.id, offset, total);
+                sent_this_session += 1;
+                idx += 1;
+                if (job.fail_after > 0 and sent_this_session >= job.fail_after and offset < total) {
+                    log.print("[upload] id={d} simulated interrupt after {d} chunks (state at {d}/{d})", .{ job.id, sent_this_session, offset, total });
+                    var body_buf: [64]u8 = undefined;
+                    const body = std.fmt.bufPrint(&body_buf, "{{\"offset\":{d},\"total\":{d}}}", .{ offset, total }) catch "{}";
+                    self.emitHttpResponse(job.id, 0, body, "InterruptedForResume");
+                    return;
+                }
+            }
+            upload_resume.clearState(io, spath);
+            log.print("[upload] id={d} complete ({d} bytes, {d} chunks this session)", .{ job.id, offset, sent_this_session });
+            var body_buf: [64]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf, "{{\"offset\":{d},\"total\":{d}}}", .{ offset, total }) catch "{}";
+            self.emitHttpResponse(job.id, 200, body, "");
         }
 
         fn newSoupSession(timeout_ms: u32, proxy: ?[]const u8) [*c]c.SoupSession {

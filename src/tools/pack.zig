@@ -351,3 +351,17 @@ pub fn main() !void {
         return error.BadTarget;
     }
 }
+/// v0.4.1 H13：读取 deb 维护脚本钩子文件 -> 逐行 shell（env 变量为路径）。
+/// 内容泄漏到进程退出（pack 为短生命周期工具——文档化取舍）。
+fn readHookLines(alloc: std.mem.Allocator, env_name: []const u8) []const []const u8 {
+    const path = getEnv(alloc, env_name) orelse return &.{};
+    defer alloc.free(path);
+    const content = readFileAlloc(alloc, path) orelse return &.{};
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, content, 10); // LF
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, &[_]u8{ 32, 9, 13 }); // 空白/CR
+        if (t.len > 0) lines.append(alloc, t) catch break;
+    }
+    return lines.items;
+}

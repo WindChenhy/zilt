@@ -1262,6 +1262,41 @@ function runSecondWindowProbe() {
     check('bcount', bc || bcErr.indexOf('NotSupported') >= 0, `bc=${bc} err=${bcErr.slice(0, 40)}`);
   } catch (e) { check('bcount', false, String(e.message || e)); }
 
+  // ---- v0.4.1：H4 channel credit 背压（maxInFlight=2，8 帧 32KB 上行）+
+  //      H14 断点续传（failAfter=2 演练中断 → 状态续传 → 完成）----
+  try {
+    const got = [];
+    const rcv = [];
+    let closedErr = null;
+    const ch = Z().channel.create({ binary: true, maxInFlight: 2, onmessage: (b, s) => { got.push(s); rcv.push(b[0]); }, onclose: (e) => { closedErr = e; } });
+    const prs = [];
+    for (let i = 0; i < 8; i++) { const f = new Uint8Array(32 * 1024); f[0] = i; prs.push(ch.send(f)); }
+    const results = await Promise.all(prs);
+    let okSeq = false;
+    for (let t = 0; t < 50 && !okSeq; t++) { await wait(100); okSeq = got.length === 8 && got.every((s) => s === 0) && rcv.length === 8 && rcv.every((v, i) => v === i); }
+    ch.close();
+    check('bp', results.every((v) => v === true) && okSeq && closedErr == null, `rcv=${JSON.stringify(rcv)} closed=${closedErr}`);
+  } catch (e) { check('bp', false, String(e.message || e)); }
+  try {
+    const roots = await Z().fs.roots();
+    const appData = roots && (roots.appData || roots.appCache);
+    if (!appData) throw new Error('no appData root');
+    const name = 'smoke_tus_' + Date.now() + '.bin';
+    const size = 64 * 1024;
+    let payload = '';
+    for (let i = 0; i < size / 64; i++) payload += 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    await Z().fs.write(name, payload);
+    const abs = await Z().path.join(appData, name);
+    let failErr = null;
+    try {
+      await Z().http.uploadResumable({ url: 'http://127.0.0.1:8788/resume-upload', path: abs, chunkSize: 16384, failAfter: 2 });
+    } catch (e) { failErr = e; }
+    const r2 = await Z().http.uploadResumable({ url: 'http://127.0.0.1:8788/resume-upload', path: abs, chunkSize: 16384 });
+    await Z().fs.remove(name).catch(() => {});
+    check('tus', !!failErr && failErr.offset === 2 * 16384 && !!r2 && r2.offset === size && r2.total === size,
+      `failErr=${failErr ? failErr.message + '@' + failErr.offset : 'none'} r2=${JSON.stringify(r2)}`);
+  } catch (e) { check('tus', false, String(e.message || e)); }
+
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {
     await Z().invoke('__zilt.linuxSmoke', {

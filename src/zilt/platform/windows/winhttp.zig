@@ -557,3 +557,24 @@ test "v0.1.20: error mapping is stable" {
     try testing.expectEqual(@as(u32, 4), @intFromEnum(WebSocketBuffer.close));
     _ = testing;
 }
+
+// ---------------------------------------------------------------------------
+// v0.4.1 H21：等响应头看门狗语义（实现于 v0.3.15——SendRequest 前启动；
+// 本组测试锁定 done/fired 原子语义：done 置位 → 线程退出且不点火）。
+// ---------------------------------------------------------------------------
+test "watchdog: done 置位 → 退出且不点火（CloseHandle 不触达）" {
+    var w = Watchdog{ .handle = @ptrFromInt(0xDEADBEEF), .ms = 60 };
+    const t = try std.Thread.spawn(.{}, watchdogMain, .{&w});
+    w.done.store(true, .release);
+    t.join();
+    try testing.expect(!w.fired.load(.acquire));
+}
+
+test "watchdog: done 在轮询窗口内置位 → 不点火（本机真实时序）" {
+    var w = Watchdog{ .handle = @ptrFromInt(0xDEADBEEF), .ms = 5000 };
+    const t = try std.Thread.spawn(.{}, watchdogMain, .{&w});
+    win32.Sleep(60); // 让看门狗进入轮询循环
+    w.done.store(true, .release);
+    t.join();
+    try testing.expect(!w.fired.load(.acquire));
+}

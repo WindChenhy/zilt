@@ -23,6 +23,8 @@ pub fn frontendLog(_: Context, payload: struct { msg: []const u8 }) void {
 /// v0.3.16 G25：二进制通道上行帧回显（冒烟 c-bchan）。JS `ch.send(bytes)` →
 /// 事件 channelUp（帧 {id, seq, data_b64, sum}）→ 验和 → channelSendBinary
 /// 回显 → JS binary 模式解回 Uint8Array + 验收。
+/// v0.4.1 H4：处理完每帧后 channelCredit(1) 补充背压窗口（maxInFlight 通道
+/// 靠它流动；未启用窗口的通道忽略 credit 事件——两模式共存）。
 pub fn channelUp(ctx: Context, payload: struct { id: u32, seq: u32 = 0, data_b64: []const u8, sum: u32 = 0 }) void {
     const bytes = zilt.ipc.channelDecodeBase64(ctx.msg_allocator, payload.data_b64) orelse {
         zilt.log.print("[channel] up frame decode failed", .{});
@@ -34,6 +36,7 @@ pub fn channelUp(ctx: Context, payload: struct { id: u32, seq: u32 = 0, data_b64
         return;
     }
     ctx.channelSendBinary(payload.id, payload.seq, bytes);
+    ctx.channelCredit(payload.id, 1);
 }
 
 // ---- 菜单 / 全局快捷键（v0.1.2）----
@@ -161,6 +164,9 @@ pub fn smokeResult(ctx: Context, payload: struct {
     v04: bool = false,
     gpu: bool = false,
     bcount: bool = false,
+    // v0.4.1：H4 channel 背压（c-bp）+ H14 断点续传（c-tus）
+    bp: bool = false,
+    tus: bool = false,
     appquit: bool = false,
     fatal: ?[]const u8 = null,
 }) void {
@@ -175,10 +181,10 @@ pub fn smokeResult(ctx: Context, payload: struct {
             payload.cdp and payload.shot and payload.hdrs and payload.find and payload.proxy and payload.overlay and payload.proto and payload.ua and
             payload.scheme and payload.privacy and payload.monitor and payload.exp2 and payload.res and payload.dpapi and payload.binipc and
             payload.postbody and payload.upload and payload.iso and payload.sidecar and payload.comp and payload.win3 and payload.pdf and payload.acc and payload.sys2 and payload.bchan and
-            payload.v04 and payload.gpu and payload.bcount;
+            payload.v04 and payload.gpu and payload.bcount and payload.bp and payload.tus;
         appquit = payload.appquit;
         if (ok) {
-            zilt.log.print("[smoke] ALL CHECKS PASSED (69 checks: core-10 + window-api/eval/webview-api/capability/clipboard-multi/notification/acl/spa + tray-check/taskbar/hotkey/sysinfo/appearance/autostart + store/fs + path/log/state + services + http + ws + webviews + proc + partition + wincontrol + fsops + channel + initupd + http2 + wss + zigev + acl2 + fs2 + cdp + shot + hdrs + find + proxy + overlay + proto + ua + scheme/privacy/monitor/exp2/res/dpapi/binipc/postbody/upload/iso/sidecar/comp/win3/pdf/acc/sys2/bchan/v04/gpu/bcount + appquit)", .{});
+            zilt.log.print("[smoke] ALL CHECKS PASSED (71 checks: core-10 + window-api/eval/webview-api/capability/clipboard-multi/notification/acl/spa + tray-check/taskbar/hotkey/sysinfo/appearance/autostart + store/fs + path/log/state + services + http + ws + webviews + proc + partition + wincontrol + fsops + channel + initupd + http2 + wss + zigev + acl2 + fs2 + cdp + shot + hdrs + find + proxy + overlay + proto + ua + scheme/privacy/monitor/exp2/res/dpapi/binipc/postbody/upload/iso/sidecar/comp/win3/pdf/acc/sys2/bchan/v04/gpu/bcount/bp/tus + appquit)", .{});
         } else {
             zilt.log.print("[smoke] FAILED greet={} add={} fail={} user={} event={} mode={} clip={} win={} range={} winevent={} windowapi={} eval={} webview={} capability={} clipmulti={} notification={}", .{
                 payload.greet, payload.add, payload.fail, payload.user, payload.event, payload.mode, payload.clip,
@@ -190,10 +196,10 @@ pub fn smokeResult(ctx: Context, payload: struct {
                 payload.appearance, payload.autostart, payload.storage, payload.peripheral, payload.services,
                 payload.http, payload.ws, payload.webviews, payload.proc, payload.partition, payload.wincontrol, payload.fsops, payload.channel, payload.initupd, payload.http2, payload.wss, payload.zigev, payload.acl2, payload.fs2,
             });
-            zilt.log.print("[smoke] FAILED(3) cdp={} shot={} hdrs={} find={} proxy={} overlay={} proto={} ua={} scheme={} privacy={} monitor={} exp2={} res={} dpapi={} binipc={} postbody={} upload={} iso={} sidecar={} comp={} win3={} pdf={} acc={} sys2={} bchan={} v04={} gpu={} bcount={}", .{
+            zilt.log.print("[smoke] FAILED(3) cdp={} shot={} hdrs={} find={} proxy={} overlay={} proto={} ua={} scheme={} privacy={} monitor={} exp2={} res={} dpapi={} binipc={} postbody={} upload={} iso={} sidecar={} comp={} win3={} pdf={} acc={} sys2={} bchan={} v04={} gpu={} bcount={} bp={} tus={}", .{
                 payload.cdp, payload.shot, payload.hdrs, payload.find, payload.proxy, payload.overlay, payload.proto, payload.ua,
                 payload.scheme, payload.privacy, payload.monitor, payload.exp2, payload.res, payload.dpapi, payload.binipc, payload.postbody, payload.upload, payload.iso, payload.sidecar, payload.comp, payload.win3, payload.pdf, payload.acc, payload.sys2, payload.bchan,
-                payload.v04, payload.gpu, payload.bcount,
+                payload.v04, payload.gpu, payload.bcount, payload.bp, payload.tus,
             });
         }
     }

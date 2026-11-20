@@ -133,6 +133,11 @@ pub const InstallerConfig = struct {
     schemes: []const []const u8 = &.{},
     /// 安装时注册的文件关联扩展名（如 ".zilt"）
     file_exts: []const []const u8 = &.{},
+    // ---- v0.4.1 H13：安装脚本钩子（NSIS 片段直插）----
+    /// pre-hook：插在 WebView2 引导之后、升级检测之前（Section "Install" 开头）
+    pre_hook_nsh: ?[]const u8 = null,
+    /// post-hook：插在注册表写入之后、SectionEnd 之前
+    post_hook_nsh: ?[]const u8 = null,
 };
 
 /// NSIS 字符串转义（$\ = 双引号，$$ = 字面 $）。
@@ -214,6 +219,7 @@ pub fn generateNsis(alloc: std.mem.Allocator, cfg: InstallerConfig) ![]u8 {
         \\
         \\Section "Install"
         \\  Call MaybeInstallWebView2
+        \\{HOOK_PRE}
         \\{UPGRADE_CHECK}
         \\  SetOutPath "$INSTDIR"
         \\  File "{EXE}"
@@ -229,6 +235,7 @@ pub fn generateNsis(alloc: std.mem.Allocator, cfg: InstallerConfig) ![]u8 {
         \\  WriteRegStr @UNINST_ROOT@ "${UNINST_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
         \\  WriteRegStr @UNINST_ROOT@ "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
         \\{ASSOC_INSTALL}
+        \\{HOOK_POST}
         \\SectionEnd
         \\
         \\Section "Uninstall"
@@ -251,6 +258,9 @@ pub fn generateNsis(alloc: std.mem.Allocator, cfg: InstallerConfig) ![]u8 {
     cur = try repStep(alloc, cur, "{APPID}", app_id);
     cur = try repStep(alloc, cur, "{OUT}", out_path);
     cur = try repStep(alloc, cur, "{EXE}", exe_path);
+    // v0.4.1 H13：安装钩子（NSIS 片段直插；null = 移除占位）
+    cur = try repStep(alloc, cur, "{HOOK_PRE}", cfg.pre_hook_nsh orelse "");
+    cur = try repStep(alloc, cur, "{HOOK_POST}", cfg.post_hook_nsh orelse "");
 
     // v0.1.15：per-machine / License / 图标 / 协议与文件关联 / 升级检测
     {

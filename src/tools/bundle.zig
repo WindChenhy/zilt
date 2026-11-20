@@ -138,14 +138,18 @@ pub fn main() !void {
         .schemes = schemes,
         .file_exts = file_exts,
         // v0.3.4：侧车资源（project.resources 首项；build install 同布局）
-        .resources = if (app_meta.resources.len > 0) app_meta.resources[0] else null,
+        .resources = if (meta.resources.len > 0) meta.resources[0] else null,
         // v0.3.11 E1b：external_bin sidecar 名单
-        .sidecars = &app_meta.external_bin,
+        .sidecars = &meta.external_bin,
+        // v0.4.1 H13：安装脚本钩子（ZILT_INSTALLER_HOOK_PRE/POST = .nsh 文件路径，
+        // 内容直插 Section "Install" 的 pre/post 占位）
+        .pre_hook_nsh = readHookFile(alloc, "ZILT_INSTALLER_HOOK_PRE"),
+        .post_hook_nsh = readHookFile(alloc, "ZILT_INSTALLER_HOOK_POST"),
     });
     // makensis 以 UTF-8 BOM 识别编码（脚本含非 ASCII 注释）
     // v0.3.11 E1b：{SIDECAR_DIR} = exe 所在目录（sidecar 与 exe 同目录分发）
     const sidecar_dir = std.fs.path.dirname(exe_abs) orelse ".";
-    var sidecar_dir_esc = try alloc.dupe(u8, sidecar_dir);
+    const sidecar_dir_esc = try alloc.dupe(u8, sidecar_dir);
     for (sidecar_dir_esc) |*ch| {
         if (ch.* == '$') ch.* = '_';
     }
@@ -336,4 +340,22 @@ fn signArtifacts(alloc: std.mem.Allocator, exe_path: []const u8, setup_path: []c
         log.print("[sign] {s} -> exit {d}", .{ file, code });
         if (code != 0) return;
     }
+}
+
+/// v0.4.1 H13：读取 NSIS 钩子文件内容（env 变量为路径；缺失/空 → null）。
+/// 内容泄漏到进程退出（bundle 为短生命周期工具——文档化取舍）。
+fn readHookFile(alloc: std.mem.Allocator, env_name: []const u8) ?[]const u8 {
+    const win32 = zilt.platform_windows.win32;
+    const path = win32.getEnvUtf8(alloc, env_name) orelse return null;
+    if (path.len == 0) {
+        alloc.free(path);
+        return null;
+    }
+    defer alloc.free(path);
+    const content = win32.readFileAlloc(alloc, path) orelse return null;
+    if (content.len == 0) {
+        alloc.free(content);
+        return null;
+    }
+    return content;
 }

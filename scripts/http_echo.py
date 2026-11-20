@@ -114,6 +114,61 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(404, b"not found")
 
+    # v0.4.1 H14：断点续传分块上传（JSON-tus-lite 协议端点）。
+    # PUT /resume-upload {"size":N} → {"uploadId": "..."}
+    # PATCH /resume-upload/<id>（Upload-Offset + X-Fail-After 头）→ {"offset": 新偏移}
+    #   X-Fail-After: 本会话已成功块数 ≥ N 且未到末尾 → 500 {"offset": 已应用偏移}
+    #   （供冒烟演练「中断→续传」；状态服务端内存 + 客户端状态文件双份）
+    def do_PATCH(self):
+        u = urlparse(self.path)
+        if not u.path.startswith("/resume-upload/"):
+            self._send(404, b"not found")
+            return
+        uid = u.path[len("/resume-upload/"):]
+        st = RESUME_STORE.get(uid)
+        if st is None:
+            self._send(404, b"unknown upload id")
+            return
+        n = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(n) if n else b""
+        offset = int(self.headers.get("Upload-Offset", "-1"))
+        if offset < 0 or offset != len(st["data"]):
+            self._json(409, {"offset": len(st["data"]), "error": "OffsetMismatch"})
+            return
+        st["data"].extend(body)
+        sent = st["chunks"]
+        st["chunks"] += 1
+        fail_after = int(self.headers.get("X-Fail-After", "0"))
+        if fail_after > 0 and sent >= fail_after and len(st["data"]) < st["size"]:
+            self._json(500, {"offset": len(st["data"]), "error": "SimulatedInterrupt"})
+            return
+        self._json(200, {"offset": len(st["data"])})
+
+    def do_PUT(self):
+        u = urlparse(self.path)
+        if u.path == "/resume-upload":
+            n = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(n) if n else b""
+            try:
+                req = json.loads(body.decode("utf-8"))
+                size = int(req.get("size", 0))
+                key = str(req.get("key", ""))
+            except Exception:
+                self._send(400, b"bad json")
+                return
+            # 确定性 uploadId = sha256(key)[:16]——客户端重启后 PUT 同 key
+            # 幂等返回既有 id（跨重启续传的前提）
+            uid = hashlib.sha256(key.encode()).hexdigest()[:16]
+            if uid not in RESUME_STORE:
+                RESUME_STORE[uid] = {"size": size, "data": bytearray(), "chunks": 0}
+            self._json(200, {"uploadId": uid, "received": len(RESUME_STORE[uid]["data"])})
+            return
+        self._send(404, b"not found")
+
+
+RESUME_STORE = {}
+REQ_SEQ = [0]
+
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8788

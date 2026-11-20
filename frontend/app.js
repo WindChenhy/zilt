@@ -1350,6 +1350,64 @@ async function runChecks() {
       if (!ok) window.zilt.log('warn', 'c-bcount note: ' + set1 + '/' + set2 + '/' + cleared);
     } catch (e) { setCheck('c-bcount', false, String(e.message || e)); window.zilt.log('warn', 'c-bcount error: ' + String(e.message || e)); }
 
+    // 70. v0.4.1 H4：channel credit 背压——maxInFlight=2 窗口下 8 帧 32KB 上行，
+    //     Zig 每帧处理后 channelCredit(1)；send() await 全部 resolve 且回显有序
+    try {
+      const got = [];
+      const rcv = [];
+      let closedErr = null;
+      const ch = window.zilt.channel.create({
+        binary: true, maxInFlight: 2,
+        onmessage: (bytes, seq) => { got.push(seq); rcv.push(bytes[0]); },
+        onclose: (err) => { closedErr = err; },
+      });
+      const size = 32 * 1024;
+      const prs = [];
+      for (let i = 0; i < 8; i++) {
+        const f = new Uint8Array(size); f[0] = i;
+        prs.push(ch.send(f));
+      }
+      const t0 = Date.now();
+      const results = await Promise.all(prs);
+      const dt = Date.now() - t0;
+      let okSeq = false;
+      for (let t = 0; t < 50 && !okSeq; t++) {
+        await sleep(100);
+        // 单帧消息 seq 恒 0；到达顺序以首字节标记（回显保序 = [0..7]）
+        okSeq = got.length === 8 && got.every((s) => s === 0) &&
+          rcv.length === 8 && rcv.every((v, i) => v === i);
+      }
+      ch.close();
+      const ok = results.every((v) => v === true) && okSeq && closedErr == null;
+      setCheck('c-bp', ok, ok ? `backpressure ok (8 frames, window=2, ${dt}ms, ordered echo by payload, send awaited credit)` :
+        `resolved=${results.every((v) => v === true)} rcv=${JSON.stringify(rcv)} closed=${closedErr}`);
+      if (!ok) window.zilt.log('warn', 'c-bp note: rcv=' + JSON.stringify(rcv) + ' closed=' + closedErr);
+    } catch (e) { setCheck('c-bp', false, String(e.message || e)); window.zilt.log('warn', 'c-bp error: ' + String(e.message || e)); }
+
+    // 71. v0.4.1 H14：断点续传分块上传——failAfter=2 演练中断（状态落盘）→
+    //     二次调用从持久化 offset 续传 → 完成；错误对象带 offset
+    try {
+      const roots = await window.zilt.fs.roots();
+      const appData = roots && (roots.appData || roots.appCache);
+      if (!appData) throw new Error('no appData root');
+      const name = 'smoke_tus_' + Date.now() + '.bin';
+      const size = 64 * 1024;
+      let payload = '';
+      for (let i = 0; i < size / 64; i++) payload += 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+      await window.zilt.fs.write(name, payload);
+      const abs = await window.zilt.path.join(appData, name);
+      let failErr = null;
+      try {
+        await window.zilt.http.uploadResumable({ url: 'http://127.0.0.1:8788/resume-upload', path: abs, chunkSize: 16384, failAfter: 2 });
+      } catch (e) { failErr = e; }
+      const r2 = await window.zilt.http.uploadResumable({ url: 'http://127.0.0.1:8788/resume-upload', path: abs, chunkSize: 16384 });
+      await window.zilt.fs.remove(name).catch(() => {});
+      const ok = !!failErr && failErr.offset === 2 * 16384 && !!r2 && r2.offset === size && r2.total === size;
+      setCheck('c-tus', ok, ok ? 'tus ok (interrupt@32768 -> resume -> 65536 complete, state file resume)' :
+        `failErr=${failErr ? (failErr.message + '@' + failErr.offset) : 'none'} r2=${JSON.stringify(r2)}`);
+      if (!ok) window.zilt.log('warn', 'c-tus note: failErr=' + (failErr && failErr.message) + '@' + (failErr && failErr.offset) + ' r2=' + JSON.stringify(r2));
+    } catch (e) { setCheck('c-tus', false, String(e.message || e)); window.zilt.log('warn', 'c-tus error: ' + String(e.message || e)); }
+
     $('ver').textContent = window.zilt.version;
     $('conn').textContent = '已连接（IPC 正常）';
     // 上报给 Zig 侧断言（events.smokeResult → 通过则退出码 0）。
@@ -1427,6 +1485,9 @@ async function runChecks() {
       v04: $('c-v04').className === 'pass',
       gpu: $('c-gpu').className === 'pass',
       bcount: $('c-bcount').className === 'pass',
+      // v0.4.1：H4 channel 背压（c-bp）+ H14 断点续传（c-tus）
+      bp: $('c-bp').className === 'pass',
+      tus: $('c-tus').className === 'pass',
       appquit: !!window.zilt.app,
     };
     window.zilt.emit('smokeResult', smokeFlags);

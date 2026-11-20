@@ -138,7 +138,17 @@ g_application_run abort 实测）→ 会话总线 init 一次性缓存 + emit �
 L2 的 `monitors.scale` 在 1.0/1.25 两种缩放下断言；L7 用「人为让新 exe 退出」演练回滚；
 L8 的清单断言在 gtk3 与 gtk4 两种本地构建下均通过（CI 双栈随 L1 在 v0.4.3 接入）。
 
-### v0.4.1 — 网络/IPC/分发深化
+### v0.4.1 — 网络/IPC/分发深化 ✅ 完成（2026-11-21，见 git 提交记录）
+
+**验收**：双平台单测全绿（Windows/Linux `zig build test` 0 失败 0 泄漏，新增
+upload_resume 状态机 4 测试 + winhttp 看门狗语义 2 测试）+ 冒烟新增 c-bp / c-tus
+（双平台）。Windows 冒烟 71 项中 69 通过（clip/clipmulti 为既有环境问题——外部
+剪贴板占用，cmd/PowerShell 同样失败；c-bp/c-tus 全过）；**Linux 冒烟 exit 0 全过**
+（含 tus 中断→续传 E2E：failAfter=2 演练中断@32768 → 状态续传 → 65536 完成）。
+**实测教训**：① worker 线程持有的 job/字符串必须 page_allocator 分配（dispatch
+per-message arena 回收后 worker free = free(): invalid pointer abort）；② libsoup
+3.0.7（22.04）同步读取即 `soup_session_send_and_read`（无 _sync 变体）；③
+`std.c.getenv` 在 Windows 构建触发 libc 链接要求 → 平台分派。
 
 目标：IPC 与网络面补齐 Wails v3.1 对齐的最后两块（背压、TLS），分发链收尾。
 
@@ -269,6 +279,11 @@ codesign 验证 + Gatekeeper 实测。
   L1/L3/L4/L5/L6 独立为 **v0.4.3 Linux 专项**——理由：GTK4 默认化与 AppImage 自包含会改变
   发布产物与依赖面，不宜与其他小项混在一个版本（一个版本一个主题）；macOS 顺延为
   v0.4.4/v0.4.5，弹性位顺延 v0.4.6+。
+- **D8（2026-11-21）**：H5 server TLS 选型定为**文档化「外层反代承担」**（实施于
+  v0.4.1 发布说明）：Zig std 无服务端 TLS；引入 OpenSSL/mbedTLS dlopen 违反零依赖
+  文化；headless/server 模式定位为内网/本机桥，TLS 由部署层（nginx/caddy）承担。
+  tus 协议同步调整为 JSON-tus-lite（offset 回执走响应体——http.request 面无响应头
+  读取；tus 标准响应头形态列为 stretch）。
 - **D7（2026-11-21）**：GTK3 **不立即移除**，以 `-Dgtk=gtk3` legacy 形式保留至少一个周期
   （与 Wails v3.1 直接移除不同）——理由：Ubuntu 22.04 / Debian 12 / RHEL 9 仍在支持期，
   且 Zilt 的 dlopen 依赖策略本就偏向“宽兼容”。移除时间点由发行版 EOL 与实际使用数据决定。

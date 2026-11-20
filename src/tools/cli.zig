@@ -64,6 +64,8 @@ pub fn main(init: std.process.Init) !u8 {
     if (eql(u8, cmd, "icon")) return runIcon(alloc, args.items[1..]);
     if (eql(u8, cmd, "npm-pack")) return runNpmPack(alloc, args.items[1..]);
     if (eql(u8, cmd, "new")) return runNew(alloc, args.items[1..]);
+    // v0.4.1 H12：CLI 自更新（ed25519 清单 + sha256 + staging 原子替换）
+    if (eql(u8, cmd, "self-update")) return runSelfUpdate(alloc, args.items[1..]);
     if (eql(u8, cmd, "help") or eql(u8, cmd, "--help") or eql(u8, cmd, "-h")) {
         printHelp();
         return 0;
@@ -92,6 +94,9 @@ fn printHelp() void {
         \\                 PNG → 多尺寸 .ico（Windows 发布图标）
         \\  zilt npm-pack [-o npm] [--name @zilt/runtime] [--version <x.y.z>]
         \\                 生成 @zilt/runtime npm 包（package.json/index.js/index.d.ts）
+        \\  zilt self-update --manifest <url> --pubkey <64hex> [--github owner/repo]
+        \\                 [--channel stable|beta] [--exe-name <name>]
+        \\                 CLI 自身经更新器基建更新（ed25519 验签 + 原子替换 + .zilt-old 备份）
         \\
         \\构建/运行仍走 zig build:
         \\  zig build           编译应用
@@ -645,4 +650,136 @@ fn chdirToFrameworkRoot(alloc: std.mem.Allocator) void {
         @memcpy(rz, r);
         _ = std.c.chdir(rz.ptr); // 失败保持原 cwd（scaffold 报 SourceMissing）
     }
+}
+
+// ---------------------------------------------------------------------------
+// v0.4.1 H12：`zilt self-update` —— CLI 自身经 updater 基建更新。
+// ed25519 清单验签 + sha256 + staging 原子替换 + .zilt-old 备份（与应用侧同一套
+// updater.zig 流程；目标 = zilt.exe 自身，重启由用户执行新 exe 完成）。
+// 凭据：--manifest/--pubkey/--github/--channel/--exe-name 参数，或
+// ZILT_UPDATE_URL / ZILT_UPDATE_PK 环境变量（与应用侧 env 覆盖同名呼应）。
+// ---------------------------------------------------------------------------
+
+fn cliFetchFn(ctx: *anyopaque, alloc: std.mem.Allocator, url: []const u8) anyerror![]u8 {
+    _ = ctx;
+    var threaded: Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    var client: std.http.Client = .{ .allocator = alloc, .io = threaded.io() };
+    defer client.deinit();
+    var aw: Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const result = try client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &aw.writer,
+    });
+    if (result.status != .ok) return error.HttpRequestFailed;
+    return aw.toOwnedSlice();
+}
+
+/// 跨平台 env 读取（Windows win32 / Linux std.c——cli 的 Windows 构建不链
+/// libc，std.c.getenv 会触发链接要求）。返回值泄漏到进程退出（短生命周期）。
+fn cliGetEnv(alloc: std.mem.Allocator, name: []const u8) ?[]const u8 {
+    if (comptime builtin.os.tag == .windows) {
+        const w = zilt.platform_windows.win32;
+        const v = w.getEnvUtf8(alloc, name) orelse return null;
+        if (v.len == 0) {
+            alloc.free(v);
+            return null;
+        }
+        return v;
+    }
+    const name_z = alloc.allocSentinel(u8, name.len, 0) catch return null;
+    defer alloc.free(name_z);
+    @memcpy(name_z[0..name.len], name);
+    const v = std.c.getenv(name_z.ptr) orelse return null;
+    return alloc.dupe(u8, std.mem.span(v)) catch null;
+}
+
+fn runSelfUpdate(alloc: std.mem.Allocator, rest: []const []const u8) !u8 {
+    const eql = std.mem.eql;
+    var manifest_url: ?[]const u8 = null;
+    var pubkey_hex: ?[]const u8 = null;
+    var github: ?[]const u8 = null;
+    var channel: []const u8 = "stable";
+    var exe_name: []const u8 = "zilt.exe";
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        const val = if (i + 1 < rest.len) rest[i + 1] else null;
+        if (eql(u8, a, "--manifest") and val != null) { manifest_url = val; i += 1; } else if (eql(u8, a, "--pubkey") and val != null) {
+            pubkey_hex = val;
+            i += 1;
+        } else if (eql(u8, a, "--github") and val != null) {
+            github = val;
+            i += 1;
+        } else if (eql(u8, a, "--channel") and val != null) {
+            channel = val.?;
+            i += 1;
+        } else if (eql(u8, a, "--exe-name") and val != null) {
+            exe_name = val.?;
+            i += 1;
+        } else {
+            print("self-update: unknown arg '{s}'\n", .{a});
+            return 2;
+        }
+    }
+    if (manifest_url == null) manifest_url = cliGetEnv(alloc, "ZILT_UPDATE_URL");
+    if (pubkey_hex == null) pubkey_hex = cliGetEnv(alloc, "ZILT_UPDATE_PK");
+    if (manifest_url == null or pubkey_hex == null) {
+        print("self-update 需要 --manifest <url> --pubkey <64hex>（或 ZILT_UPDATE_URL / ZILT_UPDATE_PK 环境变量）\n", .{});
+        return 2;
+    }
+    var pk: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&pk, pubkey_hex.?) catch {
+        print("公钥格式非法（需要 64 个 hex 字符）\n", .{});
+        return 2;
+    };
+    const exe_path = std.process.executablePathAlloc(toolIo(), alloc) catch {
+        print("无法定位自身 exe\n", .{});
+        return 1;
+    };
+
+    const fetcher = zilt.updater.Fetcher{ .ctx = @ptrFromInt(1), .fetchFn = cliFetchFn };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const env = zilt.updater.Env{
+        .manifest_url = manifest_url.?,
+        .public_key = pk,
+        .current_version = zilt.version,
+        .exe_path = @constCast(exe_path),
+        .exe_name = exe_name,
+        .fetcher = fetcher,
+        .channel = if (eql(u8, channel, "beta")) .beta else .stable,
+        .github_repo = github,
+    };
+
+    print("self-update: 当前 {s}（{s}）\n  manifest={s}\n", .{ zilt.version, exe_path, manifest_url.? });
+    const m = zilt.updater.checkForUpdateEnv(arena.allocator(), env) catch |e| {
+        print("检查失败: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    if (m == null) {
+        print("已是最新版本\n", .{});
+        return 0;
+    }
+    print("发现新版本 {s}：{s}\n下载中...\n", .{ m.?.version, m.?.notes });
+    const artifact = zilt.updater.downloadAndVerify(alloc, env.fetcher, m.?, pk) catch |e| {
+        print("下载/验签失败: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    defer alloc.free(artifact);
+    // zip（PK 魔数）→ stageUpdate 解出 exe_name；裸 exe → stageBytes 直替
+    if (artifact.len > 4 and artifact[0] == 'P' and artifact[1] == 'K') {
+        _ = zilt.updater.stageUpdate(alloc, exe_path, exe_name, artifact) catch |e| {
+            print("暂存失败: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+    } else {
+        zilt.updater.stageBytes(alloc, exe_path, artifact) catch |e| {
+            print("暂存失败: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+    }
+    print("已暂存 {s} → 重启 zilt 生效（旧版备份 .zilt-old，10s 健康后清理）\n", .{exe_path});
+    return 0;
 }

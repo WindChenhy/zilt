@@ -197,6 +197,21 @@ pub const MultiPart = struct {
 
 pub const HttpOp = union(enum) {
     request: HttpRequest,
+    /// v0.4.1 H14：断点续传分块上传（JSON-tus-lite 协议：PATCH 分块 +
+    /// `Upload-Offset` 请求头 + 响应体 `{"offset":N}` 回执；状态落盘 appData
+    /// 支持重启续传；fail_after 供冒烟演练「中断→续传」路径）
+    upload_resumable: UploadResumableReq,
+};
+
+pub const UploadResumableReq = struct {
+    id: i64,
+    url: []const u8,
+    /// 本地文件绝对路径（fs scope 校验由调用方——builtin——保证）
+    path: []const u8,
+    chunk_size: u32 = 64 * 1024,
+    /// 本会话发送 N 个分块后强制失败（0 = 正常）；状态已逐块落盘 →
+    /// 下次调用从持久化 offset 续传
+    fail_after: u32 = 0,
 };
 
 /// WebSocket（v0.1.16）。connect 异步执行：立即返回，握手结果与后续消息

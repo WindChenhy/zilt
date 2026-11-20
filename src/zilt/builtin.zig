@@ -82,6 +82,9 @@ pub const Args = struct {
     drag_drop: ?bool = null,
     javascript: ?bool = null,
     badge_count: ?i64 = null,
+    // ---- v0.4.1：H4 channel 背压窗口 / H14 断点续传 ----
+    max_in_flight: ?u32 = null,
+    fail_after: ?u32 = null,
     /// v0.3.4：updater.skipVersion 的版本串
     version_str: ?[]const u8 = null,
     /// v0.3.6：SharedBuffer 二进制 IPC（__zilt.binary.request 的载荷字节数）
@@ -939,6 +942,18 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
                 .follow_redirects = a.follow_redirects orelse true,
                 .multipart = parts,
                 .upload_progress = true,
+            } } };
+        }
+        // v0.4.1 H14：断点续传分块上传（PATCH + Upload-Offset；状态落盘可续传）
+        if (eql(u8, a.action, "uploadResumable")) {
+            const path = a.path orelse return error.MissingPath;
+            if (path.len == 0 or std.fs.path.isAbsolute(path) == false) return error.AbsolutePathRequired;
+            return .{ .http = .{ .upload_resumable = .{
+                .id = a.id orelse 0,
+                .url = a.url orelse return error.MissingUrl,
+                .path = path,
+                .chunk_size = a.chunk_size orelse 64 * 1024,
+                .fail_after = a.fail_after orelse 0,
             } } };
         }
         return error.UnknownHttpAction;
