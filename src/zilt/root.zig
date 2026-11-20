@@ -108,6 +108,11 @@ test {
     _ = @import("bindings.zig");
     _ = @import("bundler.zig");
     _ = @import("updater.zig");
+    // 测试补齐（v0.3.18 审计）：以下三模块此前只有 `pub const` 惰性声明，测试从未进入编译图
+    // （41 个用例长期未执行，其中 patch/png 已随 Zig 0.17 失效而无法编译）。
+    _ = @import("patch.zig");
+    _ = @import("png.zig");
+    _ = @import("ico.zig");
     if (builtin.os.tag == .windows) {
         _ = @import("platform/windows/backend.zig");
         _ = @import("platform/windows/sqlite.zig");
@@ -120,5 +125,16 @@ test {
         _ = @import("platform/windows/system_integration.zig");
         _ = @import("platform/windows/custom_scheme.zig");
         _ = @import("platform/windows/dpapi.zig");
+        _ = @import("platform/windows/dcomp.zig"); // v0.3.19：vtable 槽位回归（v0.3.18 根因）
+        // 测试补齐（v0.3.18 审计）：此前未纳入测试图的平台模块
+        _ = @import("platform/windows/app_data.zig");
+        _ = @import("platform/windows/deep_link.zig");
+        _ = @import("platform/windows/dialog_ext.zig");
+        _ = @import("platform/windows/icon.zig");
+        _ = @import("platform/windows/menu_runtime.zig");
+        _ = @import("platform/windows/range.zig");
+        _ = @import("platform/windows/single_instance.zig");
+        _ = @import("platform/windows/tray.zig");
+        _ = @import("platform/windows/winhttp.zig");
     }
 }

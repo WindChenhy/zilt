@@ -1050,21 +1050,27 @@ pub fn systemRequestFromArgs(method: []const u8, a: Args) !system_api.Request {
 /// v0.3.6：SharedBuffer 二进制通道。request {size, rid} → 分配确定性载荷
 /// （pseudorandom 字节 + 头部 8 字节 size/seed）→ ctx.postBinary（SharedBuffer）
 /// → JS 'sharedbufferreceived' 事件（additionalData.rid 匹配 Promise）。
+/// v0.3.6：确定性载荷填充（JS 侧在 sharedbufferreceived 处理器内按同一公式重算
+/// checksum 并与 Zig 返回值比对；字节本身零拷贝留在共享缓冲区）。返回字节和。
+/// v0.3.19：抽为纯函数以便单测锁定这条跨语言契约。
+pub fn fillBinaryPayload(buf: []u8, rid: u64) u32 {
+    const seed: u8 = @truncate(rid +% 0x5A);
+    var sum: u32 = 0;
+    for (buf, 0..) |*b, i| {
+        b.* = @truncate((i *% 31 +% seed) & 0xff);
+        sum +%= b.*;
+    }
+    return sum;
+}
+
 fn binaryCmd(ctx: ipc.Context, a: Args) ![]u8 {
     const size = a.size orelse return error.MissingSize;
     if (size > 32 * 1024 * 1024) return error.BinaryTooLarge; // 上限 32MB
     const rid = a.rid orelse 0;
 
-    // 确定性载荷：字节值 = (i * 31 + seed) 截断——JS 侧在 sharedbufferreceived
-    // 处理器内重算 checksum 并与这里返回的期望值比对（字节本身零拷贝留在缓冲区）
     const bytes = try ctx.allocator.alloc(u8, size);
     defer ctx.allocator.free(bytes);
-    const seed: u8 = @truncate(@as(u64, @bitCast(rid)) +% 0x5A);
-    var sum: u32 = 0;
-    for (bytes, 0..) |*b, i| {
-        b.* = @truncate((i *% 31 +% seed) & 0xff);
-        sum +%= b.*;
-    }
+    const sum = fillBinaryPayload(bytes, @bitCast(rid));
 
     const additional = try std.fmt.allocPrint(ctx.allocator, "{{\"rid\":{d},\"size\":{d}}}", .{ rid, size });
     defer ctx.allocator.free(additional);
@@ -1431,4 +1437,25 @@ test "v0.3.14: app builtin 动作名未知时明确报错" {
         }.f,
     };
     try testing.expectError(error.UnknownAppAction, appCmd(ctx, .{ .action = "explode" }));
+}
+
+test "v0.3.6: SharedBuffer 确定性载荷与字节和（JS 侧同公式）" {
+    const testing = std.testing;
+    var buf: [8]u8 = undefined;
+    const sum = fillBinaryPayload(&buf, 1);
+    try testing.expectEqual(@as(u8, 0x5B), buf[0]); // seed = rid + 0x5A
+    try testing.expectEqual(@as(u8, 0x7A), buf[1]); // +31
+    var expect: u32 = 0;
+    for (buf) |b| expect += b;
+    try testing.expectEqual(expect, sum);
+
+    // 相同入参 → 相同载荷（页面按 rid 重算 checksum 的前提）
+    var buf2: [8]u8 = undefined;
+    _ = fillBinaryPayload(&buf2, 1);
+    try testing.expectEqualSlices(u8, &buf, &buf2);
+
+    // 不同 rid → 不同载荷
+    var buf3: [8]u8 = undefined;
+    _ = fillBinaryPayload(&buf3, 2);
+    try testing.expect(!std.mem.eql(u8, &buf, &buf3));
 }

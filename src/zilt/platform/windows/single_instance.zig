@@ -50,7 +50,7 @@ pub const Guard = struct {
 
 const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
 
-pub const SealError = error{ InvalidKey, InvalidFormat, BadSignature };
+pub const SealError = error{ InvalidKey, InvalidFormat, BadSignature, OutOfMemory };
 
 /// 解析 64 字符 hex → 32 字节密钥（与 isolation.keyFromHex 同语义）。
 fn keyFromHex(hex: []const u8) SealError![32]u8 {
@@ -64,14 +64,11 @@ fn keyFromHex(hex: []const u8) SealError![32]u8 {
 /// payload 为原样字节（deep_link.parsePayload 的 JSON），nonce 随机防重放。
 pub fn sealPayload(alloc: std.mem.Allocator, key_hex: []const u8, payload: []const u8, nonce: [16]u8) SealError![]u8 {
     const key = try keyFromHex(key_hex);
-    var nonce_hex: [32]u8 = undefined;
-    _ = std.fmt.bufPrint(&nonce_hex, "{x:0>2}{x:0>2}", .{ nonce[0..8], nonce[8..16] }) catch unreachable;
+    const nonce_hex: [32]u8 = std.fmt.bytesToHex(nonce, .lower);
     var mac: [Hmac.mac_length]u8 = undefined;
     Hmac.create(&mac, payload, &key);
-    var mac_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&mac_hex, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{ mac[0..8], mac[8..16], mac[16..24], mac[24..32] }) catch unreachable;
-    // nonce_hex 是 64 字符（每字节 2 hex × 16B）——修正：32 字符
-    return std.fmt.allocPrint(alloc, "zilt1|{s}|{s}|{s}", .{ nonce_hex[0..32], mac_hex, payload });
+    const mac_hex: [64]u8 = std.fmt.bytesToHex(mac, .lower);
+    return std.fmt.allocPrint(alloc, "zilt1|{s}|{s}|{s}", .{ nonce_hex[0..], mac_hex[0..], payload });
 }
 
 /// 验封：校验前缀 + HMAC；成功返回载荷副本（alloc 拥有），失败返回 null。
@@ -85,11 +82,15 @@ pub fn openPayload(alloc: std.mem.Allocator, key_hex: []const u8, sealed: []cons
         std.log.warn("[single-instance] plaintext payload rejected (sealing required)", .{});
         return null;
     }
-    var it = std.mem.splitScalar(u8, sealed[prefix.len..], '|');
-    const nonce_hex = it.next() orelse return null;
-    const mac_hex = it.next() orelse return null;
-    const payload = it.next() orelse return null;
-    if (nonce_hex.len != 32 or mac_hex.len != 64) return null;
+    // 定长解析：n(32 hex) | s(64 hex) | payload——payload 自身可能含 '|'
+    //（deepLink URL 参数常见），split 会把载荷截断导致 HMAC 永不匹配。
+    const rest = sealed[prefix.len..];
+    if (rest.len < 32 + 1 + 64 + 1) return null;
+    const nonce_hex = rest[0..32];
+    if (rest[32] != '|') return null;
+    const mac_hex = rest[33..97];
+    if (rest[97] != '|') return null;
+    const payload = rest[98..];
 
     var nonce: [16]u8 = undefined;
     _ = std.fmt.hexToBytes(&nonce, nonce_hex) catch return null;

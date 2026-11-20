@@ -7,7 +7,8 @@
 //! ABI 槽位以 Windows SDK 10.0.26100.0 um/dcomp.h 逐一核对（DECLARE_INTERFACE_IID_
 //! 段）：IDCompositionDevice {C37EA93A-…} Commit(3)/CreateTargetForHwnd(6)/
 //! CreateVisual(7)；IDCompositionTarget {EACDD04C-…} SetRoot(3)；
-//! IDCompositionVisual {4D93059D-…} SetContent(11)/AddVisual(12)。
+//! IDCompositionVisual {4D93059D-…} SetContent(15)/AddVisual(16)——**v0.3.18 修正**：
+//! 重载接口各占 2 槽，v0.3.12 误记 11/12（调用落到 SetBorderMode 报 E_INVALIDARG）。
 //! IID 值同样取自该头（DECLARE_INTERFACE_IID_ 第三参）。
 const std = @import("std");
 const win32 = @import("win32.zig");
@@ -130,4 +131,23 @@ pub fn createDevice(rendering_device: ?*anyopaque) ?*Device {
     const hr = api.createDevice2(rendering_device, &IID_IDCompositionDevice, &out);
     if (com.failed(hr)) return null;
     return @ptrCast(@alignCast(out.?));
+}
+
+// ---------------------------------------------------------------------------
+// 测试：ABI 槽位锁定（v0.3.18 渲染专项的根因就是槽位算错——加用例防回归）
+// ---------------------------------------------------------------------------
+
+test "v0.3.18: DComp vtable 槽位（重载位导致的错位已修正）" {
+    const slot = @sizeOf(*const anyopaque);
+    // IDCompositionDevice
+    try std.testing.expectEqual(@as(usize, 3), @offsetOf(Device.VTable, "Commit") / slot);
+    try std.testing.expectEqual(@as(usize, 6), @offsetOf(Device.VTable, "CreateTargetForHwnd") / slot);
+    try std.testing.expectEqual(@as(usize, 7), @offsetOf(Device.VTable, "CreateVisual") / slot);
+    // IDCompositionTarget
+    try std.testing.expectEqual(@as(usize, 3), @offsetOf(Target.VTable, "SetRoot") / slot);
+    // IDCompositionVisual：SetOffsetX/Y、Transform、Clip 各占 2 槽
+    try std.testing.expectEqual(@as(usize, 12), @offsetOf(Visual.VTable, "SetBorderMode") / slot);
+    try std.testing.expectEqual(@as(usize, 13), @offsetOf(Visual.VTable, "SetClip") / slot);
+    try std.testing.expectEqual(@as(usize, 15), @offsetOf(Visual.VTable, "SetContent") / slot);
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(Visual.VTable, "AddVisual") / slot);
 }

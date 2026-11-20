@@ -122,6 +122,10 @@ pub fn buildPatch(alloc: std.mem.Allocator, old: []const u8, new: []const u8) Pa
                     // 精比通过 → 向后延伸
                     var l: usize = block_size;
                     while (o + l < old.len and i + l < new.len and old[o + l] == new[i + l]) l += 1;
+                    // 保持 4KiB 对齐：COPY 只在块边界收尾（除非已到 new 末尾）。否则一次
+                    // 块内改动会让 i 相对块栅格漂移，后续块再也命中不了旧文件的块索引，
+                    // 剩余内容整段退化为 LITERAL（200KB 文件改 100 字节 → 150KB 补丁）。
+                    if (i + l != new.len) l = l / block_size * block_size;
                     if (l > matched_len) {
                         matched_len = l;
                         matched_off = o;
@@ -187,7 +191,7 @@ test "buildPatch/applyPatch: 小改动（大部分 COPY）" {
     defer testing.allocator.free(old);
     const new = try testing.allocator.dupe(u8, old);
     defer testing.allocator.free(new);
-    @memcpy(new[50_000..50_100], "PATCHED-REGION-0123456789PATCHED-REGION!!"); // 100 字节改动
+    @memset(new[50_000..50_100], 0x5A); // 100 字节改动（原字面量仅 41 字节 → 编译期长度不符）
     const patch = try buildPatch(testing.allocator, old, new);
     defer testing.allocator.free(patch);
     try testing.expect(patch.len < 20_000); // 远小于全量
@@ -213,10 +217,12 @@ test "buildPatch/applyPatch: 全新内容（全 LITERAL）+ 追加尾部" {
 test "applyPatch: 基线错误 → sha256 拦截" {
     const old_a = try randomBytes(testing.allocator, 50_000, 5);
     defer testing.allocator.free(old_a);
-    const old_b = try randomBytes(testing.allocator, 50_000, 6);
+    const old_b = try randomBytes(testing.allocator, 50_000, 6); // 同长度、不同内容
     defer testing.allocator.free(old_b);
-    const new = try randomBytes(testing.allocator, 50_000, 7);
+    // 补丁必须含 COPY 才能检验基线：全 LITERAL 补丁与基线无关（重建结果仍正确）
+    const new = try testing.allocator.dupe(u8, old_a);
     defer testing.allocator.free(new);
+    new[1000] ^= 0xFF;
 
     const patch = try buildPatch(testing.allocator, old_a, new);
     defer testing.allocator.free(patch);

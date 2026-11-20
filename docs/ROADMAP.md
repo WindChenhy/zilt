@@ -2,6 +2,10 @@
 
 > 依据：`docs/research/zig-webview-gui-framework-feasibility.md` §6.2。
 > **优先级调整（2026-11-07）**：Windows 优先做深（Phase 0→2 连续完成），Linux/macOS（原 Phase 1）后置。
+>
+> **范围说明**：本文档记录到 **v0.1.24**（Windows 全栈）。后续版本的逐版本实施与验收记录在
+> [`docs/v0.2-LINUX.md`](v0.2-LINUX.md)（v0.2.0–v0.3.1）与
+> [`docs/v0.3.x-PLAN.md`](v0.3.x-PLAN.md)（v0.3.2–v0.3.19），当前版本见 `src/zilt/version.zig`。
 
 ## Phase 0 — Windows PoC ✅ 完成（2026-11-07）
 

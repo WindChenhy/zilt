@@ -143,14 +143,14 @@ const testing = std.testing;
 
 test "Tray.init: 结构体字段与 tooltip" {
     var tray = try Tray.init(testing.allocator, @ptrFromInt(0x1000), 0x8100, "Zilt 托盘", null);
-    defer tray.allocator.free(tray.nid.szTip[0..0]); // szTip 内嵌数组无需释放
+    // szTip 是内嵌定长数组，无堆分配可释放
 
     try testing.expectEqual(@sizeOf(win32.NOTIFYICONDATAW), tray.nid.cbSize);
     try testing.expectEqual(@as(win32.UINT, 1), tray.nid.uID);
     try testing.expect(win32.NIF_MESSAGE | win32.NIF_ICON | win32.NIF_TIP == tray.nid.uFlags);
     try testing.expectEqual(@as(win32.UINT, 0x8100), tray.nid.uCallbackMessage);
-    try testing.expectEqualSlices(u16, &.{ 'Z', 'i', 'l', 't', ' ', 0x6258, 0x76D8 }, tray.nid.szTip[0..6]);
-    try testing.expectEqual(@as(u16, 0), tray.nid.szTip[6]);
+    try testing.expectEqualSlices(u16, &.{ 'Z', 'i', 'l', 't', ' ', 0x6258, 0x76D8 }, tray.nid.szTip[0..7]);
+    try testing.expectEqual(@as(u16, 0), tray.nid.szTip[7]); // 7 个码元后为 NUL
     try testing.expect(!tray.active);
 }
 
@@ -164,7 +164,9 @@ test "utf16Trunc: 边界截断 + NUL" {
     // 短于上限 → 原样
     const s = try utf16Trunc(16, testing.allocator, "hi");
     defer testing.allocator.free(s);
-    try testing.expectEqualStrings("hi", std.unicode.utf16LeToUtf8Alloc(testing.allocator, s) catch unreachable);
+    const back = std.unicode.utf16LeToUtf8Alloc(testing.allocator, s) catch unreachable;
+    defer testing.allocator.free(back);
+    try testing.expectEqualStrings("hi", back);
 
     // 多字节字符不跨界截断（按码元数）
     const c = try utf16Trunc(3, testing.allocator, "你a你b");

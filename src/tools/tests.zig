@@ -10,6 +10,8 @@ test {
     _ = @import("capability_codegen.zig");
     _ = @import("gen_capabilities.zig");
     _ = @import("init.zig");
+    // 测试补齐（v0.3.18 审计）：driver.zig 跨平台化（v0.2.9）后其单测未进入任何测试根
+    _ = @import("driver.zig");
 
     if (builtin.os.tag == .windows) {
         _ = @import("win_env.zig");

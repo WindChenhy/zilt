@@ -191,8 +191,8 @@ const testing = std.testing;
 test "decode minimal 2x2 RGBA png (hand-built)" {
     // 手工构造一个最小合法 PNG：IHDR + IDAT(zlib) + IEND，2x2 RGBA8
     const zlib = try buildZlibIdat(testing.allocator, &[_]u8{
-        0, 0xFF, 0x00, 0x00, 0xFF, // 行0 filter=0: 红、绿
-        0, 0x00, 0x00, 0xFF, 0xFF, // 行1 filter=0: 蓝、白（半透明）
+        0, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, // 行0 filter=0: 红、绿
+        0, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x80, // 行1 filter=0: 蓝、半透明白
     });
     defer testing.allocator.free(zlib);
 
@@ -256,9 +256,10 @@ fn pushChunk(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), ctype: 
 fn buildZlibIdat(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
+    try aw.ensureTotalCapacity(256); // Compress.init 断言 output.buffer.len > 8
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var cmp = try std.compress.flate.Compress.init(&aw.writer, &window, .zlib, .fastest);
     try cmp.writer.writeAll(raw);
-    try cmp.finish(&aw.writer);
+    try cmp.finish();
     return alloc.dupe(u8, aw.written());
 }

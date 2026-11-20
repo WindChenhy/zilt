@@ -169,7 +169,7 @@ const testing = std.testing;
 
 test "parseArgs: scheme URL / 忽略旗标与不存在路径" {
     const args = [_][]const u8{ "--zilt-x", "zilt://open?id=7", "C:\\definitely\\not\\here.txt", "ZILT://upper", "" };
-    const l = try parseArgs(testing.allocator, &args, "zilt");
+    var l = try parseArgs(testing.allocator, &args, "zilt");
     defer l.deinit(testing.allocator);
     try testing.expectEqualStrings("zilt://open?id=7", l.url.?);
     try testing.expectEqual(@as(usize, 0), l.files.len);
@@ -181,13 +181,13 @@ test "payloadOfArgs / parsePayload: 往返" {
     defer testing.allocator.free(payload);
     try testing.expectEqualStrings("zilt://a\nb\n--flag", payload);
 
-    const l = try parsePayload(testing.allocator, payload, "zilt");
+    var l = try parsePayload(testing.allocator, payload, "zilt");
     defer l.deinit(testing.allocator);
     try testing.expectEqualStrings("zilt://a", l.url.?);
 }
 
 test "parsePayload: 空载荷" {
-    const l = try parsePayload(testing.allocator, "", "zilt");
+    var l = try parsePayload(testing.allocator, "", "zilt");
     defer l.deinit(testing.allocator);
     try testing.expect(l.isEmpty());
 }

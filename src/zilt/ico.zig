@@ -114,7 +114,7 @@ test "encodeIco produces valid icondir and entry sizes" {
     // 第一个条目：16x16 32bpp
     try testing.expectEqual(@as(u8, 16), ico[6]);
     try testing.expectEqual(@as(u8, 16), ico[7]);
-    try testing.expectEqual(@as(u16, 32), std.mem.readInt(u16, ico[14..16], .little));
+    try testing.expectEqual(@as(u16, 32), std.mem.readInt(u16, ico[12..14], .little));
     // 条目数据偏移 = 6 + 16*2
     const off1 = std.mem.readInt(u32, ico[18..22], .little);
     try testing.expectEqual(@as(u32, 6 + 32), off1);

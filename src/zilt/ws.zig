@@ -414,6 +414,27 @@ test "frame round-trip for small / medium / large payloads" {
     }
 }
 
+test "encodeFrameServer never sets the mask bit (v0.3.13 回归)" {
+    const a = testing.allocator;
+    // 服务端帧带掩码会被真实浏览器按协议错误断开（v0.3.7 缺陷，v0.3.13 修正）
+    const sizes = [_]usize{ 0, 5, 125, 126, 200, 65535, 65536 };
+    for (sizes) |n| {
+        const payload = try a.alloc(u8, n);
+        defer a.free(payload);
+        for (payload, 0..) |*b, i| b.* = @intCast(i % 251);
+
+        const wire = try encodeFrameServer(a, .text, payload);
+        defer a.free(wire);
+
+        try testing.expectEqual(@as(u8, 0x81), wire[0]); // FIN=1 | text
+        try testing.expectEqual(@as(u8, 0), wire[1] & 0x80); // 无掩码位
+        const f = try parseFrame(a, wire);
+        defer a.free(f.payload);
+        try testing.expectEqual(n, f.payload.len);
+        try testing.expectEqualSlices(u8, payload, f.payload);
+    }
+}
+
 test "parseFrame tolerates unmasked server frames" {
     const a = testing.allocator;
     // 服务端帧：FIN|text, len=5, 无掩码
