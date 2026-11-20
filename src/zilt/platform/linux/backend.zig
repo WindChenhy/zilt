@@ -30,7 +30,7 @@
 //!     * **cookies**：WebKitCookieManager 的 get/set/delete/按域名清理
 //!       （异步 API 用嵌套 GMainLoop 同步化；返回 {"cookies":[…]} 与 Windows 同形）。
 //!     * **clear_storage**：WebKitWebsiteDataManager::clear（本版为全来源清理，
-//!       origin 参数不参与过滤——超集语义，已在 docs/v0.2-LINUX.md 标注）。
+//!       origin 参数不参与过滤——超集语义）。
 //!     * **截图**：WebKit 无 CDP，仅支持 `Page.captureScreenshot`（PNG）——
 //!       webkit_web_view_get_snapshot + cairo PNG + base64 → `webviewCdp` 事件，
 //!       runtime 的 captureScreenshot 无需改动；其余 CDP 方法 NotSupported。
@@ -754,7 +754,7 @@ pub fn run(comptime config: Config) !void {
         alloc.destroy(self);
     }
 
-    // 无 DISPLAY 时 gtk_init 会直接 abort —— CI 必须用 xvfb-run（见 docs/v0.2-LINUX.md §7）
+    // 无 DISPLAY 时 gtk_init 会直接 abort —— CI 必须用 xvfb-run
     gtk_compat.gtkInit();
     // v0.3.0：WM 探测（Xvfb 裸跑无 WM → windowMoved/Resized/Focus 不会触发；
     // CI 装 openbox 后这些事件真实生效，冒烟据此决定是否断言）
@@ -1125,7 +1125,7 @@ fn Backend(comptime config: Config) type {
         const MenuKind = enum { menu, tray_menu };
 
         /// 托盘（v0.2.2）：libayatana-appindicator3 为**可选依赖**，用 dlopen 动态加载；
-        /// 缺失时只记日志不阻断启动（对齐 docs/v0.2-LINUX.md §2.3 的决定）。
+        /// 缺失时只记日志不阻断启动。
         const Tray = struct {
             lib: std.DynLib,
             indicator: ?*anyopaque,
@@ -8573,7 +8573,7 @@ fn Backend(comptime config: Config) type {
         /// v0.3.9 A4L 冒烟：按键派发探针（{windowId, key, ctrl}）。
         /// 走与 key-press-event handler **同一条匹配→事件路径**（matchKeyBinding +
         /// emitKeyBinding），keyval/mods 由 key 名合成。X 层注入（XSendEvent/XTest）
-        /// 实测在 Xvfb+WebKit 下段错（环境限制，见 ROADMAP），真实按键路径由
+        /// 实测在 Xvfb+WebKit 下段错（环境限制），真实按键路径由
         /// matchKeyBinding 单测 + GTK key-press 语义保证。
         fn smokeKeyBindInject(self: *Self, args_json: []const u8) void {
             var arena = std.heap.ArenaAllocator.init(self.allocator);

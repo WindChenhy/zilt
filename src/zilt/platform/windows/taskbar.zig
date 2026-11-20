@@ -1,8 +1,8 @@
 //! 任务栏集成 Windows 实现（v0.1.13）：ITaskbarList3。
 //!
 //! 覆盖：进度条、overlay 图标、缩略图提示、缩略图工具栏按钮、闪烁窗口。
-//! Jump List 需要 ICustomDestinationList + IShellLink 组合，见 docs/ROADMAP 的
-//! v0.1.13 备注（当前未实现，调用会返回 error.JumpListNotImplemented）。
+//! Jump List 需要 ICustomDestinationList + IShellLink 组合
+//! （当前未实现，调用会返回 error.JumpListNotImplemented）。
 //!
 //! ABI 依据：ShellApi.h / ShObjIdl_core.h（ITaskbarList3 槽序：
 //! IUnknown 3 + ITaskbarList 5 + ITaskbarList2 1 + ITaskbarList3 12 = 21）。

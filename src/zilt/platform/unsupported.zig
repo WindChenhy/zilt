@@ -7,6 +7,6 @@ pub fn run(comptime config: Config) !void {
     _ = config;
     @compileError(
         \\Zilt: 当前平台尚无后端。
-        \\  已支持：Windows（v0.1.x）；Linux 在 v0.2 落地（docs/v0.2-LINUX.md）；macOS 计划 v0.3+。
+        \\  已支持：Windows（v0.1.x）；Linux 在 v0.2 落地；macOS 计划 v0.3+。
     );
 }

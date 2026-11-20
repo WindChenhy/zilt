@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 性能基线（v0.2.5）：Release 构建 → 冷启动（进程级）+ 冒烟全程耗时 + 峰值 RSS。
-# 输出 .zilt-probe/perf.log；供 docs/v0.2-LINUX.md §性能基线 引用（每版重跑对比）。
+# 输出 .zilt-probe/perf.log（每版重跑对比）。
 set -eu
 cd "$(dirname "$0")/../.."
 LOG=".zilt-probe/perf.log"

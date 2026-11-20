@@ -122,7 +122,7 @@ pub const windows_capabilities = [_]Capability{
     .prevent_overflow,      .tray_attach_window,   .binary_ipc,
 };
 
-/// Linux 目标能力（v0.2.0–v0.2.9 的验收清单；见 docs/v0.2-LINUX.md §5）。
+/// Linux 目标能力（v0.2.0–v0.2.9 的验收清单）。
 /// 平台独占项（taskbar / mica / PE 资源 / Authenticode / MSIX）刻意不在列表内。
 pub const linux_target_capabilities = [_]Capability{
     .window,                .multi_window,   .window_state,      .window_transparency,

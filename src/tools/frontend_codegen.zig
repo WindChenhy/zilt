@@ -2,7 +2,7 @@
 //! 遍历前端 dist 目录（win32 FindFirstFile，自包含实现）→ 生成 zilt-assets 模块
 //! （@embedFile 相对路径表 + payload 副本）。
 //!
-//! 设计要点（对标 tauri-codegen，见 docs/research/frontend-integration.md §4.2）：
+//! 设计要点（对标 tauri-codegen）：
 //!  - 遍历结果按路径排序 → 生成文件内容确定 → zig 缓存命中（资产未变不重编）
 //!  - 内建排除：node_modules/.git/zig-cache 等（防误嵌，Tauri build.rs 同款防御）
 //!  - dist 缺失 → 空资产表 + 生成文件内注释警告（应用可构建，运行时 404）

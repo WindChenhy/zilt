@@ -13,7 +13,7 @@ pub const exe_name = "zilt-app.exe";
 // 自定义示例：pub const icon: ?[]const u8 = "frontend/app.ico";
 pub const icon: ?[]const u8 = null;
 
-// 前端工程配置（语义对齐 Tauri build 四件套，见 docs/research/frontend-integration.md §4.1）
+// 前端工程配置（语义对齐 Tauri build 四件套）
 // v0.3.4：侧车资源（resources）——随安装器/便携包分发的外部文件（相对项目根）。
 // 目录 = 整树复制；文件 = 单文件。安装布局：<安装目录>/resources/<相对路径>。
 // 运行时经 `window.zilt.path.resource(rel)` 解析（exe 目录 + resources/rel）。

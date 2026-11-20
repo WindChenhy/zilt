@@ -1,6 +1,6 @@
 //! WebView2 运行时发现与加载（纯 Zig，替代官方 WebView2Loader.dll，0 胶水）。
 //!
-//! 协议依据（docs/reference/webview2-binding-notes.md §D，已本机实证）：
+//! 协议依据（已本机实证）：
 //!  1. 注册表 `HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\ClientState\{F3017226-…}` 的
 //!     `EBWebView` 值（REG_SZ）指向当前版本目录；备选 `Clients\{…}` 的 `pv`+`location`；
 //!     再备选默认安装目录扫描。版本第 3 段须 ≥ 1150（API 版本门槛，同 webview 0.12.0）。

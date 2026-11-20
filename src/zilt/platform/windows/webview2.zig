@@ -1,7 +1,7 @@
 //! WebView2 COM 接口绑定（消费侧）—— vtable 槽位与 IID 逐字对齐官方 SDK 头文件。
 //!
 //! ABI 依据：Microsoft.Web.WebView2 1.0.4314.35 / build/native/include/WebView2.h
-//! （逐槽核对记录见 docs/reference/webview2-binding-notes.md，勿凭记忆改动槽序）。
+//! （勿凭记忆改动槽序）。
 //!
 //! 约定：
 //!  - 接口 = extern struct { lpVtbl: *const VTable }；方法通过便捷包装调用。

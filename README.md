@@ -7,8 +7,7 @@
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
 **当前状态：v0.3.19（测试体系收口——74 个从未执行的用例入图 + 8 处真实缺陷修复 + 文档校准）**。
-逐版本功能项与验收记录分散在三份文档：[docs/ROADMAP.md](docs/ROADMAP.md)（v0.1.0–v0.1.24）、
-[docs/v0.2-LINUX.md](docs/v0.2-LINUX.md)（v0.2.0–v0.3.1）、[docs/v0.3.x-PLAN.md](docs/v0.3.x-PLAN.md)（v0.3.2–v0.3.19）。
+逐版本功能项与验收记录见 git 提交历史（原 docs/ 目录随文档清理移除）；后续 v0.4.x 规划见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
@@ -602,7 +601,7 @@ v0.1.17 新增（2026-11-08，均已实现、验证并提交）：
 - **npm 运行时包 + 脚手架**：`zilt npm-pack` 生成 `@zilt/runtime`（Node require 实测）；`zilt new <dir> -t <tmpl>` 与 `npm/create-zilt-app`（优先 zilt CLI，回退 `zig build init`），自动定位框架根
 - **模板扩充**：4 → 8 个模板——新增 **htmx**（离线内嵌 htmx.min.js + 资产服务真实请求）、**solid**、**preact**、**angular 19**（standalone + application builder）；顺带修复占位符从未替换/从未赋值两处既有缺陷
 - **WebDriver 自动化**：`zilt-driver`（新 exe）走 msedgedriver W3C 协议直驱 WebView2（`ZILT_WEBVIEW2_ARGS` 注入调试端口 + `ms:edgeOptions.debuggerAddress`），默认 4 条断言 + `--script` 自定义，无驱动 SKIP(3)；**实测 4/4 passed**；`zig build e2e` 接入
-- **CI / 签名流水线**：`.github/workflows/ci.yml`（test 构建+单测+冒烟+可选 WebDriver → package NSIS+zip → tag 签名发布）+ `docs/CI.md`
+- **CI / 签名流水线**：`.github/workflows/ci.yml`（test 构建+单测+冒烟+可选 WebDriver → package NSIS+zip → tag 签名发布）
 - **多 WebView 数据分区**（2026-11-09）：`webviews.create({partition:'login'})` → 独立 WebView2 Environment + 独立 user data folder（`<profile>\WebView2-partitions\<name>`），Cookie/localStorage/IndexedDB 与主页面隔离；同名分区复用同一 Environment；新增 `webviews.eval(id, script)`（异步事件回传，包成 Promise）。**实测**：alpha/beta 分区 localStorage 互不可见、共享实例与主页面互通，两个 user data 目录真实落盘（12M/7.7M）
 - **日志轮转**：4MB 阈值，zilt.log → .1 → .2 → .3（实测 5MB 日志轮转）
 - **验收**：单元测试 **234/234**（框架 216 + 工具 18）；GUI 冒烟 **32 项** ALL PASSED（exit 0，含数据分区隔离）；WebDriver 4/4；headless 四端点 + SQL 真 E2E；日志轮转实测；`zilt version` 报 0.1.17
@@ -657,8 +656,7 @@ ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=my-app zig build init
 - **Windows 10/11**：系统自带 WebView2 运行时，无需安装任何 SDK。
 - **Linux**：GTK3 + WebKit2GTK 4.1 开发包与 `pkg-config`（Debian/Ubuntu：
   `libgtk-3-dev libwebkit2gtk-4.1-dev libx11-dev`；GTK4 变体改用
-  `libgtk-4-dev libwebkitgtk-6.0-dev` 并加 `-Dgtk=gtk4`）；无显示环境用 `xvfb-run`
-  （详见 [docs/v0.2-LINUX.md](docs/v0.2-LINUX.md)）。
+  `libgtk-4-dev libwebkitgtk-6.0-dev` 并加 `-Dgtk=gtk4`）；无显示环境用 `xvfb-run`。
 - **macOS**：尚未实现（见平台表）。
 
 ```sh
@@ -759,15 +757,3 @@ pub fn greet(ctx: zilt.Context, args: struct { name: []const u8 }) !struct { mes
 
 前端：`const g = await window.zilt.invoke('greet', { name: 'Zilt' });`
 TS 工程用生成的绑定：`const g = await greet({ name: 'Zilt' });`（全类型）
-
-## 文档
-
-| 文档 | 内容 |
-|---|---|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 分层架构、IPC/内存契约、运行模式 |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | 路线图与验收记录 |
-| [docs/v0.3.x-PLAN.md](docs/v0.3.x-PLAN.md) | **v0.3.x 系列规划**（对齐 Wails v3 / Tauri 2 差距：v0.3.2–v0.3.19 切片 + 三轮差距刷新） |
-| [docs/v0.2-LINUX.md](docs/v0.2-LINUX.md) | **v0.2 Linux 开发需求文档**（选型/架构/功能矩阵/v0.2.0–v0.3.1 里程碑与实施记录） |
-| [docs/research/](docs/research/) | 可行性调研报告（全部一手来源） |
-| [docs/reference/](docs/reference/) | WebView2 ABI 笔记（IID/vtable/loader 协议/实测陷阱） |
-| [docs/adr/](docs/adr/) | 架构决策记录 |

@@ -182,7 +182,7 @@ fn windowsOnlyStep(b: *std.Build, name: []const u8, desc: []const u8, target_os:
     const msg = b.fmt(
         "`{s}` 依赖 Win32（{s}），当前 target 是 {s}。\n" ++
             "Linux 支持在 v0.2 分阶段推进：工具层先从 Win32 文件/编码 API 解耦，" ++
-            "再补 GTK 后端（见 docs/v0.2-LINUX.md 与 ROADMAP 的 v0.2.0 拆分）。",
+            "再补 GTK 后端（v0.2.0 起分阶段拆分）。",
         .{ name, desc, @tagName(target_os) },
     );
     step.dependOn(&b.addFail(msg).step);
@@ -218,7 +218,7 @@ pub fn build(b: *std.Build) void {
     // ---- Linux：GTK 变体（v0.2.5）----
     // -Dgtk=gtk4 切换到 GTK4 + WebKitGTK 6.0（Ubuntu 24.04+/Debian 13+）。
     // 本机/22.04 CI 无 webkitgtk-6.0 开发包时，pkg-config 给出可读报错——
-    // 完整 GTK4 后端（GtkMenuBar 移除/事件模型差异）见 docs/v0.2-LINUX.md §v0.2.5。
+    // 完整 GTK4 后端（GtkMenuBar 移除/事件模型差异）记录于 v0.2.5。
     const gtk_variant = b.option([]const u8, "gtk", "GTK toolkit variant: gtk3 (default) | gtk4") orelse "gtk3";
     if (!std.mem.eql(u8, gtk_variant, "gtk3") and !std.mem.eql(u8, gtk_variant, "gtk4")) {
         std.debug.print("invalid -Dgtk value (expected gtk3|gtk4)\n", .{});
@@ -465,7 +465,7 @@ pub fn build(b: *std.Build) void {
         const e2e_step = b.step("e2e", "Run WebDriver E2E against the built app (SKIP without msedgedriver)");
         e2e_step.dependOn(&e2e_run.step);
     } else {
-        // v0.2 计划：同一 driver 加 WebKitWebDriver 后端（docs/v0.2-LINUX.md §7）
+        // v0.2 计划：同一 driver 加 WebKitWebDriver 后端
         _ = windowsOnlyStep(b, "e2e", "WebDriver E2E", target_os);
     }
 

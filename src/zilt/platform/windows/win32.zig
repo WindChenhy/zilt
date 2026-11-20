@@ -1,6 +1,6 @@
 //! Win32 最小绑定 —— 仅 PoC 所需（窗口/消息循环/定时器/COM 内存/注册表/动态库）。
 //! 手写声明，零依赖；x64 编写（Windows x64 上 .c 即标准 x64 调用约定）。
-//! ABI 依据：Win32 官方头文件结构（见 docs/reference/）。
+//! ABI 依据：Win32 官方头文件结构。
 
 const std = @import("std");
 const com = @import("com.zig");
