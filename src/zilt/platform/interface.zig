@@ -141,11 +141,15 @@ pub const linux_target_capabilities = [_]Capability{
     .packaging,
     .real_scheme,           .incognito,      .monitor_current,   .power_events,
     .window_mask,           .hide_on_focus_lost, .resize_dragging, .prevent_overflow,
+    // v0.4.3 L6：tray_attach_window 实装（XEmbed 托盘：自建 GtkStatusIcon 左键
+    // toggle + gtk_status_icon_get_geometry 定位；SNI：secondary activate 目标项
+    // + 指针锚点；FFM 桌面禁用 hideOnFocusLost。GTK4 变体无托盘 → 随 tray 文档化）
+    .tray_attach_window,
     // v0.4.0 L8：window_key_bindings 于 v0.3.9 A4L 实装（Linux 清单补齐——
     // 此前清单与实现漂移：有单测有冒烟却未入清单）
     .window_key_bindings,
     // v0.3.2 平台差异：background_throttling / profile_settings（autofill/password）
-    // v0.3.3 平台差异：tray_attach_window（Linux 未实装 → L6，规划 v0.4.3；文档化）
+    // v0.3.3 平台差异：tray_attach_window 已随 L6 实装（见上）
     // v0.3.6 平台差异：binary_ipc（WebView2 SharedBuffer 独占；Linux 走 base64 分块）
 };
 

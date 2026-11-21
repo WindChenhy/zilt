@@ -223,6 +223,122 @@ pub const apprun_script =
     \\
 ;
 
+/// v0.4.3 L3：自包含 AppImage 的 AppRun（WebKit 随包）。
+///
+/// 占位符：`APP_EXE_NAME` / `WK_DIR` / `TRIPLET` / `APP_ID`。
+///
+/// 关键点：
+///   - `LD_LIBRARY_PATH` 只指向随包目录，宿主 WebKit/GTK 不会被优先加载；
+///   - WebKit 2.52 的 helper 路径是**编译期常量**（无 WEBKIT_EXEC_PATH，
+///     strace 实测：即使设置该变量仍 exec /usr/lib/…）→ 打包时已把 libwebkit
+///     里的 `/usr/lib/<triplet>/webkit2gtk-4.1` 改写成 `WK_DIR`（固定短路径，
+///     挂载点长度可变不能写死 AppImage 路径），这里用符号链把随包 helper
+///     暴露到该路径；
+///   - `WEBKIT_INJECTED_BUNDLE_PATH` 指向随包 injected-bundle（双保险：打包
+///     时同样改写了字面量路径）；
+///   - bwrap 沙箱：helper 在进入沙箱前 exec，路径/库在宿主命名空间已解析；
+///     沙箱内 WebKit 会自行 bind 注入包目录（WK_DIR 为 /tmp 下普通目录，内外一致）。
+pub const apprun_script_bundled =
+    \\#!/bin/sh
+    \\# v0.4.3 L3：自包含 AppImage（WebKit 随包；bwrap 内外路径一致）
+    \\HERE=$(dirname "$(readlink -f "$0")")
+    \\TRIPLET="@TRIPLET@"
+    \\export LD_LIBRARY_PATH="$HERE/usr/lib:$HERE/usr/lib/$TRIPLET${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    \\export WEBKIT_INJECTED_BUNDLE_PATH="$HERE/usr/lib/$TRIPLET/webkit2gtk-4.1/injected-bundle"
+    \\[ -d "$HERE/usr/lib/$TRIPLET/gio/modules" ] && export GIO_EXTRA_MODULES="$HERE/usr/lib/$TRIPLET/gio/modules"
+    \\[ -d "$HERE/usr/lib/$TRIPLET/gdk-pixbuf-2.0/2.10.0/loaders" ] && export GDK_PIXBUF_MODULEDIR="$HERE/usr/lib/$TRIPLET/gdk-pixbuf-2.0/2.10.0/loaders"
+    \\[ -f "$HERE/usr/share/glib-2.0/schemas/gschemas.compiled" ] && export GSETTINGS_SCHEMA_DIR="$HERE/usr/share/glib-2.0/schemas"
+    \\export XDG_DATA_DIRS="$HERE/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    \\# helper 暴露到打包时写入的固定路径（见上）
+    \\WK="WK_DIR"
+    \\# /tmp 共享：防符号链劫持——目录必须是我们自己的（非 -O 直接拒绝执行）
+    \\if [ -L "$WK" ]; then rm -f "$WK"; fi
+    \\mkdir -p "$WK" 2>/dev/null && chmod 700 "$WK" 2>/dev/null
+    \\if [ ! -O "$WK" ]; then echo "zilt: unsafe WebKit runtime dir $WK" >&2; exit 1; fi
+    \\for f in WebKitWebProcess WebKitNetworkProcess WebKitGPUProcess; do
+    \\  [ -x "$HERE/usr/lib/$TRIPLET/webkit2gtk-4.1/$f" ] && ln -sf "$HERE/usr/lib/$TRIPLET/webkit2gtk-4.1/$f" "$WK/$f" 2>/dev/null
+    \\done
+    \\[ -d "$HERE/usr/lib/$TRIPLET/webkit2gtk-4.1/injected-bundle" ] && ln -sfn "$HERE/usr/lib/$TRIPLET/webkit2gtk-4.1/injected-bundle" "$WK/injected-bundle" 2>/dev/null
+    \\exec "$HERE/usr/bin/APP_EXE_NAME" "$@"
+    \\
+;
+
+/// v0.4.3 L3：WebKit 固定运行时目录（helper 路径改写目标）。
+/// 长度必须 ≤ 原编译期前缀（x86_64 46 / aarch64 48 字节）；`/tmp/.zk-` + 12 hex。
+pub fn webkitRuntimeDir(alloc: std.mem.Allocator, app_id: []const u8, version: []const u8) ![]u8 {
+    var hasher = std.hash.Wyhash.init(0x6b696c74);
+    hasher.update(app_id);
+    hasher.update("\x00");
+    hasher.update(version);
+    const h = hasher.final();
+    return std.fmt.allocPrint(alloc, "/tmp/.zk-{x:0>12}", .{@as(u32, @truncate(h))});
+}
+
+/// ldd 输出行 → { soname, 解析路径 }。
+/// 形态：`\tlibgtk-3.so.0 => /usr/lib/…/libgtk-3.so.0 (0x00007f…)`；
+/// 跳过 `linux-vdso.so.1`、`ld-linux-…`、`not found` 与静态行。
+pub const LddEntry = struct { soname: []const u8, path: []const u8 };
+
+pub fn parseLddLine(line_in: []const u8) ?LddEntry {
+    const line = std.mem.trim(u8, line_in, " \t\r");
+    if (line.len == 0) return null;
+    const arrow = std.mem.indexOf(u8, line, "=>") orelse {
+        // 直接给绝对路径的行（`/lib64/ld-linux-x86-64.so.2 (0x…)`）
+        if (line[0] != '/') return null;
+        const sp = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+        return .{ .soname = std.fs.path.basename(line[0..sp]), .path = line[0..sp] };
+    };
+    const soname = std.mem.trim(u8, line[0..arrow], " \t");
+    if (soname.len == 0) return null;
+    var rest = std.mem.trim(u8, line[arrow + 2 ..], " \t");
+    if (std.mem.startsWith(u8, rest, "not found")) return null;
+    if (std.mem.lastIndexOfScalar(u8, rest, '(')) |lp| rest = std.mem.trim(u8, rest[0..lp], " \t");
+    if (rest.len == 0 or rest[0] != '/') return null;
+    return .{ .soname = soname, .path = rest };
+}
+
+/// 不随包分发的系统库（glibc 家族 / 编译器运行时 / 图形驱动栈）。
+/// 依据 linuxdeploy 的 excludelist 口径：这些库必须用宿主的（ABI 与驱动绑定）。
+pub fn lddExcluded(soname: []const u8) bool {
+    const exact = [_][]const u8{
+        "linux-vdso.so.1",
+        "libc.so.6",         "libm.so.6",           "libdl.so.2",
+        "libpthread.so.0",   "librt.so.1",          "libresolv.so.2",
+        "libnsl.so.1",       "libutil.so.1",        "libanl.so.1",
+        "libgcc_s.so.1",     "libstdc++.so.6",      "libz.so.1",
+        "libGL.so.1",        "libEGL.so.1",         "libGLX.so.0",
+        "libGLdispatch.so.0", "libOpenGL.so.0",     "libgbm.so.1",
+        "libdrm.so.2",       "libvulkan.so.1",      "libglapi.so.0",
+    };
+    for (exact) |e| if (std.mem.eql(u8, soname, e)) return true;
+    const prefixes = [_][]const u8{
+        "ld-linux",   "libnvidia-", "libcuda.so",     "libX11-xcb.so",
+        "libxcb-dri", "libxcb-glx",  "libxcb-shm.so",
+    };
+    for (prefixes) |p| if (std.mem.startsWith(u8, soname, p)) return true;
+    return false;
+}
+
+/// 在 `buf` 中把所有 `needle` 原地改写为 `replacement` + NUL 填充（长度不可增）。
+/// 返回替换次数。用于把 libwebkit 里编译期的 helper/注入包路径改写到固定短路径。
+pub fn patchCStringInPlace(buf: []u8, needle: []const u8, replacement: []const u8) usize {
+    if (needle.len == 0 or replacement.len > needle.len) return 0;
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i + needle.len <= buf.len) {
+        if (!std.mem.eql(u8, buf[i .. i + needle.len], needle)) {
+            i += 1;
+            continue;
+        }
+        @memcpy(buf[i .. i + replacement.len], replacement);
+        @memset(buf[i + replacement.len .. i + needle.len], 0);
+        count += 1;
+        i += needle.len;
+    }
+    return count;
+}
+
+
 /// .desktop（AppImage AppDir / deb 共用）。
 pub fn generateDesktopFile(alloc: std.mem.Allocator, meta: PackMeta) ![]u8 {
     const exe_base = if (std.mem.endsWith(u8, meta.exe_name, ".exe"))
@@ -257,6 +373,7 @@ pub fn generateRpmSpec(alloc: std.mem.Allocator, meta: PackMeta) ![]u8 {
         \\Summary:        {s}
         \\License:        Proprietary
         \\BuildArch:      x86_64
+        \\Source0:        {s}
         \\
         \\%description
         \\{s}
@@ -268,7 +385,71 @@ pub fn generateRpmSpec(alloc: std.mem.Allocator, meta: PackMeta) ![]u8 {
         \\%files
         \\/usr/bin/{s}
         \\
-    , .{ name, meta.version, meta.description, meta.description, exe_base, exe_base });
+    , .{ name, meta.version, meta.description, meta.description, exe_base, exe_base, exe_base });
+}
+
+// ---------------------------------------------------------------------------
+// AUR（PKGBUILD -bin 形态 + .SRCINFO；字段与 rpm/deb 命名约定一致）
+// ---------------------------------------------------------------------------
+
+/// AUR PKGBUILD（-bin 惯例：分发预编译二进制，不参与源码构建）。
+/// source 指向随包分发的 tar（pack-aur.sh 生成），package() 仅安装。
+pub fn generatePkgbuild(alloc: std.mem.Allocator, meta: PackMeta) ![]u8 {
+    const name = try debianName(alloc, meta.app_id);
+    defer alloc.free(name);
+    const exe_base = if (std.mem.endsWith(u8, meta.exe_name, ".exe"))
+        meta.exe_name[0 .. meta.exe_name.len - 4]
+    else
+        meta.exe_name;
+    return std.fmt.allocPrint(alloc,
+        \\# Maintainer: {s} <{s}>
+        \\# v0.4.3 L5：AUR -bin 打包面（zilt-pack 生成；makepkg -sf 走通为验收项）
+        \\pkgname={s}-bin
+        \\pkgver={s}
+        \\pkgrel=1
+        \\pkgdesc="{s}"
+        \\arch=('x86_64')
+        \\url="https://example.invalid/{s}"
+        \\license=('Proprietary')
+        \\depends=('gtk3' 'webkit2gtk-4.1' 'libsoup3')
+        \\optdepends=('libayatana-appindicator3: 托盘图标支持')
+        \\source=("$pkgname-$pkgver.tar.gz")
+        \\sha256sums=('SKIP')
+        \\noextract=()
+        \\
+        \\package() {{
+        \\    install -Dm755 "$srcdir/{s}" "$pkgdir/usr/bin/{s}"
+        \\    for d in "$srcdir"/*.desktop; do
+        \\        [ -e "$d" ] && install -Dm644 "$d" "$pkgdir/usr/share/applications/$(basename "$d")"
+        \\    done
+        \\}}
+        \\
+    , .{ meta.maintainer, meta.maintainer, name, meta.version, meta.description, name, exe_base, exe_base });
+}
+
+/// AUR .SRCINFO（静态生成——makepkg --printsrcinfo 的等价输出，离线可单测）。
+pub fn generateSrcinfo(alloc: std.mem.Allocator, meta: PackMeta) ![]u8 {
+    const name = try debianName(alloc, meta.app_id);
+    defer alloc.free(name);
+    return std.fmt.allocPrint(alloc,
+        \\pkgbase = {s}-bin
+        \\pkgname = {s}-bin
+        \\pkgver = {s}
+        \\pkgrel = 1
+        \\pkgdesc = {s}
+        \\url = https://example.invalid/{s}
+        \\arch = x86_64
+        \\license = Proprietary
+        \\depends = gtk3
+        \\depends = webkit2gtk-4.1
+        \\depends = libsoup3
+        \\optdepends = libayatana-appindicator3: 托盘图标支持
+        \\noextract = 
+        \\
+        \\source = {s}-bin-{s}.tar.gz
+        \\sha256sums = SKIP
+        \\
+    , .{ name, name, meta.version, meta.description, name, name, meta.version });
 }
 
 // ---------------------------------------------------------------------------
@@ -639,6 +820,24 @@ test "generateDesktopFile/generateRpmSpec: 内容断言" {
     try testing.expect(std.mem.indexOf(u8, spec, "Version:        0.1.5") != null);
 }
 
+test "generatePkgbuild/generateSrcinfo: AUR 字段齐全（v0.4.3 L5）" {
+    const meta = PackMeta{ .name = "Zilt Demo", .version = "0.4.3", .app_id = "app.zilt.desktop", .exe_name = "zilt-app", .description = "Demo app" };
+    const pkb = try generatePkgbuild(testing.allocator, meta);
+    defer testing.allocator.free(pkb);
+    try testing.expect(std.mem.startsWith(u8, pkb, "# Maintainer:"));
+    try testing.expect(std.mem.indexOf(u8, pkb, "pkgname=app.zilt.desktop-bin") != null);
+    try testing.expect(std.mem.indexOf(u8, pkb, "pkgver=0.4.3") != null);
+    try testing.expect(std.mem.indexOf(u8, pkb, "depends=('gtk3' 'webkit2gtk-4.1' 'libsoup3')") != null);
+    try testing.expect(std.mem.indexOf(u8, pkb, "install -Dm755") != null);
+
+    const info = try generateSrcinfo(testing.allocator, meta);
+    defer testing.allocator.free(info);
+    try testing.expect(std.mem.startsWith(u8, info, "pkgbase = app.zilt.desktop-bin"));
+    try testing.expect(std.mem.indexOf(u8, info, "pkgver = 0.4.3") != null);
+    try testing.expect(std.mem.indexOf(u8, info, "arch = x86_64") != null);
+    try testing.expect(std.mem.indexOf(u8, info, "source = app.zilt.desktop-bin-0.4.3.tar.gz") != null);
+}
+
 test "buildDeb: ar 结构 + control.tar.gz 内容回读" {
     const meta = PackMeta{ .name = "Zilt Demo", .version = "0.1.5", .app_id = "app.zilt.desktop", .exe_name = "zilt-app.exe", .maintainer = "Z <z@x.io>", .description = "Demo app" };
     const deb = try buildDeb(testing.allocator, meta, "MZBINARY");
@@ -696,4 +895,67 @@ test "buildDeb: 确定性输出" {
     const d2 = try buildDeb(testing.allocator, meta, "X");
     defer testing.allocator.free(d2);
     try testing.expectEqualSlices(u8, d1, d2);
+}
+
+test "v0.4.3 L3: parseLddLine 形态（箭头/绝对路径/not found/垃圾行）" {
+    const a = parseLddLine("\tlibgtk-3.so.0 => /usr/lib/x86_64-linux-gnu/libgtk-3.so.0 (0x00007f8c12345678)").?;
+    try testing.expectEqualStrings("libgtk-3.so.0", a.soname);
+    try testing.expectEqualStrings("/usr/lib/x86_64-linux-gnu/libgtk-3.so.0", a.path);
+
+    // 无箭头（解释器行）
+    const b = parseLddLine("\t/lib64/ld-linux-x86-64.so.2 (0x00007f00deadbeef)").?;
+    try testing.expectEqualStrings("ld-linux-x86-64.so.2", b.soname);
+    try testing.expectEqualStrings("/lib64/ld-linux-x86-64.so.2", b.path);
+
+    try testing.expect(parseLddLine("\tlibfoo.so.1 => not found") == null);
+    try testing.expect(parseLddLine("\tlinux-vdso.so.1 (0x00007ffd)") == null);
+    try testing.expect(parseLddLine("") == null);
+    try testing.expect(parseLddLine("hello world") == null);
+}
+
+test "v0.4.3 L3: lddExcluded 系统库/驱动栈不随包" {
+    // glibc 家族与编译器运行时
+    try testing.expect(lddExcluded("libc.so.6"));
+    try testing.expect(lddExcluded("libm.so.6"));
+    try testing.expect(lddExcluded("libgcc_s.so.1"));
+    try testing.expect(lddExcluded("ld-linux-aarch64.so.1"));
+    // 图形驱动栈
+    try testing.expect(lddExcluded("libGL.so.1"));
+    try testing.expect(lddExcluded("libEGL.so.1"));
+    try testing.expect(lddExcluded("libdrm.so.2"));
+    try testing.expect(lddExcluded("libnvidia-glcore.so.550"));
+    // 业务库要随包
+    try testing.expect(!lddExcluded("libwebkit2gtk-4.1.so.0"));
+    try testing.expect(!lddExcluded("libjavascriptcoregtk-4.1.so.0"));
+    try testing.expect(!lddExcluded("libgtk-3.so.0"));
+    try testing.expect(!lddExcluded("libsoup-3.0.so.0"));
+    try testing.expect(!lddExcluded("libicui18n.so.70"));
+}
+
+test "v0.4.3 L3: patchCStringInPlace 等长改写 + NUL 填充 + 长度保护" {
+    var buf = [_]u8{ 'x', ' ', '/', 'u', 's', 'r', '/', 'l', 'i', 'b', '/', 'w', 'k', '/', 'i', 'b', '/', 'z', 'z' };
+    const n = patchCStringInPlace(&buf, "/usr/lib/wk", "/tmp/.zk-1");
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqualStrings("/tmp/.zk-1", buf[2..12]);
+    try testing.expectEqual(@as(u8, 0), buf[12]); // 余下字节 NUL（C 字符串语义）
+    try testing.expectEqualStrings("/ib/zz", buf[13..19]);
+
+    // 替换串超长 → 拒绝（必须原地等长约束）
+    var buf2 = [_]u8{ '/', 'u', 's', 'r' };
+    try testing.expectEqual(@as(usize, 0), patchCStringInPlace(&buf2, "/usr", "/very/long/path"));
+    try testing.expectEqualStrings("/usr", &buf2);
+}
+
+test "v0.4.3 L3: webkitRuntimeDir 长度受限且确定性" {
+    const d1 = try webkitRuntimeDir(testing.allocator, "app.zilt.desktop", "0.4.3");
+    defer testing.allocator.free(d1);
+    const d2 = try webkitRuntimeDir(testing.allocator, "app.zilt.desktop", "0.4.3");
+    defer testing.allocator.free(d2);
+    try testing.expectEqualStrings(d1, d2);
+    try testing.expect(std.mem.startsWith(u8, d1, "/tmp/.zk-"));
+    // x86_64 前缀 46 字节 / aarch64 48 字节——固定目录必须更短
+    try testing.expect(d1.len <= 40);
+    const d3 = try webkitRuntimeDir(testing.allocator, "app.other", "0.4.3");
+    defer testing.allocator.free(d3);
+    try testing.expect(!std.mem.eql(u8, d1, d3));
 }

@@ -2,6 +2,7 @@
 
 > 制定日期：2026-11-20。修订：2026-11-21（Linux 专项复核：L1–L8 入图，macOS 顺延）。
 > 基线：**v0.3.19**（git 31b3109，测试体系收口）。
+> 当前：**v0.4.3**（2026-11-21，L1a GTK4 基础 + L3 自包含 AppImage + L6 托盘挂窗完成；L4 脚本/CI 就绪）。
 > 对标：**Wails v3.1.0 stable（2026-11-01）+ v3.2.0-nightly**、**Tauri 2.12.x**（2026-11 最新，2.12.x 仅 bugfix）。
 > 历史说明：原 docs/ 文档（v0.1–v0.3 逐版本记录、调研报告、WebView2 ABI 笔记、ADR）已随文档清理移除，
 > 逐版本实施与验收记录见 **git 提交历史**；当前能力索引与平台状态见 [README](../README.md)。
@@ -67,10 +68,10 @@
 |---|---|---|---|---|---|
 | L1 | **GTK4 默认化 + 双栈构建** | Wails v3 默认 GTK4/WebKitGTK 6.0，`-tags gtk3` 于 v3.1 移除 | Linux | 中 | `build.zig` 默认 `gtk=gtk4`，`-Dgtk=gtk3` 保留为 legacy 一个周期；README/打包依赖/CI 安装包同步；**CI 增 gtk3 + gtk4 双 job**（单测 + Xvfb 冒烟；workflow 先落地，remote 建立后生效），本地等价脚本 `scripts/linux/dev-test-matrix.sh`；GTK4 差异（portal 文件对话框、AppIndicator、分数缩放）逐项回归 |
 | L2 | 分数缩放 | Wails GTK4 `gdk_monitor_get_scale`（GTK 4.14+） | Linux | 小 | GTK4 走 `gdk_monitor_get_scale`（小数），GTK3 回退 `get_scale_factor` 并文档化；`system.info('monitors')` 增浮点 `scale`；窗口尺寸/截图/坐标换算路径复核（避免 1.25 下取整错位） |
-| L3 | **AppImage 自包含 + 沙箱** | Wails AppImage 打包 WebKit 并修补 AppRun（保留 bubblewrap） | Linux | 大 | AppDir 收入 `libwebkit2gtk` + `WebKitNetworkProcess`/`WebKitWebProcess` helper；AppRun 处理工作目录与库路径（bwrap 内外均可解析）；`scripts/linux/dev-appimage-e2e.sh` 增「无宿主 WebKit」容器验证 + 无 FUSE 降级 extract；产物体积预期 +30–40MB，发布说明标注 |
-| L4 | **ARM64 构建链** | Wails Docker 交叉 / Tauri Docker+QEMU | Linux | 中 | `scripts/linux/build-arm64.sh`：`arm64v8/ubuntu:24.04` 容器 + GTK/WebKit 依赖 → `zig build -Dtarget=aarch64-linux-gnu` → deb/AppImage；先落脚本与文档，CI 待 remote 建立后接入 |
-| L5 | RPM/AUR 实构建 + PGP 签名 | Wails：deb/rpm `wails3 sign`、AUR 任务 | Linux | 中 | `rpmbuild -bb` 走通 spec（当前仅生成）；新增 `packaging/PKGBUILD` + `.SRCINFO`；`zilt-sign --linux`（gpg detach-sign：deb `_gpgorigin`、rpm `%_gpg_name`），密钥经 `ZILT_GPG_KEY` 注入 |
-| L6 | 托盘挂窗（Linux） | Wails `AttachWindow`（定位/去抖/焦点丢失语义） | Linux | 中 | `tray.attach_window` 在 Linux 接线：左键 toggle + 依据 `gtk_status_icon_get_geometry` 定位（X11）；无几何（Wayland）回退光标位；focus-follows-mouse（Hyprland/Sway）下禁用 `hideOnFocusLost`（对齐 Wails 行为） |
+| L3 | **AppImage 自包含 + 沙箱** | Wails AppImage 打包 WebKit 并修补 AppRun（保留 bubblewrap） | Linux | 大 | ✅ 已实施（2026-11-21）：`ZILT_BUNDLE_WEBKIT=1 zig build pack` → ldd 闭包（117 库，剔除 glibc/驱动栈）+ WebKit helper/injected-bundle 复制；**libwebkit 编译期 helper 路径等长改写**（2.52 无 `WEBKIT_EXEC_PATH`，strace 实测）为 `/tmp/.zk-<hash>`，AppRun 建符号链并设 `LD_LIBRARY_PATH`/`WEBKIT_INJECTED_BUNDLE_PATH`/GIO/pixbuf/GSettings 面；`dev-appimage-e2e.sh` 增「无宿主 WebKit」验证（docker 优先；无镜像时 bwrap 掩 14 处宿主 WebKit，等价命名空间），LD_DEBUG 断言加载随包路径；**实测 +88MB**（squashfs 88MB，WebKit 2.52 比预期大，见 R7） |
+| L4 | **ARM64 构建链** | Wails Docker 交叉 / Tauri Docker+QEMU | Linux | 中 | 脚本就绪（2026-11-21）：`scripts/linux/build-arm64.sh`（默认 docker：`arm64v8/ubuntu:24.04` + QEMU binfmt → 容器内装 GTK3/WebKitGTK + aarch64 Zig → `zig build` + `ZILT_BUNDLE_WEBKIT=1 zig build pack`；`--sysroot DIR` 本地交叉走 `PKG_CONFIG_SYSROOT_DIR`）+ `dev-arm64-e2e.sh`（qemu-aarch64-static -L sysroot / arm64 容器跑冒烟，ELF machine 断言）+ CI `linux-arm64` job（setup-qemu-action）。**本机 WSL 无外网且无 arm64 镜像 → 容器路径如实 SKIP，验收待 CI** |
+| L5 | RPM/AUR 实构建 + PGP 签名 | Wails：deb/rpm `wails3 sign`、AUR 任务 | Linux | 中 | **[~] 脚本就绪（2026-11-21）**：`scripts/linux/pack-rpm.sh`（rpmbuild -bb → dist/*.rpm）、`pack-aur.sh`（PKGBUILD/.SRCINFO + tar.gz，docker 可用时 makepkg -sf）、`sign-packages.sh`（deb 追加 `_gpgorigin` 分离签名 / rpm `--addsign` + 双向校验；密钥 `ZILT_GPG_KEY_ID`，CI 经 `ZILT_GPG_KEY` 导入）——语法校验通过；**实构建与 `gpg --verify` 验收待环境**（rpm/makepkg/GPG key 未在本机就绪） |
+| L6 | 托盘挂窗（Linux） | Wails `AttachWindow`（定位/去抖/焦点丢失语义） | Linux | 中 | ✅ 已实施（2026-11-21）：XEmbed 宿主（stalonetray/trayer/面板）→ **自建 GtkStatusIcon**（左键 `activate` → toggle；libayatana 回退把左键绑成弹菜单，拿不到该语义）+ `gtk_status_icon_get_geometry` 定位；无 XEmbed 宿主 → libayatana SNI（`secondary_activate_target` 隐藏菜单项为点击入口，左键菜单/中键 toggle 由宿主决定）；点击 200ms 去抖（Wails WindowDebounce）；FFM 桌面（Hyprland/Sway/i3…）禁用挂窗 `hideOnFocusLost`；WM 外框偏移用延时校正（openbox 实测 +20px）；`scripts/linux/dev-tray-e2e.sh` 实测（Xvfb+openbox+stalonetray+XTest） |
 | L7 | Linux 更新健康回滚 | —（Windows helper 已有，Linux 缺编排） | Linux | 小 | `--zilt-restart` helper：替换后等新 exe 存活 ≥N 秒且退出码 0，否则 `rollbackToBackup`（POSIX rename 已具备）+ 重新拉起；与 Windows 同语义、同日志 |
 | L8 | capability 清单修正 | —（清单与实现不一致） | Linux | 极小 | 补 `window_key_bindings`（v0.3.9 A4L 已实现且有单测）；删除「Linux 未接线」过期注释；契约测试增「清单 ⊆ 后端 @hasDecl」断言，防再漂移 |
 
@@ -93,7 +94,7 @@
 | 默认工具栈 | GTK3 + WebKit2GTK 4.1（GTK4 可选，**CI 未覆盖**） | GTK4 + WebKitGTK 6.0（GTK3 legacy 至 v3.1） | GTK3 + WebKit2GTK 4.1 | 落后 → L1 |
 | 分数缩放 | 仅整数 scale factor | `gdk_monitor_get_scale`（4.14+） | 仅整数（GTK3） | 落后 Wails → L2 |
 | GNOME 主菜单 | 无 | `LinuxMenuStylePrimaryMenu` | 无 | 落后 |
-| 托盘 | dlopen libayatana（可选依赖）、无挂窗 | 硬依赖 appindicator + `AttachWindow` | 硬依赖 appindicator、无挂窗 | 依赖更轻 / 挂窗落后 → L6 |
+| 托盘 | dlopen libayatana（可选依赖）、挂窗（XEmbed 自建图标 + 几何定位 / SNI 目标项） | 硬依赖 appindicator + `AttachWindow` | 硬依赖 appindicator、无挂窗 | 持平（依赖更轻） |
 | Wayland 全局快捷键 | X11 + portal 双路 | 文档未明确 | **仅 X11** | 领先 Tauri |
 | 二进制 IPC | evaluate + base64 | Streams | raw IPC | 落后 → H4 相关 |
 | 包格式 | deb / AppImage / Flatpak manifest / rpm spec | deb / AppImage / rpm / AUR | deb / rpm / AppImage | 落后 → L5 |
@@ -185,7 +186,7 @@ page_allocator（延续 v0.4.1 教训）。
 **验收**：libsecret 物理 E2E（seahorse/secret-tool 互操作可见）+ 降级路径 +
 通知定时触发实测 + reparent 往返（父子/销毁级联）+ 全量回归。
 
-### v0.4.3 — Linux 发行版兼容专项 [~] L1a 完成（2026-11-21），其余随环境分批
+### v0.4.3 — Linux 发行版兼容专项 [~] L1a + L3 + L6 完成，L4 脚本+CI 就绪（2026-11-21）
 
 **L1a ✅（2026-11-21）——GTK4 构建级兼容基础 + 双栈环境**：
 - 环境：Ubuntu 24.04 第二发行版（WSL，D 盘迁移后新建）+ GTK 4.14.5 / WebKitGTK 6.0
@@ -204,19 +205,119 @@ GdkDrag ↔ gtk_drag_*、GtkPopoverMenu ↔ GtkMenu 族、gdk_toplevel ↔ gtk_w
 状态、GtkFileDialog ↔ GtkFileChooserNative）；完成后切 `-Dgtk=gtk4` 默认化（D7 保留
 gtk3 legacy 一个周期）。前置已就绪（本 L1a 环境）。
 
+**L6 ✅（2026-11-21）——托盘挂窗（attach_window 接线 + stalonetray 实测）**：
+
+- **XEmbed 宿主（stalonetray/trayer/xfce4-panel）→ 自建 GtkStatusIcon**：libayatana 在无
+  SNI 宿主时的回退实现把左键绑成「弹菜单」，拿不到 AttachWindow 的左键 toggle 语义；
+  自建图标接 `activate`（toggle）/`popup-menu`（菜单），并用 `gtk_status_icon_get_geometry`
+  取真实图标矩形。检测：`_NET_SYSTEM_TRAY_S<n>` 选择拥有者存在即走该路径（GTK3；GTK4 仍无托盘，文档化）
+- **无 XEmbed 宿主 → libayatana SNI**：`app_indicator_set_secondary_activate_target` 的隐藏
+  菜单项为点击入口（GNOME/KDE 的 SecondaryActivate → 激活该目标）；字符串审计确认
+  libayatana 0.5/0.6 无 `secondary-activate` GObject 信号（D-Bus 方法由库内部转为激活目标项），
+  故不连信号；左键菜单/中键 toggle 由宿主策略决定（文档化）
+- **定位**：XEmbed 几何（`gtk_status_icon_get_geometry` → X 树扫描 `_XEMBED_INFO` 兜底）→
+  右缘贴图标右缘、下/上方 4px、工作区夹取；SNI 无图标窗口 → 指针锚点；Wayland 无全局坐标 → 原位
+- **WM 外框校正**：openbox 把 ConfigureRequest 当外框位置（实测客户区 +20px），同步读几何又是旧值
+  → show 后 80ms 延时校正一次（`surfaceOrigin` 实测原点补偿；只校一次，不覆盖后续拖动）
+- **去抖 / FFM**：点击 200ms 去抖（Wails WindowDebounce；目标项与信号面可能对同一次点击各触发一遍）；
+  focus-follows-mouse 桌面（Hyprland/Sway/i3/xmonad/qtile 令牌匹配 + `HYPRLAND_INSTANCE_SIGNATURE`/
+  `SWAYSOCK`；`ZILT_FOCUS_FOLLOWS_MOUSE` 覆盖）下挂窗 `hideOnFocusLost` 整段禁用（Wails 语义）
+- **检测时机**：托盘路径在启动时定（有 XEmbed 宿主 → 自建图标；否则 SNI）。托盘宿主晚于
+  应用启动时，libayatana 回退仍会挂上图标但左键语义回到「弹菜单」——需要挂窗语义时先启托盘
+  宿主（真实桌面总是先有面板；E2E 亦如此）
+- **实测**：`scripts/linux/dev-tray-e2e.sh`（Xvfb 1280x800 + openbox + stalonetray 顶部右侧 +
+  `scripts/linux/xtool.py` XTest 合成点击，无 xdotool 依赖）：左键隐藏/再左键显示（318,30 =
+  图标右缘 1278 / 下缘 26+4）、右键菜单、FFM 检测全 PASS；单测 GTK3/GTK4 各 301（283+18，1 skip）
+  全绿，冒烟 95 项含 `tray.attach` PASS（当时的 screenshot/clipboard 两项既有失败已在 L3 阶段定位修复，
+  见下）
+
+**L3 ✅（2026-11-21）——AppImage 自包含（WebKit 随包 + 无宿主实测）**：
+
+- **随包面**（`src/pack_linux.zig`，`ZILT_BUNDLE_WEBKIT=1`）：`ldd` 闭包（exe + 三个
+  helper）按 soname 摊平到 `usr/lib/`（剔除 glibc 家族 / libstdc++ / GL·EGL·drm·gbm /
+  nvidia），共 117 库；helper 目录（WebKit{Web,Network,GPU}Process + injected-bundle）
+  复制到 `usr/lib/<triplet>/webkit2gtk-4.1/`；GIO 模块、gdk-pixbuf loaders、
+  `gschemas.compiled` 一并带上
+- **路径改写（关键实测）**：WebKitGTK 2.52 **没有** `WEBKIT_EXEC_PATH`——strace 三段对照
+  （默认 / 设为副本 / 设为不存在）均 exec `/usr/lib/<triplet>/webkit2gtk-4.1/WebKit*`。
+  AppImage 挂载点长度可变，只能把 libwebkit 里的**编译期常量前缀等长改写**为固定短路径
+  `/tmp/.zk-<12hex>`（+ NUL 填充；`/injected-bundle/` 长串先单独改），AppRun 再把随包
+  helper 符号链到该路径 → bwrap 内外路径一致（helper 在进沙箱前 exec）
+- **AppRun（bundled 版）**：`LD_LIBRARY_PATH` 只指随包目录、`WEBKIT_INJECTED_BUNDLE_PATH`、
+  `GIO_EXTRA_MODULES`、`GDK_PIXBUF_MODULEDIR`、`GSETTINGS_SCHEMA_DIR`、`XDG_DATA_DIRS`
+- **无宿主验证**（`scripts/linux/dev-appimage-e2e.sh`）：runtime 拼接 → 无 FUSE
+  `--appimage-extract` → ①宿主基线 ②**掩掉宿主 WebKit** 再跑（docker 有镜像时用
+  `--network none` 的 `ubuntu:22.04`；本机无镜像/无外网 → bwrap 掩 14 处宿主
+  libwebkit/libjavascriptcore/helper，等价命名空间）→ 冒烟 95 项，LD_DEBUG 断言 252 次
+  加载都命中 `squashfs-root`（随包）
+- **体积实测**：AppDir 222MB → squashfs **88MB**（+78MB；WebKit 89MB + JSC 33MB + ICU，
+  strip 无收益——发行版包本就已 strip）。**R7 的 +30–40MB 估计偏乐观**，发布说明按实测标注
+- **顺带修复（实测暴露的三处既有缺陷，均在 GTK4 兼容层 WIP 范围内）**：
+  ① **主 WebView 只分到 1px 高**——布局重构把 GtkOverlay 用 `gtk_box_pack_start(expand=0)`
+  装进 GtkBox，窗口其余区域空白（截图快照 `800x1` 暴露）→ 新增 `boxPackStartFill`
+  （expand+fill），reparent 路径同步从 overlay main-child 摘除后按 fill 装箱；
+  ② **剪贴板写入未拷贝**——`allocSentinel` 后直接传 `z.ptr`，把未初始化内存写进剪贴板
+  （读回乱码，`Error converting selection from UTF8_STRING`）→ `@memcpy(z, text)`；
+  ③ **fs.readStream use-after-free**——`thread.detach()` 后仍读 `job.chunk_size`，
+  小文件在 worker 释放后段错误（30KB 必现）；读失败路径双重释放 → spawn 前取局部副本、
+  错误路径所有权交给 idle 回调。修复后 **Linux 冒烟 95/95 exit 0**（两条 L3 E2E 均严格断言）
+
+**L4 [~]（2026-11-21）——ARM64 构建链（脚本 + CI 就绪，容器验收待 CI）**：
+
+- `scripts/linux/build-arm64.sh`：
+  - 默认 docker：`arm64v8/ubuntu:24.04` + QEMU binfmt → 容器内装
+    `libgtk-3-dev libwebkit2gtk-4.1-dev libx11/xext-dev squashfs-tools` + aarch64 Zig
+    0.17.1 → `zig build` + `zig build test` + `ZILT_BUNDLE_WEBKIT=1 zig build pack`
+    （容器内 ldd 可用，随包与 x86_64 同路径）→ `dist-arm64/`；产物 chown 回宿主用户
+  - `--sysroot DIR`：`PKG_CONFIG_SYSROOT_DIR`/`PKG_CONFIG_LIBDIR` + `-Dtarget=aarch64-linux-gnu`
+    （host 版 pack 无法 ldd 外来架构 → 该路径不随包，自包含走 docker）
+  - 预检 `--check`（打印将执行命令）；无 docker / 无镜像且 pull 失败 / 无 binfmt →
+    `ARM64_BUILD=SKIP`（exit 3，不伪装成功）
+- `scripts/linux/dev-arm64-e2e.sh`：`readelf` 断言 ELF machine=AArch64；优先
+  `qemu-aarch64-static [-L sysroot]`，否则 arm64 容器；冒烟口径同 L3（失败白名单默认为空，
+  任何失败都 FAIL；机制保留以备平台差异）
+- CI：新增 `linux-arm64` job（`docker/setup-qemu-action@v3` + build + qemu 冒烟 + 产物上传）
+- **本机限制**：WSL 无外网（registry/镜像站不可达），24.04 的 docker 29.1.3 与
+  qemu-aarch64-static 8.2 均在位但无 arm64 镜像 → 容器路径如实 SKIP；已用
+  `zig build-exe -target aarch64-linux-musl` + qemu 跑通 aarch64 二进制，验证执行器可用
+
 目标：把 Linux 从「API 齐全」推进到「发行版可直接采用」——GTK4 默认、自包含 AppImage、
 ARM64、包签名/AUR、托盘挂窗。这是 L 系列的主体，也是与 Wails v3.1 差距最集中的一段。
 
 - **L1** GTK4 默认化 + 双栈构建（`-Dgtk=gtk3` 保留为 legacy 一个周期，CI 双 job）
-- **L3** AppImage 内嵌 WebKit（helper 进程）+ AppRun 沙箱修补
-- **L4** ARM64 构建链（Docker + GTK/WebKit sysroot → deb/AppImage）
+- **L3 ✅** AppImage 自包含（WebKit 随包 + helper 路径改写；无宿主 WebKit 实测见上）
+- **L4 [~]** ARM64 构建链（Docker+QEMU 脚本 / `--sysroot` 交叉 / CI job；本机无镜像 SKIP）
 - **L5** RPM/AUR 实构建 + PGP 签名（deb `_gpgorigin` / rpm detach-sign）
-- **L6** 托盘挂窗（AttachWindow 语义：左键 toggle、贴图标定位、focus-follows-mouse 规避）
+- **L6 ✅** 托盘挂窗（见上：XEmbed 自建图标 / SNI 目标项、贴图标定位、去抖、FFM 规避）
 
 **验收**：gtk3/gtk4 双栈单测 + Xvfb/openbox 冒烟全绿；AppImage 在「未安装 WebKit 的容器」
 内启动并跑通冒烟（无 FUSE 走 extract 路径）；ARM64 deb/AppImage 在 qemu-user 下冒烟通过；
 `gpg --verify` 校验 deb/rpm 签名；AUR `makepkg` 构建通过；托盘挂窗 X11 实测 +
 Wayland 回退路径文档化；既有冒烟/单测全量回归（Windows 侧零回归）。
+
+**v0.4.3 验收记录（2026-11-21，Windows 11 + WSL Ubuntu 22.04 / 24.04）**：
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| Windows 单测 | `zig build test` | 384/385（1 skip） |
+| GTK3 单测 | `zig build test`（22.04） | 301/302（283+18，1 skip） |
+| GTK4 单测 | `zig build test -Dgtk=gtk4`（24.04） | 301/302（1 skip） |
+| Linux 冒烟 | `scripts/linux/dev-smoke.sh` | **95/95 exit 0** |
+| 托盘挂窗 | `scripts/linux/dev-tray-e2e.sh` | PASS（toggle / 贴图标定位 / 右键菜单 / FFM 共 12 断言） |
+| AppImage 自包含 | `scripts/linux/dev-appimage-e2e.sh` | PASS：宿主 + 掩掉宿主 WebKit 各 **95/95**；LD_DEBUG 252 次命中随包 `libwebkit2gtk` |
+| ARM64 构建链 | `build-arm64.sh --check` / `dev-arm64-e2e.sh` | 预检 PASS；容器路径 SKIP（本机无外网、无 arm64 镜像）；qemu-aarch64-static 已用交叉编译的 aarch64 二进制验证 |
+| Windows GUI 冒烟 | `ZILT_SMOKE_EXIT=1` | 仅 echo-server 依赖项（ws/http2/wss/tus）失败，其余全 true（零回归） |
+
+- **体积**：自包含 AppDir 222MB → squashfs **88MB（+78MB）**；R7 的 +30–40MB 估计已按实测修正
+- **顺带修复**（L3 实测暴露的既有缺陷）：主 WebView 只分 1px（`boxPackStartFill`）、剪贴板写入缺
+  memcpy、`fs.readStream` use-after-free —— 修复后 Linux 冒烟从 93/95 升到 **95/95 exit 0**
+- **未完成项**：ARM64 容器内构建与 qemu 冒烟（CI `linux-arm64` job 待 remote 首次执行）、
+  L5 RPM/AUR 与 PGP 签名的**实构建/校验**（三脚本已就绪并通过语法校验，见 L5 行）、
+  L1b（4.x UI 面移植）
+- **已知 flake**：`platform.linux.hotkey` 的「真实抓键」用例在并发 Xvfb/残留显示下偶发
+  X11 抓键失败（复跑即过，与版本无关）
+- **坑位记录**：22.04 与 24.04 共用仓库 `zig-out/`，GTK4 构建会覆盖 GTK3 产物（表现为
+  `libgtk-4.so.1: cannot open`）——验收前先确认最后构建的栈
 
 ### v0.4.4 — macOS 全栈 I（骨架）
 
@@ -265,10 +366,16 @@ codesign 验证 + Gatekeeper 实测。
 
 1. `zig build test`（基线：Windows 364 / Linux 280，随功能递增；0 失败 0 泄漏）
 2. `zig build`（构建 + capability 清单 + 资产嵌入）
-3. GUI 冒烟（基线：Windows 66 / Linux 86 项；新增能力必须带检查项，exit 0）
+3. GUI 冒烟（基线：Windows 74 / Linux 95 项；新增能力必须带检查项，exit 0）
 4. 触碰面专项：headless/MCP E2E、server E2E、PACK_E2E、e2e_fixed_runtime
 5. **Linux 双栈（v0.4.3 起）**：`-Dgtk=gtk3` 与 `-Dgtk=gtk4` 各跑单测 + Xvfb/openbox 冒烟；
-   AppImage「无宿主 WebKit」容器冒烟 + ARM64 qemu-user 冒烟 + `gpg --verify` 签名校验
+   `gpg --verify` 校验 deb/rpm 签名；AUR `makepkg` 构建通过；Windows 侧零回归
+6. **托盘挂窗（L6 起）**：`scripts/linux/dev-tray-e2e.sh`（Xvfb+openbox+stalonetray，
+   XTest 合成点击；`scripts/linux/xtool.py` 无 xdotool 依赖）——toggle/定位/右键菜单/FFM 四组断言
+7. **AppImage 自包含（L3 起）**：`dev-appimage-e2e.sh`（`ZILT_BUNDLE_WEBKIT=1` + runtime 拼接 +
+   无 FUSE extract + docker/bwrap 掩宿主 WebKit）——冒烟 + LD_DEBUG 随包命中
+8. **ARM64（L4 起）**：`build-arm64.sh`（docker+QEMU 或 `--sysroot`）+ `dev-arm64-e2e.sh`
+   （qemu-aarch64-static / arm64 容器 + ELF machine 断言）；CI `linux-arm64` job
 6. macOS 切片自建验收链（v0.4.4 起）：zig build test macOS + 冒烟骨架 + codesign 产物验证
 
 ## 4. 风险与依赖
@@ -287,9 +394,13 @@ codesign 验证 + Gatekeeper 实测。
   `-Dgtk=gtk3` legacy 至少一个周期，且发布说明按发行版分列依赖；GTK4 的文件对话框走
   xdg-desktop-portal，默认目录/过滤器行为与 GTK3 不同（需回归对话框用例）；AppIndicator
   在 GTK4 下仍需 libayatana（保持 dlopen 可选）。
-- **R7（L3 AppImage 自包含）**：内嵌 WebKit 体积 +30–40MB，且 WebKit 的 bwrap 沙箱在
-  AppImage 挂载路径下对 helper 解析敏感——先做可行性脚本（无宿主 WebKit 容器 + extract
-  路径），验证 AppRun 工作目录方案后再改打包器。
+- **R7（L3 AppImage 自包含）**：✅ 实测结论（2026-11-21）——①体积 **+78MB**（squashfs 88MB），
+  R7 原估 +30–40MB 偏乐观（WebKitGTK 2.52 的 libwebkit 89MB + JSC 33MB + ICU，已 strip 无收益）；
+  ②WebKit 2.52 **无 `WEBKIT_EXEC_PATH`**，helper 路径是编译期常量，必须等长改写为固定短路径
+  （`/tmp/.zk-<hash>`）再由 AppRun 建链——这是自包含的唯一可行路径，改写点已收敛在
+  `pack_formats.patchCStringInPlace`（有单测）；③bwrap 沙箱与随包 helper：helper 在进沙箱前
+  exec，injected-bundle 走 `WEBKIT_INJECTED_BUNDLE_PATH`，实测通过（E2E 关闭 WebKit 沙箱跑冒烟，
+  真机沙箱路径另测）
 - **上游**：CompositionController 渲染修复取决于 WebView2 Runtime；WebKitGTK 自定义
   scheme POST body 上游修复自动生效（v0.3.8 已接线）。
 

@@ -6,24 +6,24 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.4.2（安全与系统集成——H3 Linux 密钥环加密 store（libsecret dlopen，
-`secret:` 标记）/ H15 计划通知（进程内 timer + notificationScheduled 事件）/
-H16 reparent（WebView 移挂目标窗口，state.parent 记账）/ H17 拖出 opt-in
-（dragSource → dragStartUp 事件桥））**。
-v0.4.1（网络/IPC/分发深化——H4 channel credit 背压 / H14 断点续传分块上传
-（JSON-tus-lite，状态落盘跨重启续传）/ H12 zilt self-update / H13 NSIS+deb 安装钩子与
-Flatpak E2E 脚本 / H21 WinHTTP 看门狗语义测试 / H5 TLS 选型定案：外层反代）**。
-H9 物理像素面 / H10 数值徽标（Unity LauncherEntry 实装） / H11 GPU 信息（DXGI + DRM） /
-H20 深链参数结构化解析）**。
-逐版本功能项与验收记录见 git 提交历史（原 docs/ 目录随文档清理移除）；后续 v0.4.x 规划见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**当前状态：v0.4.3（Linux 发行版可用性——L1a GTK4 构建级兼容：`-Dgtk=gtk4` 双栈，
+GTK 4.14.5 / WebKitGTK 6.0 2.52.6 实测；L3 AppImage 自包含：WebKit 随包 + helper 路径改写，
+「无宿主 WebKit」bwrap/容器实测 95/95；L6 托盘挂窗：XEmbed 自建图标左键 toggle + 贴图标定位 +
+FFM 规避，stalonetray 实测；L4 ARM64 构建链脚本 + CI job（容器验收待 CI））**。
+v0.4.2（安全与系统集成——H3 Linux 密钥环加密 store（libsecret dlopen，`secret:` 标记）/
+H15 计划通知（进程内 timer + notificationScheduled 事件）/ H16 reparent（WebView 移挂目标窗口）/
+H17 拖出 opt-in）。v0.4.1（网络/IPC/分发深化——H4 channel credit 背压 / H14 断点续传 /
+H12 zilt self-update / H13 安装钩子与 Flatpak E2E / H21 WinHTTP 看门狗 / H5 TLS 选型定案）。
+v0.4.0（H6–H11 / H20 / L2 / L7 / L8 双平台小项收尾）。
+逐版本功能项见 git 提交历史；规划与验收记录见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
-| Windows | ✅ 全栈（v0.1.0–v0.3.19） | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
-| Linux | ✅ 全栈（v0.2.0–v0.3.19，冒烟 86 项） | GTK3 + WebKit2GTK 4.1；`-Dgtk=gtk4` 构建变体 |
+| Windows | ✅ 全栈（v0.1.0–v0.4.3） | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
+| Linux | ✅ 全栈（v0.2.0–v0.4.3，冒烟 95 项） | GTK3 + WebKit2GTK 4.1；`-Dgtk=gtk4` 构建变体 |
 | macOS | ⏳ 未开始（原计划 v0.3+，v0.3 系列未覆盖） | WKWebView（zig-objc 路线） |
 
-Windows 能力面（截至 v0.3.18）：窗口/多窗口/覆盖式标题栏/窗口形状 mask/每按钮状态/失焦与 Escape 隐藏/
+Windows 能力面（截至 v0.4.3）：窗口/多窗口/覆盖式标题栏/窗口形状 mask/每按钮状态/失焦与 Escape 隐藏/
 窗口级 KeyBindings、WebView2 事件面与 Settings（含 printToPdf、加速键与手势开关）、IPC + 事件 + 流式 channel
 （含二进制 FNV-1a32 帧）+ isolation 密封、内嵌资产（gzip/ETag/Range）、capability ACL + scope + 运行时授权、
 fs（scope/watch/流式）、SQL、store（可选 DPAPI 加密）、http（WinHTTP：https/wss/代理/multipart/流式/上传进度）、
@@ -34,7 +34,7 @@ fs（scope/watch/流式）、SQL、store（可选 DPAPI 加密）、http（WinHT
 Linux 复用同一 JS API 面，差异逐版本以「文档化」条目记录（无 SharedBuffer → evaluate 通道、无 PDF 导出 →
 `PdfNotSupported` 等）。
 
-## 能力索引（v0.3.18）
+## 能力索引（v0.4.3）
 
 | 能力组 | 主要入口 | Windows | Linux |
 |---|---|---|---|
@@ -45,9 +45,9 @@ Linux 复用同一 JS API 面，差异逐版本以「文档化」条目记录（
 | 安全 | capability ACL + scope、运行时授权、isolation HMAC 密封、原型冻结、导航白名单 | ✅ | ✅ |
 | 数据 | `store`（DPAPI 可选）、`fs`（scope/watch/流式）、`sql`（sqlite3） | ✅ | ✅ |
 | 网络 | `http`（https/代理/multipart/流式/上传进度）、`ws`/`wss` | ✅ | ✅ |
-| 系统集成 | 托盘（暗色图标）/菜单/全局与窗口快捷键/任务栏徽标/通知/剪贴板/拖放/对话框 | ✅ | ✅（徽标 Unity-only） |
+| 系统集成 | 托盘（暗色图标/挂窗）/菜单/全局与窗口快捷键/任务栏徽标/通知/剪贴板/拖放/对话框 | ✅ | ✅（徽标 Unity-only；挂窗 XEmbed/SNI） |
 | 桌面 | 自启/深链/单实例（HMAC）/窗口状态持久化/透明与覆盖式标题栏/窗口效果 | ✅ | ✅ |
-| 更新与分发 | ed25519 清单/差分补丁/回滚/skipVersion/GitHub provider；NSIS/MSI/MSIX/zip/deb/AppImage/Flatpak spec | ✅ | ✅（deb/AppImage/Flatpak） |
+| 更新与分发 | ed25519 清单/差分补丁/回滚/skipVersion/GitHub provider；NSIS/MSI/MSIX/zip/deb/AppImage/Flatpak spec | ✅ | ✅（deb/AppImage，v0.4.3 起可随包 WebKit 自包含；Flatpak spec；ARM64 脚本） |
 | 运行模式 | GUI / headless（HTTP + MCP）/ server（浏览器 runtime）/ dev HMR | ✅ | ✅ |
 | 工具链 | `zilt` CLI（init/doctor/info/gen/icon/npm-pack/mcp/keygen/sign/diff/pack）、12 套模板、WebDriver | ✅ | ✅ |
 
@@ -447,7 +447,8 @@ v0.3.3 新增（2026-11-17，窗口体验包 II——对齐 Wails WindowMask/But
 - **每按钮状态**：`window.create({closable,minimizable,maximizable})` + 运行时
   `window.setButtonState({closable,...}, id)`——Windows 系统菜单项灰化/恢复（GTK3 无 API 文档化）
 - **托盘附着窗口**：`Config.tray.attach_window = <label>`——点击托盘切换该窗口显示/隐藏，
-  定位到托盘图标附近（Shell_NotifyIconGetRect，屏幕边缘自适应；配合 `hideOnFocusLost` 即托盘弹窗）
+  定位到托盘图标附近（Windows `Shell_NotifyIconGetRect`；Linux v0.4.3 L6：XEmbed 托盘走
+  `gtk_status_icon_get_geometry`、SNI 走指针锚点；屏幕边缘自适应，配合 `hideOnFocusLost` 即托盘弹窗）
 - **失焦/Escape 隐藏**：`window.create({hideOnFocusLost, hideOnEscape})`——Windows 失焦
   WM_ACTIVATE+WA_INACTIVE / Escape 经窗口 ACCEL 表（专用 id 0xF000）；Linux focus-out-event /
   key-press-event（gdk_event_get_keyval，GdkEventKey opaque 规避）

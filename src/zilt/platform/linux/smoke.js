@@ -556,6 +556,17 @@ function runSecondWindowProbe() {
     check('menu.popup', pop === true, JSON.stringify(pop));
   } catch (e) { check('menu.model', false, String(e.message || e)); }
 
+  // ---- v0.4.3 L6：托盘挂窗（tray.attach_window——toggle + 指针定位 + 抑制窗）----
+  try {
+    const attachResult = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(null), 5000);
+      Z().on('linuxSmokeAttach', (p) => { clearTimeout(timer); resolve(p); });
+      Z().invoke('__zilt.linuxSmokeAttach', {}).catch(() => { clearTimeout(timer); resolve(null); });
+    });
+    const ok = !!attachResult && attachResult.before === true && attachResult.after === true;
+    check('tray.attach', ok, JSON.stringify(attachResult));
+  } catch (e) { check('tray.attach', false, String(e.message || e)); }
+
   // ---- v0.2.2：系统信息（/etc/os-release + GDK monitors）----
   try {
     const os = await Z().system.os();

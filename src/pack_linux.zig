@@ -100,6 +100,216 @@ fn exeBaseName(alloc: Allocator, meta: PackMeta) ![]const u8 {
     return meta.exe_name;
 }
 
+// ---------------------------------------------------------------------------
+// v0.4.3 L3：WebKit 随包（AppImage 自包含）
+//
+// 目标：宿主没有 libwebkit2gtk-4.1 也能跑。做法：
+//   1. `ldd` 收集 exe + WebKit helper 的**全部**共享库（剔除 glibc/驱动栈），
+//      按 soname 摊平到 `usr/lib/`（loader 按 soname 查找，无需符号链）；
+//   2. helper 进程目录（WebKitWebProcess/NetworkProcess/GPUProcess +
+//      injected-bundle）复制到 `usr/lib/<triplet>/webkit2gtk-4.1/`；
+//   3. **改写 libwebkit 里的编译期路径**：2.52 无 WEBKIT_EXEC_PATH（strace
+//      实测设置无效），helper 路径是常量 `/usr/lib/<triplet>/webkit2gtk-4.1`。
+//      等长改写为 `/tmp/.zk-<hash>`（AppImage 挂载点长度可变，不能写死），
+//      并把 `/injected-bundle/` 后缀一并改写（双保险，AppRun 亦设
+//      WEBKIT_INJECTED_BUNDLE_PATH）；
+//   4. AppRun 换成 bundled 版（LD_LIBRARY_PATH / GIO 模块 / pixbuf loaders /
+//      GSettings schema / helper 符号链）。
+// ---------------------------------------------------------------------------
+
+fn runTool(alloc: Allocator, argv: []const []const u8) ?[]u8 {
+    const r = std.process.run(alloc, sharedIo(), .{
+        .argv = argv,
+        .stdout_limit = .limited(4 * 1024 * 1024),
+        .stderr_limit = .limited(8 * 1024),
+    }) catch return null;
+    alloc.free(r.stderr);
+    if (!r.term.success()) {
+        alloc.free(r.stdout);
+        return null;
+    }
+    return r.stdout;
+}
+
+fn fileSize(path: []const u8) u64 {
+    // 0.17：std.fs.cwd 已移除，走 Io.Dir（绝对/相对均可）
+    const st = std.Io.Dir.cwd().statFile(sharedIo(), path, .{}) catch return 0;
+    return st.size;
+}
+
+/// `cp -aL src dst`（跟随符号链：ldd 目录里的 soname 常是链，链目标不随包会悬空）。
+fn copyFile(alloc: Allocator, src: []const u8, dst: []const u8) bool {
+    if (runTool(alloc, &.{ "cp", "-aL", src, dst })) |out| {
+        alloc.free(out);
+        return true;
+    }
+    return false;
+}
+
+/// `cp -aL src/. dst/`（目录内容合并；dst 必须是已存在的目录）。
+fn copyDirInto(alloc: Allocator, src: []const u8, dst: []const u8) bool {
+    const src_dot = std.fmt.allocPrint(alloc, "{s}/.", .{src}) catch return false;
+    defer alloc.free(src_dot);
+    if (runTool(alloc, &.{ "cp", "-aL", src_dot, dst })) |out| {
+        alloc.free(out);
+        return true;
+    }
+    return false;
+}
+
+/// 把 `binary` 的 ldd 依赖按 soname 摊平复制到 `lib_dir`（去重、剔除系统库）。
+fn collectLibs(alloc: Allocator, binary: []const u8, lib_dir: []const u8, seen: *std.StringHashMapUnmanaged(void)) usize {
+    const out = runTool(alloc, &.{ "ldd", binary }) orelse return 0;
+    defer alloc.free(out);
+    var copied: usize = 0;
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        const e = pack_formats.parseLddLine(line) orelse continue;
+        if (pack_formats.lddExcluded(e.soname)) continue;
+        const gop = seen.getOrPut(alloc, e.soname) catch continue;
+        if (gop.found_existing) continue;
+        const dst = std.fmt.allocPrint(alloc, "{s}/{s}", .{ lib_dir, e.soname }) catch continue;
+        defer alloc.free(dst);
+        if (!copyFile(alloc, e.path, dst)) {
+            _ = seen.remove(e.soname);
+            continue;
+        }
+        copied += 1;
+    }
+    return copied;
+}
+
+/// WebKit 随包主流程。成功返回 true（AppRun 已换 bundled 版）。
+fn bundleWebkit(alloc: Allocator, app_dir: []const u8, app_bin: []const u8, meta: PackMeta, wk_dir: []const u8) bool {
+    const lib_dir = pathJoin(alloc, app_dir, "usr/lib") catch return false;
+    mkDirs(alloc, lib_dir);
+
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(alloc);
+
+    // 1) exe 依赖闭包（同时留一份 ldd 文本用于定位 libwebkit）
+    const exe_out = runTool(alloc, &.{ "ldd", app_bin }) orelse {
+        std.debug.print("[pack:webkit] ldd 不可用——跳过 WebKit 随包（宿主依赖模式）\n", .{});
+        return false;
+    };
+    defer alloc.free(exe_out);
+    var lib_count: usize = 0;
+    var webkit_host: ?[]const u8 = null;
+    var webkit_soname: ?[]const u8 = null;
+    {
+        var it = std.mem.splitScalar(u8, exe_out, '\n');
+        while (it.next()) |line| {
+            const e = pack_formats.parseLddLine(line) orelse continue;
+            if (std.mem.startsWith(u8, e.soname, "libwebkit2gtk-")) {
+                webkit_host = e.path;
+                webkit_soname = e.soname;
+            }
+            if (pack_formats.lddExcluded(e.soname)) continue;
+            const gop = seen.getOrPut(alloc, e.soname) catch continue;
+            if (gop.found_existing) continue;
+            const dst = std.fmt.allocPrint(alloc, "{s}/{s}", .{ lib_dir, e.soname }) catch continue;
+            defer alloc.free(dst);
+            if (!copyFile(alloc, e.path, dst)) {
+                _ = seen.remove(e.soname);
+                continue;
+            }
+            lib_count += 1;
+        }
+    }
+
+    // 2) 定位 WebKit：triplet + helper 目录
+    const wk_lib_host = webkit_host orelse {
+        std.debug.print("[pack:webkit] 未在 ldd 中找到 libwebkit2gtk——跳过随包\n", .{});
+        return false;
+    };
+    const wk_soname = webkit_soname orelse return false;
+    const host_libdir = std.fs.path.dirname(wk_lib_host) orelse return false;
+    const triplet = std.fs.path.basename(host_libdir);
+    const helpers_host = std.fmt.allocPrint(alloc, "{s}/webkit2gtk-4.1", .{host_libdir}) catch return false;
+    defer alloc.free(helpers_host);
+
+    // 3) helper 依赖闭包（helper 是独立可执行文件，不在 libwebkit 的 ldd 里）
+    for ([_][]const u8{ "WebKitWebProcess", "WebKitNetworkProcess", "WebKitGPUProcess" }) |name| {
+        const hp = std.fmt.allocPrint(alloc, "{s}/{s}", .{ helpers_host, name }) catch continue;
+        defer alloc.free(hp);
+        if (fileSize(hp) == 0) continue;
+        lib_count += collectLibs(alloc, hp, lib_dir, &seen);
+    }
+
+    // 4) helper 目录 → AppDir（helper + injected-bundle + 探测文件）
+    const helpers_dst = std.fmt.allocPrint(alloc, "{s}/usr/lib/{s}/webkit2gtk-4.1", .{ app_dir, triplet }) catch return false;
+    defer alloc.free(helpers_dst);
+    mkDirs(alloc, helpers_dst);
+    if (!copyDirInto(alloc, helpers_host, helpers_dst)) {
+        std.debug.print("[pack:webkit] helper 目录复制失败\n", .{});
+        return false;
+    }
+
+    // 5) 改写 libwebkit 字面量路径（先改带 /injected-bundle/ 的长串，再改前缀）
+    const wk_lib_dst = std.fmt.allocPrint(alloc, "{s}/{s}", .{ lib_dir, wk_soname }) catch return false;
+    defer alloc.free(wk_lib_dst);
+    const bytes = readFileAlloc(alloc, wk_lib_dst, 512 * 1024 * 1024) orelse {
+        std.debug.print("[pack:webkit] libwebkit 读取失败（{s}，{d} bytes）\n", .{ wk_lib_dst, fileSize(wk_lib_dst) });
+        return false;
+    };
+    defer alloc.free(bytes);
+    const prefix = std.fmt.allocPrint(alloc, "{s}/webkit2gtk-4.1", .{host_libdir}) catch return false;
+    defer alloc.free(prefix);
+    const long_needle = std.fmt.allocPrint(alloc, "{s}/injected-bundle/", .{prefix}) catch return false;
+    defer alloc.free(long_needle);
+    const long_repl = std.fmt.allocPrint(alloc, "{s}/injected-bundle/", .{wk_dir}) catch return false;
+    defer alloc.free(long_repl);
+    const n_bundle = pack_formats.patchCStringInPlace(bytes, long_needle, long_repl);
+    const n_helper = pack_formats.patchCStringInPlace(bytes, prefix, wk_dir);
+    if (!writeFile(alloc, wk_lib_dst, bytes, 0o644)) {
+        std.debug.print("[pack:webkit] libwebkit 回写失败\n", .{});
+        return false;
+    }
+    std.debug.print("[pack:webkit] libwebkit 路径改写: helper×{d} / injected-bundle×{d} -> {s}\n", .{ n_helper, n_bundle, wk_dir });
+
+    // 6) 可选运行时面：GIO 模块（TLS）、gdk-pixbuf loaders、GLib schemas
+    const extras = [_][]const u8{ "gio/modules", "gdk-pixbuf-2.0/2.10.0/loaders" };
+    for (extras) |rel| {
+        const src = std.fmt.allocPrint(alloc, "{s}/{s}", .{ host_libdir, rel }) catch continue;
+        defer alloc.free(src);
+        var dir_ok = true;
+        if (std.Io.Dir.cwd().openDir(sharedIo(), src, .{})) |d| {
+            var dd = d;
+            dd.close(sharedIo());
+        } else |_| dir_ok = false;
+        if (!dir_ok) continue;
+        const dst = std.fmt.allocPrint(alloc, "{s}/usr/lib/{s}/{s}", .{ app_dir, triplet, rel }) catch continue;
+        defer alloc.free(dst);
+        mkDirs(alloc, dst);
+        _ = copyDirInto(alloc, src, dst);
+    }
+    if (fileSize("/usr/share/glib-2.0/schemas/gschemas.compiled") > 0) {
+        const schema_dst = std.fmt.allocPrint(alloc, "{s}/usr/share/glib-2.0/schemas", .{app_dir}) catch return false;
+        defer alloc.free(schema_dst);
+        mkDirs(alloc, schema_dst);
+        const dst_file = std.fmt.allocPrint(alloc, "{s}/gschemas.compiled", .{schema_dst}) catch return false;
+        defer alloc.free(dst_file);
+        _ = copyFile(alloc, "/usr/share/glib-2.0/schemas/gschemas.compiled", dst_file);
+    }
+
+    // 7) AppRun → bundled 版
+    const apprun_filled = fillBundledAppRun(alloc, meta, triplet, wk_dir) orelse return false;
+    defer alloc.free(apprun_filled);
+    const apprun_path = pathJoin(alloc, app_dir, "AppRun") catch return false;
+    defer alloc.free(apprun_path);
+    if (!writeFile(alloc, apprun_path, apprun_filled, 0o755)) return false;
+    std.debug.print("[pack:webkit] 随包完成: libs={d} triplet={s} wk={s}\n", .{ lib_count, triplet, wk_dir });
+    return true;
+}
+
+fn fillBundledAppRun(alloc: Allocator, meta: PackMeta, triplet: []const u8, wk_dir: []const u8) ?[]u8 {
+    const exe_base = exeBaseName(alloc, meta) catch return null;
+    var s = std.mem.replaceOwned(u8, alloc, pack_formats.apprun_script_bundled, "APP_EXE_NAME", exe_base) catch return null;
+    s = std.mem.replaceOwned(u8, alloc, s, "@TRIPLET@", triplet) catch return null;
+    s = std.mem.replaceOwned(u8, alloc, s, "WK_DIR", wk_dir) catch return null;
+    return s;
+}
+
 /// 桌面项文件名：`<pkg>.desktop`；pkg 已以 .desktop 结尾时不重复拼接
 /// （v0.2.7 修正：app_id `app.zilt.desktop` 此前会生成
 /// `app.zilt.desktop.desktop`——与运行时 desktop_entry.entryFileName 同规则）。
@@ -305,6 +515,20 @@ pub fn main() !void {
     }
     std.debug.print("[pack] AppDir -> {s}/（AppRun 可直接执行）\n", .{app_dir});
 
+    // v0.4.3 L3：WebKit 随包（ZILT_BUNDLE_WEBKIT=1）。ldd/cp 缺失时保持宿主依赖，
+    // 并在日志里明确原因——默认关闭，发布 AppImage 时才需要自包含。
+    {
+        const flag = getEnv(alloc, "ZILT_BUNDLE_WEBKIT");
+        const enabled = if (flag) |v| !std.mem.eql(u8, v, "0") else false;
+        if (enabled) {
+            const wk_dir = pack_formats.webkitRuntimeDir(alloc, meta.app_id, meta.version) catch return error.OutOfMemory;
+            defer alloc.free(wk_dir);
+            if (!bundleWebkit(alloc, app_dir, app_bin, meta, wk_dir)) {
+                std.debug.print("[pack:webkit] 随包失败——AppRun 保持宿主依赖模式\n", .{});
+            }
+        }
+    }
+
     // mksquashfs：真实 squashfs 镜像 + 拼 AppImage 的脚本（runtime 需下载；
     // 无 mksquashfs 时跳过，AppDir/AppRun 始终可用）
     const sq_out = try pathJoin(alloc, out_dir, try std.fmt.allocPrint(alloc, "{s}.squashfs", .{pkg}));
@@ -360,6 +584,17 @@ pub fn main() !void {
     const spec_out = try pathJoin(alloc, out_dir, try std.fmt.allocPrint(alloc, "{s}.spec", .{pkg}));
     if (!writeFile(alloc, spec_out, spec, 0o644)) return error.WriteFailed;
     std.debug.print("[pack] spec -> {s}（rpmbuild -bb 可构建）\n", .{spec_out});
+
+    // ---- 5) AUR（v0.4.3 L5）：dist/aur/PKGBUILD + .SRCINFO（-bin 形态）----
+    const aur_dir = try pathJoin(alloc, out_dir, "aur");
+    mkDirs(alloc, aur_dir);
+    const pkgbuild = try pack_formats.generatePkgbuild(alloc, meta);
+    const pkb_out = try pathJoin(alloc, aur_dir, "PKGBUILD");
+    if (!writeFile(alloc, pkb_out, pkgbuild, 0o644)) return error.WriteFailed;
+    const srcinfo = try pack_formats.generateSrcinfo(alloc, meta);
+    const src_out = try pathJoin(alloc, aur_dir, ".SRCINFO");
+    if (!writeFile(alloc, src_out, srcinfo, 0o644)) return error.WriteFailed;
+    std.debug.print("[pack] aur -> {s}（PKGBUILD + .SRCINFO；makepkg -sf 走通为验收项）\n", .{aur_dir});
 }
 
 

@@ -67,6 +67,10 @@ pub fn main() !void {
         // 图标：项目未指定 → 使用内置 Zig 官方图标（窗口/托盘/exe 资源）
         .tray = .{
             .tooltip = "Zilt — 点击显示/隐藏窗口",
+            // v0.4.3 L6：托盘挂窗——左键 toggle 主窗口并贴托盘图标定位
+            //（Linux XEmbed 取图标矩形；Windows Shell_NotifyIconGetRect）。
+            // 右键菜单不受影响；scripts/linux/dev-tray-e2e.sh 实测此语义。
+            .attach_window = "main",
             .menu = &.{
                 .{ .label = "显示窗口", .id = "show-window" },
                 .{ .label = "隐藏窗口", .id = "hide-window" },

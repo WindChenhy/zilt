@@ -19,6 +19,8 @@ APT_PACKAGES=(
   # v0.2.6 全局快捷键（X11 头文件，capi.h 硬依赖）+ v0.2.7 shell（xdg-open）
   # v0.2.9 WebDriver E2E（WebKitWebDriver）
   libx11-dev xdg-utils webkit2gtk-driver
+  # v0.4.3 L6 托盘挂窗 E2E：openbox（WM 语义）+ stalonetray（XEmbed 托盘宿主）
+  openbox stalonetray
 )
 
 say() { printf '\n== %s ==\n' "$*"; }

@@ -613,7 +613,7 @@ fn keyvalLower(k: c.guint) c.guint {
 /// 0x41-0x5A，而事件 keyval 是实际 level 的键值，'X' 绑定按 'x' 0x78 到达）。
 /// mods 只比较四个语义修饰符位（忽略 MOD2 numlock 等 lock 位）。
 pub fn matchKeyBinding(entries: []const KeyBindEntry, keyval: c.guint, mods: c.GdkModifierType) ?*const KeyBindEntry {
-    const semantic: c.GdkModifierType = c.GDK_CONTROL_MASK | c.GDK_MOD1_MASK | c.GDK_SHIFT_MASK | c.GDK_SUPER_MASK;
+    const semantic: c.GdkModifierType = c.GDK_CONTROL_MASK | gtk_compat.MOD1_MASK | c.GDK_SHIFT_MASK | c.GDK_SUPER_MASK;
     const pressed = mods & semantic;
     const ev_key = keyvalLower(keyval);
     for (entries) |*kb| {
@@ -637,7 +637,7 @@ pub fn parseAccelGtk(accel: []const u8) ?AccelGtk {
         } else if (std.ascii.eqlIgnoreCase(part, "Shift")) {
             mods |= c.GDK_SHIFT_MASK;
         } else if (std.ascii.eqlIgnoreCase(part, "Alt") or std.ascii.eqlIgnoreCase(part, "Mod1")) {
-            mods |= c.GDK_MOD1_MASK;
+            mods |= gtk_compat.MOD1_MASK;
         } else if (std.ascii.eqlIgnoreCase(part, "Super")) {
             mods |= c.GDK_SUPER_MASK;
         } else {
@@ -735,6 +735,48 @@ fn detectWindowManager() bool {
     return status == 0 and nitems == 1 and prop != null;
 }
 
+// ---------------------------------------------------------------------------
+// v0.4.3 L6：焦点跟随鼠标（focus-follows-mouse）桌面判定
+//
+// hideOnFocusLost 在点击聚焦的桌面上是托盘弹窗的标配；FFM 桌面下指针一离
+// 开弹窗就失焦 → 窗口在用户点到之前消失。Wails 在 Hyprland/Sway/i3 一类
+// 环境禁用该行为（HideOnEscape 保留），Zilt 同语义：挂窗 + FFM → 不自动隐藏。
+// X11 没有「当前焦点策略」的查询面（EWMH 无此属性），判定按桌面/合成器标识。
+// ---------------------------------------------------------------------------
+
+/// 桌面标识是否属于 FFM 默认桌面。令牌匹配（大小写不敏感）：XDG 的值形如
+/// "sway" / "Hyprland" / "ubuntu:GNOME" / "i3"，按 `:;,/ ` 切分后逐个比较，
+/// 避免 "i386" 之类子串误命中。
+pub fn impliesFocusFollowsMouse(desktop: []const u8) bool {
+    const known = [_][]const u8{ "hyprland", "sway", "i3", "xmonad", "qtile", "wayfire" };
+    var it = std.mem.tokenizeAny(u8, desktop, ":;,/ \t");
+    while (it.next()) |token| {
+        for (known) |name| {
+            if (std.ascii.eqlIgnoreCase(token, name)) return true;
+        }
+    }
+    return false;
+}
+
+/// 会话级 FFM 判定：
+/// - `ZILT_FOCUS_FOLLOWS_MOUSE=1|0` 强制覆盖（其它 WM / 实测用）
+/// - `HYPRLAND_INSTANCE_SIGNATURE` / `SWAYSOCK`（Wayland 合成器环境变量）
+/// - XDG 桌面标识令牌（XDG_CURRENT_DESKTOP / XDG_SESSION_DESKTOP / DESKTOP_SESSION）
+fn detectFocusFollowsMouse() bool {
+    if (std.c.getenv("ZILT_FOCUS_FOLLOWS_MOUSE")) |v| {
+        const s = std.mem.span(v);
+        if (s.len != 0) return !(s[0] == '0' or s[0] == 'n' or s[0] == 'N' or s[0] == 'f' or s[0] == 'F');
+    }
+    if (std.c.getenv("HYPRLAND_INSTANCE_SIGNATURE") != null) return true;
+    if (std.c.getenv("SWAYSOCK") != null) return true;
+    inline for (.{ "XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP", "DESKTOP_SESSION" }) |key| {
+        if (std.c.getenv(key)) |v| {
+            if (impliesFocusFollowsMouse(std.mem.span(v))) return true;
+        }
+    }
+    return false;
+}
+
 pub fn run(comptime config: Config) !void {
     // 进程级长生命周期分配器：emit 可能来自任意 worker 线程，必须线程安全；
     // 后端已链接 libc，c_allocator 是最稳的选择（无泄漏检测开销，也不需要 deinit）。
@@ -788,6 +830,9 @@ pub fn run(comptime config: Config) !void {
     // CI 装 openbox 后这些事件真实生效，冒烟据此决定是否断言）
     self.wm_present = detectWindowManager();
     log.print("[linux] window manager: {s}", .{if (self.wm_present) "present" else "none (Xvfb)"});
+    // v0.4.3 L6：FFM 桌面 → 挂窗的 hideOnFocusLost 禁用（Wails 对齐）
+    self.ffm = detectFocusFollowsMouse();
+    if (self.ffm) log.print("[tray] focus-follows-mouse desktop — attach window hideOnFocusLost disabled", .{});
 
     // scheme 必须在创建 WebView 之前注册（web process 首次启动后不再接受）
     const wc = c.webkit_web_context_get_default();
@@ -801,7 +846,12 @@ pub fn run(comptime config: Config) !void {
         }
     }
     // v0.2.1：下载事件（分区 context 在 createPartitionContext 里同样注册）
-    _ = c.g_signal_connect_data(wc, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
+            if (comptime gtk_compat.isGtk4()) {
+                const session = gtk_compat.networkSessionDefault();
+                _ = c.g_signal_connect_data(session, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
+            } else {
+                _ = c.g_signal_connect_data(wc, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
+            }
 
     // v0.2.2：GApplication 宿主 = 通知 + 单实例 + 深链转交三合一。
     // **先注册再建窗口**：第二实例在远端检测命中后立即转交退出（不建窗口、
@@ -927,9 +977,9 @@ pub fn run(comptime config: Config) !void {
 
     // v0.2.2：剪贴板变化监听（owner-change → clipboardChanged 事件）
     if (config.clipboard_change_event) {
-        const cb = c.gtk_clipboard_get(c.GDK_SELECTION_CLIPBOARD);
+        const cb = gtk_compat.clipboardGet();
         if (cb != null) {
-            _ = c.g_signal_connect_data(cb, "owner-change", @ptrCast(&Self.onClipboardOwnerChange), self, null, 0);
+            gtk_compat.clipboardConnectChanged(cb, &Self.onClipboardChangedEvent, self);
             log.print("[clip] change listener attached", .{});
         }
     }
@@ -957,7 +1007,7 @@ pub fn run(comptime config: Config) !void {
             args_list.append(alloc, std.mem.span(a)) catch break;
         }
         if (args_list.items.len > 0) self.handleLaunchArgs(args_list.items);
-        c.gtk_main();
+        gtk_compat.mainLoopRun();
     }
 
     // 主循环退出时窗口通常还没 destroy（ctx.quit 路径）→ 逐窗口落盘状态
@@ -983,7 +1033,7 @@ fn Backend(comptime config: Config) type {
         const IpcSink = struct {
             backend: *Self,
             win_id: u32,
-            view: [*c]c.WebKitWebView,
+            view: ?*c.WebKitWebView,
         };
 
         /// 单窗口状态（v0.2.1 切片 3 注册表化；WM 参与的状态以 GTK 查询为准，
@@ -1006,8 +1056,8 @@ fn Backend(comptime config: Config) type {
             menubar: [*c]c.GtkWidget = null,
             /// 菜单项激活时的 user_data（窗口销毁时统一释放）
             menu_actions: std.ArrayListUnmanaged(*MenuAction) = .empty,
-            view: [*c]c.WebKitWebView,
-            ucm: [*c]c.WebKitUserContentManager,
+            view: ?*c.WebKitWebView,
+            ucm: ?*c.WebKitUserContentManager,
             /// 入口 URL（ACL 判定用，形如 zilt://app/index.html）
             app_url: []u8,
             sink: *IpcSink,
@@ -1036,7 +1086,8 @@ fn Backend(comptime config: Config) type {
             child_webviews: std.ArrayListUnmanaged(*ChildView) = .empty,
             next_child_webview_id: u32 = 1,
             /// v0.2.2：菜单加速键的 GtkAccelGroup（惰性创建；窗口销毁时随 GTK 释放）
-            accel_group: ?*c.GtkAccelGroup = null,
+            // GTK4 无 GtkAccelGroup（accel 面移除）→ 占位不透明类型
+            accel_group: if (gtk_compat.isGtk4()) ?*anyopaque else ?*c.GtkAccelGroup = null,
             /// v0.3.9 A4L：窗口级 KeyBindings（创建时解析好的 keyval/mods；
             /// key-press-event 匹配——菜单 accel 由 GTK accel group 先行消费）
             key_bindings: []const KeyBindEntry = &.{},
@@ -1063,6 +1114,11 @@ fn Backend(comptime config: Config) type {
             /// v0.4.0 H8：JS 开关（false = WebKitSettings enable-javascript=false，
             /// 本窗口注入 runtime 不可用——kiosk 锁定用途）
             javascript: bool = true,
+            // v0.4.3 L6：托盘挂窗（tray.attach_window label 匹配标记 + 失焦抑制窗）
+            tray_attached: bool = false,
+            /// 显示挂窗后短暂抑制失焦隐藏（focus-follows-mouse WM 下指针
+            /// 掠过即失焦——Wails 对齐语义，600ms 窗口）
+            hide_suppress_until_ms: i64 = 0,
             /// v0.4.2 H17：拖出 opt-in drag source（runtime dragstart 桥标记）
             drag_source: bool = false,
             // ---- v0.3.3：窗口体验包 II ----
@@ -1091,8 +1147,8 @@ fn Backend(comptime config: Config) type {
         /// 子 WebView（webviews.* op 管理的窗口内附加视图）。
         const ChildView = struct {
             id: u32,
-            view: [*c]c.WebKitWebView,
-            ucm: [*c]c.WebKitUserContentManager,
+            view: ?*c.WebKitWebView,
+            ucm: ?*c.WebKitUserContentManager,
             sink: *IpcSink,
             /// 数据分区名（null = 共享默认 WebContext）。生命周期归 ChildView。
             partition: ?[]u8 = null,
@@ -1107,16 +1163,22 @@ fn Backend(comptime config: Config) type {
 
         /// 分区 WebContext 表项（key = 规范化后的分区名）。
         /// 同名分区复用同一 context → 同分区多个子 WebView 共享存储。
+        /// 分区 WebContext 表项（key = 规范化后的分区名）。
+        /// 同名分区复用同一 context → 同分区多个子 WebView 共享存储。
+        /// 6.0：网络/存储面在 session（与 ctx 配对使用）。
         const PartitionCtx = struct {
             name: []u8,
-            ctx: [*c]c.WebKitWebContext,
+            ctx: ?*c.WebKitWebContext,
+            session: ?*anyopaque = null,
         };
 
         /// per-window WebView 代理（v0.2.7，对齐 Windows v0.1.23）：同 proxy 串
         /// 复用同一 WebContext（独立数据目录，cookie/缓存不与主窗口共享）。
+        /// 6.0：网络面拆到 WebKitNetworkSession（与 ctx 同 manager 源）。
         const ProxyEntry = struct {
             proxy: []u8,
-            ctx: [*c]c.WebKitWebContext,
+            ctx: ?*c.WebKitWebContext,
+            session: ?*anyopaque = null,
         };
 
         /// 进行中的下载（v0.2.1）。WebKit 持有 WebKitDownload 的所有权，
@@ -1124,7 +1186,7 @@ fn Backend(comptime config: Config) type {
         const Download = struct {
             backend: *Self,
             id: u64,
-            dl: [*c]c.WebKitDownload,
+            dl: ?*c.WebKitDownload,
             total: i64 = -1,
             last_progress: u64 = 0,
             /// 三个信号的处理 id：终止事件到达后先断开再释放记录。
@@ -1154,7 +1216,8 @@ fn Backend(comptime config: Config) type {
         const ClipPayload = struct {
             backend: *Self,
             data: []u8,
-            targets: []c.GtkTargetEntry,
+            // GTK4 走 eager content provider（无延迟提供回调）→ 占位类型
+            targets: if (gtk_compat.isGtk4()) []u8 else []c.GtkTargetEntry,
         };
 
         /// 菜单项激活的 user_data（窗口注册表持有，窗口销毁时统一释放）。
@@ -1174,7 +1237,7 @@ fn Backend(comptime config: Config) type {
             lib: std.DynLib,
             indicator: ?*anyopaque,
             set_status: *const fn (?*anyopaque, c_int) callconv(.c) void,
-            set_menu: *const fn (?*anyopaque, ?*c.GtkMenu) callconv(.c) void,
+            set_menu: *const fn (?*anyopaque, ?*anyopaque) callconv(.c) void,
         };
 
         /// v0.3.2：logind 订阅状态（signal id 供将来注销；connection 生命周期
@@ -1306,8 +1369,20 @@ fn Backend(comptime config: Config) type {
         /// 模型驱动的托盘 GtkMenu。有 indicator 时所有权归 indicator（替换后旧菜单
         /// 由 indicator 析构，绝不能再 destroy）；无 indicator 时归我们
         ///（tray_menu_owned = true，替换/退出时 destroy）。
-        tray_menu_widget: ?*c.GtkMenu = null,
+        // GTK4：libayatana-appindicator3 为 GTK3 链接库，进程内不可载 → 无托盘
+        tray_menu_widget: if (gtk_compat.isGtk4()) ?*anyopaque else ?*c.GtkMenu = null,
+        /// v0.4.3 L6：XEmbed 托盘自建 GtkStatusIcon（左键 activate → 挂窗 toggle；
+        /// 几何经 gtk_status_icon_get_geometry）。与 SNI 的 libayatana 互斥。
+        tray_status_icon: if (gtk_compat.isGtk4()) ?*anyopaque else ?*c.GtkStatusIcon = null,
+        /// v0.4.3 L6：secondary activate 目标控件（挂窗点击面；托盘存续期持有）
+        tray_sec_target: ?*anyopaque = null,
+        /// v0.4.3 L6：挂窗 toggle 去抖（Wails WindowDebounce 语义——SNI 与
+        /// GtkStatusIcon 回退路径可能对同一次点击各触发一遍，且双击不应抖动）
+        tray_toggle_ms: i64 = 0,
         tray_menu_owned: bool = false,
+        /// v0.4.3 L6：焦点跟随鼠标桌面（Hyprland/Sway/i3 等）——挂窗的
+        /// hideOnFocusLost 在这些桌面下禁用（Wails 对齐；否则指针离开即消失）
+        ffm: bool = false,
         /// 启动 / 第二实例转交的深链载荷（页面尚未就绪时挂起，load-finished 补发）
         pending_launch: ?deep_link.Launch = null,
         /// 冒烟：dropFiles 模拟投递只发一次
@@ -1407,8 +1482,22 @@ fn Backend(comptime config: Config) type {
             if (self.menu_state) |*m| m.deinit();
             // 托盘菜单：有 indicator 时归它（进程退出无需释放）；无 indicator 归我们
             if (self.tray_menu_widget) |menu| {
-                if (self.tray_menu_owned) c.gtk_widget_destroy(@ptrCast(menu));
+                if (comptime gtk_compat.isGtk3()) {
+                    if (self.tray_menu_owned) c.gtk_widget_destroy(@ptrCast(menu));
+                }
                 self.tray_menu_widget = null;
+            }
+            if (self.tray_sec_target) |sec| {
+                if (comptime gtk_compat.isGtk3()) c.g_object_unref(sec);
+                self.tray_sec_target = null;
+            }
+            // v0.4.3 L6：XEmbed 自建托盘图标（GTK3 独占；先隐藏再 unref）
+            if (self.tray_status_icon) |si| {
+                if (comptime gtk_compat.isGtk3()) {
+                    c.gtk_status_icon_set_visible(si, 0);
+                    c.g_object_unref(@ptrCast(si));
+                }
+                self.tray_status_icon = null;
             }
             if (self.tray) |*t| t.lib.close();
             if (self.gapp) |app| c.g_object_unref(@ptrCast(app));
@@ -1570,9 +1659,9 @@ fn Backend(comptime config: Config) type {
             return std.fmt.allocPrint(self.allocator, "{s}/partitions/{s}", .{ root, name });
         }
 
-        fn findPartition(self: *Self, name: []const u8) ?[*c]c.WebKitWebContext {
+        fn findPartition(self: *Self, name: []const u8) ?ProxyPieces {
             for (self.partitions.items) |pe| {
-                if (std.mem.eql(u8, pe.name, name)) return pe.ctx;
+                if (std.mem.eql(u8, pe.name, name)) return .{ .ctx = pe.ctx, .session = pe.session };
             }
             return null;
         }
@@ -1582,7 +1671,7 @@ fn Backend(comptime config: Config) type {
         /// Cookie/localStorage/IndexedDB 与其他分区、默认 context 完全隔离。
         /// scheme 处理器同样注册（资产服务对分区子 WebView 可用）。
         /// 返回的 context 引用归注册表（deinit 时释放）。
-        fn createPartitionContext(self: *Self, name: []const u8) ![*c]c.WebKitWebContext {
+        fn createPartitionContext(self: *Self, name: []const u8) !ProxyPieces {
             const dir = try self.partitionDirectory(name);
             defer self.allocator.free(dir);
             // 目录不存在则创建（WebKit 会往里写 localStorage/IndexedDB 等）
@@ -1590,20 +1679,29 @@ fn Backend(comptime config: Config) type {
             const dir_z = try dupeZ(self.allocator, dir);
             defer self.allocator.free(dir_z);
 
-            const mgr = c.webkit_website_data_manager_new(
-                "base-data-directory",
-                @as(?*const anyopaque, dir_z.ptr),
-                @as(?*anyopaque, null), // 属性表哨兵
-            );
-            if (mgr == null) return error.WebKitContextUnavailable;
-            defer c.g_object_unref(@ptrCast(mgr)); // context 会持有自己的引用
+            // 6.0：分区隔离由 session 目录承载；GTK3：manager + context
+            const session = if (comptime gtk_compat.isGtk4())
+                gtk_compat.networkSessionNew(dir_z.ptr, dir_z.ptr)
+            else
+                null;
+            defer if (session) |s| c.g_object_unref(@ptrCast(s));
+            const mgr = if (comptime gtk_compat.isGtk3())
+                gtk_compat.websiteDataManagerNew(dir_z.ptr)
+            else
+                null;
+            defer if (mgr) |m| c.g_object_unref(@ptrCast(m));
 
-            const ctx = c.webkit_web_context_new_with_website_data_manager(mgr);
+            const ctx: ?*c.WebKitWebContext = @ptrCast(@alignCast(gtk_compat.webContextNewWithManager(mgr)));
             if (ctx == null) return error.WebKitContextUnavailable;
             c.webkit_web_context_register_uri_scheme(ctx, scheme, Self.onSchemeRequest, self, null);
-            _ = c.g_signal_connect_data(ctx, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
+            if (comptime gtk_compat.isGtk4()) {
+                _ = c.g_signal_connect_data(session, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
+            } else {
+                _ = c.g_signal_connect_data(ctx, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
+            }
             log.print("[webviews] partition '{s}' context created ({s})", .{ name, dir });
-            return ctx;
+            // 注册表持引用（session 单独 ref；ctx 引用归表）
+            return .{ .ctx = ctx, .session = session };
         }
 
         // ------------------------------------------------------------------
@@ -1614,7 +1712,7 @@ fn Backend(comptime config: Config) type {
         fn addUserScriptTo(
             self: *Self,
             scripts: *std.ArrayListUnmanaged(?*c.WebKitUserScript),
-            ucm: [*c]c.WebKitUserContentManager,
+            ucm: ?*c.WebKitUserContentManager,
             source: []const u8,
         ) void {
             const src = dupeZ(self.allocator, source) catch return;
@@ -1632,8 +1730,8 @@ fn Backend(comptime config: Config) type {
         }
 
         /// 给一个（窗口主 / 子）WebView 接好 IPC 信号并注入全套脚本。
-        fn attachIpc(self: *Self, sink: *IpcSink, ucm: [*c]c.WebKitUserContentManager, scripts: *std.ArrayListUnmanaged(?*c.WebKitUserScript)) void {
-            if (c.webkit_user_content_manager_register_script_message_handler(ucm, "zilt") == 0) {
+        fn attachIpc(self: *Self, sink: *IpcSink, ucm: ?*c.WebKitUserContentManager, scripts: *std.ArrayListUnmanaged(?*c.WebKitUserScript)) void {
+            if (!gtk_compat.registerScriptMessageHandler(ucm, "zilt")) {
                 log.print("[linux] script message handler register failed (win={d})", .{sink.win_id});
                 return;
             }
@@ -1682,7 +1780,7 @@ fn Backend(comptime config: Config) type {
         }
 
         /// 执行一段 JS（UI 线程）。WebKit 会把脚本复制进异步任务，返回后即可释放入参。
-        fn evalScriptOn(view: [*c]c.WebKitWebView, script: []const u8) void {
+        fn evalScriptOn(view: ?*c.WebKitWebView, script: []const u8) void {
             if (view == null or script.len == 0) return;
             c.webkit_web_view_evaluate_javascript(
                 view,
@@ -1697,7 +1795,7 @@ fn Backend(comptime config: Config) type {
         }
 
         /// 把一条 IPC 消息推给指定 WebView（runtime_js 暴露的 `window.__ziltDeliver`）。
-        fn deliverAlloc(self: *Self, view: [*c]c.WebKitWebView, json: []const u8) void {
+        fn deliverAlloc(self: *Self, view: ?*c.WebKitWebView, json: []const u8) void {
             const script = std.fmt.allocPrint(self.allocator, "window.__ziltDeliver({s})", .{json}) catch return;
             defer self.allocator.free(script);
             evalScriptOn(view, script);
@@ -1845,7 +1943,7 @@ fn Backend(comptime config: Config) type {
 
         fn quitIdle(data: c.gpointer) callconv(.c) c.gboolean {
             const self: *Self = @ptrCast(@alignCast(data orelse {
-                c.gtk_main_quit();
+                gtk_compat.mainLoopQuit();
                 return G_SOURCE_REMOVE;
             }));
             self.requestQuit();
@@ -1862,7 +1960,7 @@ fn Backend(comptime config: Config) type {
                 }
                 c.g_application_quit(self.gapp.?);
             } else {
-                c.gtk_main_quit();
+                gtk_compat.mainLoopQuit();
             }
         }
 
@@ -1896,11 +1994,11 @@ fn Backend(comptime config: Config) type {
             const app_url = try mapAppUrl(self.allocator, opts.url orelse config.url);
             errdefer self.allocator.free(app_url);
 
-            const win = c.gtk_window_new(c.GTK_WINDOW_TOPLEVEL);
+            const win = gtk_compat.windowNew();
             if (win == null) return error.WindowCreateFailed;
             const win_typed: [*c]c.GtkWindow = @ptrCast(win);
             // 失败路径统一销毁窗口控件（此时 destroy 信号尚未连接，不会触碰 Zig 记录）
-            errdefer c.gtk_widget_destroy(win);
+            errdefer gtk_compat.windowDestroy(win_typed);
 
             const title_z = try dupeZ(self.allocator, opts.title);
             defer self.allocator.free(title_z);
@@ -1911,9 +2009,9 @@ fn Backend(comptime config: Config) type {
             // data-zilt-drag-region 拖动，语义对齐 Windows v0.1.23）
             const overlay_title = opts.titlebar_overlay;
             c.gtk_window_set_decorated(win_typed, if (opts.decorations and !overlay_title) 1 else 0);
-            if (opts.always_on_top) c.gtk_window_set_keep_above(win_typed, 1);
-            if (opts.skip_taskbar) c.gtk_window_set_skip_taskbar_hint(win_typed, 1);
-            if (opts.x != null and opts.y != null) c.gtk_window_move(win_typed, opts.x.?, opts.y.?);
+            if (opts.always_on_top) gtk_compat.setKeepAbove(win_typed, true);
+            if (opts.skip_taskbar) gtk_compat.setSkipTaskbar(win_typed, true);
+            if (opts.x != null and opts.y != null) gtk_compat.windowMove(win_typed, opts.x.?, opts.y.?);
             if (parent_state) |p| {
                 c.gtk_window_set_transient_for(win_typed, p.win);
                 if (opts.modal) c.gtk_window_set_modal(win_typed, 1);
@@ -1987,6 +2085,15 @@ fn Backend(comptime config: Config) type {
                 .drag_drop = opts.drag_drop,
                 .javascript = opts.javascript,
                 .drag_source = opts.drag_source,
+                // v0.4.3 L6：tray.attach_window label 匹配（与 Windows 的
+                // tray_attached 同语义；toggle 兜底 mainWindow）
+                .tray_attached = if (opts.label) |lbl|
+                    (if (config.tray) |tray|
+                        (tray.attach_window != null and std.mem.eql(u8, lbl, tray.attach_window.?))
+                    else
+                        false)
+                else
+                    false,
                 .key_bindings = kb_entries,
             };
 
@@ -1998,7 +2105,7 @@ fn Backend(comptime config: Config) type {
                 const menubar = self.buildMenuBar(items, st);
                 if (menubar != null) {
                     st.menubar = menubar;
-                    c.gtk_box_pack_start(@ptrCast(box), menubar, 0, 0, 0);
+                    gtk_compat.boxPackStart(@ptrCast(@alignCast(box)), menubar);
                 }
             }
 
@@ -2006,8 +2113,12 @@ fn Backend(comptime config: Config) type {
             const overlay = c.gtk_overlay_new();
             if (overlay == null) return error.WebViewCreateFailed;
             st.overlay = @ptrCast(overlay);
-            c.gtk_box_pack_start(@ptrCast(box), overlay, 1, 1, 0);
-            c.gtk_container_add(@ptrCast(win), box);
+            gtk_compat.boxPackStartFill(@ptrCast(@alignCast(box)), overlay); // 主内容区必须 expand+fill
+            if (comptime gtk_compat.isGtk4()) {
+                c.gtk_window_set_child(win_typed, box);
+            } else {
+                c.gtk_container_add(@ptrCast(win), box);
+            }
 
             const ucm = c.webkit_user_content_manager_new();
             if (ucm == null) return error.UserContentManagerFailed;
@@ -2023,8 +2134,8 @@ fn Backend(comptime config: Config) type {
             // view 自带的（同分区子 WebView 的既有手法）。失败降级共享 context。
             var view_widget: [*c]c.GtkWidget = null;
             if (opts.proxy) |proxy| {
-                if (self.proxyContext(proxy)) |vctx| {
-                    view_widget = @ptrCast(c.webkit_web_view_new_with_context(vctx));
+                if (self.proxyContext(proxy)) |pieces| {
+                    view_widget = @ptrCast(@alignCast(gtk_compat.webViewNew(null, pieces.ctx, pieces.session)));
                     if (view_widget != null) {
                         st.ucm = c.webkit_web_view_get_user_content_manager(@ptrCast(view_widget));
                     }
@@ -2034,8 +2145,8 @@ fn Backend(comptime config: Config) type {
             }
             // v0.3.2：无痕窗口（ephemeral data manager；与 proxy 独立 context 同手法）
             if (view_widget == null and opts.incognito) {
-                if (self.incognitoContext()) |vctx| {
-                    view_widget = @ptrCast(c.webkit_web_view_new_with_context(vctx));
+                if (self.incognitoContext()) |pieces| {
+                    view_widget = @ptrCast(@alignCast(gtk_compat.webViewNew(null, pieces.ctx, pieces.session)));
                     if (view_widget != null) {
                         st.ucm = c.webkit_web_view_get_user_content_manager(@ptrCast(view_widget));
                         st.incognito = true;
@@ -2045,10 +2156,10 @@ fn Backend(comptime config: Config) type {
                 }
             }
             if (view_widget == null) {
-                view_widget = c.webkit_web_view_new_with_user_content_manager(ucm);
+                view_widget = @ptrCast(@alignCast(gtk_compat.webViewNew(ucm, null, null)));
             }
             if (view_widget == null) return error.WebViewCreateFailed;
-            const view: [*c]c.WebKitWebView = @ptrCast(view_widget);
+            const view: ?*c.WebKitWebView = @ptrCast(view_widget);
             st.view = view;
             sink.view = view;
             // v0.4.0 H8：禁用 JS（kiosk/锁定；本窗口注入 runtime 随之不可用——
@@ -2072,7 +2183,11 @@ fn Backend(comptime config: Config) type {
             // v0.3.15 G13：browser_accelerators——WebKitGTK 无对应 API（加速键由
             // WM/GTK 消费），文档化 skip
             // 主 WebView 作为 main child：随窗口内容区自动伸缩
-            c.gtk_container_add(@ptrCast(overlay), view_widget);
+            if (comptime gtk_compat.isGtk4()) {
+                c.gtk_overlay_set_child(@ptrCast(@alignCast(overlay)), view_widget);
+            } else {
+                c.gtk_container_add(@ptrCast(overlay), view_widget);
+            }
 
             // v0.3.0：透明窗口 / WebView 背景色（RGBA visual + app_paintable +
             // webkit_web_view_set_background_color；必须在 realize 之前设置）
@@ -2109,7 +2224,9 @@ fn Backend(comptime config: Config) type {
             // v0.3.0：拖出（window.zilt.drag.start → text/uri-list 文件拖放）。
             // 只在 JS 主动请求时 begin（不做常驻 drag source——否则会抢走页面
             // 文本选择/图片拖拽的默认手势）。
-            _ = c.g_signal_connect_data(@ptrCast(view_widget), "drag-data-get", @ptrCast(&Self.onDragDataGet), sink, null, 0);
+            if (comptime gtk_compat.isGtk3()) {
+                _ = c.g_signal_connect_data(@ptrCast(view_widget), "drag-data-get", @ptrCast(&Self.onDragDataGet), sink, null, 0);
+            }
 
             // v0.2.2：拖放（文件拖入）。dest 与信号挂主 WebView：drag-drop 里
             // gtk_drag_get_data 后返回 TRUE（user handler 先于 WebKit 的 class
@@ -2118,23 +2235,36 @@ fn Backend(comptime config: Config) type {
             // v0.4.0 H7：每窗口拖放开关（false = 不挂 drag-dest——页面原生
             // drag 事件可用，dropFiles 事件不再产生；冒烟模拟投递不走 dest）
             if (opts.drag_drop) {
-                const dnd_targets = [_]c.GtkTargetEntry{
-                    .{ .target = @constCast("text/uri-list"), .flags = 0, .info = 0 },
-                    .{ .target = @constCast("text/plain"), .flags = 0, .info = 1 },
-                };
-                c.gtk_drag_dest_set(
-                    view_widget,
-                    c.GTK_DEST_DEFAULT_ALL,
-                    &dnd_targets,
-                    dnd_targets.len,
-                    c.GDK_ACTION_COPY,
-                );
-                _ = c.g_signal_connect_data(@ptrCast(view_widget), "drag-drop", @ptrCast(&Self.onDragDrop), sink, null, 0);
-                _ = c.g_signal_connect_data(@ptrCast(view_widget), "drag-data-received", @ptrCast(&Self.onDragDataReceived), sink, null, 0);
+                if (comptime gtk_compat.isGtk4()) {
+                    // GTK4：GtkDropTarget 控制器（drop 信号内异步读 uri-list，
+                    // 解析 → handleDropUris 与 GTK3 的 drag-data-received 同汇）
+                    const mimes = [_][*:0]const u8{ "text/uri-list", "text/plain" };
+                    _ = gtk_compat.dropTargetAttach(view_widget, &mimes, &Self.onGdkDrop, sink);
+                } else {
+                    const dnd_targets = [_]c.GtkTargetEntry{
+                        .{ .target = @constCast("text/uri-list"), .flags = 0, .info = 0 },
+                        .{ .target = @constCast("text/plain"), .flags = 0, .info = 1 },
+                    };
+                    c.gtk_drag_dest_set(
+                        view_widget,
+                        c.GTK_DEST_DEFAULT_ALL,
+                        &dnd_targets,
+                        dnd_targets.len,
+                        c.GDK_ACTION_COPY,
+                    );
+                    _ = c.g_signal_connect_data(@ptrCast(view_widget), "drag-drop", @ptrCast(&Self.onDragDrop), sink, null, 0);
+                    _ = c.g_signal_connect_data(@ptrCast(view_widget), "drag-data-received", @ptrCast(&Self.onDragDataReceived), sink, null, 0);
+                }
             }
 
             // geometry hints（min/max；Xvfb 无 WM 不执行，真实桌面生效）
-            applyGeometryHints(st, win_typed);
+            gtk_compat.applyGeometryHints(
+                win_typed,
+                st.min_width,
+                st.min_height,
+                st.max_width,
+                st.max_height,
+            );
 
             // 窗口状态恢复（v0.2.1）：位置/尺寸/最大化/全屏覆盖 opts 默认值
             self.restoreWindowState(st);
@@ -2149,25 +2279,32 @@ fn Backend(comptime config: Config) type {
             // 注册成功后才接窗口级信号：destroy 处理器会解引用 st，
             // 之前的错误路径（errdefer destroy(st)）绝不能有 destroy 处理器存活。
             _ = c.g_signal_connect_data(win, "destroy", @ptrCast(&Self.onDestroy), st, null, 0);
-            _ = c.g_signal_connect_data(win, "configure-event", @ptrCast(&Self.onConfigureEvent), st, null, 0);
-            // v0.2.6：窗口事件面——焦点（focus-in/out）+ 关闭请求（delete-event，
-            // config.close_requested_event=true 时不销毁、发 windowCloseRequested
+            if (comptime gtk_compat.isGtk3()) {
+                _ = c.g_signal_connect_data(win, "configure-event", @ptrCast(&Self.onConfigureEvent), st, null, 0);
+            } else {
+                // GTK4：size-allocate 信号对 GtkWindow 不存在（实测 GLib CRITICAL）
+                // → 尺寸/位置全部走 focusPollTick 的 X11 轮询面（Wayland 以
+                // 跟踪值为准，文档化）
+            }
+            // v0.2.6：窗口事件面——焦点 + 关闭请求（close-request/delete-event 收敛
+            // 进 compat；close_requested_event=true 时不销毁、发 windowCloseRequested
             // 由前端确认后调 windowClose——对齐 Windows 的 WM_CLOSE opt-in 语义）
-            _ = c.g_signal_connect_data(win, "focus-in-event", @ptrCast(&Self.onFocusChange), st, null, 0);
-            _ = c.g_signal_connect_data(win, "focus-out-event", @ptrCast(&Self.onFocusChange), st, null, 0);
-            // v0.3.0：WebKit 的焦点落在子 GdkWindow 上，GtkWindow 的 focus-in/out
-            // 事件与 is-active 在 openbox 下都拿不到——补 has-toplevel-focus 通知
-            //（Wayland 等非 X11 后端的低延迟路径；X11 由 focusPollTick 兜底）。
-            _ = c.g_signal_connect_data(win, "notify::has-toplevel-focus", @ptrCast(&Self.onActiveNotify), st, null, 0);
-            _ = c.g_signal_connect_data(win, "delete-event", @ptrCast(&Self.onDeleteEvent), st, null, 0);
-            // v0.3.3：Escape 隐藏（key-press-event；hideOnEscape opt-in）
+            gtk_compat.connectFocusSignals(win, &Self.onFocusCompat, st);
+            if (comptime gtk_compat.isGtk3()) {
+                // v0.3.0：WebKit 的焦点落在子 GdkWindow 上，GtkWindow 的 focus-in/out
+                // 事件与 is-active 在 openbox 下都拿不到——补 has-toplevel-focus 通知
+                //（Wayland 等非 X11 后端的低延迟路径；X11 由 focusPollTick 兜底）。
+                _ = c.g_signal_connect_data(win, "notify::has-toplevel-focus", @ptrCast(&Self.onActiveNotify), st, null, 0);
+            }
+            gtk_compat.connectCloseRequest(win, &Self.onDeleteEvent, st);
+            // v0.3.3：Escape 隐藏（hideOnEscape opt-in）
             // v0.3.9 A4L：窗口级 KeyBindings 同一 handler 匹配（有绑定即接线）
             if (st.hide_on_escape or st.key_bindings.len > 0) {
-                _ = c.g_signal_connect_data(win, "key-press-event", @ptrCast(&Self.onKeyPress), st, null, 0);
+                gtk_compat.connectKeyPress(@ptrCast(win), &Self.onKeyPressCompat, st);
             }
             // v0.3.0：恢复过几何的窗口在 map 后补一次 move（WM 会忽略 map 前的请求）
             if (st.restored_geometry) {
-                _ = c.g_signal_connect_data(win, "map-event", @ptrCast(&Self.onMapRestore), st, null, 0);
+                gtk_compat.connectMap(win, &Self.onMapRestore, st);
             }
             // v0.3.3：窗口形状 mask（PNG alpha → cairo region → shape；realize 后有效）
             if (opts.mask) |mask_path| {
@@ -2182,7 +2319,7 @@ fn Backend(comptime config: Config) type {
                 0,
             );
 
-            c.gtk_widget_show_all(win);
+            gtk_compat.showAll(@ptrCast(win));
             if (opts.visible) c.gtk_window_present(win_typed);
             // v0.3.14：创建即最大化（Wails StartState.Maximised / Tauri maximized；
             // show 之后应用——GTK 的 maximize 在映射后生效）
@@ -2208,25 +2345,6 @@ fn Backend(comptime config: Config) type {
             return st;
         }
 
-        /// 尺寸约束 → gdk geometry hints（0 = 无约束；全空则不下发任何 hint 位）。
-        /// 注意 WM 才会执行约束，Xvfb 下无 WM——所以 query 读跟踪值而非 hint。
-        fn applyGeometryHints(st: *WinState, win: [*c]c.GtkWindow) void {
-            var geom: c.GdkGeometry = std.mem.zeroes(c.GdkGeometry);
-            var flags: c.GdkWindowHints = 0;
-            if (st.min_width != 0 or st.min_height != 0) {
-                geom.min_width = @intCast(st.min_width);
-                geom.min_height = @intCast(st.min_height);
-                flags |= c.GDK_HINT_MIN_SIZE;
-            }
-            if (st.max_width != 0 or st.max_height != 0) {
-                geom.max_width = @intCast(st.max_width);
-                geom.max_height = @intCast(st.max_height);
-                flags |= c.GDK_HINT_MAX_SIZE;
-            }
-            // geometry_widget 传 null = 约束相对窗口自身
-            c.gtk_window_set_geometry_hints(win, null, &geom, flags);
-        }
-
         // ------------------------------------------------------------------
         // v0.3.0：透明窗口 / 背景色 / 光标 / 拖出
         // ------------------------------------------------------------------
@@ -2238,28 +2356,36 @@ fn Backend(comptime config: Config) type {
         fn applyWindowBackground(st: *WinState) void {
             const widget: [*c]c.GtkWidget = @ptrCast(st.win);
             if (st.transparent) {
-                const screen = c.gtk_widget_get_screen(widget);
                 var rgba_visual = false;
-                if (screen != null) {
-                    if (c.gdk_screen_get_rgba_visual(screen)) |visual| {
-                        c.gtk_widget_set_visual(widget, visual);
-                        rgba_visual = true;
-                    }
+                if (comptime gtk_compat.isGtk3()) {
+                    gtk_compat.applyTransparentWindow(widget);
+                    _ = c.g_signal_connect_data(widget, "draw", @ptrCast(&Self.onTransparentDraw), st, null, 0);
+                    rgba_visual = true; // GTK3：visual+app_paintable 路径
+                } else {
+                    // GTK4：display 级 CSS（透明背景类）；visual 由 GDK 自动选择
+                    gtk_compat.applyTransparentWindow(widget);
+                    rgba_visual = true;
                 }
-                c.gtk_widget_set_app_paintable(widget, 1);
-                _ = c.g_signal_connect_data(widget, "draw", @ptrCast(&Self.onTransparentDraw), st, null, 0);
                 var clear = c.GdkRGBA{ .red = 0, .green = 0, .blue = 0, .alpha = 0 };
                 c.webkit_web_view_set_background_color(st.view, &clear);
                 log.print("[window] #{d} transparent (rgba visual={s})", .{ st.id, boolStr(rgba_visual) });
                 return;
             }
             if (st.background_color) |rgb| {
-                // 0xRRGGBB → GdkRGBA（alpha=1）
-                const r: f64 = @floatFromInt((rgb >> 16) & 0xff);
-                const g: f64 = @floatFromInt((rgb >> 8) & 0xff);
-                const b: f64 = @floatFromInt(rgb & 0xff);
-                var color = c.GdkRGBA{ .red = r / 255.0, .green = g / 255.0, .blue = b / 255.0, .alpha = 1 };
-                c.webkit_web_view_set_background_color(st.view, &color);
+                // 0xRRGGBB → GdkRGBA（alpha=1）。字段宽度差异：GTK3 double / GTK4 float
+                if (comptime gtk_compat.isGtk4()) {
+                    const r: f32 = @floatFromInt((rgb >> 16) & 0xff);
+                    const g: f32 = @floatFromInt((rgb >> 8) & 0xff);
+                    const b: f32 = @floatFromInt(rgb & 0xff);
+                    var color = c.GdkRGBA{ .red = r / 255.0, .green = g / 255.0, .blue = b / 255.0, .alpha = 1 };
+                    c.webkit_web_view_set_background_color(st.view, &color);
+                } else {
+                    const r: f64 = @floatFromInt((rgb >> 16) & 0xff);
+                    const g: f64 = @floatFromInt((rgb >> 8) & 0xff);
+                    const b: f64 = @floatFromInt(rgb & 0xff);
+                    var color = c.GdkRGBA{ .red = r / 255.0, .green = g / 255.0, .blue = b / 255.0, .alpha = 1 };
+                    c.webkit_web_view_set_background_color(st.view, &color);
+                }
                 log.print("[window] #{d} background color #{x:0>6}", .{ st.id, rgb });
             }
         }
@@ -2275,26 +2401,20 @@ fn Backend(comptime config: Config) type {
             return 1;
         }
 
-        /// 1×1 全透明光标（隐藏光标用；GDK3 没有 ShowCursor 式的全局开关）。
-        fn blankCursor(display: *c.GdkDisplay) ?*c.GdkCursor {
-            const pixbuf = c.gdk_pixbuf_new(c.GDK_COLORSPACE_RGB, 1, 8, 1, 1) orelse return null;
-            defer c.g_object_unref(@ptrCast(pixbuf));
-            c.gdk_pixbuf_fill(pixbuf, 0);
-            return c.gdk_cursor_new_from_pixbuf(display, pixbuf, 0, 0);
+        /// 1×1 全透明光标（compat 面收敛：GTK4 走 texture 构造）。
+        fn blankCursorCompat(widget: [*c]c.GtkWidget) ?*anyopaque {
+            return gtk_compat.blankCursorFor(widget);
         }
 
         /// 把 st.cursor / cursor_hidden 的当前状态落到 GdkWindow。
         fn applyWindowCursor(st: *WinState) bool {
-            const gdk_win = c.gtk_widget_get_window(@ptrCast(st.win)) orelse return false;
+            const widget: [*c]c.GtkWidget = @ptrCast(st.win);
             if (st.cursor_hidden) {
-                const display = c.gdk_window_get_display(gdk_win) orelse return false;
-                const blank = blankCursor(display) orelse return false;
-                c.gdk_window_set_cursor(gdk_win, blank);
-                c.g_object_unref(@ptrCast(blank));
-                return true;
+                const blank = blankCursorCompat(widget) orelse return false;
+                defer c.g_object_unref(@ptrCast(blank));
+                return gtk_compat.surfaceSetCursor(widget, blank);
             }
-            c.gdk_window_set_cursor(gdk_win, st.cursor);
-            return true;
+            return gtk_compat.surfaceSetCursor(widget, st.cursor);
         }
 
         /// 释放拖出文件列表（替换/窗口销毁时）。
@@ -2344,13 +2464,20 @@ fn Backend(comptime config: Config) type {
             }
             if (st.drag_files.items.len == 0) return error.NoFiles;
 
-            const widget: [*c]c.GtkWidget = @ptrCast(st.view);
-            const gdk_win = c.gtk_widget_get_window(widget) orelse return error.DragNotAvailable;
-            const display = c.gdk_window_get_display(gdk_win) orelse return error.DragNotAvailable;
-            const seat = c.gdk_display_get_default_seat(display) orelse return error.DragNotAvailable;
+            // GTK4：GDK 无公开的「脚本发起拖拽」入口（GtkDragSource 仅手势驱动；
+            // 低层 gdk_drag_begin 的数据面不走 content provider）→ 文档化 NotAvailable。
+            // 待拖文件列表仍记录（恢复 GTK3 或后续 GDK 级方案时语义不变）。
+            if (comptime !gtk_compat.programmaticDragAvailable()) {
+                log.print("[dnd] drag-out not available under GTK4 (window #{d})", .{st.id});
+                return error.DragNotAvailable;
+            }
             var x: c.gint = 0;
             var y: c.gint = 0;
-            c.gdk_device_get_position(c.gdk_seat_get_pointer(seat), null, &x, &y);
+            if (!gtk_compat.pointerRootPos(@ptrCast(st.view), &x, &y)) {
+                log.print("[dnd] pointer position unavailable", .{});
+                return error.DragNotAvailable;
+            }
+            const widget: [*c]c.GtkWidget = @ptrCast(st.view);
 
             const targets = [_]c.GtkTargetEntry{
                 .{ .target = @constCast("text/uri-list"), .flags = 0, .info = 0 },
@@ -2379,8 +2506,7 @@ fn Backend(comptime config: Config) type {
                 // v0.3.16 G21：全工作区可见（gtk_window_stick——所有工作区显示；
                 // Tauri visibleOnAllWorkspaces 对齐）
                 .visible_on_all_workspaces => |on| {
-                    c.gtk_window_stick(win);
-                    if (!on) c.gtk_window_unstick(win);
+                    gtk_compat.setSticky(win, on);
                     return true;
                 },
                 .set_title => |t| {
@@ -2388,7 +2514,7 @@ fn Backend(comptime config: Config) type {
                     defer self.allocator.free(z);
                     c.gtk_window_set_title(win, z.ptr);
                 },
-                .minimize => c.gtk_window_iconify(win),
+                .minimize => gtk_compat.setIconic(win, true),
                 .maximize => c.gtk_window_maximize(win),
                 .restore => {
                     // 全屏 → 最大化 → 最小化，逐层退出（与 Windows restore 语义对齐）
@@ -2397,33 +2523,32 @@ fn Backend(comptime config: Config) type {
                         st.fullscreen = false;
                     }
                     if (c.gtk_window_is_maximized(win) != 0) c.gtk_window_unmaximize(win);
-                    _ = c.gtk_window_deiconify(win);
+                    gtk_compat.setIconic(win, false);
                 },
                 .fullscreen => |on| {
                     if (on) c.gtk_window_fullscreen(win) else c.gtk_window_unfullscreen(win);
                     st.fullscreen = on;
                 },
                 .size => |s| {
-                    c.gtk_window_resize(win, @intCast(s.width), @intCast(s.height));
+                    gtk_compat.windowResize(win, @intCast(s.width), @intCast(s.height));
                     // 跟踪值同步：窗口状态持久化在 destroy 期间查不到真实几何
                     st.geom_width = s.width;
                     st.geom_height = s.height;
                 },
                 .position => |p| {
-                    c.gtk_window_move(win, p.x, p.y);
+                    gtk_compat.windowMove(win, p.x, p.y);
                     st.geom_x = p.x;
                     st.geom_y = p.y;
                 },
-                .show => c.gtk_widget_show_all(widget),
+                .show => gtk_compat.showAll(widget),
                 .hide => c.gtk_widget_hide(widget),
                 .focus => c.gtk_window_present(win),
                 .close => {
-                    // opt-in：直接发 delete-event 信号（本 GTK3 构建的 gtk_window_close
-                    // 实测不派发 delete-event；真实 WM 的关闭请求会自然到达该信号）
+                    // opt-in：直接发 close-request / delete-event（变体收敛于 compat；
+                    // gtk_window_close 实测不派发关闭信号——真实 WM 的关闭请求自然到达）
                     if (st.close_requested_event) {
-                        var handled: c.gboolean = 0;
-                        c.g_signal_emit_by_name(@ptrCast(win), "delete-event", @as(?*anyopaque, null), &handled);
-                        if (handled == 0) c.gtk_window_close(win); // 未拦截（理论不达）兜底
+                        const handled = gtk_compat.emitCloseRequest(win);
+                        if (!handled) c.gtk_window_close(win); // 未拦截（理论不达）兜底
                     } else {
                         c.gtk_window_close(win);
                     }
@@ -2432,33 +2557,25 @@ fn Backend(comptime config: Config) type {
                     // v0.3.3：内容区拖拽缩放（gtk_window_begin_resize_drag）
                     const st2 = self.windowById(window_id) orelse return false;
                     const edge_int: c.gint = if (std.mem.eql(u8, edge, "n"))
-                        c.GDK_WINDOW_EDGE_NORTH
+                        gtk_compat.EDGE_NORTH
                     else if (std.mem.eql(u8, edge, "s"))
-                        c.GDK_WINDOW_EDGE_SOUTH
+                        gtk_compat.EDGE_SOUTH
                     else if (std.mem.eql(u8, edge, "e"))
-                        c.GDK_WINDOW_EDGE_EAST
+                        gtk_compat.EDGE_EAST
                     else if (std.mem.eql(u8, edge, "w"))
-                        c.GDK_WINDOW_EDGE_WEST
+                        gtk_compat.EDGE_WEST
                     else if (std.mem.eql(u8, edge, "ne"))
-                        c.GDK_WINDOW_EDGE_NORTH_EAST
+                        gtk_compat.EDGE_NORTH_EAST
                     else if (std.mem.eql(u8, edge, "nw"))
-                        c.GDK_WINDOW_EDGE_NORTH_WEST
+                        gtk_compat.EDGE_NORTH_WEST
                     else if (std.mem.eql(u8, edge, "sw"))
-                        c.GDK_WINDOW_EDGE_SOUTH_WEST
+                        gtk_compat.EDGE_SOUTH_WEST
                     else
-                        c.GDK_WINDOW_EDGE_SOUTH_EAST;
+                        gtk_compat.EDGE_SOUTH_EAST;
                     var px: c.gint = 0;
                     var py: c.gint = 0;
-                    const display = c.gdk_display_get_default();
-                    if (display != null) {
-                        const seat = c.gdk_display_get_default_seat(display);
-                        if (seat != null) {
-                            const pointer = c.gdk_seat_get_pointer(seat);
-                            if (pointer != null) c.gdk_device_get_position(pointer, null, &px, &py);
-                        }
-                    }
-                    const ev_time: c.guint32 = @intCast(c.gtk_get_current_event_time());
-                    c.gtk_window_begin_resize_drag(st2.win, @intCast(edge_int), 1, px, py, ev_time);
+                    if (!gtk_compat.pointerRootPos(widget, &px, &py)) return false;
+                    gtk_compat.beginResizeDrag(st2.win, edge_int, px, py);
                     return true;
                 },
                 // v0.3.3：体验包 II 的 Linux 范围——simple_fullscreen 语义同 fullscreen；
@@ -2476,20 +2593,19 @@ fn Backend(comptime config: Config) type {
                 // center：居中到最近显示器工作区（gdk_monitor_get_workarea）
                 .center => {
                     const display = c.gdk_display_get_default() orelse return false;
-                    const gdk_win = c.gtk_widget_get_window(widget);
-                    const monitor = if (gdk_win != null)
-                        c.gdk_display_get_monitor_at_window(display, gdk_win)
+                    const monitor = if (gtk_compat.surfaceOf(widget) != null)
+                        gtk_compat.monitorAtSurface(widget)
                     else
-                        c.gdk_display_get_primary_monitor(display);
+                        gtk_compat.displayPrimaryMonitor(display);
                     if (monitor == null) return false;
                     var wa: c.GdkRectangle = undefined;
-                    c.gdk_monitor_get_workarea(monitor, &wa);
+                    gtk_compat.monitorWorkarea(monitor, &wa);
                     var ww: c.gint = 0;
                     var wh: c.gint = 0;
-                    c.gtk_window_get_size(win, &ww, &wh);
+                    gtk_compat.windowGetSize(win, &ww, &wh);
                     const x = wa.x + @divTrunc(wa.width - ww, 2);
                     const y = wa.y + @divTrunc(wa.height - wh, 2);
-                    c.gtk_window_move(win, x, y);
+                    gtk_compat.windowMove(win, x, y);
                     st.geom_x = x;
                     st.geom_y = y;
                     return true;
@@ -2511,49 +2627,47 @@ fn Backend(comptime config: Config) type {
                 // destroy：强制销毁（绕过 delete-event 请求链；对齐 Tauri destroy()）
                 // GTK3 无 gtk_window_destroy（GTK4 才有）——用 gtk_widget_destroy
                 .destroy_win => {
-                    c.gtk_widget_destroy(widget);
+                    gtk_compat.windowDestroy(win);
                     return true;
                 },
                 // setScreen：移动到目标显示器工作区（gdk_display 枚举序，与
                 // system.info('monitors') 一致）
                 .set_screen => |index| {
                     const display2 = c.gdk_display_get_default() orelse return false;
-                    const n = c.gdk_display_get_n_monitors(display2);
+                    const n = gtk_compat.displayMonitorCount(display2);
                     if (index >= @as(u32, @intCast(n))) return false;
-                    const monitor = c.gdk_display_get_monitor(display2, @intCast(index)) orelse return false;
+                    const monitor = gtk_compat.displayMonitorAtIdx(display2, @intCast(index)) orelse return false;
                     var wa: c.GdkRectangle = undefined;
-                    c.gdk_monitor_get_workarea(monitor, &wa);
+                    gtk_compat.monitorWorkarea(monitor, &wa);
                     var ww: c.gint = 0;
                     var wh: c.gint = 0;
-                    c.gtk_window_get_size(win, &ww, &wh);
+                    gtk_compat.windowGetSize(win, &ww, &wh);
                     const width = @min(ww, wa.width);
                     const height = @min(wh, wa.height);
                     const x = wa.x + @divTrunc(wa.width - width, 2);
                     const y = wa.y + @divTrunc(wa.height - height, 2);
-                    c.gtk_window_move(win, x, y);
+                    gtk_compat.windowMove(win, x, y);
                     st.geom_x = x;
                     st.geom_y = y;
                     return true;
                 },
                 .start_dragging => {
-                    // 无鼠标事件上下文也能拖：取指针根坐标 + GLib 当前事件时间戳
-                    const display = c.gdk_display_get_default() orelse return false;
-                    const seat = c.gdk_display_get_default_seat(display) orelse return false;
+                    // 无鼠标事件上下文也能拖：取指针根坐标（begin 细节收敛 compat）
                     var x: c.gint = 0;
                     var y: c.gint = 0;
-                    c.gdk_device_get_position(c.gdk_seat_get_pointer(seat), null, &x, &y);
-                    c.gtk_window_begin_move_drag(win, 1, x, y, c.gtk_get_current_event_time());
+                    if (!gtk_compat.pointerRootPos(widget, &x, &y)) return false;
+                    gtk_compat.beginMoveDrag(win, x, y);
                 },
                 .always_on_top => |on| {
-                    c.gtk_window_set_keep_above(win, @intFromBool(on));
+                    gtk_compat.setKeepAbove(win, on);
                     st.always_on_top = on;
                 },
                 .always_on_bottom => |on| {
-                    c.gtk_window_set_keep_below(win, @intFromBool(on));
+                    gtk_compat.setKeepBelow(win, on);
                     st.always_on_bottom = on;
                 },
-                .skip_taskbar => |on| c.gtk_window_set_skip_taskbar_hint(win, @intFromBool(on)),
-                .focusable => |on| c.gtk_window_set_accept_focus(win, @intFromBool(on)),
+                .skip_taskbar => |on| gtk_compat.setSkipTaskbar(win, on),
+                .focusable => |on| gtk_compat.setAcceptFocus(win, on),
                 .enabled => |on| c.gtk_widget_set_sensitive(widget, @intFromBool(on)),
                 .theme => |t| {
                     // GTK3 只有暗色偏好这一项可映射；caption/border 等 DWM 配色是 Windows 独占
@@ -2573,26 +2687,30 @@ fn Backend(comptime config: Config) type {
                     if (lim.min_height) |v| st.min_height = @intCast(v) else st.min_height = 0;
                     if (lim.max_width) |v| st.max_width = @intCast(v) else st.max_width = 0;
                     if (lim.max_height) |v| st.max_height = @intCast(v) else st.max_height = 0;
-                    applyGeometryHints(st, win);
+                    gtk_compat.applyGeometryHints(win, st.min_width, st.min_height, st.max_width, st.max_height);
                 },
                 .fullscreen_monitor => |idx| {
-                    // GTK3 的 API 走 GdkScreen（3.22 起才有 GdkMonitor 版本）
-                    const screen = c.gdk_screen_get_default() orelse return false;
-                    if (idx >= @as(u32, @intCast(c.gdk_screen_get_n_monitors(screen)))) return false;
-                    c.gtk_window_fullscreen_on_monitor(win, screen, @intCast(idx));
+                    if (!gtk_compat.fullscreenOnMonitor(win, idx)) return false;
                     st.fullscreen = true;
                 },
                 // ---- v0.3.0：窗口精细控制 ----
                 .cursor => |kind| {
-                    const gdk_win = c.gtk_widget_get_window(widget) orelse return false;
-                    const display = c.gdk_window_get_display(gdk_win) orelse return false;
                     const name = gdkCursorName(kind);
-                    var cursor = c.gdk_cursor_new_from_name(display, name.ptr);
+                    var cursor = if (comptime gtk_compat.isGtk4())
+                        c.gdk_cursor_new_from_name(name.ptr, null)
+                    else
+                        c.gdk_cursor_new_from_name(c.gdk_display_get_default(), name.ptr);
                     if (cursor == null and !std.mem.eql(u8, name, "default")) {
-                        cursor = c.gdk_cursor_new_from_name(display, "default");
+                        cursor = if (comptime gtk_compat.isGtk4())
+                            c.gdk_cursor_new_from_name("default", null)
+                        else
+                            c.gdk_cursor_new_from_name(c.gdk_display_get_default(), "default");
                     }
                     if (cursor == null) return false;
-                    c.gdk_window_set_cursor(gdk_win, cursor);
+                    if (!gtk_compat.surfaceSetCursor(widget, cursor)) {
+                        c.g_object_unref(@ptrCast(cursor));
+                        return false;
+                    }
                     if (st.cursor) |old| c.g_object_unref(@ptrCast(old));
                     st.cursor = cursor;
                     st.cursor_hidden = false;
@@ -2603,6 +2721,11 @@ fn Backend(comptime config: Config) type {
                     return applyWindowCursor(st);
                 },
                 .cursor_grab => |grab| {
+                    if (comptime gtk_compat.isGtk4()) {
+                        // 4.14 capi 无 gdk_seat_grab（指针抓取面移除）→ 文档化 skip
+                        log.print("[window] cursor grab unsupported under GTK4 (seat grab removed)", .{});
+                        return false;
+                    }
                     const gdk_win = c.gtk_widget_get_window(widget) orelse return false;
                     const display = c.gdk_window_get_display(gdk_win) orelse return false;
                     const seat = c.gdk_display_get_default_seat(display) orelse return false;
@@ -2629,19 +2752,22 @@ fn Backend(comptime config: Config) type {
                     const display = c.gdk_display_get_default() orelse return false;
                     const seat = c.gdk_display_get_default_seat(display) orelse return false;
                     const pointer = c.gdk_seat_get_pointer(seat) orelse return false;
-                    const screen = c.gdk_window_get_screen(c.gtk_widget_get_window(widget)) orelse return false;
-                    c.gdk_device_warp(pointer, screen, p.x, p.y);
-                    return true;
+                    return gtk_compat.deviceWarp(widget, pointer, p.x, p.y);
                 },
                 .ignore_cursor => |ignore| {
-                    const gdk_win = c.gtk_widget_get_window(widget) orelse return false;
-                    if (ignore) {
-                        // 空 input shape = 该窗口不接收指针事件（穿透到下层窗口）
-                        const region = c.cairo_region_create() orelse return false;
-                        defer c.cairo_region_destroy(region);
-                        c.gdk_window_input_shape_combine_region(gdk_win, region, 0, 0);
+                    if (comptime gtk_compat.isGtk4()) {
+                        // GDK4 无 input shape 面 → X11 XShape（Wayland skip 文档化）
+                        if (!gtk_compat.inputShapeSetIgnore(widget, ignore)) return false;
                     } else {
-                        c.gdk_window_input_shape_combine_region(gdk_win, null, 0, 0);
+                        const gdk_win = c.gtk_widget_get_window(widget) orelse return false;
+                        if (ignore) {
+                            // 空 input shape = 该窗口不接收指针事件（穿透到下层窗口）
+                            const region = c.cairo_region_create() orelse return false;
+                            defer c.cairo_region_destroy(region);
+                            c.gdk_window_input_shape_combine_region(gdk_win, region, 0, 0);
+                        } else {
+                            c.gdk_window_input_shape_combine_region(gdk_win, null, 0, 0);
+                        }
                     }
                     st.ignore_cursor = ignore;
                     return true;
@@ -2661,16 +2787,12 @@ fn Backend(comptime config: Config) type {
                     if (maybe_path) |path| {
                         const z = dupeZ(self.allocator, path) catch return false;
                         defer self.allocator.free(z);
-                        var err: ?*c.GError = null;
-                        const ok = c.gtk_window_set_icon_from_file(win, z.ptr, &err);
-                        if (err) |e| {
-                            log.print("[window] icon load failed ('{s}'): {s}", .{ path, std.mem.span(e.*.message) });
-                            c.g_error_free(e);
-                        }
-                        return ok != 0;
+                        const ok = gtk_compat.setIconFromPath(win, z.ptr);
+                        if (!ok) log.print("[window] icon load failed ('{s}')", .{path});
+                        return ok;
                     }
-                    // null = 清空图标（GTK 回退到默认）
-                    c.gtk_window_set_icon(win, null);
+                    // null = 清空图标（GTK 回退到默认；GTK4 无属性面 → no-op）
+                    gtk_compat.setIcon(win, null);
                     return true;
                 },
                 // builtin 的 state 动作在调用 window_fn 之前已走 window_query_fn
@@ -2681,9 +2803,24 @@ fn Backend(comptime config: Config) type {
                     if (target.id == st.id) return false;
                     const old_box = st.box orelse return false;
                     const view_w: [*c]c.GtkWidget = @ptrCast(st.view orelse return false);
-                    _ = c.gtk_container_remove(@ptrCast(old_box), view_w);
-                    const tbox = target.box orelse return false;
-                    c.gtk_container_add(@ptrCast(tbox), view_w);
+                    if (comptime gtk_compat.isGtk4()) {
+                        // GTK4：GtkBox 无 container 面且 reparent 需先 unparent——
+                        // view 主挂点在 GtkOverlay（set_child），子视图为 overlay child
+                        if (st.overlay != null and old_box == st.box) {
+                            // 主视图换窗：目标窗口的 overlay 接收
+                            c.gtk_overlay_remove_overlay(@ptrCast(@alignCast(st.overlay)), view_w);
+                            c.gtk_overlay_add_overlay(@ptrCast(@alignCast(target.overlay)), view_w);
+                        } else {
+                            c.gtk_box_remove(@ptrCast(@alignCast(old_box)), view_w);
+                            c.gtk_box_append(@ptrCast(@alignCast(target.box)), view_w);
+                        }
+                    } else {
+                        // 主视图在 overlay 的 main child 位（v0.3.11 布局），不是 box
+                        // 的直接子控件——从 overlay 摘除后再按 expand+fill 装进目标窗口
+                        _ = c.gtk_container_remove(@ptrCast(@alignCast(st.overlay)), view_w);
+                        const tbox2 = target.box orelse return false;
+                        gtk_compat.boxPackStartFill(@ptrCast(@alignCast(tbox2)), view_w);
+                    }
                     st.parent_id = target.id;
                     return true;
                 },
@@ -2722,26 +2859,23 @@ fn Backend(comptime config: Config) type {
 
             var x: c.gint = 0;
             var y: c.gint = 0;
-            c.gtk_window_get_position(win, &x, &y);
+            gtk_compat.windowGetPosition(win, &x, &y);
             var width: c.gint = 0;
             var height: c.gint = 0;
-            c.gtk_window_get_size(win, &width, &height);
+            gtk_compat.windowGetSize(win, &width, &height);
 
-            var iconic = false;
-            if (c.gtk_widget_get_window(widget)) |gdk_win| {
-                iconic = (c.gdk_window_get_state(gdk_win) & c.GDK_WINDOW_STATE_ICONIFIED) != 0;
-            }
+            const iconic = gtk_compat.surfaceIconified(widget);
 
             // v0.4.0 H9：物理像素面——frame extents（外框物理）+ 客户区原点；
-            // Xvfb 无 WM 时 frame == 窗口 → 边框 0（合法值）
+            // Xvfb 无 WM 时 frame == 窗口 → 边框 0（合法值）；Wayland 无全局
+            // 坐标/外框 → false 回退零值（文档化）
             var frame: c.GdkRectangle = std.mem.zeroes(c.GdkRectangle);
             var ox: c.gint = 0;
             var oy: c.gint = 0;
             var scale: c.gint = 1;
-            if (c.gtk_widget_get_window(widget)) |gdk_win| {
-                c.gdk_window_get_frame_extents(gdk_win, &frame);
-                _ = c.gdk_window_get_origin(gdk_win, &ox, &oy);
-                scale = c.gdk_window_get_scale_factor(gdk_win);
+            if (gtk_compat.frameExtents(widget, &frame)) {
+                _ = gtk_compat.surfaceOrigin(widget, &ox, &oy);
+                scale = gtk_compat.surfaceScale(widget);
             }
             const phys_client_w = width * scale;
             const phys_client_h = height * scale;
@@ -2769,20 +2903,19 @@ fn Backend(comptime config: Config) type {
                 boolStr(st.always_on_top),
                 boolStr(st.always_on_bottom),
                 boolStr(st.ignore_cursor),
-                boolStr(c.gtk_window_get_accept_focus(win) != 0),
+                boolStr(gtk_compat.getAcceptFocus(win)),
                 boolStr(st.titlebar_overlay),
                 boolStr(st.incognito),
                 @as(i64, blk: {
-                    // v0.3.2：当前窗口所在显示器（枚举序；无 GDK 窗口时 0）
+                    // v0.3.2：当前窗口所在显示器（枚举序；无 GDK surface 时 0）
                     const widget2: [*c]c.GtkWidget = @ptrCast(win);
-                    const gdk_win = c.gtk_widget_get_window(widget2);
                     const display = c.gdk_display_get_default() orelse break :blk 0;
-                    const mon = if (gdk_win != null) c.gdk_display_get_monitor_at_window(display, @ptrCast(gdk_win)) else null;
+                    const mon = gtk_compat.monitorAtSurface(widget2);
                     if (mon == null) break :blk 0;
-                    const n = c.gdk_display_get_n_monitors(display);
+                    const n = gtk_compat.displayMonitorCount(display);
                     var idx: c_int = 0;
                     while (idx < n) : (idx += 1) {
-                        if (c.gdk_display_get_monitor(display, idx) == mon) break;
+                        if (gtk_compat.displayMonitorAtIdx(display, idx) == mon) break;
                     }
                     break :blk @intCast(idx);
                 }),
@@ -2848,7 +2981,7 @@ fn Backend(comptime config: Config) type {
             _ = self;
             var query_w: c.gint = 0;
             var query_h: c.gint = 0;
-            c.gtk_window_get_size(st.win, &query_w, &query_h);
+            gtk_compat.windowGetSize(st.win, &query_w, &query_h);
             const width: u32 = if (st.geom_width > 0)
                 st.geom_width
             else if (query_w > 0)
@@ -2895,8 +3028,8 @@ fn Backend(comptime config: Config) type {
                 return;
             }) orelse return;
             if (state.width == 0 or state.height == 0) return;
-            c.gtk_window_resize(st.win, @intCast(state.width), @intCast(state.height));
-            c.gtk_window_move(st.win, state.x, state.y);
+            gtk_compat.windowResize(st.win, @intCast(state.width), @intCast(state.height));
+            gtk_compat.windowMove(st.win, state.x, state.y);
             st.geom_x = state.x;
             st.geom_y = state.y;
             st.geom_width = state.width;
@@ -2937,27 +3070,30 @@ fn Backend(comptime config: Config) type {
         // 剪贴板（v0.2.2）：文本 / HTML / 文件列表 / 图片
         // ------------------------------------------------------------------
 
-        /// GtkClipboard 在 translate-c 里是不透明类型 → 用单指针（C 指针不可索引）。
-        fn gtkClipboard() ?*c.GtkClipboard {
-            return c.gtk_clipboard_get(c.GDK_SELECTION_CLIPBOARD);
+        /// 剪贴板句柄（GtkClipboard / GdkClipboard 收敛于 compat——不透明句柄）。
+        fn gtkClipboard() ?*anyopaque {
+            return gtk_compat.clipboardGet();
+        }
+
+        /// GTK3 延迟提供面的类型化句柄（set_with_data 需要 GtkClipboard 具体类型）。
+        fn gtkClipboardTyped() ?*c.GtkClipboard {
+            return @ptrCast(@alignCast(gtkClipboard()));
         }
 
         fn clipboardWriteTextEntry(_: *anyopaque, text: []const u8) bool {
             const cb = gtkClipboard() orelse return false;
             const z = std.heap.c_allocator.allocSentinel(u8, text.len, 0) catch return false;
             defer std.heap.c_allocator.free(z);
+            // allocSentinel 不清零：必须显式拷贝（漏了这步会把未初始化内存写进
+            // 剪贴板 → 读回乱码；v0.4.3 L3 冒烟实测的 clipboard 失败根因）
             @memcpy(z, text);
-            c.gtk_clipboard_set_text(cb, z.ptr, @intCast(text.len));
-            c.gtk_clipboard_store(cb);
+            gtk_compat.clipboardWriteText(cb, z.ptr, text.len);
             return true;
         }
 
         fn readClipboardText(alloc: std.mem.Allocator) ?[]u8 {
             const cb = gtkClipboard() orelse return null;
-            const text = c.gtk_clipboard_wait_for_text(cb);
-            if (text == null) return null;
-            defer c.g_free(@ptrCast(text));
-            return alloc.dupe(u8, std.mem.span(text)) catch null;
+            return gtk_compat.clipboardReadText(cb, alloc);
         }
 
         fn clipboardReadTextEntry(_: *anyopaque, alloc: std.mem.Allocator) ?[]u8 {
@@ -2968,58 +3104,35 @@ fn Backend(comptime config: Config) type {
             const cb = gtkClipboard() orelse return error.ClipboardNotAvailable;
             switch (format) {
                 .text => {
-                    const text = readClipboardText(alloc) orelse return null;
+                    const text = gtk_compat.clipboardReadText(cb, alloc) orelse return null;
                     return clipboard.Data{ .text = text };
                 },
                 .html => {
-                    const atom = c.gdk_atom_intern("text/html", 0);
-                    const sel = c.gtk_clipboard_wait_for_contents(cb, atom) orelse return null;
-                    defer c.gtk_selection_data_free(sel);
-                    const len = c.gtk_selection_data_get_length(sel);
-                    const raw = c.gtk_selection_data_get_data(sel);
-                    if (len <= 0 or raw == null) return null;
-                    return clipboard.Data{ .html = try alloc.dupe(u8, raw[0..@intCast(len)]) };
+                    const raw = gtk_compat.clipboardReadMime(cb, "text/html", alloc) orelse return null;
+                    return clipboard.Data{ .html = raw };
                 },
                 .image => {
-                    const pixbuf = c.gtk_clipboard_wait_for_image(cb) orelse return null;
-                    defer c.g_object_unref(@ptrCast(pixbuf));
-                    const width: u32 = @intCast(c.gdk_pixbuf_get_width(pixbuf));
-                    const height: u32 = @intCast(c.gdk_pixbuf_get_height(pixbuf));
-                    if (width == 0 or height == 0) return null;
-                    const channels = c.gdk_pixbuf_get_n_channels(pixbuf);
-                    const rowstride: usize = @intCast(c.gdk_pixbuf_get_rowstride(pixbuf));
-                    const pixels = c.gdk_pixbuf_get_pixels(pixbuf);
-                    if (pixels == null) return null;
-                    const rgba = try alloc.alloc(u8, @as(usize, width) * height * 4);
-                    errdefer alloc.free(rgba);
-                    for (0..height) |row| {
-                        const src = pixels + row * rowstride;
-                        for (0..width) |col| {
-                            const s = src + col * @as(usize, @intCast(channels));
-                            const d = rgba[(row * width + col) * 4 ..][0..4];
-                            d[0] = s[0];
-                            d[1] = s[1];
-                            d[2] = s[2];
-                            d[3] = if (channels >= 4) s[3] else 255;
-                        }
-                    }
-                    return clipboard.Data{ .image = .{ .width = width, .height = height, .rgba = rgba } };
+                    const img = gtk_compat.clipboardReadImage(cb, alloc) orelse return null;
+                    return clipboard.Data{ .image = .{ .width = img.width, .height = img.height, .rgba = img.rgba } };
                 },
                 .files => {
-                    const uris = c.gtk_clipboard_wait_for_uris(cb) orelse return null;
-                    defer c.g_strfreev(uris);
-                    var count: usize = 0;
-                    while (uris[count] != null) : (count += 1) {}
-                    if (count == 0) return null;
-                    const paths = try alloc.alloc([]const u8, count);
-                    errdefer alloc.free(paths);
-                    var filled: usize = 0;
-                    errdefer for (paths[0..filled]) |p| alloc.free(p);
-                    for (0..count) |i| {
-                        paths[i] = try fileUriToPath(alloc, std.mem.span(uris[i]));
-                        filled += 1;
+                    const raw = gtk_compat.clipboardReadUriList(cb, alloc) orelse return null;
+                    defer alloc.free(raw);
+                    // uri-list（CRLF 分隔）→ 路径数组（两栈输入形状一致）
+                    var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+                    errdefer for (paths.items) |p| alloc.free(p);
+                    errdefer paths.deinit(alloc);
+                    var it = std.mem.splitAny(u8, raw, "\r\n");
+                    while (it.next()) |uri| {
+                        if (uri.len == 0) continue;
+                        const path = try fileUriToPath(alloc, uri);
+                        paths.append(alloc, path) catch {
+                            alloc.free(path);
+                            continue;
+                        };
                     }
-                    return clipboard.Data{ .files = paths };
+                    if (paths.items.len == 0) return null;
+                    return clipboard.Data{ .files = try paths.toOwnedSlice(alloc) };
                 },
             }
         }
@@ -3049,27 +3162,37 @@ fn Backend(comptime config: Config) type {
                     if (image.width == 0 or image.height == 0) return error.ClipboardWriteFailed;
                     const expect = @as(usize, image.width) * image.height * 4;
                     if (image.rgba.len != expect) return error.ClipboardWriteFailed;
-                    const pixbuf = c.gdk_pixbuf_new(c.GDK_COLORSPACE_RGB, 1, 8, @intCast(image.width), @intCast(image.height));
-                    if (pixbuf == null) return error.ClipboardWriteFailed;
-                    defer c.g_object_unref(@ptrCast(pixbuf));
-                    const rowstride: usize = @intCast(c.gdk_pixbuf_get_rowstride(pixbuf));
-                    const pixels = c.gdk_pixbuf_get_pixels(pixbuf);
-                    if (pixels == null) return error.ClipboardWriteFailed;
-                    for (0..image.height) |row| {
-                        const src = image.rgba[row * image.width * 4 ..];
-                        const dst = pixels + row * rowstride;
-                        @memcpy(dst[0 .. image.width * 4], src[0 .. image.width * 4]);
+                    if (!gtk_compat.clipboardWriteImage(cb, image.rgba, image.width, image.height)) {
+                        return error.ClipboardWriteFailed;
                     }
-                    c.gtk_clipboard_set_image(cb, pixbuf);
-                    c.gtk_clipboard_store(cb);
                 },
             }
         }
 
-        /// HTML / 文件列表走“延迟提供”：GTK 在目标粘贴时才回调 clipGet。
+        /// HTML / 文件列表写面。
+        /// GTK3：走“延迟提供”（目标粘贴时才回调 clipGet，payload 随 owner-change 释放）。
+        /// GTK4：GdkContentProvider 立即提供（GDK4 无 set_with_data 回调面；
+        /// mime 内容 + UTF-8 纯文本回退双 provider 联合，语义对齐）。
         fn writeClipboardPayload(self: *Self, mime: [:0]const u8, bytes: []const u8) !void {
             const cb = gtkClipboard() orelse return error.ClipboardNotAvailable;
-            c.gtk_clipboard_clear(cb); // 释放旧 payload（clipClear）
+            if (comptime gtk_compat.isGtk4()) {
+                const data_g = c.g_bytes_new(bytes.ptr, bytes.len) orelse return error.ClipboardWriteFailed;
+                defer c.g_object_unref(@ptrCast(data_g));
+                const text_g = c.g_bytes_new(bytes.ptr, bytes.len) orelse return error.ClipboardWriteFailed;
+                defer c.g_object_unref(@ptrCast(text_g));
+                const p_mime = c.gdk_content_provider_new_for_bytes(mime.ptr, data_g) orelse return error.ClipboardWriteFailed;
+                const p_text = c.gdk_content_provider_new_for_bytes("text/plain;charset=utf-8", text_g) orelse return error.ClipboardWriteFailed;
+                var providers = [_][*c]c.GdkContentProvider{ @ptrCast(p_mime), @ptrCast(p_text) };
+                const union_p = c.gdk_content_provider_new_union(@as([*c][*c]c.GdkContentProvider, @ptrCast(&providers)), @intCast(providers.len)) orelse return error.ClipboardWriteFailed;
+                defer c.g_object_unref(@ptrCast(union_p));
+                if (c.gdk_clipboard_set_content(@ptrCast(@alignCast(cb)), @ptrCast(@alignCast(union_p))) == 0) {
+                    return error.ClipboardWriteFailed;
+                }
+                gtk_compat.clipboardStore(cb);
+                return;
+            }
+            const cb3 = gtkClipboardTyped();
+            c.gtk_clipboard_clear(cb3); // 释放旧 payload（clipClear）
             const targets = try self.allocator.alloc(c.GtkTargetEntry, 2);
             errdefer self.allocator.free(targets);
             targets[0] = .{ .target = @ptrCast(@constCast(mime.ptr)), .flags = 0, .info = 0 };
@@ -3080,11 +3203,11 @@ fn Backend(comptime config: Config) type {
             const p = try self.allocator.create(ClipPayload);
             errdefer self.allocator.destroy(p);
             p.* = .{ .backend = self, .data = data, .targets = targets };
-            if (c.gtk_clipboard_set_with_data(cb, targets.ptr, @intCast(targets.len), clipGet, clipClear, p) == 0) {
+            if (c.gtk_clipboard_set_with_data(cb3, targets.ptr, @intCast(targets.len), clipGet, clipClear, p) == 0) {
                 return error.ClipboardWriteFailed;
             }
             self.clip_payload = p;
-            c.gtk_clipboard_store(cb);
+            gtk_compat.clipboardStore(cb);
         }
 
         fn clipGet(_: ?*c.GtkClipboard, selection: ?*c.GtkSelectionData, _: c.guint, user_data: c.gpointer) callconv(.c) void {
@@ -3103,7 +3226,7 @@ fn Backend(comptime config: Config) type {
             backend.allocator.destroy(p);
         }
 
-        fn onClipboardOwnerChange(_: ?*c.GtkClipboard, _: ?*anyopaque, user_data: c.gpointer) callconv(.c) void {
+        fn onClipboardChangedEvent(user_data: c.gpointer) callconv(.c) void {
             const self: *Self = @ptrCast(@alignCast(user_data orelse return));
             const w = self.windowById(0) orelse return;
             const msg = ipc.encodeEvent(self.allocator, "clipboardChanged", "{}") catch return;
@@ -3116,7 +3239,12 @@ fn Backend(comptime config: Config) type {
         // ------------------------------------------------------------------
 
         /// 每窗口菜单栏：config.menu（静态树）→ GtkMenuBar。
+        /// GTK4：GtkMenuBar 已移除 → 恒 null（menuBarAvailable 收敛点）。
         fn buildMenuBar(self: *Self, items: []const Config.MenuItem, st: *WinState) [*c]c.GtkWidget {
+            if (comptime gtk_compat.isGtk4()) {
+                log.print("[menu] menu bar unsupported under GTK4 (config.menu ignored)", .{});
+                return null;
+            }
             const bar = c.gtk_menu_bar_new();
             if (bar == null) return null;
             self.appendMenuItems(@ptrCast(bar), items, st.id, .menu);
@@ -3177,7 +3305,19 @@ fn Backend(comptime config: Config) type {
 
         fn onMenuActivate(_: [*c]c.GtkMenuItem, user_data: c.gpointer) callconv(.c) void {
             const action: *MenuAction = @ptrCast(@alignCast(user_data orelse return));
-            const self = action.backend;
+            dispatchMenuAction(action.backend, action);
+        }
+
+        /// GTK4：GSimpleAction activate/change-state → 同一激活分发面。
+        fn onMenuActionGtk4(action_obj: ?*anyopaque, value: ?*anyopaque, user_data: c.gpointer) callconv(.c) void {
+            _ = action_obj;
+            _ = value;
+            const action: *MenuAction = @ptrCast(@alignCast(user_data orelse return));
+            dispatchMenuAction(action.backend, action);
+        }
+
+        /// 菜单激活统一分发（role → WebKit 编辑命令 + menu/menu/trayMenu 事件）。
+        fn dispatchMenuAction(self: *Self, action: *MenuAction) void {
             const name: []const u8 = switch (action.kind) {
                 .menu => "menu",
                 .tray_menu => "trayMenu",
@@ -3312,12 +3452,86 @@ fn Backend(comptime config: Config) type {
             }
         }
 
+        /// 递归构建 GMenu 模型（GTK4 上下文菜单面）：分隔符/子菜单/勾选/
+        /// 禁用。叶子经 GSimpleAction（activate/change-state → dispatchMenuAction）。
+        /// action 名在组内全局序号化；动作激活后 popover 关闭（GTK 模型）。
+        fn appendModelItemsGMenu(
+            self: *Self,
+            menu: ?*anyopaque,
+            nodes: []*menu_model.Node,
+            win_id: u32,
+            kind: MenuKind,
+            group: ?*anyopaque,
+            counter: *u32,
+        ) void {
+            for (nodes) |node| {
+                if (node.isSeparator()) {
+                    gtk_compat.menuModelAppendSeparator(menu);
+                    continue;
+                }
+                const label_z = dupeZ(self.allocator, node.label) catch continue;
+                defer self.allocator.free(label_z);
+                if (node.children.items.len != 0) {
+                    const sub = gtk_compat.menuModelNew() orelse continue;
+                    self.appendModelItemsGMenu(sub, node.children.items, win_id, kind, group, counter);
+                    gtk_compat.menuModelAppendSubmenu(menu, label_z.ptr, sub);
+                    continue;
+                }
+                counter.* += 1;
+                const action_name = std.fmt.allocPrintSentinel(self.allocator, "m{d}", .{counter.*}, 0) catch continue;
+                defer self.allocator.free(action_name);
+                const detailed = std.fmt.allocPrintSentinel(self.allocator, "ziltmenu.{s}", .{action_name}, 0) catch continue;
+                defer self.allocator.free(detailed);
+                const stateful = node.checked;
+                const action = gtk_compat.menuActionAdd(group, action_name.ptr, stateful, node.checked);
+                if (action == null) continue;
+                if (!node.enabled or node.id.len == 0) {
+                    // 无 id 的叶子置灰（与 Windows 的 id 表语义一致）
+                    gtk_compat.menuActionSetEnabled(action, false);
+                } else if (self.mkMenuAction(win_id, kind, node.id, node.role)) |ma| {
+                    gtk_compat.menuActionConnect(action, stateful, &Self.onMenuActionGtk4, ma);
+                }
+                gtk_compat.menuModelAppendItem(menu, label_z.ptr, detailed.ptr);
+            }
+        }
+
+        /// MenuAction 构造（bindMenuItem 的无菜单项部分——GTK4 动作面共用）。
+        fn mkMenuAction(self: *Self, win_id: u32, kind: MenuKind, id: []const u8, role: ?[]const u8) ?*MenuAction {
+            const owner = self.windowById(win_id) orelse return null;
+            const action = self.allocator.create(MenuAction) catch return null;
+            const id_copy = self.allocator.dupe(u8, id) catch {
+                self.allocator.destroy(action);
+                return null;
+            };
+            const role_copy: ?[]u8 = if (role) |r| (self.allocator.dupe(u8, r) catch null) else null;
+            action.* = .{ .backend = self, .win_id = win_id, .kind = kind, .id = id_copy, .role = role_copy };
+            owner.menu_actions.append(self.allocator, action) catch {
+                self.allocator.free(id_copy);
+                if (role_copy) |r| self.allocator.free(r);
+                self.allocator.destroy(action);
+                return null;
+            };
+            return action;
+        }
+
         /// 程序化弹出（右键上下文菜单）：模型 → 临时 GtkMenu → gtk_menu_popup_at_rect。
         /// deactivate 即销毁（MenuAction 挂在窗口注册表，随窗口释放——与 Windows
         /// 的 TrackPopupMenu 每次全量构建同构）。
         fn popupMenu(self: *Self, x: i32, y: i32) !system_api.Result {
             const model = if (self.menu_state) |*m| m else return error.MenuNotConfigured;
             const w = self.windowById(0) orelse return error.WindowNotFound;
+            if (comptime gtk_compat.isGtk4()) {
+                // GTK4：GMenu 模型 + GSimpleActionGroup + GtkPopoverMenu
+                const gmenu = gtk_compat.menuModelNew() orelse return error.MenuNotConfigured;
+                const group = gtk_compat.menuActionGroupNew() orelse return error.MenuNotConfigured;
+                var counter: u32 = 0;
+                self.appendModelItemsGMenu(@ptrCast(gmenu), model.roots.items, w.id, .menu, group, &counter);
+                if (!gtk_compat.menuPopupAt(@ptrCast(@alignCast(w.win)), gmenu, group, x, y)) {
+                    return error.MenuNotConfigured;
+                }
+                log.print("[menu] popup at {d},{d} ({d} roots, gtk4 popover)", .{ x, y, model.roots.items.len });
+                return .{ .ok = true };
+            }
             const menu_widget = c.gtk_menu_new() orelse return error.MenuNotConfigured;
             self.appendModelItems(@ptrCast(menu_widget), model.roots.items, w.id, .menu);
             c.gtk_widget_show_all(menu_widget);
@@ -3401,6 +3615,12 @@ fn Backend(comptime config: Config) type {
         /// popup 无 indicator 也可用），再 dlopen libayatana-appindicator3.so.1
         ///（**可选依赖**：缺失/符号缺失只记日志）。
         fn initTray(self: *Self) void {
+            if (comptime gtk_compat.isGtk4()) {
+                // GTK4 限制：libayatana-appindicator3 链接 GTK3，混载会符号冲突。
+                // 托盘面（含 SNI D-Bus 直连方案）记录于 ROADMAP L1b 已知限制。
+                log.print("[tray] tray unavailable under GTK4 (ayatana is GTK3-linked)", .{});
+                return;
+            }
             const tray_cfg = config.tray orelse return;
             // 1) 菜单：模型优先（menu.* 可变）；模型缺失回退静态树
             if (self.menu_state) |*model| {
@@ -3411,7 +3631,16 @@ fn Backend(comptime config: Config) type {
                 }
             }
 
-            // 2) indicator：dlopen（缺失 → 无托盘图标，但菜单/模型仍然可用）
+            // 2) XEmbed 宿主优先：自建 GtkStatusIcon——libayatana 的回退实现把
+            // 左键绑成弹菜单（activate → menu），拿不到「左键 toggle」语义；
+            // 自建图标还能用 gtk_status_icon_get_geometry 取真实图标矩形。
+            if (gtk_compat.hasXembedTray()) {
+                self.initTrayXembed(tray_cfg);
+                return;
+            }
+
+            // 3) 无 XEmbed 宿主 → libayatana（SNI；GNOME/KDE 经 D-Bus 绘制）
+            // dlopen（缺失 → 无托盘图标，但菜单/模型仍然可用）
             var lib = std.DynLib.open("libayatana-appindicator3.so.1") catch |err| {
                 log.print("[tray] libayatana-appindicator3 unavailable ({s}) — running without tray icon", .{@errorName(err)});
                 return;
@@ -3433,7 +3662,7 @@ fn Backend(comptime config: Config) type {
                 return;
             };
             const set_menu_fn = lib.lookup(
-                *const fn (?*anyopaque, ?*c.GtkMenu) callconv(.c) void,
+                *const fn (?*anyopaque, ?*anyopaque) callconv(.c) void,
                 "app_indicator_set_menu",
             ) orelse {
                 lib.close();
@@ -3470,6 +3699,26 @@ fn Backend(comptime config: Config) type {
             }
             // 菜单已在上面构建（setTrayMenu）；交给 indicator 后所有权归它
             if (self.tray_menu_widget) |menu| set_menu_fn(indicator, menu);
+
+            // v0.4.3 L6：托盘挂窗点击面——secondary activate（SNI 次级激活）→
+            // toggle 挂窗。隐藏 GtkMenuItem 作为目标控件（ayatana 内部代理激活）。
+            if (lib.lookup(
+                *const fn (?*anyopaque, ?*anyopaque) callconv(.c) void,
+                "app_indicator_set_secondary_activate_target",
+            )) |sec_fn| {
+                if (c.gtk_menu_item_new()) |sec_item| {
+                    _ = c.g_object_ref_sink(@ptrCast(sec_item));
+                    c.gtk_widget_hide(sec_item);
+                    _ = c.g_signal_connect_data(@ptrCast(sec_item), "activate", @ptrCast(&Self.onTraySecondaryActivate), self, null, 0);
+                    sec_fn(indicator, @ptrCast(sec_item));
+                    self.tray_sec_target = @ptrCast(sec_item);
+                    log.print("[tray] secondary activate wired (attach_window toggle)", .{});
+                }
+            }
+            // 说明：libayatana 0.5/0.6 没有 `secondary-activate` GObject 信号
+            //（字符串审计确认；D-Bus `SecondaryActivate`/`XAyatanaSecondaryActivate`
+            // 由库内部转成「激活 target 菜单项」）→ 上面的隐藏菜单项就是 SNI 面
+            // 的点击入口，无需再连信号。
             // APP_INDICATOR_STATUS_ACTIVE = 1
             set_status_fn(indicator, 1);
             self.tray = .{
@@ -3480,6 +3729,50 @@ fn Backend(comptime config: Config) type {
             };
             self.tray_menu_owned = false;
             log.print("[tray] indicator created (icon={s}, menu={})", .{ icon_name, self.tray_menu_widget != null });
+        }
+
+        /// v0.4.3 L6：XEmbed 托盘（stalonetray/trayer/xfce4-panel…）自建图标。
+        ///
+        /// 为什么不复用 libayatana：它在无 SNI 宿主时的 GtkStatusIcon 回退把
+        /// 左键绑成「弹菜单」（activate → gtk_menu_popup），拿不到左键 toggle；
+        /// 自建图标既能接 activate，又能用 gtk_status_icon_get_geometry 取真实
+        /// 图标矩形（挂窗定位锚点，与 Wails 的 gtk_status_icon_get_geometry 一致）。
+        fn initTrayXembed(self: *Self, tray_cfg: Config.Tray) void {
+            const icon_name = trayIconName(tray_cfg.icon orelse config.icon);
+            const icon_z = dupeZ(self.allocator, icon_name) catch return;
+            defer self.allocator.free(icon_z);
+            const status_icon = c.gtk_status_icon_new_from_icon_name(icon_z.ptr);
+            if (status_icon == null) {
+                log.print("[tray] gtk_status_icon_new_from_icon_name failed — tray disabled", .{});
+                return;
+            }
+            const title_z = dupeZ(self.allocator, tray_cfg.tooltip) catch null;
+            if (title_z) |tz| {
+                defer self.allocator.free(tz);
+                c.gtk_status_icon_set_title(status_icon, tz.ptr);
+                c.gtk_status_icon_set_tooltip_text(status_icon, tz.ptr);
+            }
+            _ = c.g_signal_connect_data(@ptrCast(status_icon), "activate", @ptrCast(&Self.onXembedTrayActivate), self, null, 0);
+            _ = c.g_signal_connect_data(@ptrCast(status_icon), "popup-menu", @ptrCast(&Self.onXembedTrayPopupMenu), self, null, 0);
+            c.gtk_status_icon_set_visible(status_icon, 1);
+            self.tray_status_icon = status_icon;
+            self.tray_menu_owned = true; // 菜单归我们（无 indicator 接管）
+            log.print("[tray] xembed status icon created (icon={s}, menu={}, embedded={})", .{
+                icon_name, self.tray_menu_widget != null, c.gtk_status_icon_is_embedded(status_icon) != 0,
+            });
+        }
+
+        fn onXembedTrayActivate(_: ?*c.GtkStatusIcon, user_data: c.gpointer) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return));
+            self.toggleAttachedWindow();
+        }
+
+        /// 右键：图标旁弹菜单（gtk_status_icon_position_menu 负责边缘翻转）。
+        fn onXembedTrayPopupMenu(status_icon: [*c]c.GtkStatusIcon, button: c.guint, activate_time: c.guint, user_data: c.gpointer) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return));
+            const menu = self.tray_menu_widget orelse return;
+            c.gtk_menu_popup(menu, null, null, @ptrCast(&c.gtk_status_icon_position_menu), @ptrCast(status_icon), button, activate_time);
+            log.print("[tray] xembed popup menu (button={d})", .{button});
         }
 
         /// 托盘菜单替换。有 indicator 时所有权归它（旧菜单由 indicator 在
@@ -3497,8 +3790,165 @@ fn Backend(comptime config: Config) type {
         }
 
         fn rebuildTrayMenu(self: *Self) void {
+            if (comptime gtk_compat.isGtk4()) return; // 托盘不可用（菜单模型仍可 list/set）
             const model = if (self.menu_state) |*m| m else return;
             if (self.buildTrayMenuFromModel(model)) |menu| self.setTrayMenu(menu);
+        }
+
+        // ------------------------------------------------------------------
+        // v0.4.3 L6：托盘挂窗（tray.attach_window）
+        // 点击面：libayatana 的 secondary activate（托盘图标中键/宿主次级激活，
+        // SNI 协议 SecondaryActivate；左键按 SNI 惯例开菜单）→ toggle。
+        // 定位：X11 以指针位置近似图标位（点击瞬时光标即在图标上）→ 窗口右下
+        // 对齐 + 工作区夹取；Wayland 无全局坐标 → 保持原位（文档化）。
+        // FFM：显示后 600ms 抑制失焦隐藏（notifyFocus 面）。
+        // ------------------------------------------------------------------
+
+        fn onTraySecondaryActivate(_: [*c]c.GtkMenuItem, user_data: c.gpointer) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return));
+            self.toggleAttachedWindow();
+        }
+
+        /// 点击入口：去抖（Wails WindowDebounce 语义）。目标菜单项与信号面可能
+        /// 对同一次点击各触发一次；双击也不应把窗口瞬间藏了又显。
+        fn toggleAttachedWindow(self: *Self) void {
+            const now = gtk_compat.nowMs();
+            const elapsed = now - self.tray_toggle_ms;
+            if (self.tray_toggle_ms != 0 and elapsed < 200) {
+                log.print("[tray] toggle debounced ({d}ms)", .{elapsed});
+                return;
+            }
+            self.tray_toggle_ms = now;
+            self.toggleAttachedWindowInner(true);
+        }
+
+        /// 挂窗定位的一次性校正上下文（延时回调 → 读客户区真实原点 → 补偿 WM
+        /// 外框偏移；只校正一次，之后用户拖动/程序移动不再被覆盖）。
+        const TrayPosCtx = struct {
+            backend: *Self,
+            win_id: u32,
+            x: c_int,
+            y: c_int,
+        };
+
+        fn onTrayPosCorrect(user_data: c.gpointer) callconv(.c) c.gboolean {
+            const ctx: *TrayPosCtx = @ptrCast(@alignCast(user_data orelse return G_SOURCE_REMOVE));
+            defer std.heap.c_allocator.destroy(ctx);
+            const st = ctx.backend.windowById(ctx.win_id) orelse return G_SOURCE_REMOVE;
+            const widget: [*c]c.GtkWidget = @ptrCast(st.win);
+            var ox: c_int = 0;
+            var oy: c_int = 0;
+            if (!gtk_compat.surfaceOrigin(widget, &ox, &oy)) return G_SOURCE_REMOVE;
+            const dx = ctx.x - ox;
+            const dy = ctx.y - oy;
+            if (dx != 0 or dy != 0) {
+                gtk_compat.windowMove(st.win, ctx.x + dx, ctx.y + dy);
+                log.print("[tray] attach window #{d} position corrected by {d},{d} (was {d},{d})", .{
+                    st.id, dx, dy, ox, oy,
+                });
+            }
+            return G_SOURCE_REMOVE;
+        }
+
+        fn toggleAttachedWindowInner(self: *Self, position: bool) void {
+            var attached: ?*WinState = null;
+            for (self.windows.items) |w| {
+                if (w.tray_attached) attached = w;
+            }
+            const w = attached orelse (self.windowById(0) orelse return);
+            const widget: [*c]c.GtkWidget = @ptrCast(w.win);
+            const visible = c.gtk_widget_get_visible(widget) != 0;
+            if (visible) {
+                c.gtk_widget_hide(widget);
+                log.print("[tray] attach window #{d} hidden", .{w.id});
+                return;
+            }
+            // 定位锚点：优先图标窗口几何（XEmbed 托盘，stalonetray/trayer/面板），
+            // 否则点击瞬时的指针位置（SNI 宿主无图标窗口；X11 下指针就在图标上），
+            // Wayland 无全局坐标 → 保持原位（文档化）。
+            var target: ?[2]c_int = null;
+            var anchor_log: [2]c_int = .{ 0, 0 };
+            if (position) {
+                var right: c_int = 0;
+                var bottom: c_int = 0;
+                var top: c_int = 0;
+                var anchored = false;
+                // ① GtkStatusIcon 几何（XEmbed 自建图标——与 Wails 同源）
+                if (self.tray_status_icon) |si| {
+                    if (comptime gtk_compat.isGtk3()) {
+                        var area: c.GdkRectangle = std.mem.zeroes(c.GdkRectangle);
+                        if (c.gtk_status_icon_get_geometry(si, null, &area, null) != 0 and area.width > 0 and area.height > 0) {
+                            right = area.x + area.width;
+                            bottom = area.y + area.height;
+                            top = area.y;
+                            anchored = true;
+                            log.print("[tray] icon geometry {d},{d} {d}x{d} (status icon)", .{ area.x, area.y, area.width, area.height });
+                        }
+                    }
+                }
+                // ② X 树扫描（图标由别的进程绘制、或 geometry 暂不可用）
+                if (!anchored) {
+                    if (gtk_compat.xembedTrayIconRect()) |r| {
+                        right = r.x + r.width;
+                        bottom = r.y + r.height;
+                        top = r.y;
+                        anchored = true;
+                        log.print("[tray] icon rect {d},{d} {d}x{d} (xembed)", .{ r.x, r.y, r.width, r.height });
+                    }
+                }
+                // ③ 指针位置（SNI 宿主无图标窗口；X11 下点击点即图标）
+                if (!anchored) {
+                    var px: c_int = 0;
+                    var py: c_int = 0;
+                    if (gtk_compat.pointerRootPos(widget, &px, &py)) {
+                        right = px;
+                        bottom = py;
+                        top = py;
+                        anchored = true;
+                        log.print("[tray] icon geometry unavailable — pointer anchor {d},{d}", .{ px, py });
+                    }
+                }
+                if (anchored) {
+                    const display = c.gdk_display_get_default();
+                    const prim = gtk_compat.displayPrimaryMonitor(display);
+                    var wa: c.GdkRectangle = std.mem.zeroes(c.GdkRectangle);
+                    gtk_compat.monitorWorkarea(prim, &wa);
+                    var ww: c_int = 0;
+                    var wh: c_int = 0;
+                    gtk_compat.windowGetSize(w.win, &ww, &wh);
+                    var x: c_int = right - ww; // 右缘贴图标右缘（Windows 同款对齐）
+                    var y: c_int = bottom + 4;
+                    // 底部放不下 → 图标上方
+                    if (y + wh > wa.y + wa.height) y = top - wh - 4;
+                    x = @min(@max(x, wa.x), @max(wa.x, wa.x + wa.width - ww));
+                    y = @min(@max(y, wa.y), @max(wa.y, wa.y + wa.height - wh));
+                    target = .{ x, y };
+                    anchor_log = .{ right, bottom };
+                }
+            }
+            // 失焦抑制窗：显示后 600ms 内不因失焦隐藏（FFM 桌面另有整段禁用）
+            w.hide_suppress_until_ms = gtk_compat.nowMs() + 600;
+            c.gtk_widget_show(widget);
+            c.gtk_window_present(w.win);
+            // **先 show/present 再 move**：openbox 等 reparent 型 WM 会忽略未映射
+            // 窗口的 move 请求（退化成智能放置/居中；L6 实测 y=95）。
+            if (target) |t| {
+                gtk_compat.windowMove(w.win, t[0], t[1]);
+                w.geom_x = t[0];
+                w.geom_y = t[1];
+                // map 后的「恢复启动几何」会盖掉托盘定位（v0.3.0 onMapRestore
+                // 的补 move）——挂窗显示时以托盘锚点为准，撤销待补的恢复。
+                w.restored_geometry = false;
+                // reparent 型 WM（openbox 等）把 ConfigureRequest 当外框位置，
+                // 客户区会偏移标题栏高度（L6 实测 +20px）。同步读几何拿到的是
+                // 旧值（WM 尚未处理请求），因此延后 80ms 校正一次。
+                if (std.heap.c_allocator.create(TrayPosCtx)) |ctx| {
+                    ctx.* = .{ .backend = self, .win_id = w.id, .x = t[0], .y = t[1] };
+                    _ = c.g_timeout_add(80, @ptrCast(&Self.onTrayPosCorrect), @ptrCast(ctx));
+                } else |_| {}
+                log.print("[tray] attach window #{d} positioned {d},{d} (anchor {d},{d})", .{ w.id, t[0], t[1], anchor_log[0], anchor_log[1] });
+            }
+            log.print("[tray] attach window #{d} shown", .{w.id});
         }
 
         // ------------------------------------------------------------------
@@ -3925,14 +4375,22 @@ fn Backend(comptime config: Config) type {
                 text_z.ptr,
             );
             if (dlg == null) return .cancel;
-            defer c.gtk_widget_destroy(dlg);
+            defer gtk_compat.destroyDialog(@ptrCast(@alignCast(dlg)));
             c.gtk_window_set_title(@ptrCast(dlg), caption_z.ptr);
-            return switch (c.gtk_dialog_run(@ptrCast(dlg))) {
+            return switch (gtk_compat.runDialog(@ptrCast(@alignCast(dlg)))) {
                 c.GTK_RESPONSE_OK => .ok,
                 c.GTK_RESPONSE_YES => .yes,
                 c.GTK_RESPONSE_NO => .no,
                 else => .cancel,
             };
+        }
+
+        /// ipc.Filter → compat FileFilterSpec（同形状零拷贝映射；null 终结由
+        /// compat 内部 dupeZ 处理）。
+        fn toFilterSpecs(alloc: std.mem.Allocator, filters: []const ipc.Filter) ![]gtk_compat.FileFilterSpec {
+            const out = try alloc.alloc(gtk_compat.FileFilterSpec, filters.len);
+            for (filters, 0..) |f, i| out[i] = .{ .name = f.name, .pattern = f.pattern };
+            return out;
         }
 
         const FileMode = enum { open, save };
@@ -3947,12 +4405,26 @@ fn Backend(comptime config: Config) type {
             mode: FileMode,
         ) !?[]u8 {
             _ = self;
+            if (comptime gtk_compat.isGtk4()) {
+                // GTK4：GtkFileDialog（async → SyncWait 桥保持同步接口）
+                const title_z = try dupeZ(alloc, if (opts.title.len > 0) opts.title else (if (mode == .save) "保存文件" else "打开文件"));
+                defer alloc.free(title_z);
+                const default_z: ?[:0]u8 = if (opts.default_name.len > 0) try dupeZ(alloc, opts.default_name) else null;
+                defer if (default_z) |dz| alloc.free(dz);
+                const filters = try toFilterSpecs(alloc, opts.filters);
+                defer alloc.free(filters);
+                const chosen = if (mode == .save)
+                    gtk_compat.fileDialogSaveSync(parent, title_z.ptr, if (default_z) |dz| dz.ptr else null, filters, alloc)
+                else
+                    gtk_compat.fileDialogOpenSync(parent, title_z.ptr, if (default_z) |dz| dz.ptr else null, filters, alloc);
+                return chosen;
+            }
             const native = (try nativeChooser(alloc, parent, opts, if (mode == .save) .save else .open)) orelse
                 return error.DialogNotAvailable;
             defer c.g_object_unref(@ptrCast(native));
             const chooser: *c.GtkFileChooser = @ptrCast(native);
             if (mode == .save) c.gtk_file_chooser_set_do_overwrite_confirmation(chooser, 1);
-            if (c.gtk_native_dialog_run(@alignCast(@ptrCast(native))) != c.GTK_RESPONSE_ACCEPT) return null;
+            if (gtk_compat.nativeDialogRun(native) != c.GTK_RESPONSE_ACCEPT) return null;
             const chosen = c.gtk_file_chooser_get_filename(chooser);
             if (chosen == null) return null;
             defer c.g_free(@ptrCast(chosen));
@@ -3963,11 +4435,14 @@ fn Backend(comptime config: Config) type {
             _ = self;
             const title_z = try dupeZ(alloc, if (title.len > 0) title else "选择文件夹");
             defer alloc.free(title_z);
+            if (comptime gtk_compat.isGtk4()) {
+                return gtk_compat.fileDialogSelectFolderSync(parent, title_z.ptr, alloc);
+            }
             const native = c.gtk_file_chooser_native_new(title_z.ptr, parent, c.GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER, "选择", "取消") orelse
                 return error.DialogNotAvailable;
             defer c.g_object_unref(@ptrCast(native));
             const chooser: *c.GtkFileChooser = @ptrCast(native);
-            if (c.gtk_native_dialog_run(@alignCast(@ptrCast(native))) != c.GTK_RESPONSE_ACCEPT) return null;
+            if (gtk_compat.nativeDialogRun(native) != c.GTK_RESPONSE_ACCEPT) return null;
             const chosen = c.gtk_file_chooser_get_filename(chooser);
             if (chosen == null) return null;
             defer c.g_free(@ptrCast(chosen));
@@ -3976,11 +4451,18 @@ fn Backend(comptime config: Config) type {
 
         fn filesDialog(self: *Self, alloc: std.mem.Allocator, parent: [*c]c.GtkWindow, opts: ipc.FileDialogOptions) !?[][]u8 {
             _ = self;
+            if (comptime gtk_compat.isGtk4()) {
+                const title_z = try dupeZ(alloc, if (opts.title.len > 0) opts.title else "打开文件");
+                defer alloc.free(title_z);
+                const filters = try toFilterSpecs(alloc, opts.filters);
+                defer alloc.free(filters);
+                return gtk_compat.fileDialogOpenMultipleSync(parent, title_z.ptr, filters, alloc);
+            }
             const native = (try nativeChooser(alloc, parent, opts, .open)) orelse return error.DialogNotAvailable;
             defer c.g_object_unref(@ptrCast(native));
             const chooser: *c.GtkFileChooser = @ptrCast(native);
             c.gtk_file_chooser_set_select_multiple(chooser, 1);
-            if (c.gtk_native_dialog_run(@alignCast(@ptrCast(native))) != c.GTK_RESPONSE_ACCEPT) return null;
+            if (gtk_compat.nativeDialogRun(native) != c.GTK_RESPONSE_ACCEPT) return null;
 
             const list = c.gtk_file_chooser_get_filenames(chooser);
             if (list == null) return null;
@@ -4057,7 +4539,7 @@ fn Backend(comptime config: Config) type {
             defer std.heap.c_allocator.free(title_z);
             const dlg = c.gtk_color_chooser_dialog_new(title_z.ptr, parent);
             if (dlg == null) return null;
-            defer c.gtk_widget_destroy(dlg);
+            defer gtk_compat.destroyDialog(@ptrCast(@alignCast(dlg)));
             c.gtk_color_chooser_set_use_alpha(@ptrCast(dlg), 0);
             var rgba = c.GdkRGBA{
                 .red = @as(f32, @floatFromInt(opts.default_rgb >> 16 & 0xFF)) / 255.0,
@@ -4066,7 +4548,7 @@ fn Backend(comptime config: Config) type {
                 .alpha = 1.0,
             };
             c.gtk_color_chooser_set_rgba(@ptrCast(dlg), &rgba);
-            if (c.gtk_dialog_run(@ptrCast(dlg)) != c.GTK_RESPONSE_OK) return null;
+            if (gtk_compat.runDialog(@ptrCast(@alignCast(dlg))) != c.GTK_RESPONSE_OK) return null;
             c.gtk_color_chooser_get_rgba(@ptrCast(dlg), &rgba);
             const r: u32 = @intFromFloat(@round(std.math.clamp(rgba.red, 0, 1) * 255));
             const g: u32 = @intFromFloat(@round(std.math.clamp(rgba.green, 0, 1) * 255));
@@ -4079,9 +4561,9 @@ fn Backend(comptime config: Config) type {
             const title_z = try dupeZ(alloc, opts.title);
             defer alloc.free(title_z);
             const dlg = c.gtk_font_chooser_dialog_new(title_z.ptr, parent);
-            if (dlg == null) return error.DialogNotAvailable;
-            defer c.gtk_widget_destroy(dlg);
-            if (c.gtk_dialog_run(@ptrCast(dlg)) != c.GTK_RESPONSE_OK) return null;
+            if (dlg == null) return null;
+            defer gtk_compat.destroyDialog(@ptrCast(@alignCast(dlg)));
+            if (gtk_compat.runDialog(@ptrCast(@alignCast(dlg))) != c.GTK_RESPONSE_OK) return null;
 
             const font = c.gtk_font_chooser_get_font(@ptrCast(dlg));
             if (font == null) return null;
@@ -4161,20 +4643,20 @@ fn Backend(comptime config: Config) type {
                 @as(?*anyopaque, null),
             );
             if (dlg == null) return error.DialogFailed;
-            defer c.gtk_widget_destroy(dlg);
+            defer gtk_compat.destroyDialog(@ptrCast(@alignCast(dlg)));
             const chooser: *c.GtkFileChooser = @ptrCast(dlg);
             const name_z = try dupeZ(self.allocator, suggested);
             defer self.allocator.free(name_z);
             c.gtk_file_chooser_set_current_name(chooser, name_z.ptr);
             c.gtk_file_chooser_set_do_overwrite_confirmation(chooser, 1);
-            if (c.gtk_dialog_run(@ptrCast(dlg)) != c.GTK_RESPONSE_ACCEPT) return null;
+            if (gtk_compat.runDialog(@ptrCast(@alignCast(dlg))) != c.GTK_RESPONSE_ACCEPT) return null;
             const chosen = c.gtk_file_chooser_get_filename(chooser);
             if (chosen == null) return null;
             defer c.g_free(@ptrCast(chosen));
             return try self.allocator.dupe(u8, std.mem.span(chosen));
         }
 
-        fn onDownloadStarted(_: [*c]c.WebKitWebContext, download: [*c]c.WebKitDownload, user_data: c.gpointer) callconv(.c) void {
+        fn onDownloadStarted(_: ?*c.WebKitWebContext, download: ?*c.WebKitDownload, user_data: c.gpointer) callconv(.c) void {
             const self: *Self = @ptrCast(@alignCast(user_data orelse return));
             if (!config.webview.downloads.enabled or download == null) return;
 
@@ -4239,7 +4721,7 @@ fn Backend(comptime config: Config) type {
             self.emitDownloadStarted(d, url, dest);
         }
 
-        fn onDownloadReceived(_: [*c]c.WebKitDownload, _: c.guint64, user_data: c.gpointer) callconv(.c) void {
+        fn onDownloadReceived(_: ?*c.WebKitDownload, _: c.guint64, user_data: c.gpointer) callconv(.c) void {
             const d: *Download = @ptrCast(@alignCast(user_data orelse return));
             const received = c.webkit_download_get_received_data_length(d.dl);
             // 节流：WebKit 每个数据块都发信号，只按 32KB 步进上报
@@ -4248,7 +4730,7 @@ fn Backend(comptime config: Config) type {
             d.backend.emitDownloadProgress(d, "webview.download_progress", 0);
         }
 
-        fn onDownloadFinished(_: [*c]c.WebKitDownload, user_data: c.gpointer) callconv(.c) void {
+        fn onDownloadFinished(_: ?*c.WebKitDownload, user_data: c.gpointer) callconv(.c) void {
             const d: *Download = @ptrCast(@alignCast(user_data orelse return));
             const received = c.webkit_download_get_received_data_length(d.dl);
             d.backend.disconnectDownloadSignals(d);
@@ -4257,7 +4739,7 @@ fn Backend(comptime config: Config) type {
             d.backend.removeDownload(d);
         }
 
-        fn onDownloadFailed(_: [*c]c.WebKitDownload, err: [*c]c.GError, user_data: c.gpointer) callconv(.c) void {
+        fn onDownloadFailed(_: ?*c.WebKitDownload, err: [*c]c.GError, user_data: c.gpointer) callconv(.c) void {
             const d: *Download = @ptrCast(@alignCast(user_data orelse return));
             const received = c.webkit_download_get_received_data_length(d.dl);
             d.backend.disconnectDownloadSignals(d);
@@ -4332,7 +4814,7 @@ fn Backend(comptime config: Config) type {
 
         /// 下载/子 WebView 事件的目标窗口：按发起下载的 WebView 反查注册表，
         /// 找不到时退回主窗口（对齐 Windows 的「事件回发起窗口」语义）。
-        fn windowForView(self: *Self, view: [*c]c.WebKitWebView) ?*WinState {
+        fn windowForView(self: *Self, view: ?*c.WebKitWebView) ?*WinState {
             if (view != null) {
                 for (self.windows.items) |st| {
                     if (st.view == view) return st;
@@ -4358,7 +4840,7 @@ fn Backend(comptime config: Config) type {
         //   结果都是「值的 JSON 文本」（undefined → "null"），JS 异常 → JavaScriptException。
 
         /// JSCValue → 结果 JSON（undefined/不可序列化 → "null"）。self.allocator 分配。
-        fn evalResultJson(self: *Self, value: [*c]c.JSCValue) ?[]u8 {
+        fn evalResultJson(self: *Self, value: ?*c.JSCValue) ?[]u8 {
             if (value == null) return self.allocator.dupe(u8, "null") catch null;
             if (c.jsc_value_is_undefined(value) != 0) return self.allocator.dupe(u8, "null") catch null;
             const text = c.jsc_value_to_json(value, 0) orelse return self.allocator.dupe(u8, "null") catch null;
@@ -4373,7 +4855,7 @@ fn Backend(comptime config: Config) type {
         fn evalFinished(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
             const task: *EvalTask = @ptrCast(@alignCast(user_data orelse return));
             const self = task.backend;
-            const view: [*c]c.WebKitWebView = @ptrCast(source);
+            const view: ?*c.WebKitWebView = @ptrCast(source);
             var err: [*c]c.GError = null;
             const value = c.webkit_web_view_evaluate_javascript_finish(view, res, &err);
             if (err != null) {
@@ -4448,7 +4930,7 @@ fn Backend(comptime config: Config) type {
         }
 
         /// 同步 eval：嵌套泵等待 WebKit 异步完成（对应 Windows 的 SyncWait）。
-        fn syncEval(self: *Self, view: [*c]c.WebKitWebView, alloc: std.mem.Allocator, script: []const u8) ![]u8 {
+        fn syncEval(self: *Self, view: ?*c.WebKitWebView, alloc: std.mem.Allocator, script: []const u8) ![]u8 {
             var task = EvalTask{ .backend = self };
             task.loop = c.g_main_loop_new(null, 0) orelse return error.WebViewCallFailed;
             defer c.g_main_loop_unref(task.loop);
@@ -4574,10 +5056,18 @@ fn Backend(comptime config: Config) type {
         // cookies / clear_storage（v0.2.1）
         // ------------------------------------------------------------------
 
-        fn cookieManagerFor(w: *WinState) [*c]c.WebKitCookieManager {
+        fn cookieManagerFor(w: *WinState) ?*c.WebKitCookieManager {
+            if (comptime gtk_compat.isGtk4()) {
+                const view: ?*c.WebKitWebView = @ptrCast(@alignCast(w.view));
+                if (view == null) return null;
+                const session = c.webkit_web_view_get_network_session(view);
+                if (session == null) return null;
+                return c.webkit_network_session_get_cookie_manager(session);
+            }
             const ctx = c.webkit_web_view_get_context(w.view);
             if (ctx == null) return null;
-            return c.webkit_web_context_get_cookie_manager(ctx);
+            const session_any = gtk_compat.cookieManagerFromSessionOrContext(null, ctx);
+            return @ptrCast(@alignCast(session_any));
         }
 
         /// 请求未带 URL 时用窗口入口 URL；host 用于 domain 推导。
@@ -4631,6 +5121,12 @@ fn Backend(comptime config: Config) type {
                     const host = hostOf(url) orelse return error.InvalidCookie;
                     const host_z = try dupeZ(self.allocator, host);
                     defer self.allocator.free(host_z);
+                    if (comptime gtk_compat.isGtk4()) {
+                        // 6.0 的 CookieManager 无 delete_cookies_for_domain →
+                        // 文档化 NotAvailable（按域清理待 session 级 API 补齐）
+                        alloc.free(host_z);
+                        return error.WebViewCallFailed;
+                    }
                     c.webkit_cookie_manager_delete_cookies_for_domain(mgr, host_z.ptr);
                     log.print("[cookies] cleared domain '{s}'", .{host});
                     return try alloc.dupe(u8, "null");
@@ -4675,7 +5171,7 @@ fn Backend(comptime config: Config) type {
             return built;
         }
 
-        fn runCookieWrite(self: *Self, mgr: [*c]c.WebKitCookieManager, cookie: *c.SoupCookie, alloc: std.mem.Allocator) ![]u8 {
+        fn runCookieWrite(self: *Self, mgr: ?*c.WebKitCookieManager, cookie: *c.SoupCookie, alloc: std.mem.Allocator) ![]u8 {
             var task = WaitTask{ .backend = self };
             task.loop = c.g_main_loop_new(null, 0) orelse return error.WebViewCallFailed;
             defer c.g_main_loop_unref(task.loop);
@@ -4685,7 +5181,7 @@ fn Backend(comptime config: Config) type {
             return try alloc.dupe(u8, "null");
         }
 
-        fn runCookieDelete(self: *Self, mgr: [*c]c.WebKitCookieManager, cookie: *c.SoupCookie, alloc: std.mem.Allocator) ![]u8 {
+        fn runCookieDelete(self: *Self, mgr: ?*c.WebKitCookieManager, cookie: *c.SoupCookie, alloc: std.mem.Allocator) ![]u8 {
             var task = WaitTask{ .backend = self };
             task.loop = c.g_main_loop_new(null, 0) orelse return error.WebViewCallFailed;
             defer c.g_main_loop_unref(task.loop);
@@ -4697,7 +5193,7 @@ fn Backend(comptime config: Config) type {
 
         fn cookiesGetDone(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
             const task: *WaitTask = @ptrCast(@alignCast(user_data orelse return));
-            const mgr: [*c]c.WebKitCookieManager = @ptrCast(source);
+            const mgr: ?*c.WebKitCookieManager = @ptrCast(source);
             var err: [*c]c.GError = null;
             const list = c.webkit_cookie_manager_get_cookies_finish(mgr, res, &err);
             if (err != null) {
@@ -4719,7 +5215,7 @@ fn Backend(comptime config: Config) type {
 
         fn cookieWriteDone(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
             const task: *WaitTask = @ptrCast(@alignCast(user_data orelse return));
-            const mgr: [*c]c.WebKitCookieManager = @ptrCast(source);
+            const mgr: ?*c.WebKitCookieManager = @ptrCast(source);
             var err: [*c]c.GError = null;
             if (c.webkit_cookie_manager_add_cookie_finish(mgr, res, &err) == 0) task.failed = true;
             if (err != null) c.g_error_free(err);
@@ -4728,7 +5224,7 @@ fn Backend(comptime config: Config) type {
 
         fn cookieDeleteDone(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
             const task: *WaitTask = @ptrCast(@alignCast(user_data orelse return));
-            const mgr: [*c]c.WebKitCookieManager = @ptrCast(source);
+            const mgr: ?*c.WebKitCookieManager = @ptrCast(source);
             var err: [*c]c.GError = null;
             if (c.webkit_cookie_manager_delete_cookie_finish(mgr, res, &err) == 0) task.failed = true;
             if (err != null) c.g_error_free(err);
@@ -4795,9 +5291,18 @@ fn Backend(comptime config: Config) type {
         /// clear_storage：WebKit 的 clear 是「全部来源」，origin 参数仅作记录
         ///（Windows 侧可按 origin 精确清理，Linux 为超集语义，已在文档标注）。
         fn clearStorageOp(self: *Self, w: *WinState, clear: webview.ClearStorage, alloc: std.mem.Allocator) ![]u8 {
-            const ctx = c.webkit_web_view_get_context(w.view);
-            if (ctx == null) return error.WebViewCallFailed;
-            const mgr = c.webkit_web_context_get_website_data_manager(ctx);
+            var mgr: ?*c.WebKitWebsiteDataManager = null;
+            if (comptime gtk_compat.isGtk4()) {
+                // 6.0：data manager 在 view 的网络会话上
+                const view: ?*c.WebKitWebView = @ptrCast(@alignCast(w.view));
+                const session = c.webkit_web_view_get_network_session(view);
+                if (session == null) return error.WebViewCallFailed;
+                mgr = c.webkit_network_session_get_website_data_manager(session);
+            } else {
+                const ctx = c.webkit_web_view_get_context(w.view);
+                if (ctx == null) return error.WebViewCallFailed;
+                mgr = c.webkit_web_context_get_website_data_manager(ctx);
+            }
             if (mgr == null) return error.WebViewCallFailed;
 
             var types: c.WebKitWebsiteDataTypes = 0;
@@ -4826,7 +5331,7 @@ fn Backend(comptime config: Config) type {
 
         fn clearStorageDone(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
             const task: *WaitTask = @ptrCast(@alignCast(user_data orelse return));
-            const mgr: [*c]c.WebKitWebsiteDataManager = @ptrCast(source);
+            const mgr: ?*c.WebKitWebsiteDataManager = @ptrCast(source);
             var err: [*c]c.GError = null;
             if (c.webkit_website_data_manager_clear_finish(mgr, res, &err) == 0) task.failed = true;
             if (err != null) c.g_error_free(err);
@@ -4855,26 +5360,51 @@ fn Backend(comptime config: Config) type {
             const task: *SnapshotTask = @ptrCast(@alignCast(user_data orelse return));
             const self = task.backend;
             defer self.allocator.destroy(task);
-            const view: [*c]c.WebKitWebView = @ptrCast(source);
+            const view: ?*c.WebKitWebView = @ptrCast(source);
 
-            var err: [*c]c.GError = null;
-            const surface = c.webkit_web_view_get_snapshot_finish(view, res, &err);
-            if (err != null or surface == null) {
-                const message = if (err != null) std.mem.span(err.*.message) else "snapshot failed";
-                if (err != null) c.g_error_free(err);
-                log.print("[snapshot] failed: {s}", .{message});
-                return self.emitCdpError(task.win_id, task.rid, message);
+            var raw: [*c]u8 = null;
+            var size: usize = 0;
+            if (comptime gtk_compat.isGtk4()) {
+                // 6.0：快照结果为 GdkTexture → 直接编码 PNG bytes（cairo 面不参与）
+                var tex_err: [*c]c.GError = null;
+                const texture = c.webkit_web_view_get_snapshot_finish(view, res, &tex_err);
+                if (tex_err != null or texture == null) {
+                    const message = if (tex_err != null) std.mem.span(tex_err.*.message) else "snapshot failed";
+                    if (tex_err != null) c.g_error_free(tex_err);
+                    log.print("[snapshot] failed: {s}", .{message});
+                    return self.emitCdpError(task.win_id, task.rid, message);
+                }
+                defer c.g_object_unref(@ptrCast(texture));
+                const bytes = c.gdk_texture_save_to_png_bytes(texture) orelse {
+                    return self.emitCdpError(task.win_id, task.rid, "png encode failed");
+                };
+                defer c.g_object_unref(@ptrCast(bytes));
+                var bsize: c.gsize = 0;
+                raw = @constCast(@ptrCast(c.g_bytes_get_data(bytes, &bsize)));
+                size = @intCast(bsize);
+            } else {
+                var surf_err: [*c]c.GError = null;
+                const surface = c.webkit_web_view_get_snapshot_finish(view, res, &surf_err);
+                if (surf_err != null or surface == null) {
+                    const message = if (surf_err != null) std.mem.span(surf_err.*.message) else "snapshot failed";
+                    if (surf_err != null) c.g_error_free(surf_err);
+                    log.print("[snapshot] failed: {s}", .{message});
+                    return self.emitCdpError(task.win_id, task.rid, message);
+                }
+                defer c.cairo_surface_destroy(surface);
+                const sw = c.cairo_image_surface_get_width(surface);
+                const sh = c.cairo_image_surface_get_height(surface);
+                log.print("[snapshot] surface {d}x{d}", .{ sw, sh });
+
+                const stream = c.g_memory_output_stream_new_resizable();
+                if (stream == null) return self.emitCdpError(task.win_id, task.rid, "snapshot stream failed");
+                defer c.g_object_unref(@ptrCast(stream));
+                const status = c.cairo_surface_write_to_png_stream(surface, pngWrite, stream);
+                if (status != c.CAIRO_STATUS_SUCCESS) return self.emitCdpError(task.win_id, task.rid, "png encode failed");
+
+                raw = @ptrCast(c.g_memory_output_stream_get_data(@ptrCast(stream)));
+                size = @intCast(c.g_memory_output_stream_get_size(@ptrCast(stream)));
             }
-            defer c.cairo_surface_destroy(surface);
-
-            const stream = c.g_memory_output_stream_new_resizable();
-            if (stream == null) return self.emitCdpError(task.win_id, task.rid, "snapshot stream failed");
-            defer c.g_object_unref(@ptrCast(stream));
-            const status = c.cairo_surface_write_to_png_stream(surface, pngWrite, stream);
-            if (status != c.CAIRO_STATUS_SUCCESS) return self.emitCdpError(task.win_id, task.rid, "png encode failed");
-
-            const raw: [*c]u8 = @ptrCast(c.g_memory_output_stream_get_data(@ptrCast(stream)));
-            const size: usize = @intCast(c.g_memory_output_stream_get_size(@ptrCast(stream)));
             if (raw == null or size == 0) return self.emitCdpError(task.win_id, task.rid, "empty snapshot");
 
             const encoder = std.base64.standard.Encoder;
@@ -4939,12 +5469,11 @@ fn Backend(comptime config: Config) type {
                 .info => |kind| return .{ .json = try self.collectSystemInfo(kind, alloc, w) },
                 // v0.3.16 G19：全局光标位置（gdk_device_get_position 屏幕坐标）
                 .cursor_position => {
-                    const display = c.gdk_display_get_default() orelse return error.CursorNotAvailable;
-                    const seat = c.gdk_display_get_default_seat(display) orelse return error.CursorNotAvailable;
-                    const pointer = c.gdk_seat_get_pointer(seat) orelse return error.CursorNotAvailable;
                     var x: c.gint = 0;
                     var y: c.gint = 0;
-                    c.gdk_device_get_position(pointer, null, &x, &y);
+                    if (!gtk_compat.pointerRootPos(@ptrCast(@alignCast(w.win)), &x, &y)) {
+                        return error.CursorNotAvailable;
+                    }
                     return .{ .json = try std.fmt.allocPrint(alloc, "{{\"x\":{d},\"y\":{d}}}", .{ x, y }) };
                 },
                 .autostart => |op| return .{ .state = try self.runAutostartOp(op, alloc) },
@@ -5012,23 +5541,30 @@ fn Backend(comptime config: Config) type {
                         if (raw.len > 0) part_name = try sanitizePartition(self.allocator, raw);
                     }
 
-                    var web_ctx: ?[*c]c.WebKitWebContext = null;
+                    var pieces: ?ProxyPieces = null;
                     if (part_name) |pname| {
                         if (self.findPartition(pname)) |existing| {
-                            web_ctx = existing;
+                            pieces = existing;
                             log.print("[webviews] child #{d} reuse partition '{s}'", .{ id, pname });
                         } else {
-                            web_ctx = try self.createPartitionContext(pname);
+                            pieces = try self.createPartitionContext(pname);
                             // 注册失败要释放刚建的 context（OOM 路径不留悬挂引用）
                             const name_copy = self.allocator.dupe(u8, pname) catch |dup_err| {
-                                c.g_object_unref(@ptrCast(web_ctx.?));
+                                c.g_object_unref(@ptrCast(pieces.?.ctx));
                                 return dup_err;
                             };
-                            self.partitions.append(self.allocator, .{ .name = name_copy, .ctx = web_ctx.? }) catch |append_err| {
+                            self.partitions.append(self.allocator, .{
+                                .name = name_copy,
+                                .ctx = pieces.?.ctx,
+                                .session = pieces.?.session,
+                            }) catch |append_err| {
                                 self.allocator.free(name_copy);
-                                c.g_object_unref(@ptrCast(web_ctx.?));
+                                c.g_object_unref(@ptrCast(pieces.?.ctx));
                                 return append_err;
                             };
+                            if (pieces.?.session) |s| {
+                                _ = c.g_object_ref(@ptrCast(s));
+                            }
                         }
                     }
 
@@ -5040,14 +5576,14 @@ fn Backend(comptime config: Config) type {
                     // 分区 → 独立 context；无分区 → 默认 context（scheme 处理器已注册）。
                     // 本 WebKit2GTK 头文件没有 new_with_user_content_manager_and_context，
                     // 分区路径用 view 自带的 UCM（register handler / add script 等效）。
-                    const view_widget: [*c]c.GtkWidget = if (web_ctx) |wctx|
-                        @ptrCast(c.webkit_web_view_new_with_context(wctx))
+                    const view_widget: [*c]c.GtkWidget = if (pieces) |pc|
+                        @ptrCast(@alignCast(gtk_compat.webViewNew(null, pc.ctx, pc.session)))
                     else
-                        @ptrCast(c.webkit_web_view_new_with_user_content_manager(ucm));
+                        @ptrCast(@alignCast(gtk_compat.webViewNew(ucm, null, null)));
                     if (view_widget == null) return error.WebViewCreateFailed;
-                    const view: [*c]c.WebKitWebView = @ptrCast(view_widget);
+                    const view: ?*c.WebKitWebView = @ptrCast(view_widget);
                     sink.view = view;
-                    const view_ucm: [*c]c.WebKitUserContentManager = if (web_ctx != null)
+                    const view_ucm: ?*c.WebKitUserContentManager = if (pieces != null)
                         c.webkit_web_view_get_user_content_manager(view)
                     else
                         ucm;
@@ -5101,7 +5637,13 @@ fn Backend(comptime config: Config) type {
                     for (w.child_webviews.items, 0..) |cv, i| {
                         if (cv.id == id) {
                             _ = w.child_webviews.swapRemove(i);
-                            c.gtk_widget_destroy(@ptrCast(cv.view)); // UCM/信号随 view 释放
+                            // UCM/信号随 view 释放。GTK4：先摘除 overlay child 再 unref
+                            if (comptime gtk_compat.isGtk4()) {
+                                if (w.overlay) |ov| c.gtk_overlay_remove_overlay(@ptrCast(@alignCast(ov)), @ptrCast(cv.view));
+                                c.g_object_unref(@ptrCast(cv.view));
+                            } else {
+                                c.gtk_widget_destroy(@ptrCast(cv.view));
+                            }
                             self.freeChildView(cv);
                             log.print("[webviews] child #{d} removed (window #{d})", .{ id, w.id });
                             return .{ .ok = true };
@@ -5132,7 +5674,11 @@ fn Backend(comptime config: Config) type {
                 },
                 .focus => |id| {
                     const cv = childViewById(w, id) orelse return .{ .ok = false };
-                    c.gtk_widget_grab_focus(@ptrCast(cv.view));
+                    if (comptime gtk_compat.isGtk4()) {
+                        _ = c.gtk_widget_grab_focus(@ptrCast(cv.view)); // 4.x 返回 gboolean
+                    } else {
+                        c.gtk_widget_grab_focus(@ptrCast(cv.view));
+                    }
                     return .{ .ok = true };
                 },
                 .list => {
@@ -5194,12 +5740,12 @@ fn Backend(comptime config: Config) type {
                             const display = c.gdk_display_get_default();
                             if (display != null) {
                                 const widget: [*c]c.GtkWidget = @ptrCast(st.win);
-                                if (c.gtk_widget_get_window(widget)) |gdk_win| {
-                                    const mon = c.gdk_display_get_monitor_at_window(display, @ptrCast(gdk_win));
-                                    const n = c.gdk_display_get_n_monitors(display);
+                                if (gtk_compat.monitorAtSurface(widget)) |mon_any| {
+                                    const mon: ?*c.GdkMonitor = @ptrCast(@alignCast(mon_any));
+                                    const n = gtk_compat.displayMonitorCount(display);
                                     var idx: c_int = 0;
                                     while (idx < n) : (idx += 1) {
-                                        if (idx < monitors.len) monitors[@intCast(idx)].current = (c.gdk_display_get_monitor(display, idx) == mon);
+                                        if (idx < monitors.len) monitors[@intCast(idx)].current = (gtk_compat.displayMonitorAtIdx(display, idx) == @as(?*anyopaque, @ptrCast(mon)));
                                     }
                                 }
                             }
@@ -5297,13 +5843,13 @@ fn Backend(comptime config: Config) type {
         fn collectMonitors(self: *Self, alloc: std.mem.Allocator) ![]shared_sysinfo.Monitor {
             _ = self;
             const display = c.gdk_display_get_default() orelse return try alloc.alloc(shared_sysinfo.Monitor, 0);
-            const n: usize = @intCast(c.gdk_display_get_n_monitors(display));
+            const n: usize = @intCast(gtk_compat.displayMonitorCount(display));
             const out = try alloc.alloc(shared_sysinfo.Monitor, n);
             errdefer alloc.free(out);
-            const primary = c.gdk_display_get_primary_monitor(display);
+            const primary: ?*c.GdkMonitor = @ptrCast(@alignCast(gtk_compat.displayPrimaryMonitor(display)));
             var i: usize = 0;
             while (i < n) : (i += 1) {
-                const mon = c.gdk_display_get_monitor(display, @intCast(i));
+                const mon: ?*c.GdkMonitor = @ptrCast(@alignCast(gtk_compat.displayMonitorAtIdx(display, @intCast(i))));
                 var geom: c.GdkRectangle = std.mem.zeroes(c.GdkRectangle);
                 var work: c.GdkRectangle = std.mem.zeroes(c.GdkRectangle);
                 // v0.4.0 L2：分数缩放——GTK4（4.14+）gdk_monitor_get_scale 返回小数；
@@ -5312,7 +5858,7 @@ fn Backend(comptime config: Config) type {
                 var scale_f: f64 = 1.0;
                 if (mon != null) {
                     c.gdk_monitor_get_geometry(mon, &geom);
-                    c.gdk_monitor_get_workarea(mon, &work);
+                    gtk_compat.monitorWorkarea(mon, &work);
                     if (comptime gtk_compat.isGtk4()) {
                         scale_f = c.gdk_monitor_get_scale(mon);
                     } else {
@@ -5929,9 +6475,15 @@ fn Backend(comptime config: Config) type {
         /// per-window WebView 代理 context（对齐 Windows v0.1.23）：同 proxy 串
         /// 复用；独立数据目录（<应用数据>/webview-windows/<sanitized>）+ 全套
         /// scheme 处理器（资产/协议/下载）。失败返回 null（降级共享 context）。
-        fn proxyContext(self: *Self, proxy: []const u8) ?[*c]c.WebKitWebContext {
+        /// 代理 context + 网络会话（6.0 的 session 为 null = 无网络面拆分）。
+        const ProxyPieces = struct {
+            ctx: ?*c.WebKitWebContext,
+            session: ?*anyopaque = null,
+        };
+
+        fn proxyContext(self: *Self, proxy: []const u8) ?ProxyPieces {
             for (self.proxy_ctxs.items) |pe| {
-                if (std.mem.eql(u8, pe.proxy, proxy)) return pe.ctx;
+                if (std.mem.eql(u8, pe.proxy, proxy)) return .{ .ctx = pe.ctx, .session = pe.session };
             }
             const dir = self.proxyDirectory(proxy) catch return null;
             defer self.allocator.free(dir);
@@ -5941,53 +6493,80 @@ fn Backend(comptime config: Config) type {
             const proxy_z = dupeZ(self.allocator, proxy) catch return null;
             defer self.allocator.free(proxy_z);
 
-            const mgr = c.webkit_website_data_manager_new(
-                "base-data-directory",
-                @as(?*const anyopaque, dir_z.ptr),
-                @as(?*anyopaque, null),
-            );
-            if (mgr == null) return null;
-            defer c.g_object_unref(@ptrCast(mgr));
-            const ctx = c.webkit_web_context_new_with_website_data_manager(mgr);
+            // 6.0：持久化由 session 目录承载（data+cache 同根，WebKit 内部再分目录）；
+            // GTK3：manager + context 面
+            const session = if (comptime gtk_compat.isGtk4())
+                gtk_compat.networkSessionNew(dir_z.ptr, dir_z.ptr)
+            else
+                null;
+            defer if (session) |s| c.g_object_unref(@ptrCast(s));
+            const mgr = if (comptime gtk_compat.isGtk3())
+                gtk_compat.websiteDataManagerNew(dir_z.ptr)
+            else
+                null;
+            defer if (mgr) |m| c.g_object_unref(@ptrCast(m));
+            const ctx: ?*c.WebKitWebContext = @ptrCast(@alignCast(gtk_compat.webContextNewWithManager(mgr)));
             if (ctx == null) return null;
 
             // 代理：custom 模式 + 单一代理 URI（等价 Windows per-window env 代理）
+            // 6.0：设置面在 session；GTK3 在 context
             const settings = c.webkit_network_proxy_settings_new(proxy_z.ptr, null);
             if (settings != null) {
                 defer c.webkit_network_proxy_settings_free(@ptrCast(settings));
-                c.webkit_web_context_set_network_proxy_settings(ctx, c.WEBKIT_NETWORK_PROXY_MODE_CUSTOM, @ptrCast(settings));
+                const proxy_target: ?*anyopaque = if (session) |s| s else @ptrCast(@alignCast(ctx));
+                gtk_compat.setNetworkProxySettings(proxy_target, @intCast(c.WEBKIT_NETWORK_PROXY_MODE_CUSTOM), settings);
             }
             c.webkit_web_context_register_uri_scheme(ctx, scheme, Self.onSchemeRequest, self, null);
-            _ = c.g_signal_connect_data(ctx, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
+            if (comptime gtk_compat.isGtk4()) {
+                _ = c.g_signal_connect_data(session, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
+            } else {
+                _ = c.g_signal_connect_data(ctx, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
+            }
             self.registerProtocolSchemes(ctx);
 
             const copy = self.allocator.dupe(u8, proxy) catch {
                 c.g_object_unref(@ptrCast(ctx));
                 return null;
             };
-            self.proxy_ctxs.append(self.allocator, .{ .proxy = copy, .ctx = ctx }) catch {
+            // session 由 ProxyEntry 持引用（view 另持自身 ref）
+            self.proxy_ctxs.append(self.allocator, .{ .proxy = copy, .ctx = ctx, .session = session }) catch {
                 self.allocator.free(copy);
                 c.g_object_unref(@ptrCast(ctx));
                 return null;
             };
+            if (session) |s| {
+                _ = c.g_object_ref(@ptrCast(s));
+            }
             log.print("[proxy] webview context ready ({s}, dir={s})", .{ proxy, dir });
-            return ctx;
+            return .{ .ctx = ctx, .session = session };
         }
 
         /// v0.3.2：无痕窗口 context——`webkit_website_data_manager_new_ephemeral()`
         /// （内存态，Cookie/localStorage/缓存不落盘，context 销毁即消失）。
         /// 不缓存：每个无痕窗口独立 context（互不共享，也和主 context 隔离）。
-        fn incognitoContext(self: *Self) ?[*c]c.WebKitWebContext {
-            const mgr = c.webkit_website_data_manager_new_ephemeral();
-            if (mgr == null) return null;
-            defer c.g_object_unref(@ptrCast(mgr));
-            const ctx = c.webkit_web_context_new_with_website_data_manager(mgr);
+        fn incognitoContext(self: *Self) ?ProxyPieces {
+            const session = if (comptime gtk_compat.isGtk4())
+                gtk_compat.networkSessionNewEphemeral()
+            else
+                null;
+            defer if (session) |s| c.g_object_unref(@ptrCast(s));
+            const mgr = if (comptime gtk_compat.isGtk3())
+                gtk_compat.websiteDataManagerNewEphemeral()
+            else
+                null;
+            defer if (mgr) |m| c.g_object_unref(@ptrCast(m));
+            const ctx: ?*c.WebKitWebContext = @ptrCast(@alignCast(gtk_compat.webContextNewWithManager(mgr)));
             if (ctx == null) return null;
             c.webkit_web_context_register_uri_scheme(ctx, scheme, Self.onSchemeRequest, self, null);
-            _ = c.g_signal_connect_data(ctx, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
+            if (comptime gtk_compat.isGtk4()) {
+                _ = c.g_signal_connect_data(session, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
+            } else {
+                _ = c.g_signal_connect_data(ctx, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
+            }
             self.registerProtocolSchemes(ctx);
             log.print("[incognito] ephemeral web context ready", .{});
-            return ctx;
+            // 无痕 context 不缓存——ctx/session 交由 view 持引用（g_object_new 已 ref）
+            return .{ .ctx = ctx, .session = session };
         }
 
         /// 代理 → 数据目录名：非 [A-Za-z0-9._-] 全替换 '_'（防注入/超长）。
@@ -6470,6 +7049,10 @@ fn Backend(comptime config: Config) type {
                     const job = a2.create(FsStreamJob) catch return error.OutOfMemory;
                     const id = self.next_fs_stream_id;
                     self.next_fs_stream_id += 1;
+                    // job 的所有权在 spawn 后归 worker（完成即 free）——日志与
+                    // 响应必须用**局部副本**，否则小文件在日志前就 free 了
+                    //（L3 实测 30KB 文件 segfault：job.chunk_size 读已释放内存）。
+                    const chunk_size = @min(@max(req.chunk_size, 4096), 1024 * 1024);
                     job.* = .{
                         .backend = self,
                         .id = id,
@@ -6477,7 +7060,7 @@ fn Backend(comptime config: Config) type {
                             a2.destroy(job);
                             return error.OutOfMemory;
                         },
-                        .chunk_size = @min(@max(req.chunk_size, 4096), 1024 * 1024),
+                        .chunk_size = chunk_size,
                     };
                     const t = std.Thread.spawn(.{ .stack_size = sys.threadStackSize(256 * 1024) }, fsStreamMain, .{job}) catch {
                         a2.free(job.path);
@@ -6485,7 +7068,7 @@ fn Backend(comptime config: Config) type {
                         return error.SpawnFailed;
                     };
                     t.detach();
-                    log.print("[fs] readStream #{d} {s} chunk={d}", .{ id, path, job.chunk_size });
+                    log.print("[fs] readStream #{d} {s} chunk={d}", .{ id, path, chunk_size });
                     return .{ .json = try std.fmt.allocPrint(alloc, "{{\"id\":{d}}}", .{id}) };
                 },
                 .roots => {
@@ -6633,14 +7216,20 @@ fn Backend(comptime config: Config) type {
         fn fsStreamMain(job: *FsStreamJob) void {
             const self = job.backend;
             const a2 = std.heap.page_allocator;
+            // 正常结束由本线程释放；读失败时 job 交给 fsStreamErrIdle（否则
+            // defer 先释放、idle 回调再访问 = use-after-free——L3 实测路径）
+            var handed_off = false;
             defer {
-                a2.free(job.path);
-                a2.destroy(job);
+                if (!handed_off) {
+                    a2.free(job.path);
+                    a2.destroy(job);
+                }
             }
             // 一次读入（上限沿用 fs 读限制），再按 chunk 切片发事件——
             // 0.17 的 Io.File 流式读 API 面向 reader 接口，这里内存版足够
             //（fs.read 本身也是 32MB 上限）。
             const data = std.Io.Dir.cwd().readFileAlloc(sharedIo(), job.path, a2, .limited((fs_api_mod.Limits{}).max_read)) catch {
+                handed_off = true;
                 _ = c.g_idle_add(fsStreamErrIdle, job);
                 return;
             };
@@ -7842,7 +8431,7 @@ fn Backend(comptime config: Config) type {
         // <name>://<rest>?<query>，对应 Windows 的 /__proto/<name>/<rest>）
         // ------------------------------------------------------------------
 
-        fn registerProtocolSchemes(self: *Self, wc: [*c]c.WebKitWebContext) void {
+        fn registerProtocolSchemes(self: *Self, wc: ?*c.WebKitWebContext) void {
             for (config.protocols) |p| {
                 const name_z = dupeZ(self.allocator, p.name) catch continue;
                 defer self.allocator.free(name_z);
@@ -7856,12 +8445,12 @@ fn Backend(comptime config: Config) type {
             }
         }
 
-        fn onProtocolRequest(request: [*c]c.WebKitURISchemeRequest, user_data: c.gpointer) callconv(.c) void {
+        fn onProtocolRequest(request: ?*c.WebKitURISchemeRequest, user_data: c.gpointer) callconv(.c) void {
             const self: *Self = @ptrCast(@alignCast(user_data orelse return));
             self.serveProtocol(request);
         }
 
-        fn serveProtocol(self: *Self, request: [*c]c.WebKitURISchemeRequest) void {
+        fn serveProtocol(self: *Self, request: ?*c.WebKitURISchemeRequest) void {
             const uri_ptr = c.webkit_uri_scheme_request_get_uri(request);
             const uri = if (uri_ptr != null) std.mem.span(uri_ptr) else "";
             const sep = std.mem.indexOf(u8, uri, "://") orelse return self.finishProtocolError(request, 400, "bad uri");
@@ -7932,7 +8521,7 @@ fn Backend(comptime config: Config) type {
             self.finishProtocol(request, resp);
         }
 
-        fn finishProtocol(self: *Self, request: [*c]c.WebKitURISchemeRequest, resp: protocol.Response) void {
+        fn finishProtocol(self: *Self, request: ?*c.WebKitURISchemeRequest, resp: protocol.Response) void {
             const bytes = c.g_bytes_new(resp.body.ptr, resp.body.len);
             if (bytes == null) return;
             defer c.g_bytes_unref(bytes);
@@ -7969,7 +8558,7 @@ fn Backend(comptime config: Config) type {
             c.webkit_uri_scheme_request_finish_with_response(request, response);
         }
 
-        fn finishProtocolError(self: *Self, request: [*c]c.WebKitURISchemeRequest, status: u16, body: []const u8) void {
+        fn finishProtocolError(self: *Self, request: ?*c.WebKitURISchemeRequest, status: u16, body: []const u8) void {
             self.finishBytes(request, status, "text/plain; charset=utf-8", body);
         }
 
@@ -8062,6 +8651,14 @@ fn Backend(comptime config: Config) type {
                         self.deliverAlloc(sink.view, resp);
                         return;
                     }
+                    // v0.4.3 L6：托盘挂窗冒烟探针（toggle → 可见性/位置回传）
+                    if (std.mem.eql(u8, inv.method, "__zilt.linuxSmokeAttach")) {
+                        self.smokeAttachInject();
+                        const resp_at = try ipc.encodeResolve(self.allocator, inv.id, "\"sent\"");
+                        defer self.allocator.free(resp_at);
+                        self.deliverAlloc(sink.view, resp_at);
+                        return;
+                    }
                     // 框架内部：冒烟探针——v0.3.0 桌面体验面是否接线 + 会话有无 WM
                     //（windowMoved/Resized/Focus 需要 WM；Xvfb 裸跑跳过断言）
                     if (std.mem.eql(u8, inv.method, "__zilt.linuxSmokeWired")) {
@@ -8128,7 +8725,7 @@ fn Backend(comptime config: Config) type {
             }
         }
 
-        fn reject(self: *Self, view: [*c]c.WebKitWebView, id: u64, err_name: []const u8) void {
+        fn reject(self: *Self, view: ?*c.WebKitWebView, id: u64, err_name: []const u8) void {
             const resp = ipc.encodeReject(self.allocator, id, err_name) catch return;
             defer self.allocator.free(resp);
             self.deliverAlloc(view, resp);
@@ -8136,7 +8733,7 @@ fn Backend(comptime config: Config) type {
 
         /// 页面加载完成后自检：runtime_js 是否注入、messageHandlers 是否注册。
         /// 这两项任一为 false，前端所有 invoke 都会静默失败——所以显式记一行日志。
-        fn diagnoseRuntime(self: *Self, view: [*c]c.WebKitWebView) void {
+        fn diagnoseRuntime(self: *Self, view: ?*c.WebKitWebView) void {
             // 诊断三元组：runtime 是否可用 / 首屏检查结果 / 页面是否已跑过 runChecks
             const script =
                 "(() => {" ++
@@ -8157,7 +8754,7 @@ fn Backend(comptime config: Config) type {
 
         fn diagDone(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
             _ = user_data;
-            const view: [*c]c.WebKitWebView = @ptrCast(source);
+            const view: ?*c.WebKitWebView = @ptrCast(source);
             var err: [*c]c.GError = null;
             const value = c.webkit_web_view_evaluate_javascript_finish(view, res, &err);
             if (err != null) {
@@ -8172,7 +8769,7 @@ fn Backend(comptime config: Config) type {
             log.print("[linux] runtime self-check: zilt={s}", .{std.mem.span(text)});
         }
 
-        fn onLoadChanged(_: [*c]c.WebKitWebView, event: c.WebKitLoadEvent, user_data: c.gpointer) callconv(.c) void {
+        fn onLoadChanged(_: ?*c.WebKitWebView, event: c.WebKitLoadEvent, user_data: c.gpointer) callconv(.c) void {
             if (event != c.WEBKIT_LOAD_FINISHED) return;
             const sink: *IpcSink = @ptrCast(@alignCast(user_data orelse return));
             const self = sink.backend;
@@ -8217,7 +8814,7 @@ fn Backend(comptime config: Config) type {
         /// config.webview.new_window 三态；响应放行（下载走 download-started）。
         /// translate-c 把 WebKitPolicyDecisionType 变成 c_uint → 用 if 链比较。
         fn onDecidePolicy(
-            _: [*c]c.WebKitWebView,
+            _: ?*c.WebKitWebView,
             decision: ?*c.WebKitPolicyDecision,
             dtype: c.WebKitPolicyDecisionType,
             user_data: c.gpointer,
@@ -8320,10 +8917,10 @@ fn Backend(comptime config: Config) type {
         /// `create` 信号：默认弹窗一律不建（策略已在 decide-policy 处理——
         /// ignore 后不会走到这里；兜底返回 NULL 阻断 WebKit 自建窗口）。
         fn onCreate(
-            _: [*c]c.WebKitWebView,
+            _: ?*c.WebKitWebView,
             _: ?*c.WebKitNavigationAction,
             _: c.gpointer,
-        ) callconv(.c) [*c]c.WebKitWebView {
+        ) callconv(.c) ?*c.WebKitWebView {
             return null;
         }
 
@@ -8331,7 +8928,7 @@ fn Backend(comptime config: Config) type {
         /// ask 在冒烟模式直接拒绝（无交互；桌面弹原生询问框），事件 payload
         /// {url,kind,policy} 与 Windows 同形（WebKitGTK 拿不到发起 URL → 空串）。
         fn onPermissionRequest(
-            _: [*c]c.WebKitWebView,
+            _: ?*c.WebKitWebView,
             request: ?*c.WebKitPermissionRequest,
             user_data: c.gpointer,
         ) callconv(.c) c.gboolean {
@@ -8411,7 +9008,7 @@ fn Backend(comptime config: Config) type {
             );
             c.gtk_widget_show(dialog);
             c.g_main_loop_run(st.loop.?);
-            c.gtk_widget_destroy(dialog);
+            gtk_compat.destroyDialog(@ptrCast(@alignCast(dialog)));
             return if (st.allowed) .allow else .deny;
         }
 
@@ -8436,7 +9033,7 @@ fn Backend(comptime config: Config) type {
         /// + 自动恢复（对齐 Windows recover_renderer：crashed/exceeded_memory →
         /// reload；terminated_by_api 是主动调用 → 不恢复）。
         fn onWebProcessTerminated(
-            view: [*c]c.WebKitWebView,
+            view: ?*c.WebKitWebView,
             reason: c.WebKitWebProcessTerminationReason,
             user_data: c.gpointer,
         ) callconv(.c) void {
@@ -8466,7 +9063,7 @@ fn Backend(comptime config: Config) type {
 
         const CrashReloadTask = struct {
             backend: *Self,
-            view: [*c]c.WebKitWebView,
+            view: ?*c.WebKitWebView,
         };
 
         fn crashReloadIdle(data: c.gpointer) callconv(.c) c.gboolean {
@@ -8479,7 +9076,7 @@ fn Backend(comptime config: Config) type {
         }
 
         /// 由 WebView 指针反查窗口状态（崩溃恢复 idle 回调用）。
-        fn windowByView(self: *Self, view: [*c]c.WebKitWebView) ?*WinState {
+        fn windowByView(self: *Self, view: ?*c.WebKitWebView) ?*WinState {
             for (self.windows.items) |w| {
                 if (w.view == view) return w;
             }
@@ -8493,7 +9090,7 @@ fn Backend(comptime config: Config) type {
         /// v0.3.0：WebView 右键菜单接管。返回 TRUE 阻止 WebKit 默认菜单
         ///（context_menus=false；应用可经既有 menu.popup 自绘）。
         fn onContextMenu(
-            _: [*c]c.WebKitWebView,
+            _: ?*c.WebKitWebView,
             _: ?*anyopaque,
             _: ?*anyopaque,
             _: ?*anyopaque,
@@ -8508,7 +9105,7 @@ fn Backend(comptime config: Config) type {
         /// - `settings.script_dialogs=false` → 阻止原生模态框；
         /// - 冒烟模式一律阻止（无交互环境，模态框会卡死主循环）→ 默认应答。
         fn onScriptDialog(
-            _: [*c]c.WebKitWebView,
+            _: ?*c.WebKitWebView,
             dialog: ?*anyopaque,
             user_data: c.gpointer,
         ) callconv(.c) c.gboolean {
@@ -8693,7 +9290,7 @@ fn Backend(comptime config: Config) type {
             return G_SOURCE_REMOVE;
         }
 
-        fn currentUri(view: [*c]c.WebKitWebView, fallback: []const u8) []const u8 {
+        fn currentUri(view: ?*c.WebKitWebView, fallback: []const u8) []const u8 {
             if (view == null) return fallback;
             const uri = c.webkit_web_view_get_uri(view);
             if (uri == null) return fallback;
@@ -8704,7 +9301,7 @@ fn Backend(comptime config: Config) type {
         // scheme 资产服务
         // ------------------------------------------------------------------
 
-        fn serveScheme(self: *Self, request: [*c]c.WebKitURISchemeRequest) void {
+        fn serveScheme(self: *Self, request: ?*c.WebKitURISchemeRequest) void {
             const raw_ptr = c.webkit_uri_scheme_request_get_path(request);
             const raw = if (raw_ptr != null) std.mem.span(raw_ptr) else "/index.html";
             const path = asset_routes.decodePath(self.allocator, if (raw.len == 0) "/index.html" else raw) catch {
@@ -8754,13 +9351,13 @@ fn Backend(comptime config: Config) type {
             return raw;
         }
 
-        fn finishPlain(self: *Self, request: [*c]c.WebKitURISchemeRequest, status: u16, body: []const u8) void {
+        fn finishPlain(self: *Self, request: ?*c.WebKitURISchemeRequest, status: u16, body: []const u8) void {
             self.finishBytes(request, status, "text/plain; charset=utf-8", body);
         }
 
         fn finishBytes(
             self: *Self,
-            request: [*c]c.WebKitURISchemeRequest,
+            request: ?*c.WebKitURISchemeRequest,
             status: u16,
             content_type: []const u8,
             body: []const u8,
@@ -8788,7 +9385,7 @@ fn Backend(comptime config: Config) type {
         }
 
         /// 全局 CSP 与 security.headers：scheme 响应也要带上，否则 Linux 侧等于没配。
-        fn applySecurityHeaders(self: *Self, response: [*c]c.WebKitURISchemeResponse) void {
+        fn applySecurityHeaders(self: *Self, response: ?*c.WebKitURISchemeResponse) void {
             if (config.security.csp == null and config.security.headers.len == 0) return;
             const headers = c.soup_message_headers_new(c.SOUP_MESSAGE_HEADERS_RESPONSE);
             if (headers == null) return;
@@ -8839,7 +9436,7 @@ fn Backend(comptime config: Config) type {
             // 父销毁级联关子窗口（子窗口的 destroy 会重入本回调并自行摘除）
             while (self.findWindowByParent(closed_id)) |child| {
                 log.print("[linux] cascade close window #{d} (parent #{d} gone)", .{ child.id, closed_id });
-                c.gtk_widget_destroy(@ptrCast(child.win));
+                gtk_compat.windowDestroy(child.win);
             }
             // 全部窗口都销毁才退出主循环（primary / 降级两种主循环形态统一走这里）
             if (self.windows.items.len == 0) {
@@ -8861,11 +9458,11 @@ fn Backend(comptime config: Config) type {
         /// v0.3.0：map 后补一次恢复几何的 move（openbox 等 reparent 型 WM 实测
         /// 会忽略窗口 map 之前的 gtk_window_move，恢复位置退化成 0,0）。
         /// 只补一次：之后用户拖动/程序移动不再被覆盖。
-        fn onMapRestore(_: [*c]c.GtkWidget, _: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
+        fn onMapRestore(user_data: c.gpointer) callconv(.c) c.gboolean {
             const st: *WinState = @ptrCast(@alignCast(user_data orelse return 0));
             if (!st.restored_geometry) return 0;
             st.restored_geometry = false;
-            c.gtk_window_move(st.win, st.restored_x, st.restored_y);
+            gtk_compat.windowMove(st.win, st.restored_x, st.restored_y);
             st.geom_x = st.restored_x;
             st.geom_y = st.restored_y;
             log.print("[state] re-applied restored position {d},{d} after map (window #{d})", .{
@@ -8912,6 +9509,15 @@ fn Backend(comptime config: Config) type {
                 }
             }
             const widget: [*c]c.GtkWidget = @ptrCast(st.win);
+            if (comptime gtk_compat.isGtk4()) {
+                // GDK4 无 shape API → X11 直连（XShape）；Wayland 无对等 → skip
+                if (!gtk_compat.applySurfaceMask(widget, region)) {
+                    log.print("[mask] shape unsupported on this display backend (mask skipped)", .{});
+                    return;
+                }
+                log.print("[mask] applied '{s}' ({d}x{d})", .{ mask_path, img.width, img.height });
+                return;
+            }
             const gdk_win = c.gtk_widget_get_window(widget) orelse {
                 log.print("[mask] window not realized yet (mask deferred unsupported)", .{});
                 return;
@@ -8931,55 +9537,29 @@ fn Backend(comptime config: Config) type {
         /// v0.3.3：窗口位置夹取工作区（preventOverflow；configure-event 时机）。
         fn clampToWorkArea(st: *WinState) void {
             if (!st.prevent_overflow or st.win == null) return;
-            const display = c.gdk_display_get_default() orelse return;
             const widget: [*c]c.GtkWidget = @ptrCast(st.win);
-            const gdk_win = c.gtk_widget_get_window(widget) orelse return;
-            const mon = c.gdk_display_get_monitor_at_window(display, @ptrCast(gdk_win)) orelse return;
+            const mon_any = gtk_compat.monitorAtSurface(widget) orelse return;
+            const mon: ?*c.GdkMonitor = @ptrCast(@alignCast(mon_any));
             var work: c.GdkRectangle = std.mem.zeroes(c.GdkRectangle);
-            c.gdk_monitor_get_workarea(mon, &work);
+            gtk_compat.monitorWorkarea(mon, &work);
             var x: c.gint = 0;
             var y: c.gint = 0;
-            c.gtk_window_get_position(st.win, &x, &y);
+            gtk_compat.windowGetPosition(st.win, &x, &y);
             var w: c.gint = 0;
             var h: c.gint = 0;
-            c.gtk_window_get_size(st.win, &w, &h);
+            gtk_compat.windowGetSize(st.win, &w, &h);
             const max_x = @max(work.x, work.x + work.width - w);
             const max_y = @max(work.y, work.y + work.height - h);
             const cx = @min(@max(x, work.x), max_x);
             const cy = @min(@max(y, work.y), max_y);
-            if (cx != x or cy != y) c.gtk_window_move(st.win, cx, cy);
+            if (cx != x or cy != y) gtk_compat.windowMove(st.win, cx, cy);
         }
 
         fn onConfigureEvent(_: [*c]c.GtkWidget, event: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
             const st: *WinState = @ptrCast(@alignCast(user_data orelse return 0));
-            Self.clampToWorkArea(st);
             const cfg: [*c]c.GdkEventConfigure = @ptrCast(@alignCast(event orelse return 0));
             if (cfg.*.width > 0 and cfg.*.height > 0) {
-                st.geom_x = cfg.*.x;
-                st.geom_y = cfg.*.y;
-                st.geom_width = @intCast(cfg.*.width);
-                st.geom_height = @intCast(cfg.*.height);
-            }
-            // v0.2.6：windowMoved / windowResized（去重——configure 抖动/重复很常见）
-            const moved = st.geom_x != st.reported_x or st.geom_y != st.reported_y;
-            const resized = @as(i64, st.geom_width) != st.reported_w or @as(i64, st.geom_height) != st.reported_h;
-            if (moved) {
-                st.reported_x = st.geom_x;
-                st.reported_y = st.geom_y;
-                st.backend.emitWindowEvent(st, "windowMoved", &.{
-                    .{ .name = "id", .value = st.id },
-                    .{ .name = "x", .value = st.geom_x },
-                    .{ .name = "y", .value = st.geom_y },
-                });
-            }
-            if (resized) {
-                st.reported_w = @intCast(st.geom_width);
-                st.reported_h = @intCast(st.geom_height);
-                st.backend.emitWindowEvent(st, "windowResized", &.{
-                    .{ .name = "id", .value = st.id },
-                    .{ .name = "width", .value = @as(i64, st.geom_width) },
-                    .{ .name = "height", .value = @as(i64, st.geom_height) },
-                });
+                Self.syncGeometry(st, cfg.*.x, cfg.*.y, @intCast(cfg.*.width), @intCast(cfg.*.height));
             }
             return 0;
         }
@@ -9037,7 +9617,7 @@ fn Backend(comptime config: Config) type {
         ///（openbox + WebKit 实测：toplevel 从未收到 FocusIn，X 焦点是子窗口）；
         /// 这里沿 X 焦点窗口向父链走，命中 toplevel XID 即视为窗口持有焦点。
         /// 非 X11 后端（或 GTK4 变体）返回 null → 调用方回退 GTK 焦点属性。
-        const FocusProbe = if (@hasDecl(c, "gdk_x11_window_get_xid")) struct {
+        const FocusProbe = if (gtk_compat.isGtk3() and @hasDecl(c, "gdk_x11_window_get_xid")) struct {
             fn within(st: *WinState) ?bool {
                 const widget: [*c]c.GtkWidget = @ptrCast(st.win);
                 const gdk_win = c.gtk_widget_get_window(widget) orelse return null;
@@ -9066,6 +9646,35 @@ fn Backend(comptime config: Config) type {
                 }
                 return false;
             }
+        } else if (gtk_compat.isGtk4()) struct {
+            // GTK4：gdk_x11_surface_get_xid + gtk_native_get_surface
+            fn within(st: *WinState) ?bool {
+                const widget: [*c]c.GtkWidget = @ptrCast(st.win);
+                const surface = c.gtk_native_get_surface(@ptrCast(widget)) orelse return null;
+                const top_xid = c.gdk_x11_surface_get_xid(surface);
+                if (top_xid == 0) return null;
+                const display = c.gtk_widget_get_display(widget) orelse return null;
+                const xdisplay = c.gdk_x11_display_get_xdisplay(display);
+                if (xdisplay == null) return null;
+                var focus: c.Window = 0;
+                var revert: c_int = 0;
+                _ = c.XGetInputFocus(xdisplay, &focus, &revert);
+                if (focus == 0 or focus == 1) return false;
+                var cur = focus;
+                var depth: u32 = 0;
+                while (cur != 0 and depth < 32) : (depth += 1) {
+                    if (cur == top_xid) return true;
+                    var root: c.Window = 0;
+                    var parent: c.Window = 0;
+                    var children: [*c]c.Window = null;
+                    var nchildren: c_uint = 0;
+                    if (c.XQueryTree(xdisplay, cur, &root, &parent, &children, &nchildren) == 0) return null;
+                    if (children != null) _ = c.XFree(@ptrCast(children));
+                    if (parent == 0 or parent == cur) return false;
+                    cur = parent;
+                }
+                return false;
+            }
         } else struct {
             fn within(_: *WinState) ?bool {
                 return null;
@@ -9075,7 +9684,7 @@ fn Backend(comptime config: Config) type {
         /// 窗口当前是否持有焦点（X11 优先，回退 GTK 属性）。
         fn windowFocused(st: *WinState) bool {
             if (FocusProbe.within(st)) |focused| return focused;
-            return c.gtk_window_has_toplevel_focus(st.win) != 0;
+            return gtk_compat.windowHasFocus(st.win);
         }
 
         /// 200ms 焦点轮询：X11 焦点直接落在 WebKit 子窗口时 GTK 不派发任何
@@ -9083,6 +9692,25 @@ fn Backend(comptime config: Config) type {
         fn focusPollTick(user_data: c.gpointer) callconv(.c) c.gboolean {
             const st: *WinState = @ptrCast(@alignCast(user_data orelse return G_SOURCE_REMOVE));
             notifyFocus(st, windowFocused(st));
+            if (comptime gtk_compat.isGtk4()) {
+                // GTK4：无 configure-event——位置由 200ms X11 轮询面跟踪
+                //（Wayland 无全局坐标，跳过；尺寸经 size-allocate 已跟踪）
+                if (st.win != null) {
+                    const widget: [*c]c.GtkWidget = @ptrCast(st.win);
+                    var px: c.gint = 0;
+                    var py: c.gint = 0;
+                    var gw: c.gint = 0;
+                    var gh: c.gint = 0;
+                    if (gtk_compat.surfaceOrigin(widget, &px, &py)) {
+                        gtk_compat.windowGetSize(st.win, &gw, &gh);
+                        if (st.geom_x != px or st.geom_y != py or
+                            st.geom_width != @as(u32, @intCast(gw)) or st.geom_height != @as(u32, @intCast(gh)))
+                        {
+                            Self.syncGeometry(st, px, py, @intCast(gw), @intCast(gh));
+                        }
+                    }
+                }
+            }
             return 1; // G_SOURCE_CONTINUE
         }
 
@@ -9091,15 +9719,9 @@ fn Backend(comptime config: Config) type {
         /// 经 gdk_event_get_keyval 取键值（translate-c 对 opaque 事件结构不可用）。
         /// v0.3.9 A4L：窗口级 KeyBindings 匹配——菜单 accel 由 GTK accel group
         /// 先行处理，被菜单消费的键不会到达本 handler（与 Windows 菜单优先一致）。
-        fn onKeyPress(st_widget: [*c]c.GtkWidget, event: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
-            _ = st_widget;
+        /// compat 形状的按键处理器（key-press-event 与 GtkEventControllerKey 收敛点）。
+        fn onKeyPressCompat(keyval: c.guint, mods: c.GdkModifierType, user_data: c.gpointer) callconv(.c) c.gboolean {
             const st: *WinState = @ptrCast(@alignCast(user_data orelse return 0));
-            var keyval: c.guint = 0;
-            var mods: c.GdkModifierType = 0;
-            if (event != null) {
-                _ = c.gdk_event_get_keyval(@ptrCast(event), &keyval);
-                _ = c.gdk_event_get_state(@ptrCast(event), &mods);
-            }
             const is_escape: bool = keyval == 0xff1b;
             if (is_escape and st.win != null) { // GDK_KEY_Escape = 0xff1b
                 c.gtk_widget_hide(@ptrCast(st.win));
@@ -9130,6 +9752,32 @@ fn Backend(comptime config: Config) type {
         /// emitKeyBinding），keyval/mods 由 key 名合成。X 层注入（XSendEvent/XTest）
         /// 实测在 Xvfb+WebKit 下段错（环境限制），真实按键路径由
         /// matchKeyBinding 单测 + GTK key-press 语义保证。
+        /// v0.4.3 L6 冒烟：托盘挂窗探针（toggle → 隐藏/显示+定位回传）。
+        fn smokeAttachInject(self: *Self) void {
+            const w = self.windowById(0) orelse {
+                self.emitRawToWindow(1, "linuxSmokeAttach", "{\"ok\":false}");
+                return;
+            };
+            const widget: [*c]c.GtkWidget = @ptrCast(w.win);
+            const before = c.gtk_widget_get_visible(widget) != 0;
+            const x0 = w.geom_x;
+            const y0 = w.geom_y;
+            // 往返 toggle（隐藏→显示）：机制面证明（免定位——不扰动后续检查）
+            self.toggleAttachedWindowInner(false);
+            self.toggleAttachedWindowInner(false);
+            if (w.geom_x != x0 or w.geom_y != y0) {
+                gtk_compat.windowMove(w.win, x0, y0);
+                w.geom_x = x0;
+                w.geom_y = y0;
+            }
+            const after = c.gtk_widget_get_visible(widget) != 0;
+            const payload = std.fmt.allocPrint(self.allocator, "{{\"before\":{},\"after\":{},\"x\":{d},\"y\":{d}}}", .{
+                before, after, w.geom_x, w.geom_y,
+            }) catch return;
+            defer self.allocator.free(payload);
+            self.emitRawToWindow(1, "linuxSmokeAttach", payload);
+        }
+
         fn smokeKeyBindInject(self: *Self, args_json: []const u8) void {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
@@ -9153,7 +9801,7 @@ fn Backend(comptime config: Config) type {
             const spec = parseAccelGtk(accel) orelse return;
             var mods: c.GdkModifierType = spec.mods;
             // 合成事件的 state 带 MOD2（numlock）等 lock 位——handler 同样先掩码
-            mods |= c.GDK_MOD2_MASK;
+            mods |= gtk_compat.MOD2_MASK;
             const kb = matchKeyBinding(w.key_bindings, spec.keyval, mods) orelse {
                 log.print("[keybinding] smoke probe: no match for '{s}' on window #{d} (bindings={d})", .{ key_name, win_id, w.key_bindings.len });
                 // 不命中也要回传确认（冒烟断言区分「没注册」与「没收到」）
@@ -9171,12 +9819,73 @@ fn Backend(comptime config: Config) type {
             self.emitRawToWindow(1, "linuxSmokeKeyBind", confirm);
         }
 
-        fn onFocusChange(_: [*c]c.GtkWidget, event: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
-            const st: *WinState = @ptrCast(@alignCast(user_data orelse return 0));
-            const ev: [*c]c.GdkEventFocus = @ptrCast(@alignCast(event orelse return 0));
-            const focused = ev.*.in != 0;
+        /// GTK4：size-allocate → 几何跟踪（宽度/高度；位置由 X11 轮询面补齐）。
+        fn onSizeAllocated(width: c.gint, height: c.gint, user_data: c.gpointer) callconv(.c) void {
+            const st: *WinState = @ptrCast(@alignCast(user_data orelse return));
+            syncGeometry(st, null, null, @intCast(width), @intCast(height));
+        }
+
+        /// GTK4：GtkDropTarget drop → uri-list 字节（读面在 compat 内完成；
+        /// 参数按 C ABI 面：指针 + 长度）。
+        fn onGdkDrop(user_data: c.gpointer, data: ?*const anyopaque, len: usize) callconv(.c) void {
+            const sink: *IpcSink = @ptrCast(@alignCast(user_data orelse return));
+            const self = sink.backend;
+            if (data == null or len == 0) return;
+            const payload: []const u8 = @as([*]const u8, @ptrCast(data.?))[0..len];
+            self.handleDropUris(sink.win_id, payload);
+        }
+
+        /// 几何跟踪去重（GTK3 configure-event / GTK4 size-allocate+X11 轮询共用）。
+        fn syncGeometry(st: *WinState, x: ?i32, y: ?i32, width: u32, height: u32) void {
+            Self.clampToWorkArea(st);
+            var moved = false;
+            var resized = false;
+            if (x) |vx| {
+                if (st.geom_x != vx) {
+                    st.geom_x = vx;
+                    moved = true;
+                }
+            }
+            if (y) |vy| {
+                if (st.geom_y != vy) {
+                    st.geom_y = vy;
+                    moved = true;
+                }
+            }
+            if (st.geom_width != width) {
+                st.geom_width = width;
+                resized = true;
+            }
+            if (st.geom_height != height) {
+                st.geom_height = height;
+                resized = true;
+            }
+            moved = moved or st.geom_x != st.reported_x or st.geom_y != st.reported_y;
+            if (moved) {
+                st.reported_x = st.geom_x;
+                st.reported_y = st.geom_y;
+                st.backend.emitWindowEvent(st, "windowMoved", &.{
+                    .{ .name = "id", .value = st.id },
+                    .{ .name = "x", .value = st.geom_x },
+                    .{ .name = "y", .value = st.geom_y },
+                });
+            }
+            resized = resized or @as(i64, st.geom_width) != st.reported_w or @as(i64, st.geom_height) != st.reported_h;
+            if (resized) {
+                st.reported_w = @intCast(st.geom_width);
+                st.reported_h = @intCast(st.geom_height);
+                st.backend.emitWindowEvent(st, "windowResized", &.{
+                    .{ .name = "id", .value = st.id },
+                    .{ .name = "width", .value = @as(i64, st.geom_width) },
+                    .{ .name = "height", .value = @as(i64, st.geom_height) },
+                });
+            }
+        }
+
+        /// compat 形状的焦点处理器（focus-in/out 与 notify::is-active 的收敛点）。
+        fn onFocusCompat(focused: bool, user_data: c.gpointer) callconv(.c) void {
+            const st: *WinState = @ptrCast(@alignCast(user_data orelse return));
             notifyFocus(st, focused);
-            return 0;
         }
 
         /// v0.3.0：`notify::has-toplevel-focus` → windowFocus/windowBlur。
@@ -9193,8 +9902,17 @@ fn Backend(comptime config: Config) type {
             if (focused == st.reported_focus) return;
             // v0.3.3：失焦自动隐藏（hideOnFocusLost）
             if (!focused and st.hide_on_focus_lost and st.win != null) {
-                c.gtk_widget_hide(@ptrCast(st.win));
-                log.print("[window] #{d} focus lost -> hide", .{st.id});
+                if (st.tray_attached and st.backend.ffm) {
+                    // v0.4.3 L6：FFM 桌面（Hyprland/Sway/i3…）下挂窗不随失焦隐藏
+                    //（指针离开即失焦 → 弹窗在可用前消失；Wails 同语义）
+                    log.print("[window] #{d} focus lost ignored (focus-follows-mouse)", .{st.id});
+                } else if (gtk_compat.nowMs() < st.hide_suppress_until_ms) {
+                    // v0.4.3 L6：挂窗显示后的抑制窗（FFM WM 下指针掠过即失焦）
+                    log.print("[window] #{d} focus lost suppressed (attach window)", .{st.id});
+                } else {
+                    c.gtk_widget_hide(@ptrCast(st.win));
+                    log.print("[window] #{d} focus lost -> hide", .{st.id});
+                }
             }
             st.reported_focus = focused;
             log.print("[window] focus changed #{d} focused={}", .{ st.id, focused });
@@ -9205,7 +9923,7 @@ fn Backend(comptime config: Config) type {
 
         /// delete-event → close_requested_event=true 时拦截（发 windowCloseRequested
         /// 由前端确认；false = 走默认销毁）。
-        fn onDeleteEvent(_: [*c]c.GtkWidget, _: ?*anyopaque, user_data: c.gpointer) callconv(.c) c.gboolean {
+        fn onDeleteEvent(user_data: c.gpointer) callconv(.c) c.gboolean {
             const st: *WinState = @ptrCast(@alignCast(user_data orelse return 0));
             if (!st.close_requested_event) return 0; // 默认销毁
             // v0.3.14 G6：Zig 侧取消钩子（comptime 门控；true = 取消关闭）
@@ -9231,7 +9949,7 @@ fn Backend(comptime config: Config) type {
         /// GtkOverlay 的 get-child-position：子 WebView 按存储的布局矩形放置。
         /// 返回 TRUE 表示已处理（不用 GTK 默认的边缘对齐位置）。
         fn onChildPosition(
-            _: [*c]c.GtkOverlay,
+            _: ?*c.GtkOverlay,
             widget: [*c]c.GtkWidget,
             allocation: [*c]c.GdkRectangle,
             user_data: c.gpointer,
@@ -9249,24 +9967,25 @@ fn Backend(comptime config: Config) type {
             return 0;
         }
 
-        fn onSchemeRequest(request: [*c]c.WebKitURISchemeRequest, user_data: c.gpointer) callconv(.c) void {
+        fn onSchemeRequest(request: ?*c.WebKitURISchemeRequest, user_data: c.gpointer) callconv(.c) void {
             const self: *Self = @ptrCast(@alignCast(user_data orelse return));
             self.serveScheme(request);
         }
 
         fn onScriptMessage(
-            _: [*c]c.WebKitUserContentManager,
-            result: ?*c.WebKitJavascriptResult,
+            _: ?*c.WebKitUserContentManager,
+            result: ?*anyopaque,
             user_data: c.gpointer,
         ) callconv(.c) void {
             const sink: *IpcSink = @ptrCast(@alignCast(user_data orelse return));
             if (result == null) return;
 
-            // WebKitGTK 2.22+ 的信号载荷是 JSCValue：对象要用 jsc_value_to_json
-            // 才能拿到 JSON 文本（jsc_value_to_string 只会给 "[object Object]"）。
-            const value = c.webkit_javascript_result_get_js_value(result);
+            // 信号载荷收敛 JSCValue：GTK3 从 WebKitJavascriptResult 解包，
+            // 6.0 直接携带 JSCValue。对象要用 jsc_value_to_json 才能拿到 JSON
+            // 文本（jsc_value_to_string 只会给 "[object Object]"）。
+            const value = gtk_compat.scriptMessageJscValue(result);
             if (value == null) return;
-            const json_ptr = c.jsc_value_to_json(value, 0);
+            const json_ptr = c.jsc_value_to_json(@ptrCast(@alignCast(value)), 0);
             if (json_ptr == null) return;
             defer c.g_free(@ptrCast(json_ptr));
             const raw = std.mem.span(json_ptr);
@@ -9320,6 +10039,23 @@ test "reasonFor: 状态码有可读短语" {
     try testing.expectEqualStrings("Not Found", reasonFor(404));
     try testing.expectEqualStrings("OK", reasonFor(200));
     try testing.expectEqualStrings("OK", reasonFor(599)); // 未知码不崩
+}
+
+test "v0.4.3 L6: FFM 桌面判定（令牌匹配，不做子串误命中）" {
+    // 命中：FFM 默认桌面（Wails 文档点名的 Hyprland/Sway/i3 + 同类）
+    try testing.expect(impliesFocusFollowsMouse("sway"));
+    try testing.expect(impliesFocusFollowsMouse("Hyprland"));
+    try testing.expect(impliesFocusFollowsMouse("i3"));
+    try testing.expect(impliesFocusFollowsMouse("i3:WM"));
+    try testing.expect(impliesFocusFollowsMouse("ubuntu:GNOME,sway"));
+    try testing.expect(impliesFocusFollowsMouse("xmonad"));
+    // 不命中：点击聚焦桌面（含易误命中的子串）
+    try testing.expect(!impliesFocusFollowsMouse("ubuntu:GNOME"));
+    try testing.expect(!impliesFocusFollowsMouse("KDE"));
+    try testing.expect(!impliesFocusFollowsMouse("X-Cinnamon"));
+    try testing.expect(!impliesFocusFollowsMouse("i386"));
+    try testing.expect(!impliesFocusFollowsMouse(""));
+    try testing.expect(!impliesFocusFollowsMouse("swayland")); // 前缀不匹配
 }
 
 test "gdkCursorName: 14 种 CursorKind 全部映射到 GDK 标准光标名" {
@@ -9404,7 +10140,7 @@ test "v0.3.9 A4L: matchKeyBinding 大小写归一 + 修饰符掩码" {
         .{ .id = id_buf[0..], .mods = c.GDK_CONTROL_MASK, .keyval = 'X' }, // keyvalForGtk 大写键位
     };
     // 事件 'x'（0x78）+ ControlMask → 命中（归一小写比较）
-    const hit = matchKeyBinding(&entries, 'x', c.GDK_CONTROL_MASK | c.GDK_MOD2_MASK); // MOD2(numlock) 应被忽略
+    const hit = matchKeyBinding(&entries, 'x', c.GDK_CONTROL_MASK | gtk_compat.MOD2_MASK); // MOD2(numlock) 应被忽略
     try testing.expect(hit != null);
     try testing.expectEqualStrings("kb-probe", hit.?.id);
     // 修饰符不符（无 ctrl）→ 不命中
@@ -9423,9 +10159,9 @@ test "parseAccelGtk: 修饰符组合 / 键位 / 非法输入" {
     const cases = [_]struct { accel: []const u8, mods: c.GdkModifierType, keyval: c.guint }{
         .{ .accel = "Ctrl+S", .mods = c.GDK_CONTROL_MASK, .keyval = 'S' },
         .{ .accel = "Ctrl+N", .mods = c.GDK_CONTROL_MASK, .keyval = 'N' },
-        .{ .accel = "Ctrl+Alt+N", .mods = c.GDK_CONTROL_MASK | c.GDK_MOD1_MASK, .keyval = 'N' },
+        .{ .accel = "Ctrl+Alt+N", .mods = c.GDK_CONTROL_MASK | gtk_compat.MOD1_MASK, .keyval = 'N' },
         .{ .accel = "Ctrl+Shift+P", .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .keyval = 'P' },
-        .{ .accel = "Alt+F4", .mods = c.GDK_MOD1_MASK, .keyval = 0xffbe + 3 },
+        .{ .accel = "Alt+F4", .mods = gtk_compat.MOD1_MASK, .keyval = 0xffbe + 3 },
         .{ .accel = "F7", .mods = 0, .keyval = 0xffbe + 6 },
         .{ .accel = "F12", .mods = 0, .keyval = 0xffbe + 11 },
         .{ .accel = "5", .mods = 0, .keyval = '5' },
