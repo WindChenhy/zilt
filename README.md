@@ -23,7 +23,7 @@ v0.4.0（H6–H11 / H20 / L2 / L7 / L8 双平台小项收尾）。
 |---|---|---|
 | Windows | ✅ 全栈（v0.1.0–v0.4.3） | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
 | Linux | ✅ 全栈（v0.2.0–v0.4.3，冒烟 95 项） | GTK3 + WebKit2GTK 4.1；`-Dgtk=gtk4` 构建变体 |
-| macOS | ⏳ 未开始（原计划 v0.3+，v0.3 系列未覆盖） | WKWebView（zig-objc 路线） |
+| macOS | 🚧 骨架（v0.4.4）：NSApplication + NSWindow + 交叉编译/CI 闭环；WKWebView/IPC 待补 | WKWebView（手写 ObjC 消息，无 `@cImport`） |
 
 Windows 能力面（截至 v0.4.3）：窗口/多窗口/覆盖式标题栏/窗口形状 mask/每按钮状态/失焦与 Escape 隐藏/
 窗口级 KeyBindings、WebView2 事件面与 Settings（含 printToPdf、加速键与手势开关）、IPC + 事件 + 流式 channel

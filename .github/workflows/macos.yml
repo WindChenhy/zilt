@@ -1,0 +1,73 @@
+name: macOS
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - ".github/workflows/macos.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - ".github/workflows/macos.yml"
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: "0.17.1"
+
+# v0.4.4：无 Mac 硬件时的「运行环境」。开发在 Windows/Linux 上做交叉编译检查
+# （-Dtarget=aarch64-macos -Dtest-compile-only=true），真正的启动/截图在这里跑。
+jobs:
+  macos:
+    name: Build / Test / Smoke (macOS arm64)
+    runs-on: macos-15
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Smoke (window + bounded runloop + screenshot)
+        run: |
+          set -euo pipefail
+          rm -f smoke.log shot.png
+          # 冒烟：4s 后退出；日志走 stderr（std.debug.print）
+          ZILT_SMOKE_TEST_MS=4000 ./zig-out/bin/zilt-app > /dev/null 2> smoke.log &
+          pid=$!
+          sleep 2
+          # 截图失败不致命（runner 无屏幕录制权限时会黑屏/报错）——日志才是硬断言
+          screencapture -x shot.png 2>> smoke.log || true
+          if ! wait "$pid"; then
+            echo "::error::zilt-app exited non-zero"
+            cat smoke.log
+            exit 1
+          fi
+          cat smoke.log
+          grep -q "\[macos\] NSApplication ready" smoke.log
+          grep -q "\[macos\] window created" smoke.log
+          grep -q "\[macos\] smoke done, exiting" smoke.log
+
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-smoke
+          path: |
+            smoke.log
+            shot.png
+          if-no-files-found: warn

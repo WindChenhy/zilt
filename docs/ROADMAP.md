@@ -348,6 +348,27 @@ Wayland 回退路径文档化；既有冒烟/单测全量回归（Windows 侧零
 **验收**：macOS `zig build test` 链 + 冒烟骨架（greet/add 往返 + 资产 200）；
 无 macOS 环境则 GitHub Actions macOS runner 兜底（§4 R2）。
 
+**起步记录（2026-11-22，无 Mac 硬件的开发闭环）**：
+
+- **本地交叉编译已打通**：`zig build -Dtarget=aarch64-macos -p .zilt-out/macos` 在 Windows
+  上产出 arm64 Mach-O（`0xfeedfacf` / cputype 12）。Zig 自带 libSystem.tbd 与 Darwin 头，
+  缺的只是 libobjc/AppKit/Foundation 链接面 → 仓库内三份最小 `.tbd` 桩
+  （`src/zilt/platform/macos/stubs/`）。因为走 `objc_msgSend` 动态绑定，类/selector 不是
+  链接符号，框架桩可以为空。真 macOS 宿主（CI）自动绕过桩、用系统 SDK。
+- **测试面只编译不执行**：新增 `-Dtest-compile-only=true`（`test` step 只依赖编译产物）——
+  `zig build test -Dtarget=aarch64-macos -Dtest-compile-only=true` 通过，本机即可捕获
+  类型/ABI/符号错误。封装为 `scripts/macos/check.sh`。
+- **骨架**：`platform/macos/backend.zig` —— NSApplication（activationPolicy=regular）+
+  NSWindow（900×640、标题/置前）+ 有界事件泵（`ZILT_SMOKE_TEST_MS`，deadline 用 NSDate，
+  不依赖 std 时间 API）。`mod.zig` 分支、`interface.zig` 的 `macos_target_capabilities`
+  （只登记已实装的 `.window`）、`build.zig` 的 `is_macos` 分支（此前 `-Dtarget=aarch64-macos`
+  会 panic：`dev` step 重复注册）。
+- **CI**：`.github/workflows/macos.yml`（`macos-15` arm64）——build + test + 4s 冒烟 +
+  `screencapture` 截图 artifact；日志断言 `NSApplication ready` / `window created` /
+  `smoke done, exiting`。这是无 Mac 时唯一的「真跑」环境。
+- **下一步**：WKWebView + `WKURLSchemeHandler` 资产面 → IPC（`WKScriptMessageHandler`）→
+  窗口事件面。
+
 ### v0.4.5 — macOS 全栈 II（系统集成与分发）
 
 目标：macOS 能力面对齐 Windows/Linux 已有面 + 分发链。

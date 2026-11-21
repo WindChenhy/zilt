@@ -190,6 +190,28 @@ fn windowsOnlyStep(b: *std.Build, name: []const u8, desc: []const u8, target_os:
     return step;
 }
 
+/// macOS 框架链接。真 macOS 宿主直接用系统 SDK；非 macOS 宿主（无 Mac 开发）
+/// 用仓库内最小 tbd 桩：ObjC 类/selector 是运行时字符串，桩里只需 libobjc 的
+/// 几个 C 符号，框架 tbd 可以为空——`zig build -Dtarget=aarch64-macos` 因此
+/// 能在 Windows/Linux 上完成编译+链接（运行仍需 macOS 或 CI）。
+fn linkMacosFrameworks(b: *std.Build, module: *std.Build.Module) void {
+    module.link_libc = true; // std.c.getenv
+    module.linkSystemLibrary("objc", .{});
+    for ([_][]const u8{ "AppKit", "Foundation" }) |fw| module.linkFramework(fw, .{});
+    if (@import("builtin").os.tag != .macos) {
+        const stubs = b.path("src/zilt/platform/macos/stubs");
+        module.addLibraryPath(stubs);
+        module.addFrameworkPath(stubs);
+    }
+}
+
+/// macOS 尚未实装的 step：保留名字 + 给出可执行的原因（避免 `no step named`）。
+fn macosPendingStep(b: *std.Build, name: []const u8, desc: []const u8, hint: []const u8) *std.Build.Step {
+    const step = b.step(name, desc);
+    step.dependOn(&b.addFail(b.fmt("`{s}` 在 macOS 上尚未实装：{s}", .{ name, hint })).step);
+    return step;
+}
+
 /// Win32 导入库（未声明的 extern 会在链接期报 undefined symbol，
 /// 因此按需显式列全；MinGW 自带这些导入库，无需 MSVC）。
 fn linkWindowsLibs(module: *std.Build.Module) void {
@@ -215,6 +237,7 @@ pub fn build(b: *std.Build) void {
     const target_os = target.result.os.tag;
     const is_windows = target_os == .windows;
     const is_linux = target_os == .linux;
+    const is_macos = target_os == .macos;
 
     // ---- Linux：GTK 变体（v0.2.5）----
     // -Dgtk=gtk4 切换到 GTK4 + WebKitGTK 6.0（Ubuntu 24.04+/Debian 13+）。
@@ -555,6 +578,8 @@ pub fn build(b: *std.Build) void {
         dev_run.step.dependOn(b.getInstallStep());
         const dev_step = b.step("dev", "Run frontend dev server + app (HMR)");
         dev_step.dependOn(&dev_run.step);
+    } else if (is_macos) {
+        _ = macosPendingStep(b, "dev", "Run frontend dev server + app (HMR)", "v0.4.4 仅骨架，dev 编排随 WebView/IPC 落地");
     } else if (!is_linux) {
         // Linux 的 dev 在下方 rel_app 声明后注册（scripts/linux/dev.sh）
         _ = windowsOnlyStep(b, "dev", "frontend dev server + app (HMR)", target_os);
@@ -563,11 +588,19 @@ pub fn build(b: *std.Build) void {
     // ---- 单元测试（框架 + 工具） ----
     // v0.3.19：Linux 测试图补入 gtk_compat 等模块后，测试产物会真实引用 gtk_init
     // （此前只有纯逻辑函数被分析，从未需要链接 GTK）——补上与 exe 相同的系统库。
-    if (is_linux) linkLinuxWebviewLibs(b, zilt_mod);
+    if (is_linux) {
+        linkLinuxWebviewLibs(b, zilt_mod);
+    } else if (is_macos) {
+        // 测试产物同样引用 platform/mod → macos backend（std.c.getenv / objc_msgSend）
+        linkMacosFrameworks(b, zilt_mod);
+    }
     const unit_tests = b.addTest(.{ .root_module = zilt_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
+    // v0.4.4：无 Mac 开发 macOS 时的交叉检查——只编译测试产物、不执行。
+    // `zig build test -Dtarget=aarch64-macos -Dtest-compile-only=true`
+    const test_compile_only = b.option(bool, "test-compile-only", "Compile test binaries without running them (cross-target check)") orelse false;
+    if (!test_compile_only) test_step.dependOn(&run_unit_tests.step);
 
     const tools_test_mod = b.createModule(.{
         .root_source_file = b.path("src/tools/tests.zig"),
@@ -579,7 +612,12 @@ pub fn build(b: *std.Build) void {
     });
     const tools_tests = b.addTest(.{ .root_module = tools_test_mod });
     const run_tools_tests = b.addRunArtifact(tools_tests);
-    test_step.dependOn(&run_tools_tests.step);
+    if (test_compile_only) {
+        test_step.dependOn(&unit_tests.step);
+        test_step.dependOn(&tools_tests.step);
+    } else {
+        test_step.dependOn(&run_tools_tests.step);
+    }
 
     // ---- 打包器（exe → dist/ 便携 zip + NSIS 安装器） ----
     const app_meta_mod = b.createModule(.{
@@ -606,6 +644,8 @@ pub fn build(b: *std.Build) void {
         addAppIconResource(b, rel_app_mod, project.icon);
     } else if (is_linux) {
         linkLinuxWebviewLibs(b, rel_app_mod);
+    } else if (is_macos) {
+        linkMacosFrameworks(b, rel_app_mod);
     }
 
     // ---- v0.1.17：zilt CLI（doctor / info / version）----
@@ -743,6 +783,10 @@ pub fn build(b: *std.Build) void {
         const init_run = b.addRunArtifact(init_exe);
         const init_step = b.step("init", "Create a new project from a template (ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=myapp zig build init)");
         init_step.dependOn(&init_run.step);
+    } else if (is_macos) {
+        // v0.4.4 骨架：默认 install 产出 zilt-app；.app 打包/init 随后续阶段接
+        _ = macosPendingStep(b, "pack", "macOS .app bundle packaging", "v0.4.4 后段接 pack_formats.generateInfoPlist + hdiutil（需 macOS 宿主）");
+        _ = macosPendingStep(b, "init", "Create a new project from a template", "init 工具当前只在 Windows/Linux 分支安装");
     } else {
         // v0.3.1：更新签名/差分工具跨平台——Linux 发布流水线可生成补丁与清单
         b.installArtifact(keygen);

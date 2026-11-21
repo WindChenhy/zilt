@@ -15,6 +15,8 @@ const interface = @import("interface.zig");
 pub const Backend = switch (builtin.os.tag) {
     .windows => @import("windows/backend.zig"),
     .linux => @import("linux/backend.zig"),
+    // v0.4.4：macOS 骨架（NSApplication + NSWindow）；WebView/IPC 分阶段补
+    .macos => @import("macos/backend.zig"),
     else => @import("unsupported.zig"),
 };
 

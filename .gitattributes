@@ -1,0 +1,2 @@
+# macOS 链接桩：ld 解析的 YAML，行尾必须 LF（Windows check-out 不能转 CRLF）
+*.tbd text eol=lf

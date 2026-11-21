@@ -153,6 +153,12 @@ pub const linux_target_capabilities = [_]Capability{
     // v0.3.6 平台差异：binary_ipc（WebView2 SharedBuffer 独占；Linux 走 base64 分块）
 };
 
+/// macOS 目标能力（v0.4.4 骨架：仅窗口创建；WebView/IPC/系统集成分阶段补）。
+/// 只登记**已实装**项——清单与实现漂移是本文件 v0.4.0 L8 专门防的形态。
+pub const macos_target_capabilities = [_]Capability{
+    .window,
+};
+
 /// 编译期校验后端契约（`platform/mod.zig` 在本平台后端上调用一次）。
 pub fn assertBackend(comptime B: type) void {
     if (!@hasDecl(B, "platform_name")) @compileError("平台后端缺少 `pub const platform_name: []const u8`");
@@ -215,6 +221,7 @@ test "v0.2.0: 能力矩阵自身合法（无重复、覆盖核心项）" {
 
     try check.unique(&windows_capabilities);
     try check.unique(&linux_target_capabilities);
+    try check.unique(&macos_target_capabilities);
 
     // 核心项：两平台都必须有（Linux 目标集缺任一即说明规划漏项）
     const core = [_]Capability{ .window, .ipc_events, .asset_server, .capability_acl, .sql, .http, .single_instance };
