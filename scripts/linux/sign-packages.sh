@@ -27,7 +27,7 @@ case "$CMD" in
   sign-deb)
     DEB="$1"
     TMP=$(mktemp -d)
-    gpg --batch --yes --detach-sign --output "$TMP/_gpgorigin" "$DEB"
+    gpg --batch --yes --local-user "$KEY" --detach-sign --output "$TMP/_gpgorigin" "$DEB"
     SIZE=$(stat -c%s "$TMP/_gpgorigin")
     {
       printf '_gpgorigin/     '                 # name[16]

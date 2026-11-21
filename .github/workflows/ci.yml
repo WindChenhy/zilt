@@ -184,15 +184,26 @@ jobs:
           dpkg-deb --info dist/*_amd64.deb | head -12
           ls dist/
 
+      # v0.4.3 L5：RPM 实构建 + AUR package() 模拟 + deb/rpm 签名与校验
+      - name: RPM / AUR / package signing (L5)
+        run: |
+          sudo apt-get install -y --no-install-recommends rpm
+          bash scripts/linux/pack-rpm.sh
+          bash scripts/linux/pack-aur.sh
+          bash scripts/linux/dev-sign-e2e.sh --no-build
+
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
         with:
           name: zilt-linux-x64
           path: |
             dist/*_amd64.deb
+            dist/*.rpm
             dist/*.squashfs
+            dist/Zilt.AppImage
             dist/flatpak/*.json
             dist/*.spec
+            dist/aur/*
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------

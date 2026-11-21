@@ -77,10 +77,12 @@ run_body() {
   trap 'kill $ECHO_PID $WS_PID 2>/dev/null' EXIT
 
   run_smoke() { # $@ = 命令（可直接 AppRun，也可沙箱包装）
+    # ZILT_SMOKE_SANDBOX=1 → 不关 WebKit 沙箱（4c 用）
+    local deny=(WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1)
+    [ "${ZILT_SMOKE_SANDBOX:-0}" = "1" ] && deny=()
     rm -f zilt.log
     timeout 240 xvfb-run -a --server-args="-screen 0 1280x800x24" \
-      env ZILT_LINUX_SMOKE=1 GDK_BACKEND=x11 \
-          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 LIBGL_ALWAYS_SOFTWARE=1 \
+      env ZILT_LINUX_SMOKE=1 GDK_BACKEND=x11 "${deny[@]}" LIBGL_ALWAYS_SOFTWARE=1 \
       "$@" > /tmp/appimage-run.log 2>&1
     echo $?
   }
@@ -154,6 +156,47 @@ run_body() {
     return 3
   fi
 
+  # ---- 4c) WebKit 沙箱能力（发行版构建差异）----
+  # Ubuntu/Debian 的 WebKitGTK 不安装 bwrapinfo.json（构建期未启用 bubblewrap
+  # 沙箱）→ WebKit 静默无沙箱运行；此时随包 helper 路径改写与沙箱无交互。
+  # 有 bwrapinfo 的发行版（Fedora/Arch 等）上再跑一次**不关沙箱**的冒烟，并采样
+  # WebKitWebProcess 的 pid-ns/seccomp——两者都为 0 视为未生效。
+  BWRAPINFO=""
+  for cand in "$APPDIR"/usr/lib/*/webkit2gtk-4.1/bwrapinfo.json "$APPDIR"/usr/lib/webkit2gtk-4.1/bwrapinfo.json; do
+    [ -e "$cand" ] && BWRAPINFO="$cand"
+  done
+  if [ -z "$BWRAPINFO" ]; then
+    echo "SANDBOX_SUPPORT=no reason=distro-webKit-without-bwrapinfo"
+    if [ "${ZILT_SANDBOX_REQUIRE:-0}" = "1" ]; then
+      echo "SANDBOX_REQUIRED_BUT_UNSUPPORTED"
+      FAIL=1
+    fi
+  else
+    echo "SANDBOX_SUPPORT=yes bwrapinfo=$BWRAPINFO"
+    SAMPLE=/tmp/appimage-sbx-sample.txt
+    rm -f "$SAMPLE"
+    ( for _ in $(seq 1 1200); do
+        for p in $(pgrep -f 'WebKit(Web|Network)Process' 2>/dev/null); do
+          echo "$p $(readlink /proc/$p/ns/pid 2>/dev/null) $(awk '/^Seccomp:/{print $2}' /proc/$p/status 2>/dev/null)" >> "$SAMPLE"
+        done
+        sleep 0.2
+      done ) &
+    SAMPLER=$!
+    code=$(ZILT_SMOKE_SANDBOX=1 run_smoke "$EXTRACTED")
+    kill "$SAMPLER" 2>/dev/null || true
+    check_result "$code" "sandbox" || FAIL=1
+    SELF_NS=$(readlink /proc/self/ns/pid)
+    ACTIVE=$(awk -v self="$SELF_NS" '$2 != "" && $2 != self {n++} END{print n+0}' "$SAMPLE")
+    SEC=$(awk '$3 == 2 {n++} END{print n+0}' "$SAMPLE")
+    echo "SANDBOX_SAMPLES=$(sort -u "$SAMPLE" 2>/dev/null | wc -l) NS_DIFF=$ACTIVE SECCOMP=$SEC"
+    if [ "$ACTIVE" = 0 ] && [ "$SEC" = 0 ]; then
+      echo "SANDBOX_ACTIVE=no reason=no-namespace-no-seccomp"
+      if [ "${ZILT_SANDBOX_REQUIRE:-0}" = "1" ]; then echo "SANDBOX_REQUIRED_BUT_INACTIVE"; FAIL=1; fi
+    else
+      echo "SANDBOX_ACTIVE=yes"
+    fi
+  fi
+
   if [ "$FAIL" = 0 ]; then echo "APPIMAGE_E2E=PASS"; else echo "APPIMAGE_E2E=FAIL"; fi
 }
 
@@ -162,7 +205,7 @@ run_body > "$LOG" 2>&1
 rc=$?
 set -e
 
-grep -a 'BUILD=\|APPDIR_BYTES\|RUNTIME=\|APPIMAGE_BYTES\|EXTRACTED=\|SANDBOX=\|MASK_COUNT\|SMOKE\[\|ONLY_KNOWN\|KNOWN_FAIL\|NEW_FAIL\|BUNDLED_\|BUNDLE_NOT_USED\|APPIMAGE_E2E=\|MISSING' "$LOG" || true
+grep -a 'BUILD=\|APPDIR_BYTES\|RUNTIME=\|APPIMAGE_BYTES\|EXTRACTED=\|SANDBOX=\|SANDBOX_SUPPORT\|SANDBOX_SAMPLES\|SANDBOX_ACTIVE\|MASK_COUNT\|SMOKE\[\|ONLY_KNOWN\|KNOWN_FAIL\|NEW_FAIL\|BUNDLED_\|BUNDLE_NOT_USED\|APPIMAGE_E2E=\|MISSING' "$LOG" || true
 if [ "$rc" = 3 ]; then exit 3; fi
 grep -aq 'APPIMAGE_E2E=PASS' "$LOG" && exit 0
 exit 1

@@ -9,7 +9,9 @@
 **当前状态：v0.4.3（Linux 发行版可用性——L1a GTK4 构建级兼容：`-Dgtk=gtk4` 双栈，
 GTK 4.14.5 / WebKitGTK 6.0 2.52.6 实测；L3 AppImage 自包含：WebKit 随包 + helper 路径改写，
 「无宿主 WebKit」bwrap/容器实测 95/95；L6 托盘挂窗：XEmbed 自建图标左键 toggle + 贴图标定位 +
-FFM 规避，stalonetray 实测；L4 ARM64 构建链脚本 + CI job（容器验收待 CI））**。
+FFM 规避，stalonetray 实测；L4 ARM64 构建链脚本 + CI job（容器验收待 CI）；L5 打包与签名：
+rpmbuild 实构建（bin + 桌面项 + 图标，%post 刷新 desktop db）、AUR PKGBUILD/package() 验证、
+deb `_gpgorigin` 与 rpm `--addsign` 实签实校（含反向对照））**。
 v0.4.2（安全与系统集成——H3 Linux 密钥环加密 store（libsecret dlopen，`secret:` 标记）/
 H15 计划通知（进程内 timer + notificationScheduled 事件）/ H16 reparent（WebView 移挂目标窗口）/
 H17 拖出 opt-in）。v0.4.1（网络/IPC/分发深化——H4 channel credit 背压 / H14 断点续传 /
@@ -47,7 +49,7 @@ Linux 复用同一 JS API 面，差异逐版本以「文档化」条目记录（
 | 网络 | `http`（https/代理/multipart/流式/上传进度）、`ws`/`wss` | ✅ | ✅ |
 | 系统集成 | 托盘（暗色图标/挂窗）/菜单/全局与窗口快捷键/任务栏徽标/通知/剪贴板/拖放/对话框 | ✅ | ✅（徽标 Unity-only；挂窗 XEmbed/SNI） |
 | 桌面 | 自启/深链/单实例（HMAC）/窗口状态持久化/透明与覆盖式标题栏/窗口效果 | ✅ | ✅ |
-| 更新与分发 | ed25519 清单/差分补丁/回滚/skipVersion/GitHub provider；NSIS/MSI/MSIX/zip/deb/AppImage/Flatpak spec | ✅ | ✅（deb/AppImage，v0.4.3 起可随包 WebKit 自包含；Flatpak spec；ARM64 脚本） |
+| 更新与分发 | ed25519 清单/差分补丁/回滚/skipVersion/GitHub provider；NSIS/MSI/MSIX/zip/deb/AppImage/Flatpak spec | ✅ | ✅（deb/AppImage/rpm 实构建，v0.4.3 起随包 WebKit 自包含；AUR PKGBUILD；deb/rpm PGP 签名；ARM64 脚本） |
 | 运行模式 | GUI / headless（HTTP + MCP）/ server（浏览器 runtime）/ dev HMR | ✅ | ✅ |
 | 工具链 | `zilt` CLI（init/doctor/info/gen/icon/npm-pack/mcp/keygen/sign/diff/pack）、12 套模板、WebDriver | ✅ | ✅ |
 

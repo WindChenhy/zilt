@@ -143,7 +143,18 @@ fi
 # 产物清单（deb / AppDir / squashfs）
 say "产物"
 ls -lh "$OUT" 2>/dev/null || true
-if ls "$OUT"/*.deb >/dev/null 2>&1; then
-  echo "DEB=$(ls "$OUT"/*.deb | head -1) ARCH=$(dpkg-deb -f "$(ls "$OUT"/*.deb | head -1)" Architecture 2>/dev/null || echo '?')"
-fi
+FAIL=0
+for d in "$OUT"/*.deb; do
+  [ -e "$d" ] || continue
+  a=$(dpkg-deb -f "$d" Architecture 2>/dev/null || echo '?')
+  echo "DEB=$(basename "$d") ARCH=$a"
+  [ "$a" = "arm64" ] || { echo "ARCH_MISMATCH deb=$a（应为 arm64）"; FAIL=1; }
+done
+for r in "$OUT"/*.rpm; do
+  [ -e "$r" ] || continue
+  a=$(rpm -qp --qf '%{ARCH}' "$r" 2>/dev/null || echo '?')
+  echo "RPM=$(basename "$r") ARCH=$a"
+  [ "$a" = "aarch64" ] || { echo "ARCH_MISMATCH rpm=$a（应为 aarch64）"; FAIL=1; }
+done
+[ "$FAIL" = 0 ] || { echo "ARM64_BUILD=FAIL reason=arch-mismatch"; exit 1; }
 echo "ARM64_BUILD=PASS mode=docker image=$IMAGE out=$OUT"

@@ -20,7 +20,34 @@ pub const PackMeta = struct {
     exe_name: []const u8,
     maintainer: []const u8 = "Zilt App",
     description: []const u8 = "Zilt application",
+    /// v0.4.3 L5：目标架构（rpm BuildArch / PKGBUILD arch / deb 文件名与 control）。
+    /// 取 Zig 的 `builtin.cpu.arch` 语义命名：x86_64 / aarch64。
+    arch: []const u8 = "x86_64",
 };
+
+/// Debian 架构名（与 Zig/rpm 命名不同：amd64 / arm64）。
+pub fn debArch(arch: []const u8) []const u8 {
+    if (std.mem.eql(u8, arch, "aarch64") or std.mem.eql(u8, arch, "arm64")) return "arm64";
+    if (std.mem.eql(u8, arch, "x86_64") or std.mem.eql(u8, arch, "amd64")) return "amd64";
+    if (std.mem.eql(u8, arch, "arm")) return "armhf";
+    return "amd64";
+}
+
+/// 桌面项文件名：pkg 已以 `.desktop` 结尾时直接复用（`app.zilt.desktop`），
+/// 否则补后缀。必须与 pack_linux 的 desktopFileName / postinst 的
+/// `xdg-mime default <name>` 一致——此前 deb 装成 `app.zilt.desktop.desktop`
+/// 而 postinst 注册 `app.zilt.desktop`，深链默认程序实际没生效。
+pub fn desktopFileName(alloc: std.mem.Allocator, pkg: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, pkg, ".desktop")) return alloc.dupe(u8, pkg);
+    return std.fmt.allocPrint(alloc, "{s}.desktop", .{pkg});
+}
+
+/// RPM/PKGBUILD 架构名（aarch64 与 Zig 一致；x86_64 一致）。
+pub fn rpmArch(arch: []const u8) []const u8 {
+    if (std.mem.eql(u8, arch, "arm64")) return "aarch64";
+    if (std.mem.eql(u8, arch, "amd64")) return "x86_64";
+    return arch;
+}
 
 // ---------------------------------------------------------------------------
 // 纯函数：命名约定
@@ -358,34 +385,89 @@ pub fn generateDesktopFile(alloc: std.mem.Allocator, meta: PackMeta) ![]u8 {
     , .{ meta.name, meta.description, exe_base, meta.app_id });
 }
 
-/// rpm .spec（rpmbuild 可直接构建）。
+/// rpm .spec（rpmbuild 可直接构建）。默认不带图标；`generateRpmSpecOpt` 可声明
+/// Source2（打包脚本从 AppDir 取 PNG 暂存）。
 pub fn generateRpmSpec(alloc: std.mem.Allocator, meta: PackMeta) ![]u8 {
+    return generateRpmSpecOpt(alloc, meta, false);
+}
+
+pub fn generateRpmSpecOpt(alloc: std.mem.Allocator, meta: PackMeta, has_icon: bool) ![]u8 {
     const name = try debianName(alloc, meta.app_id);
     defer alloc.free(name);
     const exe_base = if (std.mem.endsWith(u8, meta.exe_name, ".exe"))
         meta.exe_name[0 .. meta.exe_name.len - 4]
     else
         meta.exe_name;
+    const desk = try desktopFileName(alloc, name);
+    defer alloc.free(desk);
+    const icon_src = if (has_icon)
+        try std.fmt.allocPrint(alloc,
+            \\Source2:        {s}.png
+            \\
+        , .{name})
+    else
+        try alloc.dupe(u8, "");
+    defer alloc.free(icon_src);
+    const icon_install = if (has_icon)
+        try std.fmt.allocPrint(alloc,
+            \\install -Dm644 %{{SOURCE2}} %{{buildroot}}%{{_datadir}}/icons/hicolor/256x256/apps/{s}.png
+            \\
+        , .{name})
+    else
+        try alloc.dupe(u8, "");
+    defer alloc.free(icon_install);
+    const icon_files = if (has_icon)
+        try std.fmt.allocPrint(alloc,
+            \\%{{_datadir}}/icons/hicolor/256x256/apps/{s}.png
+            \\
+        , .{name})
+    else
+        try alloc.dupe(u8, "");
+    defer alloc.free(icon_files);
     return std.fmt.allocPrint(alloc,
         \\Name:           {s}
         \\Version:        {s}
         \\Release:        1%{{?dist}}
         \\Summary:        {s}
         \\License:        Proprietary
-        \\BuildArch:      x86_64
+        \\BuildArch:      {s}
         \\Source0:        {s}
-        \\
+        \\Source1:        {s}
+        \\{s}
         \\%description
         \\{s}
         \\
         \\%install
-        \\mkdir -p %{{buildroot}}/usr/bin
-        \\install -m 755 %{{SOURCE0}} %{{buildroot}}/usr/bin/{s}
+        \\mkdir -p %{{buildroot}}%{{_bindir}}
+        \\install -m 755 %{{SOURCE0}} %{{buildroot}}%{{_bindir}}/{s}
+        \\install -Dm644 %{{SOURCE1}} %{{buildroot}}%{{_datadir}}/applications/{s}
+        \\{s}
+        \\%post
+        \\update-desktop-database -q %{{_datadir}}/applications 2>/dev/null || true
+        \\
+        \\%postun
+        \\update-desktop-database -q %{{_datadir}}/applications 2>/dev/null || true
         \\
         \\%files
-        \\/usr/bin/{s}
-        \\
-    , .{ name, meta.version, meta.description, meta.description, exe_base, exe_base, exe_base });
+        \\%{{_bindir}}/{s}
+        \\%{{_datadir}}/applications/{s}
+        \\{s}
+    , .{
+        name,
+        meta.version,
+        meta.description,
+        rpmArch(meta.arch),
+        exe_base,
+        desk,
+        icon_src,
+        meta.description,
+        exe_base,
+        desk,
+        icon_install,
+        exe_base,
+        desk,
+        icon_files,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -408,23 +490,25 @@ pub fn generatePkgbuild(alloc: std.mem.Allocator, meta: PackMeta) ![]u8 {
         \\pkgver={s}
         \\pkgrel=1
         \\pkgdesc="{s}"
-        \\arch=('x86_64')
+        \\arch=('{s}')
         \\url="https://example.invalid/{s}"
         \\license=('Proprietary')
         \\depends=('gtk3' 'webkit2gtk-4.1' 'libsoup3')
         \\optdepends=('libayatana-appindicator3: 托盘图标支持')
         \\source=("$pkgname-$pkgver.tar.gz")
         \\sha256sums=('SKIP')
-        \\noextract=()
         \\
         \\package() {{
         \\    install -Dm755 "$srcdir/{s}" "$pkgdir/usr/bin/{s}"
         \\    for d in "$srcdir"/*.desktop; do
         \\        [ -e "$d" ] && install -Dm644 "$d" "$pkgdir/usr/share/applications/$(basename "$d")"
         \\    done
+        \\    for p in "$srcdir"/*.png; do
+        \\        [ -e "$p" ] && install -Dm644 "$p" "$pkgdir/usr/share/icons/hicolor/256x256/apps/$(basename "$p")"
+        \\    done
         \\}}
         \\
-    , .{ meta.maintainer, meta.maintainer, name, meta.version, meta.description, name, exe_base, exe_base });
+    , .{ meta.maintainer, meta.maintainer, name, meta.version, meta.description, rpmArch(meta.arch), name, exe_base, exe_base });
 }
 
 /// AUR .SRCINFO（静态生成——makepkg --printsrcinfo 的等价输出，离线可单测）。
@@ -438,18 +522,17 @@ pub fn generateSrcinfo(alloc: std.mem.Allocator, meta: PackMeta) ![]u8 {
         \\pkgrel = 1
         \\pkgdesc = {s}
         \\url = https://example.invalid/{s}
-        \\arch = x86_64
+        \\arch = {s}
         \\license = Proprietary
         \\depends = gtk3
         \\depends = webkit2gtk-4.1
         \\depends = libsoup3
         \\optdepends = libayatana-appindicator3: 托盘图标支持
-        \\noextract = 
         \\
         \\source = {s}-bin-{s}.tar.gz
         \\sha256sums = SKIP
         \\
-    , .{ name, name, meta.version, meta.description, name, name, meta.version });
+    , .{ name, name, meta.version, meta.description, name, rpmArch(meta.arch), name, meta.version });
 }
 
 // ---------------------------------------------------------------------------
@@ -579,6 +662,13 @@ pub fn buildDebOpt(alloc: std.mem.Allocator, meta: PackMeta, exe_bytes: []const 
         meta.exe_name[0 .. meta.exe_name.len - 4]
     else
         meta.exe_name;
+    // v0.4.3 L5 实测修复：条目名必须活到 writeTarGz 之后。此前 sidecar/resources/
+    // 图标的名字在 for/if 块内 `defer alloc.free` → 块结束即回收，Zig 安全构建把
+    // 回收内存填 0xAA，tar 里出现 58 字节乱码文件名（dpkg-deb -c 可见）。统一由
+    // arena 托管，函数尾部一次性释放。
+    var names = std.heap.ArenaAllocator.init(alloc);
+    defer names.deinit();
+    const na = names.allocator();
 
     var control: std.ArrayListUnmanaged(u8) = .empty;
     defer control.deinit(alloc);
@@ -589,14 +679,11 @@ pub fn buildDebOpt(alloc: std.mem.Allocator, meta: PackMeta, exe_bytes: []const 
         \\Version: 
     );
     try control.appendSlice(alloc, meta.version);
-    try control.appendSlice(alloc,
-        \\
-        \\Section: utils
-        \\Priority: optional
-        \\Architecture: amd64
-        \\Maintainer: 
-    );
-    try control.appendSlice(alloc, meta.maintainer);
+    try control.appendSlice(alloc, "\nSection: utils\nPriority: optional\n");
+    // 架构字段单列（v0.4.3 L5：跟随目标，不再硬编码 amd64）
+    const arch_line = try std.fmt.allocPrint(alloc, "Architecture: {s}\nMaintainer: {s}", .{ debArch(meta.arch), meta.maintainer });
+    defer alloc.free(arch_line);
+    try control.appendSlice(alloc, arch_line);
     try control.appendSlice(alloc,
         \\
         \\Description: 
@@ -646,16 +733,14 @@ pub fn buildDebOpt(alloc: std.mem.Allocator, meta: PackMeta, exe_bytes: []const 
 
     var data_entries: std.ArrayListUnmanaged(TarEntry) = .empty;
     defer data_entries.deinit(alloc);
-    const exe_entry = try std.fmt.allocPrint(alloc, "./usr/bin/{s}", .{exe_base});
-    defer alloc.free(exe_entry);
+    const exe_entry = try std.fmt.allocPrint(na, "./usr/bin/{s}", .{exe_base});
     try data_entries.append(alloc, .{ .name = "./", .mode = 0o755, .typeflag = '5' });
     try data_entries.append(alloc, .{ .name = "./usr/", .mode = 0o755, .typeflag = '5' });
     try data_entries.append(alloc, .{ .name = "./usr/bin/", .mode = 0o755, .typeflag = '5' });
     try data_entries.append(alloc, .{ .name = exe_entry, .mode = 0o755, .data = exe_bytes });
     // v0.3.11 E1b：external_bin sidecar（usr/bin 同目录分发）
     for (opts.extra_files) |ef| {
-        const ef_entry = try std.fmt.allocPrint(alloc, "./usr/bin/{s}", .{ef.name});
-        defer alloc.free(ef_entry);
+        const ef_entry = try std.fmt.allocPrint(na, "./usr/bin/{s}", .{ef.name});
         try data_entries.append(alloc, .{ .name = ef_entry, .mode = 0o755, .data = ef.bytes });
     }
     // v0.3.16 G24：resources（usr/bin/resources/**；目录条目逐级补齐）。
@@ -681,18 +766,18 @@ pub fn buildDebOpt(alloc: std.mem.Allocator, meta: PackMeta, exe_bytes: []const 
             }
         }.lt);
         for (dirs.items) |d| {
-            const dir_entry = try std.fmt.allocPrint(alloc, "./usr/bin/resources/{s}/", .{d});
+            const dir_entry = try std.fmt.allocPrint(na, "./usr/bin/resources/{s}/", .{d});
             try data_entries.append(alloc, .{ .name = dir_entry, .mode = 0o755, .typeflag = '5' });
         }
         for (opts.resources) |rf| {
-            const rf_entry = try std.fmt.allocPrint(alloc, "./usr/bin/resources/{s}", .{rf.rel});
+            const rf_entry = try std.fmt.allocPrint(na, "./usr/bin/resources/{s}", .{rf.rel});
             try data_entries.append(alloc, .{ .name = rf_entry, .mode = 0o644, .data = rf.bytes });
         }
     }
     try data_entries.append(alloc, .{ .name = "./usr/share/", .mode = 0o755, .typeflag = '5' });
     try data_entries.append(alloc, .{ .name = "./usr/share/applications/", .mode = 0o755, .typeflag = '5' });
-    const desktop_entry = try std.fmt.allocPrint(alloc, "./usr/share/applications/{s}.desktop", .{pkg});
-    defer alloc.free(desktop_entry);
+    const desktop_name = try desktopFileName(na, pkg);
+    const desktop_entry = try std.fmt.allocPrint(na, "./usr/share/applications/{s}", .{desktop_name});
     const desktop = try generateDesktopFile(alloc, meta);
     defer alloc.free(desktop);
     try data_entries.append(alloc, .{ .name = desktop_entry, .mode = 0o644, .data = desktop });
@@ -701,8 +786,7 @@ pub fn buildDebOpt(alloc: std.mem.Allocator, meta: PackMeta, exe_bytes: []const 
         try data_entries.append(alloc, .{ .name = "./usr/share/icons/hicolor/", .mode = 0o755, .typeflag = '5' });
         try data_entries.append(alloc, .{ .name = "./usr/share/icons/hicolor/256x256/", .mode = 0o755, .typeflag = '5' });
         try data_entries.append(alloc, .{ .name = "./usr/share/icons/hicolor/256x256/apps/", .mode = 0o755, .typeflag = '5' });
-        const icon_entry = try std.fmt.allocPrint(alloc, "./usr/share/icons/hicolor/256x256/apps/{s}.png", .{pkg});
-        defer alloc.free(icon_entry);
+        const icon_entry = try std.fmt.allocPrint(na, "./usr/share/icons/hicolor/256x256/apps/{s}.png", .{pkg});
         try data_entries.append(alloc, .{ .name = icon_entry, .mode = 0o644, .data = png });
     }
     const data_tar = try writeTarGz(alloc, data_entries.items);
@@ -836,6 +920,52 @@ test "generatePkgbuild/generateSrcinfo: AUR 字段齐全（v0.4.3 L5）" {
     try testing.expect(std.mem.indexOf(u8, info, "pkgver = 0.4.3") != null);
     try testing.expect(std.mem.indexOf(u8, info, "arch = x86_64") != null);
     try testing.expect(std.mem.indexOf(u8, info, "source = app.zilt.desktop-bin-0.4.3.tar.gz") != null);
+}
+
+test "v0.4.3 L5: generateRpmSpec 载荷与架构（Source1/Source2 + BuildArch）" {
+    const a = testing.allocator;
+    const meta = PackMeta{
+        .name = "Zilt Demo",
+        .version = "0.4.3",
+        .app_id = "app.zilt.desktop",
+        .exe_name = "zilt-app",
+        .description = "Demo app",
+        .arch = "aarch64",
+    };
+    const spec = try generateRpmSpecOpt(a, meta, true);
+    defer a.free(spec);
+    // 参数顺序回归：Source0 是 exe 名、%description 是描述（此前错位成
+    // Source0=description、%description=exe 名）
+    try testing.expect(std.mem.indexOf(u8, spec, "Source0:        zilt-app\n") != null);
+    try testing.expect(std.mem.indexOf(u8, spec, "%description\nDemo app\n") != null);
+    try testing.expect(std.mem.indexOf(u8, spec, "BuildArch:      aarch64") != null);
+    // 载荷：桌面项 + 图标（Source1/Source2 与 %files 对齐）
+    try testing.expect(std.mem.indexOf(u8, spec, "Source1:        app.zilt.desktop\n") != null);
+    try testing.expect(std.mem.indexOf(u8, spec, "Source2:        app.zilt.desktop.png") != null);
+    try testing.expect(std.mem.indexOf(u8, spec, "install -Dm644 %{SOURCE1} %{buildroot}%{_datadir}/applications/app.zilt.desktop\n") != null);
+    try testing.expect(std.mem.indexOf(u8, spec, "%{_datadir}/icons/hicolor/256x256/apps/app.zilt.desktop.png") != null);
+    try testing.expect(std.mem.indexOf(u8, spec, "update-desktop-database") != null);
+
+    // 无图标变体不得声明 Source2（否则 rpmbuild 缺文件直接失败）
+    const plain = try generateRpmSpec(a, meta);
+    defer a.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "Source2:") == null);
+    try testing.expect(std.mem.indexOf(u8, plain, "Source1:") != null);
+}
+
+test "v0.4.3 L5: debArch/rpmArch 映射与 PKGBUILD 架构跟随" {
+    try testing.expectEqualStrings("amd64", debArch("x86_64"));
+    try testing.expectEqualStrings("arm64", debArch("aarch64"));
+    try testing.expectEqualStrings("x86_64", rpmArch("x86_64"));
+    try testing.expectEqualStrings("aarch64", rpmArch("aarch64"));
+
+    const meta = PackMeta{ .name = "Z", .version = "1.0", .app_id = "app.zilt.desktop", .exe_name = "zilt-app", .arch = "aarch64" };
+    const pkb = try generatePkgbuild(testing.allocator, meta);
+    defer testing.allocator.free(pkb);
+    try testing.expect(std.mem.indexOf(u8, pkb, "arch=('aarch64')") != null);
+    const info = try generateSrcinfo(testing.allocator, meta);
+    defer testing.allocator.free(info);
+    try testing.expect(std.mem.indexOf(u8, info, "arch = aarch64") != null);
 }
 
 test "buildDeb: ar 结构 + control.tar.gz 内容回读" {

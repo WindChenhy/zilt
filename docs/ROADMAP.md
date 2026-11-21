@@ -60,17 +60,18 @@
 **Linux 发行版兼容专项（L 系列，第四轮复核）**
 
 > 2026-11-21 对照 Wails v3.1 / Tauri 2.12 的 **Linux 专项**复核结论：Zilt 的 API 能力面更宽
-> （见 §0.4），差距集中在**工具链与分发生态**——GTK4 默认化、分数缩放、AppImage 自包含、
-> ARM64 构建链、包签名与 AUR。这一组不影响 `window.zilt` 的 API，但决定「在 24.04+/Fedora/
-> Arch/ARM 上能否顺利装上并用好」，故单列 L 系列。
+> （见 §0.4），差距集中在**工具链与分发生态**——GTK4 默认化（L1b 未做）、分数缩放、
+> ARM64 实跑。包格式/签名/AppImage 自包含/托盘挂窗已在 v0.4.3 补齐（L3/L5/L6 实测）。
+> 这一组不影响 `window.zilt` 的 API，但决定「在 24.04+/Fedora/Arch/ARM 上能否顺利装上
+> 并用好」，故单列 L 系列。
 
 | 编号 | 能力 | 对标出处 | 平台 | 工程量 | 实施路径 |
 |---|---|---|---|---|---|
 | L1 | **GTK4 默认化 + 双栈构建** | Wails v3 默认 GTK4/WebKitGTK 6.0，`-tags gtk3` 于 v3.1 移除 | Linux | 中 | `build.zig` 默认 `gtk=gtk4`，`-Dgtk=gtk3` 保留为 legacy 一个周期；README/打包依赖/CI 安装包同步；**CI 增 gtk3 + gtk4 双 job**（单测 + Xvfb 冒烟；workflow 先落地，remote 建立后生效），本地等价脚本 `scripts/linux/dev-test-matrix.sh`；GTK4 差异（portal 文件对话框、AppIndicator、分数缩放）逐项回归 |
 | L2 | 分数缩放 | Wails GTK4 `gdk_monitor_get_scale`（GTK 4.14+） | Linux | 小 | GTK4 走 `gdk_monitor_get_scale`（小数），GTK3 回退 `get_scale_factor` 并文档化；`system.info('monitors')` 增浮点 `scale`；窗口尺寸/截图/坐标换算路径复核（避免 1.25 下取整错位） |
-| L3 | **AppImage 自包含 + 沙箱** | Wails AppImage 打包 WebKit 并修补 AppRun（保留 bubblewrap） | Linux | 大 | ✅ 已实施（2026-11-21）：`ZILT_BUNDLE_WEBKIT=1 zig build pack` → ldd 闭包（117 库，剔除 glibc/驱动栈）+ WebKit helper/injected-bundle 复制；**libwebkit 编译期 helper 路径等长改写**（2.52 无 `WEBKIT_EXEC_PATH`，strace 实测）为 `/tmp/.zk-<hash>`，AppRun 建符号链并设 `LD_LIBRARY_PATH`/`WEBKIT_INJECTED_BUNDLE_PATH`/GIO/pixbuf/GSettings 面；`dev-appimage-e2e.sh` 增「无宿主 WebKit」验证（docker 优先；无镜像时 bwrap 掩 14 处宿主 WebKit，等价命名空间），LD_DEBUG 断言加载随包路径；**实测 +88MB**（squashfs 88MB，WebKit 2.52 比预期大，见 R7） |
+| L3 | **AppImage 自包含 + 沙箱** | Wails AppImage 打包 WebKit 并修补 AppRun（保留 bubblewrap） | Linux | 大 | ✅ 已实施（2026-11-21）：`ZILT_BUNDLE_WEBKIT=1 zig build pack` → ldd 闭包（117 库，剔除 glibc/驱动栈）+ WebKit helper/injected-bundle 复制；**libwebkit 编译期 helper 路径等长改写**（2.52 无 `WEBKIT_EXEC_PATH`，strace 实测）为 `/tmp/.zk-<hash>`，AppRun 建符号链并设 `LD_LIBRARY_PATH`/`WEBKIT_INJECTED_BUNDLE_PATH`/GIO/pixbuf/GSettings 面；`dev-appimage-e2e.sh` 增「无宿主 WebKit」验证（docker 优先；无镜像时 bwrap 掩 14 处宿主 WebKit，等价命名空间），LD_DEBUG 断言加载随包路径；**实测 +88MB**（squashfs 88MB，WebKit 2.52 比预期大，见 R7）；**沙箱实测结论**：Ubuntu/Debian 的 WebKitGTK 构建不安装 `bwrapinfo.json`（未启用 bubblewrap）→ WebKit 静默无沙箱运行，helper 路径改写与沙箱无交互；E2E 增 `SANDBOX_SUPPORT/SANDBOX_ACTIVE` 探测（有 bwrapinfo 的发行版上采样 `WebKitWebProcess` 的 pid-ns/seccomp，`ZILT_SANDBOX_REQUIRE=1` 时强制断言） |
 | L4 | **ARM64 构建链** | Wails Docker 交叉 / Tauri Docker+QEMU | Linux | 中 | 脚本就绪（2026-11-21）：`scripts/linux/build-arm64.sh`（默认 docker：`arm64v8/ubuntu:24.04` + QEMU binfmt → 容器内装 GTK3/WebKitGTK + aarch64 Zig → `zig build` + `ZILT_BUNDLE_WEBKIT=1 zig build pack`；`--sysroot DIR` 本地交叉走 `PKG_CONFIG_SYSROOT_DIR`）+ `dev-arm64-e2e.sh`（qemu-aarch64-static -L sysroot / arm64 容器跑冒烟，ELF machine 断言）+ CI `linux-arm64` job（setup-qemu-action）。**本机 WSL 无外网且无 arm64 镜像 → 容器路径如实 SKIP，验收待 CI** |
-| L5 | RPM/AUR 实构建 + PGP 签名 | Wails：deb/rpm `wails3 sign`、AUR 任务 | Linux | 中 | **[~] 脚本就绪（2026-11-21）**：`scripts/linux/pack-rpm.sh`（rpmbuild -bb → dist/*.rpm）、`pack-aur.sh`（PKGBUILD/.SRCINFO + tar.gz，docker 可用时 makepkg -sf）、`sign-packages.sh`（deb 追加 `_gpgorigin` 分离签名 / rpm `--addsign` + 双向校验；密钥 `ZILT_GPG_KEY_ID`，CI 经 `ZILT_GPG_KEY` 导入）——语法校验通过；**实构建与 `gpg --verify` 验收待环境**（rpm/makepkg/GPG key 未在本机就绪） |
+| L5 | RPM/AUR 实构建 + PGP 签名 | Wails：deb/rpm `wails3 sign`、AUR 任务 | Linux | 中 | **✅ 已实施（2026-11-21）**：`pack-rpm.sh` 真跑 `rpmbuild -bb` → 16.3MB `app.zilt.desktop-0.4.3-1.x86_64.rpm`（载荷 bin + `.desktop` + hicolor PNG，`%post(un)` 刷新 desktop db；rpm 自动依赖闭包）；`pack-aur.sh` 生成 PKGBUILD/.SRCINFO + 源 tar，并用 `source PKGBUILD; package` 模拟 makepkg 安装段（落地文件断言）；`sign-packages.sh` deb 追加 `_gpgorigin`（GNU ar 纯字节追加，`dpkg-deb` 仍可解析）+ rpm `--addsign`，`dev-sign-e2e.sh` 做 Good signature / `rpm -K`（独立 rpmdb 导入公钥）+ **反向对照**（空 rpmdb 与原包必须不通过）；makepkg 实跑仍缺 docker 镜像（离线），已在脚本内如实跳过 |
 | L6 | 托盘挂窗（Linux） | Wails `AttachWindow`（定位/去抖/焦点丢失语义） | Linux | 中 | ✅ 已实施（2026-11-21）：XEmbed 宿主（stalonetray/trayer/面板）→ **自建 GtkStatusIcon**（左键 `activate` → toggle；libayatana 回退把左键绑成弹菜单，拿不到该语义）+ `gtk_status_icon_get_geometry` 定位；无 XEmbed 宿主 → libayatana SNI（`secondary_activate_target` 隐藏菜单项为点击入口，左键菜单/中键 toggle 由宿主决定）；点击 200ms 去抖（Wails WindowDebounce）；FFM 桌面（Hyprland/Sway/i3…）禁用挂窗 `hideOnFocusLost`；WM 外框偏移用延时校正（openbox 实测 +20px）；`scripts/linux/dev-tray-e2e.sh` 实测（Xvfb+openbox+stalonetray+XTest） |
 | L7 | Linux 更新健康回滚 | —（Windows helper 已有，Linux 缺编排） | Linux | 小 | `--zilt-restart` helper：替换后等新 exe 存活 ≥N 秒且退出码 0，否则 `rollbackToBackup`（POSIX rename 已具备）+ 重新拉起；与 Windows 同语义、同日志 |
 | L8 | capability 清单修正 | —（清单与实现不一致） | Linux | 极小 | 补 `window_key_bindings`（v0.3.9 A4L 已实现且有单测）；删除「Linux 未接线」过期注释；契约测试增「清单 ⊆ 后端 @hasDecl」断言，防再漂移 |
@@ -97,10 +98,10 @@
 | 托盘 | dlopen libayatana（可选依赖）、挂窗（XEmbed 自建图标 + 几何定位 / SNI 目标项） | 硬依赖 appindicator + `AttachWindow` | 硬依赖 appindicator、无挂窗 | 持平（依赖更轻） |
 | Wayland 全局快捷键 | X11 + portal 双路 | 文档未明确 | **仅 X11** | 领先 Tauri |
 | 二进制 IPC | evaluate + base64 | Streams | raw IPC | 落后 → H4 相关 |
-| 包格式 | deb / AppImage / Flatpak manifest / rpm spec | deb / AppImage / rpm / AUR | deb / rpm / AppImage | 落后 → L5 |
-| 包签名 | 无（`zilt-sign` 仅 Windows） | deb/rpm PGP | 无 | 落后 → L5 |
-| AppImage 自包含 | 依赖宿主 WebKit | **打包 WebKit + 沙箱修补** | 依赖宿主 | 落后 Wails → L3 |
-| ARM64 构建 | 无流程（Zig 可交叉） | Docker | Docker/QEMU | 落后 → L4 |
+| 包格式 | deb / AppImage / Flatpak / rpm（实构建）/ AUR PKGBUILD | deb / AppImage / rpm / AUR | deb / rpm / AppImage | 持平（L5） |
+| 包签名 | deb `_gpgorigin` / rpm `--addsign`（实签实校，L5） | deb/rpm PGP | 无 | 持平（L5） |
+| AppImage 自包含 | **WebKit 随包 + helper 路径改写**（L3 实测） | **打包 WebKit + 沙箱修补** | 依赖宿主 | 持平（沙箱面见 L3 注） |
+| ARM64 构建 | 脚本 + CI job（Docker/QEMU 或 `--sysroot`），待首次实跑 | Docker | Docker/QEMU | 落后 → L4 |
 | store 加密 | Linux 明文 | 无 | keyring/stronghold | 落后 Tauri → H3 |
 | 窗口 mask / 子 WebView / sticky / preventOverflow | 全有 | 无/不全 | 无/不全 | 领先 |
 
@@ -287,7 +288,7 @@ ARM64、包签名/AUR、托盘挂窗。这是 L 系列的主体，也是与 Wail
 - **L1** GTK4 默认化 + 双栈构建（`-Dgtk=gtk3` 保留为 legacy 一个周期，CI 双 job）
 - **L3 ✅** AppImage 自包含（WebKit 随包 + helper 路径改写；无宿主 WebKit 实测见上）
 - **L4 [~]** ARM64 构建链（Docker+QEMU 脚本 / `--sysroot` 交叉 / CI job；本机无镜像 SKIP）
-- **L5** RPM/AUR 实构建 + PGP 签名（deb `_gpgorigin` / rpm detach-sign）
+- **L5 ✅** RPM/AUR 实构建 + PGP 签名（deb `_gpgorigin` / rpm `--addsign`；`dev-sign-e2e.sh` 正反向校验）
 - **L6 ✅** 托盘挂窗（见上：XEmbed 自建图标 / SNI 目标项、贴图标定位、去抖、FFM 规避）
 
 **验收**：gtk3/gtk4 双栈单测 + Xvfb/openbox 冒烟全绿；AppImage 在「未安装 WebKit 的容器」
@@ -299,21 +300,35 @@ Wayland 回退路径文档化；既有冒烟/单测全量回归（Windows 侧零
 
 | 项 | 命令 | 结果 |
 |---|---|---|
-| Windows 单测 | `zig build test` | 384/385（1 skip） |
-| GTK3 单测 | `zig build test`（22.04） | 301/302（283+18，1 skip） |
-| GTK4 单测 | `zig build test -Dgtk=gtk4`（24.04） | 301/302（1 skip） |
+| Windows 单测 | `zig build test` | 386/387（1 skip） |
+| GTK3 单测 | `zig build test`（22.04） | 303/304（285+18，1 skip） |
+| GTK4 单测 | `zig build test -Dgtk=gtk4`（24.04） | 303/304（1 skip） |
 | Linux 冒烟 | `scripts/linux/dev-smoke.sh` | **95/95 exit 0** |
 | 托盘挂窗 | `scripts/linux/dev-tray-e2e.sh` | PASS（toggle / 贴图标定位 / 右键菜单 / FFM 共 12 断言） |
-| AppImage 自包含 | `scripts/linux/dev-appimage-e2e.sh` | PASS：宿主 + 掩掉宿主 WebKit 各 **95/95**；LD_DEBUG 252 次命中随包 `libwebkit2gtk` |
+| AppImage 自包含 | `scripts/linux/dev-appimage-e2e.sh` | PASS：宿主 + 掩掉宿主 WebKit 各 **95/95**；LD_DEBUG 252 次命中随包 `libwebkit2gtk`；`SANDBOX_SUPPORT=no`（Ubuntu 构建无 bwrapinfo） |
+| RPM 实构建 | `scripts/linux/pack-rpm.sh` | PASS：`app.zilt.desktop-0.4.3-1.x86_64.rpm`，载荷 3 项 + `%post` desktop db |
+| AUR 包面 | `scripts/linux/pack-aur.sh` | PASS：`bash -n` + `.SRCINFO` 一致 + `package()` 模拟落地 3 文件；makepkg 跳过（无 Arch 镜像） |
+| 包签名 | `scripts/linux/dev-sign-e2e.sh` | PASS：deb `_gpgorigin` Good signature 且 dpkg 可解析；rpm `--addsign` → `rpm -K` signatures OK；两项反向对照通过 |
 | ARM64 构建链 | `build-arm64.sh --check` / `dev-arm64-e2e.sh` | 预检 PASS；容器路径 SKIP（本机无外网、无 arm64 镜像）；qemu-aarch64-static 已用交叉编译的 aarch64 二进制验证 |
 | Windows GUI 冒烟 | `ZILT_SMOKE_EXIT=1` | 仅 echo-server 依赖项（ws/http2/wss/tus）失败，其余全 true（零回归） |
 
 - **体积**：自包含 AppDir 222MB → squashfs **88MB（+78MB）**；R7 的 +30–40MB 估计已按实测修正
 - **顺带修复**（L3 实测暴露的既有缺陷）：主 WebView 只分 1px（`boxPackStartFill`）、剪贴板写入缺
   memcpy、`fs.readStream` use-after-free —— 修复后 Linux 冒烟从 93/95 升到 **95/95 exit 0**
+- **顺带修复**（L5 实构建暴露的打包缺陷，5 处）：
+  ① **deb tar 条目名 use-after-free**——sidecar/resources/图标的名字在 `if`/`for` 块内
+  `defer alloc.free`，块结束即回收，Zig 安全构建把内存填 0xAA → `dpkg-deb -c` 出现 58 字节
+  乱码文件名（release 构建则可能静默截断）；改为 arena 托管，函数尾释放；
+  ② **rpm spec 参数错位**——`Source0` 实际写的是 description、`%description` 写的是 exe 名；
+  ③ **deb 与 postinst 桌面项名不一致**——装的是 `app.zilt.desktop.desktop`，`xdg-mime default`
+  注册的是 `app.zilt.desktop`（深链默认程序实际未生效）；统一为 `app.zilt.desktop`；
+  ④ **AppDir 从不清理**——11-15 的旧 `app.zilt.desktop.desktop` 仍被打进 squashfs/AppImage；
+  打包前 `deleteTree`；
+  ⑤ **架构硬编码**——`BuildArch: x86_64` / deb `_amd64` / PKGBUILD `arch=('x86_64')` 改为跟随
+  `builtin.cpu.arch`（ARM64 产物名/元数据正确）
 - **未完成项**：ARM64 容器内构建与 qemu 冒烟（CI `linux-arm64` job 待 remote 首次执行）、
-  L5 RPM/AUR 与 PGP 签名的**实构建/校验**（三脚本已就绪并通过语法校验，见 L5 行）、
-  L1b（4.x UI 面移植）
+  AUR `makepkg` 实跑（本机无 Arch 镜像/外网；`package()` 已按 makepkg 语义模拟验证）、
+  WebKit 沙箱行为（Ubuntu 构建无 bwrapinfo，见 L3 行）、L1b（4.x UI 面移植）
 - **已知 flake**：`platform.linux.hotkey` 的「真实抓键」用例在并发 Xvfb/残留显示下偶发
   X11 抓键失败（复跑即过，与版本无关）
 - **坑位记录**：22.04 与 24.04 共用仓库 `zig-out/`，GTK4 构建会覆盖 GTK3 产物（表现为
@@ -364,19 +379,21 @@ codesign 验证 + Gatekeeper 实测。
 
 ## 3. 验收链（沿用 v0.3.19 口径）
 
-1. `zig build test`（基线：Windows 364 / Linux 280，随功能递增；0 失败 0 泄漏）
+1. `zig build test`（基线：Windows 386 / Linux 303，随功能递增；0 失败 0 泄漏）
 2. `zig build`（构建 + capability 清单 + 资产嵌入）
 3. GUI 冒烟（基线：Windows 74 / Linux 95 项；新增能力必须带检查项，exit 0）
 4. 触碰面专项：headless/MCP E2E、server E2E、PACK_E2E、e2e_fixed_runtime
 5. **Linux 双栈（v0.4.3 起）**：`-Dgtk=gtk3` 与 `-Dgtk=gtk4` 各跑单测 + Xvfb/openbox 冒烟；
-   `gpg --verify` 校验 deb/rpm 签名；AUR `makepkg` 构建通过；Windows 侧零回归
+   签名与 AUR 见第 8 条；Windows 侧零回归
 6. **托盘挂窗（L6 起）**：`scripts/linux/dev-tray-e2e.sh`（Xvfb+openbox+stalonetray，
    XTest 合成点击；`scripts/linux/xtool.py` 无 xdotool 依赖）——toggle/定位/右键菜单/FFM 四组断言
 7. **AppImage 自包含（L3 起）**：`dev-appimage-e2e.sh`（`ZILT_BUNDLE_WEBKIT=1` + runtime 拼接 +
    无 FUSE extract + docker/bwrap 掩宿主 WebKit）——冒烟 + LD_DEBUG 随包命中
-8. **ARM64（L4 起）**：`build-arm64.sh`（docker+QEMU 或 `--sysroot`）+ `dev-arm64-e2e.sh`
-   （qemu-aarch64-static / arm64 容器 + ELF machine 断言）；CI `linux-arm64` job
-6. macOS 切片自建验收链（v0.4.4 起）：zig build test macOS + 冒烟骨架 + codesign 产物验证
+8. **包面与签名（L5 起）**：`pack-rpm.sh`（rpmbuild -bb + 载荷断言）、`pack-aur.sh`（PKGBUILD/.SRCINFO
+   一致性 + `package()` 模拟）、`dev-sign-e2e.sh`（deb/rpm 签名 + Good signature + 反向对照）
+9. **ARM64（L4 起）**：`build-arm64.sh`（docker+QEMU 或 `--sysroot`）+ `dev-arm64-e2e.sh`
+   （qemu-aarch64-static / arm64 容器 + ELF machine 断言 + deb/rpm 架构名核对）；CI `linux-arm64` job
+10. macOS 切片自建验收链（v0.4.4 起）：zig build test macOS + 冒烟骨架 + codesign 产物验证
 
 ## 4. 风险与依赖
 

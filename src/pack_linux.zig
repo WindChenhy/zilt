@@ -395,6 +395,8 @@ pub fn main() !void {
         .exe_name = app_meta.exe_name,
         .maintainer = "Zilt App",
         .description = app_meta.app_name,
+        // v0.4.3 L5：包架构跟随构建目标（ARM64 容器内原生构建 → aarch64）
+        .arch = @tagName(@import("builtin").cpu.arch),
     };
     const pkg = try pack_formats.debianName(alloc, meta.app_id);
     const desktop_name = try desktopFileName(alloc, pkg);
@@ -451,12 +453,16 @@ pub fn main() !void {
         .extra_files = sidecar_bytes.items,
         .resources = resource_files.items,
     });
-    const deb_out = try pathJoin(alloc, out_dir, try std.fmt.allocPrint(alloc, "{s}_{s}_amd64.deb", .{ pkg, meta.version }));
+    const deb_out = try pathJoin(alloc, out_dir, try std.fmt.allocPrint(alloc, "{s}_{s}_{s}.deb", .{ pkg, meta.version, pack_formats.debArch(meta.arch) }));
     if (!writeFile(alloc, deb_out, deb, 0o644)) return error.WriteFailed;
     std.debug.print("[pack] deb -> {s}（{d} bytes）\n", .{ deb_out, deb.len });
 
     // ---- 2) AppDir（AppRun 可直接执行）+ squashfs ----
     const app_dir = try pathJoin(alloc, out_dir, pkg);
+    // 先清上一轮 AppDir：历史残留（旧版本桌面项/图标/旧 WebKit 库）会被
+    // squashfs 一起打进 AppImage——v0.4.3 实测发现 11-15 的
+    // `app.zilt.desktop.desktop` 还在（发布物污染）
+    std.Io.Dir.cwd().deleteTree(sharedIo(), app_dir) catch {};
     mkDirs(alloc, app_dir);
     inline for (.{ "usr/bin", "usr/share/applications", "usr/share/icons/hicolor/256x256/apps" }) |sub| {
         mkDirs(alloc, try pathJoin(alloc, app_dir, sub));
@@ -580,7 +586,7 @@ pub fn main() !void {
     std.debug.print("[pack] flatpak manifest -> {s}\n", .{fp_out});
 
     // ---- 4) rpm spec ----
-    const spec = try pack_formats.generateRpmSpec(alloc, meta);
+    const spec = try pack_formats.generateRpmSpecOpt(alloc, meta, icon_png != null);
     const spec_out = try pathJoin(alloc, out_dir, try std.fmt.allocPrint(alloc, "{s}.spec", .{pkg}));
     if (!writeFile(alloc, spec_out, spec, 0o644)) return error.WriteFailed;
     std.debug.print("[pack] spec -> {s}（rpmbuild -bb 可构建）\n", .{spec_out});
