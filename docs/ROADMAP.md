@@ -185,7 +185,24 @@ page_allocator（延续 v0.4.1 教训）。
 **验收**：libsecret 物理 E2E（seahorse/secret-tool 互操作可见）+ 降级路径 +
 通知定时触发实测 + reparent 往返（父子/销毁级联）+ 全量回归。
 
-### v0.4.3 — Linux 发行版兼容专项
+### v0.4.3 — Linux 发行版兼容专项 [~] L1a 完成（2026-11-21），其余随环境分批
+
+**L1a ✅（2026-11-21）——GTK4 构建级兼容基础 + 双栈环境**：
+- 环境：Ubuntu 24.04 第二发行版（WSL，D 盘迁移后新建）+ GTK 4.14.5 / WebKitGTK 6.0
+  2.52.6 / Zig 0.17.1；`scripts/linux/dev-smoke.sh --gtk4` 双栈冒烟开关
+- capi.h：WebKit 头改构建期宏 `ZILT_GTK4` 选择——实测教训：`__has_include` 会命中
+  /usr/include 默认路径下并存的另一变体头（两代 dev 包并存必现），变体选择必须显式
+- 符号审计（gtkaudit.sh：nm 对照 libgtk-4 导出）：**70 个 GTK4 移除符号**，覆盖窗口
+  主循环/基础几何/对话框/剪贴板/拖放/菜单全套——量级为 4.x UI 面重写（GdkClipboard/
+  GdkDrag/GtkPopoverMenu/GtkFileDialog/gdk_toplevel），非补丁级
+- 探针实验（已回滚，保留宏基础设施）：51 处 opaque 指针替换 + 12 处销毁语义分派 +
+  能力守卫的机制验证成立
+- **零回归**：Windows/22.04 单测全绿 + 22.04 GTK3 冒烟 exit 0
+
+**L1b（待实施）——4.x UI 面重写**：按审计表逐子系统移植（GdkClipboard ↔ GtkClipboard、
+GdkDrag ↔ gtk_drag_*、GtkPopoverMenu ↔ GtkMenu 族、gdk_toplevel ↔ gtk_window 几何/
+状态、GtkFileDialog ↔ GtkFileChooserNative）；完成后切 `-Dgtk=gtk4` 默认化（D7 保留
+gtk3 legacy 一个周期）。前置已就绪（本 L1a 环境）。
 
 目标：把 Linux 从「API 齐全」推进到「发行版可直接采用」——GTK4 默认、自包含 AppImage、
 ARM64、包签名/AUR、托盘挂窗。这是 L 系列的主体，也是与 Wails v3.1 差距最集中的一段。

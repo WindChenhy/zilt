@@ -14,15 +14,18 @@ mkdir -p .zilt-probe
   export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$HOME/.zcache/zig-global}"
   mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
 
-  # 透传额外环境变量（--extra-env K=V 形式，可重复）
+  # 透传额外环境变量（--extra-env K=V 形式，可重复）；--gtk4 = GTK4 变体
+  #（v0.4.3 L1：双栈冒烟——24.04+ WebKitGTK 6.0 环境）
+  GTK_FLAG=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --extra-env) export "$2"; shift 2 ;;
+      --gtk4) GTK_FLAG="-Dgtk=gtk4"; shift ;;
       *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
   done
 
-  zig build
+  zig build $GTK_FLAG
 
   rm -f zilt.log
   export ZILT_LINUX_SMOKE=1

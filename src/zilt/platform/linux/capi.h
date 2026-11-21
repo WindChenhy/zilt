@@ -11,7 +11,27 @@
 #pragma once
 
 #include <gtk/gtk.h>
+/* v0.4.3 L1a：WebKit 头按构建期宏选择（build.zig 按 -Dgtk 定义 ZILT_GTK4）——
+ * 实测教训：__has_include 会命中 /usr/include 默认路径下并存的另一变体头
+ *（两代 dev 包并存时必现），变体选择不可探测、必须显式。 */
+#if defined(ZILT_GTK4)
+#include <webkitgtk-6.0/webkit/webkit.h>
+#else
 #include <webkit2/webkit2.h>
+#endif
+/* v0.4.3 L1b（待实施）：GTK4 下 GtkMenu 族/GtkClipboard 类型缺失——届时
+ * 指针面前向声明 + 调用面 comptime 守卫（NotSupported）一并落地 */
+#if defined(ZILT_GTK4)
+typedef struct _GtkMenu GtkMenu;
+typedef struct _GtkMenuShell GtkMenuShell;
+typedef struct _GtkMenuItem GtkMenuItem;
+typedef struct _GtkMenuBar GtkMenuBar;
+typedef struct _GtkClipboard GtkClipboard;
+typedef struct _GtkCheckMenuItem GtkCheckMenuItem;
+typedef struct _GtkSeparatorMenuItem GtkSeparatorMenuItem;
+typedef struct _GtkAccelGroup GtkAccelGroup;
+typedef struct _GtkTargetEntry GtkTargetEntry;
+#endif
 /* v0.3.0：X11 焦点判定（gdk_x11_window_get_xid / gdk_x11_display_get_xdisplay）。
  * GTK4 的 X11 API 是 gdk_x11_surface_get_xid（v0.3.x 重做后端时再适配）——
  * 这里对 GTK3 引入，GTK4 构建下由 @hasDecl 回退到 GTK 焦点属性。 */
