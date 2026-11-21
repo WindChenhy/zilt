@@ -106,7 +106,8 @@ jobs:
   linux-test:
     name: Build / Test / Smoke (Linux)
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    # v0.4.3 L5：新增 rpm/AUR/签名步骤 + AppImage 随包构建，30 min 偏紧
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
