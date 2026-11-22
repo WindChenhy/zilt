@@ -540,14 +540,14 @@ fn Backend(comptime config: Config) type {
                     return alloc.dupe(u8, "{}");
                 },
                 .print_to_pdf => |p| {
-                    const info = msg0(Id, objc.cls("NSPrintInfo"), "sharedPrintInfo");
-                    const dict = msg0(Id, info, "dictionary");
-                    _ = objc.msgSend(*const fn (Id, Sel, Id) callconv(.c) void)(info, objc.sel("setJobDisposition:"), objc.nsStringZ("NSPrintSaveJob"));
-                    _ = objc.msgSend(*const fn (Id, Sel, Id, Id) callconv(.c) void)(dict, objc.sel("setObject:forKey:"), objc.nsString(p.path.ptr, p.path.len), objc.nsStringZ("NSPrintSavePath"));
-                    const op = objc.msgSend(*const fn (Id, Sel, Id) callconv(.c) ?Id)(wv, objc.sel("printOperationWithPrintInfo:"), info) orelse return error.PdfNotSupported;
-                    const ran = objc.msgSend(*const fn (Id, Sel) callconv(.c) bool)(op, objc.sel("runOperation"));
+                    // 不走 NSPrintOperation（保存任务在无交互 session 下会阻塞冒烟），
+                    // 改用 dataWithPDFInsideRect: 同步导出当前视图矩形的 PDF。
+                    const fr = frameOf(wv);
+                    const rect = NSRect{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = fr.size.w, .h = fr.size.h } };
+                    const data = objc.msgSend(*const fn (Id, Sel, NSRect) callconv(.c) ?Id)(wv, objc.sel("dataWithPDFInsideRect:"), rect) orelse return error.PdfNotSupported;
+                    const wrote = objc.msgSend(*const fn (Id, Sel, Id, bool) callconv(.c) bool)(data, objc.sel("writeToFile:atomically:"), objc.nsString(p.path.ptr, p.path.len), true);
                     var payload: [96]u8 = undefined;
-                    if (std.fmt.bufPrint(&payload, "{{\"rid\":{d},\"ok\":{s}}}", .{ p.rid, boolStr(ran) })) |js| {
+                    if (std.fmt.bufPrint(&payload, "{{\"rid\":{d},\"ok\":{s}}}", .{ p.rid, boolStr(wrote) })) |js| {
                         self.emitWindowEvent(window_id, "webviewPdf", js);
                     } else |_| {}
                     return alloc.dupe(u8, "{}");
