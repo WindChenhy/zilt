@@ -18,6 +18,9 @@ pub extern "c" fn objc_registerClassPair(cls: Class) void;
 pub extern "c" fn class_addMethod(cls: Class, name: Sel, imp: ?*const anyopaque, types: [*:0]const u8) bool;
 pub extern "c" fn class_addProtocol(cls: Class, proto: ?Protocol) bool;
 pub extern "c" fn objc_getProtocol(name: [*:0]const u8) ?Protocol;
+/// v0.4.5 基建：手动 autorelease pool（libobjc 导出的 C 函数）
+pub extern "c" fn objc_autoreleasePoolPush() Id;
+pub extern "c" fn objc_autoreleasePoolPop(pool: Id) void;
 
 pub fn sel(name: [*:0]const u8) Sel {
     return sel_registerName(name) orelse @panic("sel_registerName returned null");

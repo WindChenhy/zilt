@@ -395,6 +395,10 @@ fn Backend(comptime config: Config) type {
             );
             log.print("[macos] event loop start", .{});
             while (true) {
+                // v0.4.5 基建：每轮泵手动 autorelease pool——dateWithTimeIntervalSinceNow:
+                // 等返回 autoreleased 对象，不回收就是每 50ms 泄一个（长跑必泄）
+                const pool = objc.objc_autoreleasePoolPush();
+                defer objc.objc_autoreleasePoolPop(pool);
                 const until = objc.msgSend(*const fn (Class, Sel, f64) callconv(.c) Id)(
                     NSDate,
                     objc.sel("dateWithTimeIntervalSinceNow:"),
