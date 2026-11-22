@@ -75,6 +75,8 @@ fn Backend(comptime config: Config) type {
         hotkey_ok: usize = 0,
         lock_fd: c_int = -1,
         inspectable: bool = false,
+        downloads: std.ArrayListUnmanaged(DownloadRec) = .{},
+        download_seq: u64 = 0,
         smoke_ms: u32 = 0,
         /// v0.4.5：窗口控制探针结果（CI 硬断言）
         win_ops_ok: bool = false,
@@ -316,7 +318,9 @@ fn Backend(comptime config: Config) type {
                 msg0(Id, objc.cls("ZiltSchemeHandler"), "new"),
                 objc.nsStringZ(scheme),
             );
-            const wv_raw = msg0(Id, objc.cls("WKWebView"), "alloc");
+            const sub_cls = objc.cls("ZiltWebView");
+            const wv_cls = if (@intFromPtr(sub_cls) != 0) sub_cls else objc.cls("WKWebView");
+            const wv_raw = msg0(Id, wv_cls, "alloc");
             const wv = objc.msgSend(*const fn (Id, Sel, Rect, Id) callconv(.c) Id)(
                 wv_raw,
                 objc.sel("initWithFrame:configuration:"),
@@ -330,6 +334,9 @@ fn Backend(comptime config: Config) type {
             );
             if (@intFromPtr(wv) == 0) return error.WebViewCreationFailed;
             _ = msg1(void, wv, "setNavigationDelegate:", msg0(Id, objc.cls("ZiltNavigationDelegate"), "new"));
+            _ = msg1(void, wv, "setUIDelegate:", msg0(Id, objc.cls("ZiltUIDelegate"), "new"));
+            const drag_types = objc.msgSend(*const fn (Class, Sel, Id) callconv(.c) Id)(objc.cls("NSArray"), objc.sel("arrayWithObject:"), objc.nsStringZ("public.file-url"));
+            _ = objc.msgSend(*const fn (Id, Sel, Id) callconv(.c) void)(wv, objc.sel("registerForDraggedTypes:"), drag_types);
             return wv;
         }
 
@@ -552,7 +559,15 @@ fn Backend(comptime config: Config) type {
                     } else |_| {}
                     return alloc.dupe(u8, "{}");
                 },
-                .cancel_download => return error.DownloadNotFound,
+                .cancel_download => |did| {
+                    for (self.downloads.items) |rec| {
+                        if (rec.id == did) {
+                            _ = objc.msgSend(*const fn (Id, Sel, ?Id) callconv(.c) void)(rec.dl, objc.sel("cancel:"), @as(?Id, null));
+                            return alloc.dupe(u8, "{}");
+                        }
+                    }
+                    return error.DownloadNotFound;
+                },
                 else => return error.WebViewNotAvailable,
             }
         }
@@ -1019,12 +1034,32 @@ fn Backend(comptime config: Config) type {
             }
             log.print("[macos] webview pdf ok={s}", .{boolStr(pdf_ok)});
 
+            const dl_dlg = msg0(Id, objc.cls("ZiltDownloadDelegate"), "new");
+            const dl_sel = objc.sel("download:decideDestinationUsingResponse:suggestedFilename:completionHandler:");
+            const dl_ok = objc.msgSend(*const fn (Id, Sel, Sel) callconv(.c) bool)(dl_dlg, objc.sel("respondsToSelector:"), dl_sel);
+            log.print("[macos] webview download ok={s} wiring-only", .{boolStr(dl_ok)});
+
+            const ui_dlg = msg0(Id, objc.cls("ZiltUIDelegate"), "new");
+            const perm_sel = objc.sel("webView:requestMediaCapturePermissionForOrigin:initiatedByFrame:type:decisionHandler:");
+            const perm_ok = objc.msgSend(*const fn (Id, Sel, Sel) callconv(.c) bool)(ui_dlg, objc.sel("respondsToSelector:"), perm_sel);
+            log.print("[macos] webview permission ok={s} wiring-only", .{boolStr(perm_ok)});
+
+            var drop_ok = false;
+            if (msg0(?Id, self.webview, "class")) |k| {
+                if (msg0(?Id, k, "description")) |nmz| {
+                    if (msg0(?[*:0]const u8, nmz, "UTF8String")) |csz| {
+                        drop_ok = std.mem.eql(u8, std.mem.span(csz), "ZiltWebView");
+                    }
+                }
+            }
+            log.print("[macos] webview drop ok={s}", .{boolStr(drop_ok)});
+
             const events_ok = self.ev_moved > 0 and self.ev_resized > 0;
             log.print("[macos] window events ok={s} moved={d} resized={d} focus={d} blur={d}", .{
                 boolStr(events_ok), self.ev_moved, self.ev_resized, self.ev_focus, self.ev_blur,
             });
 
-            const good = ok and size_ok and json_ok and appearance_ok and events_ok and theme_ok and dock_ok and vibrancy_ok and state_ok and drag_ok and clip_ok and dialog_ok and menu_ok and tray_ok and tray_action_ok and notify_ok and deeplink_ok and single_ok and hotkey_ok and wv_zoom_ok and dv_ok and print_ok and pdf_ok and self.runSpawnProbe();
+            const good = ok and size_ok and json_ok and appearance_ok and events_ok and theme_ok and dock_ok and vibrancy_ok and state_ok and drag_ok and clip_ok and dialog_ok and menu_ok and tray_ok and tray_action_ok and notify_ok and deeplink_ok and single_ok and hotkey_ok and wv_zoom_ok and dv_ok and print_ok and pdf_ok and dl_ok and perm_ok and drop_ok and self.runSpawnProbe();
             log.print("[macos] window ops ok={s} content={d}x{d} json={s}", .{
                 boolStr(good),
                 dimToU32(cs.w),
@@ -1243,6 +1278,7 @@ fn Backend(comptime config: Config) type {
             });
             _ = objc.defineClass("ZiltNavigationDelegate", "WKNavigationDelegate", &.{
                 .{ .name = "webView:didFinishNavigation:", .imp = imp(&onNavigateFinish), .types = "v@:@@" },
+                .{ .name = "webView:navigationResponse:didBecomeDownload:", .imp = imp(&onNavBecameDownload), .types = "v@:@@" },
             });
             _ = objc.defineClass("ZiltSchemeHandler", "WKURLSchemeHandler", &.{
                 .{ .name = "webView:startURLSchemeTask:", .imp = imp(&onStartTask), .types = "v@:@@" },
@@ -1253,6 +1289,19 @@ fn Backend(comptime config: Config) type {
             });
             _ = objc.defineClass("ZiltMainQueue", null, &.{
                 .{ .name = "drain:", .imp = imp(&onDrain), .types = "v@:@" },
+            });
+            _ = objc.defineClass("ZiltDownloadDelegate", null, &.{
+                .{ .name = "download:decideDestinationUsingResponse:suggestedFilename:completionHandler:", .imp = imp(&onDecideDestination), .types = "v@:@@@" },
+                .{ .name = "downloadDidFinish:", .imp = imp(&onDownloadFinished), .types = "v@:@" },
+                .{ .name = "download:didFailWithError:", .imp = imp(&onDownloadFailed), .types = "v@:@@" },
+            });
+            _ = objc.defineClass("ZiltUIDelegate", null, &.{
+                .{ .name = "webView:requestMediaCapturePermissionForOrigin:initiatedByFrame:type:decisionHandler:", .imp = imp(&onMediaCapturePermission), .types = "v@:@@@l@" },
+            });
+            _ = objc.defineSubclass("ZiltWebView", "WKWebView", &.{}, &.{
+                .{ .name = "draggingEntered:", .imp = imp(&onDragEntered), .types = "Q@:@" },
+                .{ .name = "performDragOperation:", .imp = imp(&onPerformDrag), .types = "c@:@" },
+                .{ .name = "draggingExited:", .imp = imp(&onDragExited), .types = "v@:@" },
             });
         }
 
@@ -1534,6 +1583,120 @@ fn Backend(comptime config: Config) type {
                 inst.emitWindowEvent(0, "menu", payload);
                 return;
             }
+        }
+
+        const DownloadRec = struct { id: u64, dl: Id };
+
+        /// ObjC block 布局前四字段定长，invoke 在偏移 24；拿它当函数指针调。
+        const BlockLayout = extern struct { isa: ?*anyopaque, flags: u32, reserved: u32, invoke: ?*const anyopaque, descriptor: ?*anyopaque };
+
+        fn blockCallId(block: ?*anyopaque, arg: Id) void {
+            const b = block orelse return;
+            const blk: *BlockLayout = @ptrCast(@alignCast(b));
+            const iv = blk.invoke orelse return;
+            const f: *const fn (?*anyopaque, Id) callconv(.c) void = @ptrCast(@alignCast(iv));
+            f(b, arg);
+        }
+
+        fn blockCallLong(block: ?*anyopaque, arg: c_long) void {
+            const b = block orelse return;
+            const blk: *BlockLayout = @ptrCast(@alignCast(b));
+            const iv = blk.invoke orelse return;
+            const f: *const fn (?*anyopaque, c_long) callconv(.c) void = @ptrCast(@alignCast(iv));
+            f(b, arg);
+        }
+
+        fn findDownload(self: *Self, dl: Id) ?u64 {
+            for (self.downloads.items) |rec| {
+                if (@intFromPtr(rec.dl) == @intFromPtr(dl)) return rec.id;
+            }
+            return null;
+        }
+
+        fn onNavBecameDownload(_: Id, _: Sel, _: Id, dl: Id) callconv(.c) void {
+            _ = msg1(void, dl, "setDelegate:", msg0(Id, objc.cls("ZiltDownloadDelegate"), "new"));
+            inst.download_seq += 1;
+            inst.downloads.append(inst.alloc, .{ .id = inst.download_seq, .dl = dl }) catch {};
+            var payload: [64]u8 = undefined;
+            if (std.fmt.bufPrint(&payload, "{{\"id\":{d}}}", .{inst.download_seq})) |js| {
+                inst.emitWindowEvent(0, "downloadStarted", js);
+            } else |_| {}
+            log.print("[macos] download started id={d}", .{inst.download_seq});
+        }
+
+        fn onDecideDestination(_: Id, _: Sel, _: Id, _: Id, name: Id, handler: ?*anyopaque) callconv(.c) void {
+            const tmp = std.c.getenv("TMPDIR") orelse "/tmp";
+            var nm_buf: [256]u8 = undefined;
+            var nm: []const u8 = "zilt-download.bin";
+            if (msg0(?[*:0]const u8, name, "UTF8String")) |cs| nm = std.mem.span(cs);
+            if (nm.len > 200) nm = nm[0..200];
+            const raw = std.fmt.bufPrint(&nm_buf, "{s}zilt-dl-{s}", .{ std.mem.span(tmp), nm }) catch return blockCallId(handler, objc.nsStringZ("/tmp/zilt-download.bin"));
+            nm_buf[raw.len] = 0;
+            const path = nm_buf[0..raw.len :0];
+            const url = objc.msgSend(*const fn (Class, Sel, Id) callconv(.c) Id)(objc.cls("NSURL"), objc.sel("fileURLWithPath:"), objc.nsString(path.ptr, raw.len));
+            blockCallId(handler, url);
+            log.print("[macos] download destination {s}", .{path});
+        }
+
+        fn onDownloadFinished(_: Id, _: Sel, dl: Id) callconv(.c) void {
+            if (inst.findDownload(dl)) |id| {
+                var payload: [64]u8 = undefined;
+                if (std.fmt.bufPrint(&payload, "{{\"id\":{d}}}", .{id})) |js| {
+                    inst.emitWindowEvent(0, "downloadFinished", js);
+                } else |_| {}
+            }
+        }
+
+        fn onDownloadFailed(_: Id, _: Sel, dl: Id, err: Id) callconv(.c) void {
+            _ = err;
+            if (inst.findDownload(dl)) |id| {
+                var payload: [64]u8 = undefined;
+                if (std.fmt.bufPrint(&payload, "{{\"id\":{d}}}", .{id})) |js| {
+                    inst.emitWindowEvent(0, "downloadFailed", js);
+                } else |_| {}
+            }
+        }
+
+        /// WKPermissionDecision：0 prompt / 1 grant / 2 deny。本应用是本地壳，默认授予。
+        fn onMediaCapturePermission(_: Id, _: Sel, _: Id, _: Id, _: Id, ty: c_long, handler: ?*anyopaque) callconv(.c) void {
+            blockCallLong(handler, 1);
+            var payload: [64]u8 = undefined;
+            if (std.fmt.bufPrint(&payload, "{{\"type\":{d},\"granted\":true}}", .{ty})) |js| {
+                inst.emitWindowEvent(0, "mediaPermission", js);
+            } else |_| {}
+        }
+
+        fn onDragEntered(_: Id, _: Sel, _: Id) callconv(.c) c_ulong {
+            return 1; // NSDragOperationCopy
+        }
+
+        fn onDragExited(_: Id, _: Sel, _: Id) callconv(.c) void {
+            inst.emitWindowEvent(0, "dragOver", "{{\"kind\":\"leave\"}}");
+        }
+
+        fn onPerformDrag(_: Id, _: Sel, sender: Id) callconv(.c) bool {
+            const pb: Id = msg0(Id, sender, "draggingPasteboard");
+            const cls_arr = objc.msgSend(*const fn (Class, Sel, Id) callconv(.c) Id)(objc.cls("NSArray"), objc.sel("arrayWithObject:"), objc.cls("NSURL"));
+            const urls = objc.msgSend(*const fn (Id, Sel, Id, ?Id) callconv(.c) ?Id)(pb, objc.sel("readObjectsForClasses:options:"), cls_arr, @as(?Id, null)) orelse return false;
+            const n: c_ulong = msg0(c_ulong, urls, "count");
+            if (n == 0) return false;
+            var list = std.ArrayListUnmanaged(u8){};
+            defer list.deinit(inst.alloc);
+            list.append(inst.alloc, '{') catch return false;
+            list.appendSlice(inst.alloc, "\"paths\":[") catch return false;
+            var i: c_ulong = 0;
+            while (i < n) : (i += 1) {
+                const u = objc.msgSend(*const fn (Id, Sel, c_ulong) callconv(.c) Id)(urls, objc.sel("objectAtIndex:"), i);
+                const cs = msg0(?[*:0]const u8, u, "path") orelse continue;
+                const pth = std.mem.span(cs);
+                if (i != 0) list.append(inst.alloc, ',') catch return false;
+                list.append(inst.alloc, '"') catch return false;
+                list.appendSlice(inst.alloc, pth) catch return false;
+                list.append(inst.alloc, '"') catch return false;
+            }
+            list.appendSlice(inst.alloc, "]}") catch return false;
+            inst.emitWindowEvent(0, "filesDropped", list.items);
+            return true;
         }
 
         fn notifyEntry(backend: *anyopaque, title: []const u8, body: []const u8) void {

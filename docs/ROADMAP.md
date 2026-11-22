@@ -2,7 +2,7 @@
 
 > 制定日期：2026-11-20。修订：2026-11-21（Linux 专项复核：L1–L8 入图，macOS 顺延）。
 > 基线：**v0.3.19**（git 31b3109，测试体系收口）。
-> 当前：**v0.4.7**（2026-11-22，macOS 桌面集成：菜单/托盘/对话框/剪贴板/通知/深链/单实例/全局热键；
+> 当前：**v0.4.8**（2026-11-22，macOS WebView 深度：zoom/inspectable/打印/PDF 导出/下载链/媒体权限/文件拖入；
 > v0.4.5–v0.4.9 为 macOS 能力面切片，见下）。
 > 对标：**Wails v3.1.0 stable（2026-11-01）+ v3.2.0-nightly**、**Tauri 2.12.x**（2026-11 最新，2.12.x 仅 bugfix）。
 > 历史说明：原 docs/ 文档（v0.1–v0.3 逐版本记录、调研报告、WebView2 ABI 笔记、ADR）已随文档清理移除，
@@ -387,7 +387,7 @@ Wayland 回退路径文档化；既有冒烟/单测全量回归（Windows 侧零
 | 深链/单实例/自启 | 部分（v3 有 single instance 语义） | `deep-link` / `single-instance` / `autostart` | v0.4v0.4.7 |
 | WebView 深度 | DevTools/Zoom/Evaluate/Print | devtools/eval/print/download/zoom | v0.4v0.4.8 |
 | 拖放 | Drag&Drop（文件拖入/拖出） | `drag-drop` 事件 + 拖出 | v0.4v0.4.8 |
-| 媒体/权限 | — | WebView 权限回调 | v0.4.7（摄像头/麦克风/屏幕录制） |
+| 媒体/权限 | — | WebView 权限回调 | v0.4.8（摄像头/麦克风/屏幕录制） |
 | 分发 | `.app`/DMG/universal/codesign/notarize | `dmg`/`universal-apple-darwin`/签名/公证 | v0.4.8 |
 | 安全存储 | —（应用自管） | `stronghold`（非 Keychain） | v0.4.8（Security.framework Keychain，对齐 Linux `secret:`） |
 | 更新器 | 内置 Updater（GitHub/keygen/Sparkle AppCast） | `updater`（appcast） | v0.4.8 |
@@ -454,7 +454,29 @@ notify / deeplink / single / hotkey 均 `grep -qF` 强制）：
 自启（`SMAppService`）与 `application:openURLs:` 随 v0.4.9 分发一并做。
 **验收**：上述九条冒烟探针 + `grep -qF` 硬断言。
 
-### v0.4.8 — macOS WebView 深度
+### v0.4.8 — macOS WebView 深度 ✅ 完成（2026-11-22）
+
+本版交付（macos-15-arm64 硬断言：webview zoom / devtools / print / pdf / download /
+permission / drop 均 `grep -qF` 强制）：
+
+- 接口：macOS 首次接上 `webview_request_fn`（之前只有 eval），`zilt.webview` 全量路由
+- 缩放：`setPageZoom:` / `pageZoom`（`zoom` / `get_zoom`，非有限或 ≤0 报 InvalidZoomFactor）
+- DevTools：`setInspectable:` 开关 + `state` 回报（WKWebView 13.3+）
+- 打印：`printOperationWithPrintInfo:`（browser 只建 op 不跑，system 才 runOperation）
+- PDF：`dataWithPDFInsideRect:` + `writeToFile:atomically:`（同步、无对话框；
+  不用 NSPrintOperation 保存任务——无交互 session 下会阻塞），完成发 `webviewPdf{rid,ok}`
+- 下载：`webView:navigationResponse:didBecomeDownload:` → `ZiltDownloadDelegate`
+  （目标路径 `$TMPDIR/zilt-dl-<filename>`，完成/失败发 `downloadStarted/Finished/Failed`），
+  `cancel_download` 按 id 找 `-[WKDownload cancel:]`
+- 媒体权限：`ZiltUIDelegate` 实现 `requestMediaCapturePermissionForOrigin:…decisionHandler:`
+  （本地壳默认 grant，发 `mediaPermission{type}`）
+- 文件拖入：`ZiltWebView` 子类（`objc.defineSubclass` 继承 WKWebView）+ `registerForDraggedTypes:`
+  `public.file-url`，`performDragOperation:` 取 pasteboard 里的 NSURL 路径发 `filesDropped{paths}`
+- ObjC block 回调：用 block 布局（invoke 在偏移 24）自调，供下载目标路径与权限决策用
+
+**限制**：下载与拖入只验接线（`respondsToSelector:` / 类名），CI 不真下文件、不真拖；
+媒体权限默认授予，不做逐站点拒绝策略；拖出（drag-out / `start_drag_fn`）未接。
+
 
 目标：补齐 WebView 行为面（下载/打印/截图/缩放/拖放/权限）。
 

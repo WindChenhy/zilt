@@ -6,7 +6,7 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.4.7（macOS 多窗口 + 窗口控制 + 标题栏三态 + 材质/主题/Dock/事件面/状态持久化 + 菜单/托盘/对话框/剪贴板/通知/深链/单实例/全局热键——NSApplication/NSWindow + WKWebView + `zilt://` 资产
+**当前状态：v0.4.8（macOS WebView 深度：zoom/inspectable/打印/PDF/下载/媒体权限/文件拖入 + macOS 多窗口 + 窗口控制 + 标题栏三态 + 材质/主题/Dock/事件面/状态持久化 + 菜单/托盘/对话框/剪贴板/通知/深链/单实例/全局热键——NSApplication/NSWindow + WKWebView + `zilt://` 资产
 scheme + IPC 双向（`WKScriptMessageHandler` / `evaluateJavaScript`）；无 Mac 硬件的
 开发闭环：Windows 上 `-Dtarget=aarch64-macos` 交叉编译 + CI `macos-15` 真跑）。
 v0.4.3（Linux 发行版可用性——L1a GTK4 构建级兼容：`-Dgtk=gtk4` 双栈，
@@ -26,7 +26,7 @@ v0.4.0（H6–H11 / H20 / L2 / L7 / L8 双平台小项收尾）。
 |---|---|---|
 | Windows | ✅ 全栈（v0.1.0–v0.4.3） | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
 | Linux | ✅ 全栈（v0.2.0–v0.4.3，冒烟 95 项） | GTK3 + WebKit2GTK 4.1；`-Dgtk=gtk4` 构建变体 |
-| macOS | 🚧 集成与外观（v0.4.7）：多窗口 + 窗口控制 + 标题栏三态/透明 + 材质/主题/Dock + 菜单/托盘/对话框/剪贴板/通知/深链/单实例/热键 + `zilt://` 资产 + IPC 往返；WebView 深度与分发见 v0.4.8–v0.4.10 | WKWebView（手写 ObjC 消息，无 `@cImport`） |
+| macOS | 🚧 集成与外观 + WebView 深度（v0.4.8）：多窗口 + 窗口控制 + 标题栏三态/透明 + 材质/主题/Dock + 菜单/托盘/对话框/剪贴板/通知/深链/单实例/热键 + `zilt://` 资产 + IPC 往返；分发与对等打磨见 v0.4.9–v0.4.10 | WKWebView（手写 ObjC 消息，无 `@cImport`） |
 
 Windows 能力面（截至 v0.4.3）：窗口/多窗口/覆盖式标题栏/窗口形状 mask/每按钮状态/失焦与 Escape 隐藏/
 窗口级 KeyBindings、WebView2 事件面与 Settings（含 printToPdf、加速键与手势开关）、IPC + 事件 + 流式 channel

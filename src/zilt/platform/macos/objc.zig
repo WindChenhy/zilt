@@ -106,6 +106,28 @@ pub fn defineClass(
     return c;
 }
 
+pub fn defineSubclass(
+    name: [*:0]const u8,
+    super_name: [*:0]const u8,
+    proto_names: []const [*:0]const u8,
+    methods: []const Method,
+) ?Class {
+    const super = objc_getClass(super_name) orelse return null;
+    const c = objc_allocateClassPair(super, name, 0) orelse return null;
+    for (proto_names) |pn| {
+        if (objc_getProtocol(pn)) |p| {
+            _ = class_addProtocol(c, p);
+        }
+    }
+    for (methods) |m| {
+        if (!class_addMethod(c, sel_registerName(m.name) orelse return null, m.imp, m.types)) {
+            return null;
+        }
+    }
+    objc_registerClassPair(c);
+    return c;
+}
+
 pub fn allocInit(c: Class) Id {
     const raw = msgSend(*const fn (Class, Sel) callconv(.c) Id)(c, sel("alloc"));
     return msgSend(*const fn (Id, Sel) callconv(.c) Id)(raw, sel("init"));
