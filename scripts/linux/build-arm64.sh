@@ -105,7 +105,9 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "镜像未缓存——需要 docker pull（离线环境会失败并 SKIP）"
 fi
 
-DOCKER_RUN=(docker run --rm --platform linux/arm64
+# `-i` 必需：container_script 从 stdin 管道喂给 `bash -lc -`（缺 -i 时
+# stdin 关闭 → "bash: -c: option requires an argument"，CI 45023844806 实测）
+DOCKER_RUN=(docker run --rm -i --platform linux/arm64
   -v "$PWD":/work -w /work
   -e ZIG_VERSION="$ZIG_VERSION"
   -e ZILT_BUNDLE_WEBKIT="$BUNDLE"

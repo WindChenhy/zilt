@@ -61,8 +61,19 @@ jobs:
           $env:ZILT_SMOKE_EXIT = "1"
           & .\zig-out\bin\zilt-app.exe 2> smoke_log.txt
           $code = $LASTEXITCODE
+          "smoke exit=$code"
+          if (Test-Path zilt.log) { "== zilt.log tail =="; Get-Content zilt.log -Tail 40 }
           Get-Content smoke_log.txt | Select-String "\[smoke\]" | Select-Object -Last 2
           if ($code -ne 0) { throw "smoke failed with exit $code" }
+
+      # 单测在 CI 上静默崩溃（无 FAIL 摘要）时，直跑测试二进制拿真实栈
+      - name: Test crash triage
+        if: failure()
+        shell: bash
+        run: |
+          TB=$(ls -t .zig-cache/o/*/test.exe 2>/dev/null | head -1)
+          echo "== direct rerun: $TB =="
+          "$TB" 2>&1 | tail -60 || true
 
       - name: WebDriver E2E (optional — SKIP when driver missing)
         shell: pwsh
@@ -97,6 +108,7 @@ jobs:
           path: |
             smoke_log.txt
             driver.log
+            zilt.log
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
@@ -130,6 +142,14 @@ jobs:
 
       - name: Unit tests
         run: zig build test
+
+      # 单测在 CI 上静默崩溃（无 FAIL 摘要）时，直跑测试二进制拿真实栈
+      - name: Test crash triage
+        if: failure()
+        run: |
+          TB=$(ls -t .zig-cache/o/*/test 2>/dev/null | head -1)
+          echo "== direct rerun: $TB =="
+          "$TB" 2>&1 | tail -60 || true
 
       - name: Smoke test (95 checks under Xvfb + openbox)
         env:
