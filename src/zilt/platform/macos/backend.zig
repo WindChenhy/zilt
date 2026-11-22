@@ -15,6 +15,7 @@ const asset_routes = @import("../../asset_routes.zig");
 const inflate = @import("../../inflate.zig");
 const builtin_cmds = @import("../../builtin.zig");
 const Config = @import("../../config.zig").Config;
+const config_mod = @import("../../config.zig");
 const objc = @import("objc.zig");
 
 const Id = objc.Id;
@@ -128,8 +129,8 @@ fn Backend(comptime config: Config) type {
 
         /// 窗口材质：NSVisualEffectView 垫在 webview 下面（config.vibrancy；冒烟强制 sidebar）
         fn applyVibrancy(self: *Self) void {
-            const v: config.Vibrancy = config.vibrancy orelse blk: {
-                if (self.smoke_ms != 0) break :blk config.Vibrancy.sidebar;
+            const v: config_mod.Vibrancy = config.vibrancy orelse blk: {
+                if (self.smoke_ms != 0) break :blk config_mod.Vibrancy.sidebar;
                 return;
             };
             const material: c_long = switch (v) {
