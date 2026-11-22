@@ -573,6 +573,23 @@ fn Backend(comptime config: Config) type {
             }) catch null;
         }
 
+        /// 冒烟探针：真开一个副窗口，验证 wins 表 / spawn_window_fn 链路
+        fn runSpawnProbe(self: *Self) bool {
+            const before = self.wins.items.len;
+            const id = spawnWindowEntry(@ptrCast(self), .{
+                .title = "Zilt Secondary",
+                .width = 480,
+                .height = 360,
+            });
+            const ok = id != null and self.wins.items.len == before + 1;
+            log.print("[macos] window spawn ok={s} id={d} count={d}", .{
+                boolStr(ok),
+                id orelse 0,
+                self.wins.items.len,
+            });
+            return ok;
+        }
+
         /// 冒烟探针：窗口控制往返（尺寸 / 标题 / 置顶 / 状态查询）→ CI 硬断言
         fn runWindowOpsProbe(self: *Self) bool {
             var ok = self.applyWindowCmd(0, .{ .size = .{ .width = 640, .height = 480 } });
@@ -586,7 +603,7 @@ fn Backend(comptime config: Config) type {
                 json_ok = std.mem.indexOf(u8, json, "width") != null;
                 self.alloc.free(json);
             }
-            const good = ok and size_ok and json_ok;
+            const good = ok and size_ok and json_ok and self.runSpawnProbe();
             log.print("[macos] window ops ok={s} content={d}x{d} json={s}", .{
                 boolStr(good),
                 dimToU32(cs.w),
