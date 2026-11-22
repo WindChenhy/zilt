@@ -294,6 +294,11 @@ jobs:
     permissions:
       contents: write
     timeout-minutes: 30
+    # secrets 上下文不允许出现在 step 级 if:（解析期拒绝整个工作流）→
+    # 先提升到 job env，条件判断走 env.*
+    env:
+      WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
 
     steps:
       - uses: actions/checkout@v4
@@ -309,11 +314,8 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Sign artifacts (signtool, RFC3161)
-        if: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' }}
+        if: ${{ env.WINDOWS_CERTIFICATE_BASE64 != '' }}
         shell: pwsh
-        env:
-          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           # signtool 来自 Windows SDK（runner 预装）
           $pfx = "$env:RUNNER_TEMP\cert.pfx"
