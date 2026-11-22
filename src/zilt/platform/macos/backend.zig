@@ -517,7 +517,7 @@ fn Backend(comptime config: Config) type {
             const x: i32 = @intFromFloat(@round(f.origin.x));
             const y: i32 = @intFromFloat(@round(screenHeight() - (f.origin.y + f.size.h)));
             return std.fmt.allocPrint(alloc,
-                \\{"id":0,"x":{d},"y":{d},"width":{d},"height":{d},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"resizable":{s},"decorated":true,"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d}}
+                \\{{"id":0,"x":{d},"y":{d},"width":{d},"height":{d},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"resizable":{s},"decorated":true,"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d}}}
             , .{
                 x,
                 y,
@@ -546,7 +546,7 @@ fn Backend(comptime config: Config) type {
             const cs = contentSize(self.window);
             const size_ok = @abs(cs.w - 640.0) < 1.0 and @abs(cs.h - 480.0) < 1.0;
             var json_ok = false;
-            if (self.windowQueryEntry(@ptrCast(self), 0, self.alloc)) |json| {
+            if (windowQueryEntry(@ptrCast(self), 0, self.alloc)) |json| {
                 json_ok = std.mem.indexOf(u8, json, "width") != null;
                 self.alloc.free(json);
             }
