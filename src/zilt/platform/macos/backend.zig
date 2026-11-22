@@ -62,6 +62,10 @@ fn Backend(comptime config: Config) type {
         ipc_ok: bool = false,
         wins: std.ArrayListUnmanaged(WinState) = .empty,
         next_win_id: u32 = 1,
+        ev_moved: u32 = 0,
+        ev_resized: u32 = 0,
+        ev_focus: u32 = 0,
+        ev_blur: u32 = 0,
         smoke_ms: u32 = 0,
         /// v0.4.5：窗口控制探针结果（CI 硬断言）
         win_ops_ok: bool = false,
@@ -634,7 +638,15 @@ fn Backend(comptime config: Config) type {
             const appearance_ok = (mask1 & (1 << 15)) != 0;
             log.print("[macos] appearance ok={s} mask={d}", .{ boolStr(appearance_ok), mask1 });
 
-            const good = ok and size_ok and json_ok and appearance_ok and self.runSpawnProbe();
+            _ = self.applyWindowCmd(0, .{ .position = .{ .x = 300, .y = 320 } });
+            _ = self.applyWindowCmd(0, .{ .size = .{ .width = 620, .height = 460 } });
+            self.pumpFor(0.2);
+            const events_ok = self.ev_moved > 0 and self.ev_resized > 0;
+            log.print("[macos] window events ok={s} moved={d} resized={d} focus={d} blur={d}", .{
+                boolStr(events_ok), self.ev_moved, self.ev_resized, self.ev_focus, self.ev_blur,
+            });
+
+            const good = ok and size_ok and json_ok and appearance_ok and events_ok and self.runSpawnProbe();
             log.print("[macos] window ops ok={s} content={d}x{d} json={s}", .{
                 boolStr(good),
                 dimToU32(cs.w),
@@ -670,6 +682,53 @@ fn Backend(comptime config: Config) type {
                 if (it.webview == w) return it.id;
             }
             return 0;
+        }
+
+        fn windowIdOfWindow(self: *Self, win: Id) u32 {
+            if (win == self.window) return 0;
+            for (self.wins.items) |it| {
+                if (it.win == win) return it.id;
+            }
+            return 0;
+        }
+
+        fn emitWindowEvent(self: *Self, window_id: u32, name: []const u8, payload: []const u8) void {
+            const msg = ipc.encodeEvent(self.alloc, name, payload) catch return;
+            defer self.alloc.free(msg);
+            self.deliverAsync(window_id, msg);
+        }
+
+        /// 同 deliver，但一律异步转主线程：delegate 回调内直接 evaluate 会被丢弃
+        fn deliverAsync(self: *Self, window_id: u32, json: []const u8) void {
+            lockSpin(&self.out_mutex);
+            const copy = self.alloc.dupe(u8, json) catch {
+                self.out_mutex.unlock();
+                return;
+            };
+            self.out_queue.append(self.alloc, .{ .window_id = window_id, .json = copy }) catch {
+                self.out_mutex.unlock();
+                self.alloc.free(copy);
+                return;
+            };
+            self.out_mutex.unlock();
+            _ = objc.msgSend(*const fn (Id, Sel, Sel, ?Id, bool) callconv(.c) void)(
+                mainQueueObject(),
+                objc.sel("performSelectorOnMainThread:withObject:waitUntilDone:"),
+                objc.sel("drain:"),
+                @as(?Id, null),
+                false,
+            );
+        }
+
+        fn pumpFor(self: *Self, seconds: f64) void {
+            _ = self;
+            const rl = msg0(Id, objc.cls("NSRunLoop"), "currentRunLoop");
+            const d = objc.msgSend(*const fn (Id, Sel, f64) callconv(.c) Id)(
+                objc.cls("NSDate"),
+                objc.sel("dateWithTimeIntervalSinceNow:"),
+                seconds,
+            );
+            _ = msg1(void, rl, "runUntilDate:", d);
         }
 
         fn newNSWindow(_: *Self, title: []const u8, w: u32, h: u32, resizable: bool) !Id {
@@ -771,6 +830,10 @@ fn Backend(comptime config: Config) type {
         fn registerClasses() void {
             _ = objc.defineClass("ZiltWindowDelegate", null, &.{
                 .{ .name = "windowWillClose:", .imp = imp(&onWindowClose), .types = "v@:@" },
+                .{ .name = "windowDidMove:", .imp = imp(&onWindowDidMove), .types = "v@:@" },
+                .{ .name = "windowDidResize:", .imp = imp(&onWindowDidResize), .types = "v@:@" },
+                .{ .name = "windowDidBecomeKey:", .imp = imp(&onWindowDidBecomeKey), .types = "v@:@" },
+                .{ .name = "windowDidResignKey:", .imp = imp(&onWindowDidResignKey), .types = "v@:@" },
             });
             _ = objc.defineClass("ZiltNavigationDelegate", "WKNavigationDelegate", &.{
                 .{ .name = "webView:didFinishNavigation:", .imp = imp(&onNavigateFinish), .types = "v@:@@" },
@@ -785,6 +848,48 @@ fn Backend(comptime config: Config) type {
             _ = objc.defineClass("ZiltMainQueue", null, &.{
                 .{ .name = "drain:", .imp = imp(&onDrain), .types = "v@:@" },
             });
+        }
+
+        fn onWindowDidMove(_: Id, _: Sel, window: Id) callconv(.c) void {
+            inst.ev_moved += 1;
+            const f = frameOf(window);
+            const id = inst.windowIdOfWindow(window);
+            const payload = std.fmt.allocPrint(inst.alloc, "{{\"id\":{d},\"x\":{d},\"y\":{d}}}", .{
+                id,
+                toI32(f.origin.x),
+                toI32(screenHeight() - (f.origin.y + f.size.h)),
+            }) catch return;
+            defer inst.alloc.free(payload);
+            inst.emitWindowEvent(id, "windowMoved", payload);
+        }
+
+        fn onWindowDidResize(_: Id, _: Sel, window: Id) callconv(.c) void {
+            inst.ev_resized += 1;
+            const f = frameOf(window);
+            const id = inst.windowIdOfWindow(window);
+            const payload = std.fmt.allocPrint(inst.alloc, "{{\"id\":{d},\"width\":{d},\"height\":{d}}}", .{
+                id,
+                toI32(f.size.w),
+                toI32(f.size.h),
+            }) catch return;
+            defer inst.alloc.free(payload);
+            inst.emitWindowEvent(id, "windowResized", payload);
+        }
+
+        fn onWindowDidBecomeKey(_: Id, _: Sel, window: Id) callconv(.c) void {
+            inst.ev_focus += 1;
+            const id = inst.windowIdOfWindow(window);
+            const payload = std.fmt.allocPrint(inst.alloc, "{{\"id\":{d}}}", .{id}) catch return;
+            defer inst.alloc.free(payload);
+            inst.emitWindowEvent(id, "windowFocus", payload);
+        }
+
+        fn onWindowDidResignKey(_: Id, _: Sel, window: Id) callconv(.c) void {
+            inst.ev_blur += 1;
+            const id = inst.windowIdOfWindow(window);
+            const payload = std.fmt.allocPrint(inst.alloc, "{{\"id\":{d}}}", .{id}) catch return;
+            defer inst.alloc.free(payload);
+            inst.emitWindowEvent(id, "windowBlur", payload);
         }
 
         fn onWindowClose(_: Id, _: Sel, window: Id) callconv(.c) void {
