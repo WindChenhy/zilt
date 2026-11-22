@@ -91,6 +91,7 @@ fn Backend(comptime config: Config) type {
             log.print("[macos] NSApplication ready (policy=regular)", .{});
 
             registerClasses();
+            inst.buildMenu();
             try inst.createWindow();
             try inst.createWebView();
 
@@ -808,12 +809,35 @@ fn Backend(comptime config: Config) type {
             const dialog_ok = ctx0.dialog_fn != null;
             log.print("[macos] dialog ok={s} wiring-only", .{boolStr(dialog_ok)});
 
+            // 主菜单：条数 + 首项子菜单里是否有 Quit
+            const app0 = msg0(Id, objc.cls("NSApplication"), "sharedApplication");
+            var menu_ok = false;
+            var menu_items: c_ulong = 0;
+            if (msg0(?Id, app0, "mainMenu")) |mm| {
+                menu_items = msg0(c_ulong, mm, "numberOfItems");
+                if (menu_items >= 1) {
+                    const item0 = msg1(Id, mm, "itemAtIndex:", @as(c_ulong, 0));
+                    if (msg0(?Id, item0, "submenu")) |sm| {
+                        const n = msg0(c_ulong, sm, "numberOfItems");
+                        if (n >= 1) {
+                            const qi = msg1(Id, sm, "itemAtIndex:", n - 1);
+                            if (msg0(?Id, qi, "title")) |tz| {
+                                if (msg0(?[*:0]const u8, tz, "UTF8String")) |csz| {
+                                    menu_ok = std.mem.eql(u8, std.mem.span(csz), "Quit");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            log.print("[macos] menu ok={s} items={d}", .{ boolStr(menu_ok), menu_items });
+
             const events_ok = self.ev_moved > 0 and self.ev_resized > 0;
             log.print("[macos] window events ok={s} moved={d} resized={d} focus={d} blur={d}", .{
                 boolStr(events_ok), self.ev_moved, self.ev_resized, self.ev_focus, self.ev_blur,
             });
 
-            const good = ok and size_ok and json_ok and appearance_ok and events_ok and theme_ok and dock_ok and vibrancy_ok and state_ok and drag_ok and clip_ok and dialog_ok and self.runSpawnProbe();
+            const good = ok and size_ok and json_ok and appearance_ok and events_ok and theme_ok and dock_ok and vibrancy_ok and state_ok and drag_ok and clip_ok and dialog_ok and menu_ok and self.runSpawnProbe();
             log.print("[macos] window ops ok={s} content={d}x{d} json={s}", .{
                 boolStr(good),
                 dimToU32(cs.w),
@@ -1140,6 +1164,30 @@ fn Backend(comptime config: Config) type {
         // ------------------------------------------------------------------
         // 小工具
         // ------------------------------------------------------------------
+        /// 主菜单：应用菜单 + Quit（NSMenuItem action terminate:）
+        fn buildMenu(self: *Self) void {
+            const app = msg0(Id, objc.cls("NSApplication"), "sharedApplication");
+            const main = objc.allocInit(objc.cls("NSMenu"));
+            _ = msg1(void, main, "setTitle:", objc.nsStringZ("MainMenu"));
+
+            const app_item = objc.allocInit(objc.cls("NSMenuItem"));
+            _ = msg1(void, main, "addItem:", app_item);
+
+            const sub = objc.allocInit(objc.cls("NSMenu"));
+            _ = msg1(void, sub, "setTitle:", objc.nsString(config.title.ptr, config.title.len));
+
+            const quit_item = objc.allocInit(objc.cls("NSMenuItem"));
+            _ = msg1(void, quit_item, "setTitle:", objc.nsStringZ("Quit"));
+            _ = objc.msgSend(*const fn (Id, Sel, ?Id) callconv(.c) void)(quit_item, objc.sel("setTarget:"), app);
+            _ = objc.msgSend(*const fn (Id, Sel, Sel) callconv(.c) void)(quit_item, objc.sel("setAction:"), objc.sel("terminate:"));
+            _ = msg1(void, sub, "addItem:", quit_item);
+
+            _ = msg1(void, app_item, "setSubmenu:", sub);
+            _ = msg1(void, app, "setMainMenu:", main);
+            _ = self;
+            log.print("[macos] menu built", .{});
+        }
+
         // ---- v0.4.7 桌面集成：剪贴板 / 原生对话框 ----
 
         fn clipboardWrite(self: *Self, text: []const u8) bool {
