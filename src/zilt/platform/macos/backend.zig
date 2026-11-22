@@ -61,6 +61,8 @@ fn Backend(comptime config: Config) type {
         ipc_seen: bool = false,
         ipc_ok: bool = false,
         smoke_ms: u32 = 0,
+        /// v0.4.5：窗口控制探针结果（CI 硬断言）
+        win_ops_ok: bool = false,
         assets: std.StringHashMapUnmanaged([]u8) = .empty,
         /// 跨线程 emit 队列（worker → 主线程 drain；WebKit 只允许主线程 eval）
         out_mutex: std.atomic.Mutex = .unlocked,
@@ -320,6 +322,8 @@ fn Backend(comptime config: Config) type {
                 .window_id = 0,
                 .emit_fn = emitEntry,
                 .quit_fn = quitEntry,
+                .window_fn = windowEntry,
+                .window_query_fn = windowQueryEntry,
             };
         }
 
@@ -383,6 +387,179 @@ fn Backend(comptime config: Config) type {
         }
 
         // ------------------------------------------------------------------
+        // ------------------------------------------------------------------
+        // v0.4.5 窗口控制：window_fn / window_query_fn（本期单窗口 id 0）
+        //   坐标语义对齐 Windows/Linux：对外 x/y 用左上原点，内部换算 Cocoa 左下原点；
+        //   非主屏坐标按主屏高度换算（多屏精确换算随 v0.4.6）。
+        // ------------------------------------------------------------------
+        const Size = extern struct { w: f64, h: f64 };
+        const Pt = extern struct { x: f64, y: f64 };
+        const NSRect = extern struct { origin: Pt, size: Size };
+
+        /// NSWindowStyleMaskFullScreen / NSWindowStyleMaskResizable
+        const mask_fullscreen: c_ulong = 1 << 14;
+        const mask_resizable: c_ulong = 1 << 3;
+
+        fn frameOf(win: Id) NSRect {
+            return objc.msgSend(*const fn (Id, Sel) callconv(.c) NSRect)(win, objc.sel("frame"));
+        }
+
+        fn styleMaskOf(win: Id) c_ulong {
+            return objc.msgSend(*const fn (Id, Sel) callconv(.c) c_ulong)(win, objc.sel("styleMask"));
+        }
+
+        fn contentSize(win: Id) Size {
+            const cv = msg0(?Id, win, "contentView") orelse return .{ .w = 0, .h = 0 };
+            return objc.msgSend(*const fn (Id, Sel) callconv(.c) NSRect)(cv, objc.sel("bounds")).size;
+        }
+
+        /// 主屏高度（Cocoa 原点在左下）——把对外「左上原点」语义换算过去
+        fn screenHeight() f64 {
+            const scr = msg0(?Id, objc.cls("NSScreen"), "mainScreen") orelse return 0;
+            return objc.msgSend(*const fn (Id, Sel) callconv(.c) NSRect)(scr, objc.sel("frame")).size.h;
+        }
+
+        fn windowEntry(backend: *anyopaque, window_id: u32, cmd: ipc.WindowCmd) bool {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            if (window_id != 0) return false; // 多窗口随 spawn_window_fn 落地
+            return self.applyWindowCmd(cmd);
+        }
+
+        fn applyWindowCmd(self: *Self, cmd: ipc.WindowCmd) bool {
+            const win = self.window;
+            switch (cmd) {
+                .set_title => |t| {
+                    _ = msg1(void, win, "setTitle:", objc.nsString(t.ptr, t.len));
+                    return true;
+                },
+                .minimize => {
+                    _ = msg1(void, win, "miniaturize:", @as(?Id, null));
+                    return true;
+                },
+                .maximize => {
+                    if (!msg0(bool, win, "isZoomed")) _ = msg1(void, win, "zoom:", @as(?Id, null));
+                    return true;
+                },
+                .restore => {
+                    if (msg0(bool, win, "isMiniaturized")) _ = msg1(void, win, "deminiaturize:", @as(?Id, null));
+                    if (msg0(bool, win, "isZoomed")) _ = msg1(void, win, "zoom:", @as(?Id, null));
+                    return true;
+                },
+                .fullscreen => |want| {
+                    const cur = (styleMaskOf(win) & mask_fullscreen) != 0;
+                    if (cur != want) _ = msg1(void, win, "toggleFullScreen:", @as(?Id, null));
+                    return true;
+                },
+                .size => |sz| {
+                    _ = objc.msgSend(*const fn (Id, Sel, Size) callconv(.c) void)(win, objc.sel("setContentSize:"), .{
+                        .w = @floatFromInt(sz.width),
+                        .h = @floatFromInt(sz.height),
+                    });
+                    return true;
+                },
+                .position => |p| {
+                    const f = frameOf(win);
+                    // 左上原点 y → Cocoa 左下原点
+                    const y = screenHeight() - @as(f64, @floatFromInt(p.y)) - f.size.h;
+                    _ = objc.msgSend(*const fn (Id, Sel, Pt) callconv(.c) void)(win, objc.sel("setFrameTopLeftPoint:"), .{
+                        .x = @floatFromInt(p.x),
+                        .y = y,
+                    });
+                    return true;
+                },
+                .show, .focus => {
+                    _ = msg1(void, win, "makeKeyAndOrderFront:", @as(?Id, null));
+                    _ = msg1(void, self.app, "activateIgnoringOtherApps:", true);
+                    return true;
+                },
+                .hide => {
+                    _ = msg1(void, win, "orderOut:", @as(?Id, null));
+                    return true;
+                },
+                .close => {
+                    _ = msg0(void, win, "close");
+                    return true;
+                },
+                .always_on_top => |on| {
+                    // NSFloatingWindowLevel=3 / NSNormalWindowLevel=0
+                    _ = msg1(void, win, "setLevel:", @as(c_long, if (on) 3 else 0));
+                    return true;
+                },
+                .limits => |lim| {
+                    const mn = objc.msgSend(*const fn (Id, Sel) callconv(.c) Size)(win, objc.sel("contentMinSize"));
+                    const mx = objc.msgSend(*const fn (Id, Sel) callconv(.c) Size)(win, objc.sel("contentMaxSize"));
+                    _ = objc.msgSend(*const fn (Id, Sel, Size) callconv(.c) void)(win, objc.sel("setContentMinSize:"), .{
+                        .w = if (lim.min_width) |v| @floatFromInt(v) else mn.w,
+                        .h = if (lim.min_height) |v| @floatFromInt(v) else mn.h,
+                    });
+                    _ = objc.msgSend(*const fn (Id, Sel, Size) callconv(.c) void)(win, objc.sel("setContentMaxSize:"), .{
+                        .w = if (lim.max_width) |v| @floatFromInt(v) else mx.w,
+                        .h = if (lim.max_height) |v| @floatFromInt(v) else mx.h,
+                    });
+                    return true;
+                },
+                .state => return true, // 查询走 window_query_fn
+                else => {
+                    log.print("[macos] window cmd not mapped (v0.4.5 首批)", .{});
+                    return false;
+                },
+            }
+        }
+
+        /// 窗口状态 JSON：字段名与 Windows/Linux 对齐；macOS 无对等项的显式标记
+        fn windowQueryEntry(backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator) ?[]u8 {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            if (window_id != 0) return null;
+            const f = frameOf(self.window);
+            const cs = contentSize(self.window);
+            const mn = objc.msgSend(*const fn (Id, Sel) callconv(.c) Size)(self.window, objc.sel("contentMinSize"));
+            const mx = objc.msgSend(*const fn (Id, Sel) callconv(.c) Size)(self.window, objc.sel("contentMaxSize"));
+            const x: i32 = @intFromFloat(@round(f.origin.x));
+            const y: i32 = @intFromFloat(@round(screenHeight() - (f.origin.y + f.size.h)));
+            return std.fmt.allocPrint(alloc,
+                \\{"id":0,"x":{d},"y":{d},"width":{d},"height":{d},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"resizable":{s},"decorated":true,"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d}}
+            , .{
+                x,
+                y,
+                @as(u32, @intFromFloat(@round(cs.w))),
+                @as(u32, @intFromFloat(@round(cs.h))),
+                boolStr(msg0(bool, self.window, "isVisible")),
+                boolStr(msg0(bool, self.window, "isKeyWindow")),
+                boolStr(msg0(bool, self.window, "isZoomed")),
+                boolStr(msg0(bool, self.window, "isMiniaturized")),
+                boolStr((styleMaskOf(self.window) & mask_fullscreen) != 0),
+                boolStr(msg0(c_long, self.window, "level") > 0),
+                boolStr((styleMaskOf(self.window) & mask_resizable) != 0),
+                @as(u32, @intFromFloat(@round(mn.w))),
+                @as(u32, @intFromFloat(@round(mn.h))),
+                @as(u32, @intFromFloat(@round(mx.w))),
+                @as(u32, @intFromFloat(@round(mx.h))),
+            }) catch null;
+        }
+
+        /// 冒烟探针：窗口控制往返（尺寸 / 标题 / 置顶 / 状态查询）→ CI 硬断言
+        fn runWindowOpsProbe(self: *Self) bool {
+            var ok = self.applyWindowCmd(.{ .size = .{ .width = 640, .height = 480 } });
+            ok = self.applyWindowCmd(.{ .set_title = "Zilt Smoke (v0.4.5)" }) and ok;
+            ok = self.applyWindowCmd(.{ .always_on_top = true }) and ok;
+            ok = self.applyWindowCmd(.{ .always_on_top = false }) and ok;
+            const cs = contentSize(self.window);
+            const size_ok = @abs(cs.w - 640.0) < 1.0 and @abs(cs.h - 480.0) < 1.0;
+            var json_ok = false;
+            if (self.windowQueryEntry(@ptrCast(self), 0, self.alloc)) |json| {
+                json_ok = std.mem.indexOf(u8, json, "width") != null;
+                self.alloc.free(json);
+            }
+            const good = ok and size_ok and json_ok;
+            log.print("[macos] window ops ok={s} content={d}x{d} json={s}", .{
+                boolStr(good),
+                @as(u32, @intFromFloat(@round(cs.w))),
+                @as(u32, @intFromFloat(@round(cs.h))),
+                boolStr(json_ok),
+            });
+            return good;
+        }
+
         // 冒烟：有界 runloop + 页面/IPC 探针
         // ------------------------------------------------------------------
         fn smokeLoop(self: *Self) !void {
@@ -417,6 +594,7 @@ fn Backend(comptime config: Config) type {
                 if (self.page_loaded and !self.probe_sent) {
                     self.probe_sent = true;
                     self.evalScript(probe_js);
+                    self.win_ops_ok = self.runWindowOpsProbe();
                     log.print("[macos] probe sent", .{});
                 }
                 const left = msg0(f64, deadline, "timeIntervalSinceNow");
@@ -428,6 +606,7 @@ fn Backend(comptime config: Config) type {
             if (!self.page_loaded) return error.PageNotLoaded;
             if (!self.ipc_seen) return error.IpcProbeMissing;
             if (!self.ipc_ok) return error.IpcRoundtripFailed;
+            if (!self.win_ops_ok) return error.WindowOpsFailed;
         }
 
         // ------------------------------------------------------------------
