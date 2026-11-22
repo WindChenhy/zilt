@@ -190,19 +190,19 @@ fn windowsOnlyStep(b: *std.Build, name: []const u8, desc: []const u8, target_os:
     return step;
 }
 
-/// macOS 框架链接。真 macOS 宿主直接用系统 SDK；非 macOS 宿主（无 Mac 开发）
-/// 用仓库内最小 tbd 桩：ObjC 类/selector 是运行时字符串，桩里只需 libobjc 的
-/// 几个 C 符号，框架 tbd 可以为空——`zig build -Dtarget=aarch64-macos` 因此
-/// 能在 Windows/Linux 上完成编译+链接（运行仍需 macOS 或 CI）。
+/// macOS 框架链接：**所有宿主都用仓库内最小 tbd 桩**（含真 macOS）。
+/// ObjC 类/selector 是运行时字符串，桩里只需 libobjc 的几个 C 符号；桩的
+/// install-name 与真实 dylib 一致（/usr/lib/libobjc.A.dylib、/System/Library/
+/// Frameworks/...），运行时加载器按 install-name 找真库——所以不需要 SDK
+/// sysroot。实测：GitHub macos-15 上 Zig 0.17 不自动探测 SDK 框架路径
+/// （"searched paths: none"），桩是唯一不依赖 Xcode 环境的方案。
 fn linkMacosFrameworks(b: *std.Build, module: *std.Build.Module) void {
     module.link_libc = true; // std.c.getenv
+    const stubs = b.path("src/zilt/platform/macos/stubs");
+    module.addLibraryPath(stubs);
+    module.addFrameworkPath(stubs);
     module.linkSystemLibrary("objc", .{});
     for ([_][]const u8{ "AppKit", "Foundation" }) |fw| module.linkFramework(fw, .{});
-    if (@import("builtin").os.tag != .macos) {
-        const stubs = b.path("src/zilt/platform/macos/stubs");
-        module.addLibraryPath(stubs);
-        module.addFrameworkPath(stubs);
-    }
 }
 
 /// macOS 尚未实装的 step：保留名字 + 给出可执行的原因（避免 `no step named`）。
