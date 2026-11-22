@@ -827,11 +827,11 @@ fn Backend(comptime config: Config) type {
             if (msg0(?Id, app0, "mainMenu")) |mm| {
                 menu_items = msg0(c_ulong, mm, "numberOfItems");
                 if (menu_items >= 1) {
-                    const item0 = msg1(Id, mm, "itemAtIndex:", @as(c_ulong, 0));
+                    const item0 = objc.msgSend(*const fn (Id, Sel, c_ulong) callconv(.c) Id)(mm, objc.sel("itemAtIndex:"), 0);
                     if (msg0(?Id, item0, "submenu")) |sm| {
                         const n = msg0(c_ulong, sm, "numberOfItems");
                         if (n >= 1) {
-                            const qi = msg1(Id, sm, "itemAtIndex:", n - 1);
+                            const qi = objc.msgSend(*const fn (Id, Sel, c_ulong) callconv(.c) Id)(sm, objc.sel("itemAtIndex:"), n - 1);
                             if (msg0(?Id, qi, "title")) |tz| {
                                 if (msg0(?[*:0]const u8, tz, "UTF8String")) |csz| {
                                     menu_ok = std.mem.eql(u8, std.mem.span(csz), "Quit");
@@ -1232,7 +1232,7 @@ fn Backend(comptime config: Config) type {
         var g_inst: ?*Self = null;
 
         fn setupTray(self: *Self, force: bool) void {
-            const t: config_mod.Tray = config.tray orelse blk: {
+            const t: Config.Tray = config.tray orelse blk: {
                 if (!force) return;
                 break :blk .{};
             };
@@ -1283,8 +1283,10 @@ fn Backend(comptime config: Config) type {
         fn acquireSingleLock(self: *Self) bool {
             _ = self;
             const tmp = std.c.getenv("TMPDIR") orelse "/tmp";
-            var buf: [512]u8 = undefined;
-            const path = std.fmt.bufPrintZ(&buf, "{s}/zilt-{s}.lock", .{ std.mem.span(tmp), config.app_id }) catch return true;
+            var zbuf: [512]u8 = undefined;
+            const raw = std.fmt.bufPrint(&zbuf, "{s}/zilt-{s}.lock", .{ std.mem.span(tmp), config.app_id }) catch return true;
+            zbuf[raw.len] = 0;
+            const path = zbuf[0..raw.len :0];
             const fd = open(path.ptr, 0x0202, 0o644);
             if (fd < 0) return true;
             if (flock(fd, 0x2 | 0x4) != 0) return false;
@@ -1299,7 +1301,7 @@ fn Backend(comptime config: Config) type {
             const n: c_ulong = msg0(c_ulong, args, "count");
             var i: c_ulong = 1;
             while (i < n) : (i += 1) {
-                const a = msg1(Id, args, "objectAtIndex:", i);
+                const a = objc.msgSend(*const fn (Id, Sel, c_ulong) callconv(.c) Id)(args, objc.sel("objectAtIndex:"), i);
                 const cs = msg0(?[*:0]const u8, a, "UTF8String") orelse continue;
                 const sp = std.mem.span(cs);
                 if (self.matchUrl(sp)) {
@@ -1468,7 +1470,7 @@ fn Backend(comptime config: Config) type {
                     var filled: usize = 0;
                     var i: c_ulong = 0;
                     while (i < n) : (i += 1) {
-                        const u = msg1(Id, urls, "objectAtIndex:", i);
+                        const u = objc.msgSend(*const fn (Id, Sel, c_ulong) callconv(.c) Id)(urls, objc.sel("objectAtIndex:"), i);
                         const pz = msg0(?Id, u, "path") orelse continue;
                         const cs = msg0(?[*:0]const u8, pz, "UTF8String") orelse continue;
                         list[filled] = try alloc.dupe(u8, std.mem.span(cs));
