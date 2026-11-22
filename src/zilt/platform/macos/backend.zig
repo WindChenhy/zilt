@@ -470,6 +470,9 @@ fn Backend(comptime config: Config) type {
                 .window_fn = windowEntry,
                 .window_query_fn = windowQueryEntry,
                 .spawn_window_fn = spawnWindowEntry,
+                .clipboard_write_fn = clipWriteEntry,
+                .clipboard_read_fn = clipReadEntry,
+                .dialog_fn = dialogEntry,
             };
         }
 
@@ -786,12 +789,31 @@ fn Backend(comptime config: Config) type {
             const drag_ok = std.mem.indexOf(u8, ipc.runtime_js, "startDragging") != null;
             log.print("[macos] drag ok={s} wiring-only", .{boolStr(drag_ok)});
 
+            // 剪贴板：写→读→比对（事后还原）
+            const prev = self.clipboardRead(self.alloc);
+            const wrote = self.clipboardWrite("zilt-clip-probe");
+            var clip_ok = wrote;
+            if (self.clipboardRead(self.alloc)) |b| {
+                clip_ok = clip_ok and std.mem.eql(u8, b, "zilt-clip-probe");
+                self.alloc.free(b);
+            } else clip_ok = false;
+            if (prev) |pv| {
+                _ = self.clipboardWrite(pv);
+                self.alloc.free(pv);
+            } else _ = self.clipboardWrite("");
+            log.print("[macos] clipboard ok={s}", .{boolStr(clip_ok)});
+
+            // 对话框：只验接线（runModal 会阻塞，CI 不调）
+            const ctx0 = self.context(self.alloc, 0);
+            const dialog_ok = ctx0.dialog_fn != null;
+            log.print("[macos] dialog ok={s} wiring-only", .{boolStr(dialog_ok)});
+
             const events_ok = self.ev_moved > 0 and self.ev_resized > 0;
             log.print("[macos] window events ok={s} moved={d} resized={d} focus={d} blur={d}", .{
                 boolStr(events_ok), self.ev_moved, self.ev_resized, self.ev_focus, self.ev_blur,
             });
 
-            const good = ok and size_ok and json_ok and appearance_ok and events_ok and theme_ok and dock_ok and vibrancy_ok and state_ok and drag_ok and self.runSpawnProbe();
+            const good = ok and size_ok and json_ok and appearance_ok and events_ok and theme_ok and dock_ok and vibrancy_ok and state_ok and drag_ok and clip_ok and dialog_ok and self.runSpawnProbe();
             log.print("[macos] window ops ok={s} content={d}x{d} json={s}", .{
                 boolStr(good),
                 dimToU32(cs.w),
@@ -1118,6 +1140,122 @@ fn Backend(comptime config: Config) type {
         // ------------------------------------------------------------------
         // 小工具
         // ------------------------------------------------------------------
+        // ---- v0.4.7 桌面集成：剪贴板 / 原生对话框 ----
+
+        fn clipboardWrite(self: *Self, text: []const u8) bool {
+            _ = self;
+            const pb = msg0(Id, objc.cls("NSPasteboard"), "generalPasteboard");
+            _ = msg0(c_long, pb, "clearContents");
+            return objc.msgSend(*const fn (Id, Sel, Id, Id) callconv(.c) bool)(
+                pb,
+                objc.sel("setString:forType:"),
+                objc.nsString(text.ptr, text.len),
+                objc.nsStringZ("public.utf8-plain-text"),
+            );
+        }
+
+        fn clipboardRead(self: *Self, alloc: std.mem.Allocator) ?[]u8 {
+            _ = self;
+            const pb = msg0(Id, objc.cls("NSPasteboard"), "generalPasteboard");
+            const str = objc.msgSend(*const fn (Id, Sel, Id) callconv(.c) ?Id)(
+                pb, objc.sel("stringForType:"), objc.nsStringZ("public.utf8-plain-text"),
+            ) orelse return null;
+            const cs = msg0(?[*:0]const u8, str, "UTF8String") orelse return null;
+            return alloc.dupe(u8, std.mem.span(cs)) catch null;
+        }
+
+        fn panelPath(alloc: std.mem.Allocator, panel: Id) !?[]u8 {
+            const url = msg0(?Id, panel, "URL") orelse return null;
+            const pz = msg0(?Id, url, "path") orelse return null;
+            const cs = msg0(?[*:0]const u8, pz, "UTF8String") orelse return null;
+            return try alloc.dupe(u8, std.mem.span(cs));
+        }
+
+        /// 原生对话框（NSAlert / NSOpenPanel / NSSavePanel）。会阻塞，冒烟不调用。
+        fn runDialog(self: *Self, alloc: std.mem.Allocator, req: ipc.DialogRequest) anyerror!ipc.DialogResponse {
+            _ = self;
+            switch (req) {
+                .message_box => |o| {
+                    const alert = objc.allocInit(objc.cls("NSAlert"));
+                    _ = msg1(void, alert, "setMessageText:", objc.nsString(o.text.ptr, o.text.len));
+                    if (o.caption.len != 0) {
+                        _ = msg1(void, alert, "setInformativeText:", objc.nsString(o.caption.ptr, o.caption.len));
+                    }
+                    const r: c_long = msg0(c_long, alert, "runModal");
+                    const idx = r - 1000; // NSAlertFirstButtonReturn
+                    return .{ .button = switch (idx) {
+                        0 => .ok,
+                        1 => .cancel,
+                        2 => .yes,
+                        else => .no,
+                    } };
+                },
+                .save_file => |o| {
+                    const panel = msg0(Id, objc.cls("NSSavePanel"), "savePanel");
+                    if (o.title.len != 0) _ = msg1(void, panel, "setTitle:", objc.nsString(o.title.ptr, o.title.len));
+                    if (o.default_name.len != 0) {
+                        _ = msg1(void, panel, "setNameFieldStringValue:", objc.nsString(o.default_name.ptr, o.default_name.len));
+                    }
+                    if (msg0(c_long, panel, "runModal") != 1) return .{ .path = null };
+                    return .{ .path = try panelPath(alloc, panel) };
+                },
+                .open_file => |o| {
+                    const panel = msg0(Id, objc.cls("NSOpenPanel"), "openPanel");
+                    _ = msg1(void, panel, "setCanChooseFiles:", true);
+                    _ = msg1(void, panel, "setCanChooseDirectories:", false);
+                    _ = msg1(void, panel, "setAllowsMultipleSelection:", false);
+                    if (o.title.len != 0) _ = msg1(void, panel, "setTitle:", objc.nsString(o.title.ptr, o.title.len));
+                    if (msg0(c_long, panel, "runModal") != 1) return .{ .path = null };
+                    return .{ .path = try panelPath(alloc, panel) };
+                },
+                .pick_folder => |o| {
+                    const panel = msg0(Id, objc.cls("NSOpenPanel"), "openPanel");
+                    _ = msg1(void, panel, "setCanChooseFiles:", false);
+                    _ = msg1(void, panel, "setCanChooseDirectories:", true);
+                    if (o.title.len != 0) _ = msg1(void, panel, "setTitle:", objc.nsString(o.title.ptr, o.title.len));
+                    if (msg0(c_long, panel, "runModal") != 1) return .{ .path = null };
+                    return .{ .path = try panelPath(alloc, panel) };
+                },
+                .pick_files => |o| {
+                    const panel = msg0(Id, objc.cls("NSOpenPanel"), "openPanel");
+                    _ = msg1(void, panel, "setCanChooseFiles:", true);
+                    _ = msg1(void, panel, "setAllowsMultipleSelection:", true);
+                    if (o.title.len != 0) _ = msg1(void, panel, "setTitle:", objc.nsString(o.title.ptr, o.title.len));
+                    if (msg0(c_long, panel, "runModal") != 1) return .{ .paths = null };
+                    const urls = msg0(?Id, panel, "URLs") orelse return .{ .paths = null };
+                    const n: c_ulong = msg0(c_ulong, urls, "count");
+                    var list = try alloc.alloc([]u8, n);
+                    var filled: usize = 0;
+                    var i: c_ulong = 0;
+                    while (i < n) : (i += 1) {
+                        const u = msg1(Id, urls, "objectAtIndex:", i);
+                        const pz = msg0(?Id, u, "path") orelse continue;
+                        const cs = msg0(?[*:0]const u8, pz, "UTF8String") orelse continue;
+                        list[filled] = try alloc.dupe(u8, std.mem.span(cs));
+                        filled += 1;
+                    }
+                    if (filled == 0) return .{ .paths = null };
+                    return .{ .paths = try alloc.realloc(list, filled) };
+                },
+                .pick_color, .pick_font => return error.DialogNotAvailable,
+            }
+        }
+
+        fn clipWriteEntry(backend: *anyopaque, text: []const u8) bool {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            return self.clipboardWrite(text);
+        }
+
+        fn clipReadEntry(backend: *anyopaque, alloc: std.mem.Allocator) ?[]u8 {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            return self.clipboardRead(alloc);
+        }
+
+        fn dialogEntry(backend: *anyopaque, alloc: std.mem.Allocator, req: ipc.DialogRequest) anyerror!ipc.DialogResponse {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            return self.runDialog(alloc, req);
+        }
+
         fn emitEntry(backend: *anyopaque, window_id: u32, message_json: []const u8) void {
             const self: *Self = @ptrCast(@alignCast(backend));
             self.deliver(window_id, message_json);
