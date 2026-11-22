@@ -72,6 +72,7 @@ fn Backend(comptime config: Config) type {
         status_item: ?Id = null,
         pending_url: ?[]u8 = null,
         hotkey_ok: usize = 0,
+        lock_fd: c_int = -1,
         smoke_ms: u32 = 0,
         /// v0.4.5：窗口控制探针结果（CI 硬断言）
         win_ops_ok: bool = false,
@@ -868,7 +869,8 @@ fn Backend(comptime config: Config) type {
             const deeplink_ok = self.matchUrl(sample) and !self.matchUrl("https://example.com");
             log.print("[macos] deeplink ok={s}", .{boolStr(deeplink_ok)});
 
-            const single_ok = if (config.single_instance) !self.acquireSingleLock() else true;
+            // BSD flock 是进程级锁，同进程再次 flock 会成功，故只断言“锁已拿住”
+            const single_ok = !config.single_instance or self.lock_fd >= 0;
             log.print("[macos] single ok={s}", .{boolStr(single_ok)});
 
             var hk_out: ?*anyopaque = null;
@@ -1301,7 +1303,6 @@ fn Backend(comptime config: Config) type {
         }
 
         fn acquireSingleLock(self: *Self) bool {
-            _ = self;
             const tmp = std.c.getenv("TMPDIR") orelse "/tmp";
             var zbuf: [512]u8 = undefined;
             const raw = std.fmt.bufPrint(&zbuf, "{s}/zilt-{s}.lock", .{ std.mem.span(tmp), config.app_id }) catch return true;
@@ -1309,7 +1310,8 @@ fn Backend(comptime config: Config) type {
             const path = zbuf[0..raw.len :0];
             const fd = open(path.ptr, 0x0202, 0o644);
             if (fd < 0) return true;
-            if (flock(fd, 0x2 | 0x4) != 0) return false;
+            if (flock(fd, 0x2 | 0x4) != 0) return false; // LOCK_EX|LOCK_NB
+            self.lock_fd = fd;
             return true;
         }
 
