@@ -1237,7 +1237,7 @@ fn Backend(comptime config: Config) type {
                 break :blk .{};
             };
             const bar = msg0(Id, objc.cls("NSStatusBar"), "systemStatusBar");
-            const item = msg1(Id, bar, "statusItemWithLength:", @as(f64, -1));
+            const item = objc.msgSend(*const fn (Id, Sel, f64) callconv(.c) Id)(bar, objc.sel("statusItemWithLength:"), -1);
             if (msg0(?Id, item, "button")) |btn| {
                 _ = msg1(void, btn, "setTitle:", objc.nsStringZ("\u{25cf}"));
                 _ = msg1(void, btn, "setToolTip:", objc.nsString(t.tooltip.ptr, t.tooltip.len));
