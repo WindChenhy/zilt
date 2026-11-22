@@ -1167,11 +1167,11 @@ fn Backend(comptime config: Config) type {
         /// 主菜单：应用菜单 + Quit（NSMenuItem action terminate:）
         fn buildMenu(self: *Self) void {
             const app = msg0(Id, objc.cls("NSApplication"), "sharedApplication");
-            const main = objc.allocInit(objc.cls("NSMenu"));
-            _ = msg1(void, main, "setTitle:", objc.nsStringZ("MainMenu"));
+            const main_menu = objc.allocInit(objc.cls("NSMenu"));
+            _ = msg1(void, main_menu, "setTitle:", objc.nsStringZ("MainMenu"));
 
             const app_item = objc.allocInit(objc.cls("NSMenuItem"));
-            _ = msg1(void, main, "addItem:", app_item);
+            _ = msg1(void, main_menu, "addItem:", app_item);
 
             const sub = objc.allocInit(objc.cls("NSMenu"));
             _ = msg1(void, sub, "setTitle:", objc.nsString(config.title.ptr, config.title.len));
@@ -1183,7 +1183,7 @@ fn Backend(comptime config: Config) type {
             _ = msg1(void, sub, "addItem:", quit_item);
 
             _ = msg1(void, app_item, "setSubmenu:", sub);
-            _ = msg1(void, app, "setMainMenu:", main);
+            _ = msg1(void, app, "setMainMenu:", main_menu);
             _ = self;
             log.print("[macos] menu built", .{});
         }
