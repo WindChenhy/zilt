@@ -157,36 +157,42 @@ fn Backend(comptime config: Config) type {
         }
 
         fn statePath(_: *Self, buf: []u8) ?[]const u8 {
-            const home = std.posix.getenv("HOME") orelse return null;
-            return std.fmt.bufPrint(buf, "{s}/Library/Application Support/{s}/window.json", .{
-                home, config.app_id,
-            }) catch null;
+            const home_z = std.c.getenv("HOME") orelse return null;
+            return std.fmt.bufPrint(buf, "{s}/.zilt-window-{s}.json", .{ std.mem.span(home_z), config.app_id }) catch null;
         }
 
-        /// 关窗/退出时写当前 frame；返回是否写成功
+        /// 关窗/退出时写当前 frame（走 Foundation，避开 std.Io 差异）
         fn saveWindowState(self: *Self) bool {
             var buf: [512]u8 = undefined;
             const path = self.statePath(&buf) orelse return false;
-            if (std.fs.path.dirname(path)) |dir| std.fs.cwd().makePath(dir) catch {};
-            const file = std.fs.cwd().createFile(path, .{}) catch return false;
-            defer file.close();
             const f = frameOf(self.window);
             var out: [128]u8 = undefined;
             const body = std.fmt.bufPrint(&out, "{d} {d} {d} {d}\n", .{
                 toI32(f.origin.x), toI32(f.origin.y), dimToU32(f.size.w), dimToU32(f.size.h),
             }) catch return false;
-            file.writeAll(body) catch return false;
-            return true;
+            return objc.msgSend(*const fn (Id, Sel, Id, bool, c_ulong, ?Id) callconv(.c) bool)(
+                objc.nsString(body.ptr, body.len),
+                objc.sel("writeToFile:atomically:encoding:error:"),
+                objc.nsString(path.ptr, path.len),
+                true,
+                4, // NSUTF8StringEncoding
+                null,
+            );
         }
 
         fn loadWindowState(self: *Self) ?[4]i32 {
             var buf: [512]u8 = undefined;
             const path = self.statePath(&buf) orelse return null;
-            const file = std.fs.cwd().openFile(path, .{}) catch return null;
-            defer file.close();
-            var data: [128]u8 = undefined;
-            const n = file.readAll(&data) catch return null;
-            var it = std.mem.tokenizeAny(u8, data[0..n], " \n");
+            const ns = objc.msgSend(*const fn (Id, Sel, Id, c_ulong, ?Id) callconv(.c) ?Id)(
+                objc.cls("NSString"),
+                objc.sel("stringWithContentsOfFile:encoding:error:"),
+                objc.nsString(path.ptr, path.len),
+                4,
+                null,
+            ) orelse return null;
+            const cs = msg0(?[*:0]const u8, ns, "UTF8String") orelse return null;
+            const text = std.mem.span(cs);
+            var it = std.mem.tokenizeAny(u8, text, " \n\r");
             var vals: [4]i32 = .{ 0, 0, 0, 0 };
             var i: usize = 0;
             while (it.next()) |tok| : (i += 1) {
@@ -196,6 +202,7 @@ fn Backend(comptime config: Config) type {
             if (i < 4) return null;
             return vals;
         }
+
 
         fn applyAppearance(_: *Self, win: Id) void {
             if (config.titlebar_overlay) {
@@ -246,10 +253,8 @@ fn Backend(comptime config: Config) type {
                     win,
                     objc.sel("setFrame:display:"),
                     .{
-                        .x = @floatFromInt(v[0]),
-                        .y = @floatFromInt(v[1]),
-                        .w = @floatFromInt(v[2]),
-                        .h = @floatFromInt(v[3]),
+                        .origin = .{ .x = @floatFromInt(v[0]), .y = @floatFromInt(v[1]) },
+                        .size = .{ .w = @floatFromInt(v[2]), .h = @floatFromInt(v[3]) },
                     },
                     true,
                 );
