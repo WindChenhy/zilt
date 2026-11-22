@@ -2,7 +2,7 @@
 
 > 制定日期：2026-11-20。修订：2026-11-21（Linux 专项复核：L1–L8 入图，macOS 顺延）。
 > 基线：**v0.3.19**（git 31b3109，测试体系收口）。
-> 当前：**v0.4.4**（2026-11-22，macOS 主链跑通：窗口 + WKWebView + 资产 scheme + IPC 往返；
+> 当前：**v0.4.5**（2026-11-22，macOS 多窗口 + 窗口控制全量 + 标题栏三态/透明已取证；
 > v0.4.5–v0.4.9 为 macOS 能力面切片，见下）。
 > 对标：**Wails v3.1.0 stable（2026-11-01）+ v3.2.0-nightly**、**Tauri 2.12.x**（2026-11 最新，2.12.x 仅 bugfix）。
 > 历史说明：原 docs/ 文档（v0.1–v0.3 逐版本记录、调研报告、WebView2 ABI 笔记、ADR）已随文档清理移除，
@@ -395,25 +395,32 @@ Wayland 回退路径文档化；既有冒烟/单测全量回归（Windows 侧零
 | 系统信息/Shell/电源/主题 | Environment / Shell / 主题跟随 | `os` / `opener` / `process` | v0.4.9 |
 | 弹性项 | — | — | H18（WML）/ H19（扩展）/ H2（移动端）不进 v0.4.x |
 
-### v0.4.5 — macOS 窗口与外观
+### v0.4.5 — macOS 窗口与多窗口 ✅ 完成（2026-11-22）
 
-目标：窗口能力对齐 Wails/Tauri 的 macOS 常用面（多窗口 + 标题栏 + 材质 + 状态）。
+目标：窗口能力对齐 Wails/Tauri 的 macOS 常用面。本版交付（均已在 macos-15-arm64 上以
+冒烟硬断言取证）：
 
-- 多窗口：`spawn_window_fn` / `windowById`；每窗口一个 WKWebView + scheme handler
-- 窗口控制：min/max size、center、set_position、fullscreen、maximize、always-on-top、
-  show/hide/focus/close（`window_fn` 全量接线）
-- 标题栏：`titleBarStyle`（visible/transparent/overlay）、`hiddenTitle`、红绿灯位置、
-  `titlebar_overlay` 的拖动区域（`data-zilt-drag-region` → `performWindowDragWithEvent:`）
-- 外观：`NSVisualEffectView` 材质（sidebar/hud/window）、透明背景（`macOSPrivateApi`
-  等价 opt-in，默认关）、`NSAppearance` 明暗主题 + 系统主题变更事件
-- 窗口行为：`hideOnFocusLost`、`hideOnEscape`、visible-on-all-workspaces、
-  window level、activation policy（Regular/Accessory/Prohibited）、Dock 徽标/隐藏
-- 窗口事件：moved/resized/focus/blur/minimize/close_requested（+ 去抖与
-  `window_state` 持久化，对齐 Tauri `window-state`）
+- 多窗口：`spawn_window_fn`；`wins` 表（主窗口 id 0，副窗 id ≥ 1）；每窗口独立
+  WKWebView configuration / scheme handler / runtime 注入；IPC 按 `message.webView`
+  解 window_id 路由，投递队列带目标窗；关窗只在最后一个窗口关闭时退出
+- 窗口控制：`window_fn` 全量接线——set_title / minimize / maximize(zoom:) / restore /
+  fullscreen(toggleFullScreen:) / size(setContentSize:) / position（左上原点 ↔ Cocoa
+  左下原点换算） / show / hide / focus / close / always_on_top(setLevel:) / limits / state
+- `window_query_fn`：与 Windows/Linux 同名字段的状态 JSON（含 min/max 尺寸）
+- 标题栏与透明：`titlebar_overlay` → 摘 titled + FullSizeContentView +
+  setTitlebarAppearsTransparent + hidden title + movableByWindowBackground；
+  `transparent` → 关 opaque + 透明背景色
 
-**验收**：多窗口冒烟（开/关/标题/尺寸/置顶）+ 标题栏样式截图 + 状态持久化跨进程。
+**验收**：`[macos] window ops ok=true`、`[macos] window spawn ok=true`、
+`[macos] appearance ok=true` 三条 grep -qF 硬断言（macos.yml），任一不成立即红。
+
+**顺延（决策 D10）**：`NSVisualEffectView` 材质、`NSAppearance` 明暗主题与主题变更事件、
+Dock 徽标/激活策略、拖动区域命中、窗口事件面（moved/resized/focus/blur/close_requested）、
+`window_state` 持久化 归入 v0.4.6，与桌面集成合并交付；编号不变。
 
 ### v0.4.6 — macOS 桌面集成
+
+> 含自 v0.4.5 顺延的外观与窗口行为收尾（材质/明暗主题/Dock/拖动区域/事件面/状态持久化）。
 
 目标：系统集成能力面对齐 Windows/Linux 已有面。
 
