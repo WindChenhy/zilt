@@ -11,6 +11,7 @@
 const std = @import("std");
 const log = @import("../../log.zig");
 const ipc = @import("../../ipc.zig");
+const webview = @import("../../webview.zig");
 const asset_routes = @import("../../asset_routes.zig");
 const inflate = @import("../../inflate.zig");
 const builtin_cmds = @import("../../builtin.zig");
@@ -73,6 +74,7 @@ fn Backend(comptime config: Config) type {
         pending_url: ?[]u8 = null,
         hotkey_ok: usize = 0,
         lock_fd: c_int = -1,
+        inspectable: bool = false,
         smoke_ms: u32 = 0,
         /// v0.4.5：窗口控制探针结果（CI 硬断言）
         win_ops_ok: bool = false,
@@ -471,6 +473,89 @@ fn Backend(comptime config: Config) type {
             }
         }
 
+        fn webviewRequestEntry(backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator, req: webview.Request) anyerror![]u8 {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            return self.webviewRequest(window_id, alloc, req);
+        }
+
+        /// v0.4.8：WKWebView 行为面。只实现真正落地的能力，其余返回明确的 NotAvailable，
+        /// 不伪装成功（下载/媒体权限需 block 回调，随 v0.4.8 后续批次补）。
+        fn webviewRequest(self: *Self, window_id: u32, alloc: std.mem.Allocator, req: webview.Request) anyerror![]u8 {
+            const wv = self.webviewFor(window_id) orelse return error.WebViewNotAvailable;
+            switch (req) {
+                .reload => {
+                    _ = objc.msgSend(*const fn (Id, Sel) callconv(.c) void)(wv, objc.sel("reload"));
+                    return alloc.dupe(u8, "{}");
+                },
+                .stop => {
+                    _ = objc.msgSend(*const fn (Id, Sel) callconv(.c) void)(wv, objc.sel("stopLoading"));
+                    return alloc.dupe(u8, "{}");
+                },
+                .zoom => |z| {
+                    if (!std.math.isFinite(z) or z <= 0.0) return error.InvalidZoomFactor;
+                    _ = objc.msgSend(*const fn (Id, Sel, f64) callconv(.c) void)(wv, objc.sel("setPageZoom:"), z);
+                    return alloc.dupe(u8, "{}");
+                },
+                .get_zoom => {
+                    const z: f64 = objc.msgSend(*const fn (Id, Sel) callconv(.c) f64)(wv, objc.sel("pageZoom"));
+                    return std.fmt.allocPrint(alloc, "{{\"zoom\":{d}}}", .{z});
+                },
+                .back => {
+                    _ = objc.msgSend(*const fn (Id, Sel) callconv(.c) void)(wv, objc.sel("goBack"));
+                    return alloc.dupe(u8, "{}");
+                },
+                .forward => {
+                    _ = objc.msgSend(*const fn (Id, Sel) callconv(.c) void)(wv, objc.sel("goForward"));
+                    return alloc.dupe(u8, "{}");
+                },
+                .load_html => |html| {
+                    _ = objc.msgSend(*const fn (Id, Sel, Id, ?Id) callconv(.c) void)(wv, objc.sel("loadHTMLString:baseURL:"), objc.nsString(html.ptr, html.len), @as(?Id, null));
+                    return alloc.dupe(u8, "{}");
+                },
+                .set_user_agent => |ua| {
+                    const s_ua: ?Id = if (ua.len == 0) null else objc.nsString(ua.ptr, ua.len);
+                    _ = objc.msgSend(*const fn (Id, Sel, ?Id) callconv(.c) void)(wv, objc.sel("setCustomUserAgent:"), s_ua);
+                    return alloc.dupe(u8, "{}");
+                },
+                .devtools => |op| switch (op) {
+                    .open => {
+                        _ = objc.msgSend(*const fn (Id, Sel, bool) callconv(.c) void)(wv, objc.sel("setInspectable:"), true);
+                        self.inspectable = true;
+                        return alloc.dupe(u8, "{}");
+                    },
+                    .close => {
+                        _ = objc.msgSend(*const fn (Id, Sel, bool) callconv(.c) void)(wv, objc.sel("setInspectable:"), false);
+                        self.inspectable = false;
+                        return alloc.dupe(u8, "{}");
+                    },
+                    .state => return std.fmt.allocPrint(alloc, "{{\"inspectable\":{s}}}", .{if (self.inspectable) "true" else "false"}),
+                },
+                .print => |kind| {
+                    const info = msg0(Id, objc.cls("NSPrintInfo"), "sharedPrintInfo");
+                    const op = objc.msgSend(*const fn (Id, Sel, Id) callconv(.c) ?Id)(wv, objc.sel("printOperationWithPrintInfo:"), info) orelse return error.PrintUnavailable;
+                    if (kind == .system) {
+                        _ = objc.msgSend(*const fn (Id, Sel) callconv(.c) bool)(op, objc.sel("runOperation"));
+                    }
+                    return alloc.dupe(u8, "{}");
+                },
+                .print_to_pdf => |p| {
+                    const info = msg0(Id, objc.cls("NSPrintInfo"), "sharedPrintInfo");
+                    const dict = msg0(Id, info, "dictionary");
+                    _ = objc.msgSend(*const fn (Id, Sel, Id) callconv(.c) void)(info, objc.sel("setJobDisposition:"), objc.nsStringZ("NSPrintSaveJob"));
+                    _ = objc.msgSend(*const fn (Id, Sel, Id, Id) callconv(.c) void)(dict, objc.sel("setObject:forKey:"), objc.nsString(p.path.ptr, p.path.len), objc.nsStringZ("NSPrintSavePath"));
+                    const op = objc.msgSend(*const fn (Id, Sel, Id) callconv(.c) ?Id)(wv, objc.sel("printOperationWithPrintInfo:"), info) orelse return error.PdfNotSupported;
+                    const ran = objc.msgSend(*const fn (Id, Sel) callconv(.c) bool)(op, objc.sel("runOperation"));
+                    var payload: [96]u8 = undefined;
+                    if (std.fmt.bufPrint(&payload, "{{\"rid\":{d},\"ok\":{s}}}", .{ p.rid, boolStr(ran) })) |js| {
+                        self.emitWindowEvent(window_id, "webviewPdf", js);
+                    } else |_| {}
+                    return alloc.dupe(u8, "{}");
+                },
+                .cancel_download => return error.DownloadNotFound,
+                else => return error.WebViewNotAvailable,
+            }
+        }
+
         fn context(self: *Self, alloc: std.mem.Allocator, window_id: u32) ipc.Context {
             return .{
                 .allocator = alloc,
@@ -486,6 +571,7 @@ fn Backend(comptime config: Config) type {
                 .clipboard_read_fn = clipReadEntry,
                 .dialog_fn = dialogEntry,
                 .notify_fn = notifyEntry,
+                .webview_request_fn = webviewRequestEntry,
             };
         }
 
@@ -885,12 +971,59 @@ fn Backend(comptime config: Config) type {
                 } else |_| {}
             }
 
+            // ---- v0.4.8 WebView 深度 ----
+            var wv_zoom_ok = false;
+            if (self.webviewRequest(0, self.alloc, .{ .zoom = 1.25 })) |r| {
+                self.alloc.free(r);
+                if (self.webviewRequest(0, self.alloc, .{ .get_zoom = {} })) |js| {
+                    wv_zoom_ok = std.mem.indexOf(u8, js, "1.25") != null;
+                    self.alloc.free(js);
+                } else |_| {}
+            } else |_| {}
+            if (self.webviewRequest(0, self.alloc, .{ .zoom = 1.0 })) |r| self.alloc.free(r) else |_| {}
+            log.print("[macos] webview zoom ok={s}", .{boolStr(wv_zoom_ok)});
+
+            var dv_ok = false;
+            if (self.webviewRequest(0, self.alloc, .{ .devtools = .open })) |r| {
+                self.alloc.free(r);
+                dv_ok = self.inspectable;
+                if (self.webviewRequest(0, self.alloc, .{ .devtools = .close })) |r2| self.alloc.free(r2) else |_| {}
+            } else |_| {}
+            log.print("[macos] webview devtools ok={s}", .{boolStr(dv_ok)});
+
+            var print_ok = false;
+            if (self.webviewRequest(0, self.alloc, .{ .print = .browser })) |r| {
+                self.alloc.free(r);
+                print_ok = true;
+            } else |_| {}
+            log.print("[macos] webview print ok={s} wiring-only", .{boolStr(print_ok)});
+
+            var pdf_ok = false;
+            var pbuf: [512]u8 = undefined;
+            if (std.c.getenv("TMPDIR")) |tmp0| {
+                if (std.fmt.bufPrint(&pbuf, "{s}zilt-probe.pdf", .{std.mem.span(tmp0)})) |pth| {
+                    if (self.webviewRequest(0, self.alloc, .{ .print_to_pdf = .{ .path = pth, .rid = 7 } })) |r| {
+                        self.alloc.free(r);
+                        const fm = msg0(Id, objc.cls("NSFileManager"), "defaultManager");
+                        const ns_p = objc.nsString(pth.ptr, pth.len);
+                        const exists = objc.msgSend(*const fn (Id, Sel, Id) callconv(.c) bool)(fm, objc.sel("fileExistsAtPath:"), ns_p);
+                        if (exists) {
+                            if (objc.msgSend(*const fn (Id, Sel, Id) callconv(.c) ?Id)(objc.cls("NSData"), objc.sel("dataWithContentsOfFile:"), ns_p)) |data| {
+                                const n: c_ulong = msg0(c_ulong, data, "length");
+                                pdf_ok = n > 1000;
+                            }
+                        }
+                    } else |_| {}
+                } else |_| {}
+            }
+            log.print("[macos] webview pdf ok={s}", .{boolStr(pdf_ok)});
+
             const events_ok = self.ev_moved > 0 and self.ev_resized > 0;
             log.print("[macos] window events ok={s} moved={d} resized={d} focus={d} blur={d}", .{
                 boolStr(events_ok), self.ev_moved, self.ev_resized, self.ev_focus, self.ev_blur,
             });
 
-            const good = ok and size_ok and json_ok and appearance_ok and events_ok and theme_ok and dock_ok and vibrancy_ok and state_ok and drag_ok and clip_ok and dialog_ok and menu_ok and tray_ok and tray_action_ok and notify_ok and deeplink_ok and single_ok and hotkey_ok and self.runSpawnProbe();
+            const good = ok and size_ok and json_ok and appearance_ok and events_ok and theme_ok and dock_ok and vibrancy_ok and state_ok and drag_ok and clip_ok and dialog_ok and menu_ok and tray_ok and tray_action_ok and notify_ok and deeplink_ok and single_ok and hotkey_ok and wv_zoom_ok and dv_ok and print_ok and pdf_ok and self.runSpawnProbe();
             log.print("[macos] window ops ok={s} content={d}x{d} json={s}", .{
                 boolStr(good),
                 dimToU32(cs.w),

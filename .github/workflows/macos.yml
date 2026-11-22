@@ -82,6 +82,10 @@ jobs:
           grep -qF "[macos] deeplink ok=true" smoke.log
           grep -qF "[macos] single ok=true" smoke.log
           grep -qF "[macos] hotkey ok=true" smoke.log
+          grep -qF "[macos] webview zoom ok=true" smoke.log
+          grep -qF "[macos] webview devtools ok=true" smoke.log
+          grep -qF "[macos] webview print ok=true" smoke.log
+          grep -qF "[macos] webview pdf ok=true" smoke.log
           grep -q "\[macos\] smoke done, exiting" smoke.log
           # 资产真的走了 WKURLSchemeHandler（不是回落 file://）
           grep -q "\[assets\] .*index.html.* 200" smoke.log
