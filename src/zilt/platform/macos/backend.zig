@@ -75,7 +75,7 @@ fn Backend(comptime config: Config) type {
         hotkey_ok: usize = 0,
         lock_fd: c_int = -1,
         inspectable: bool = false,
-        downloads: std.ArrayListUnmanaged(DownloadRec) = .{},
+        downloads: std.ArrayListUnmanaged(DownloadRec) = .empty,
         download_seq: u64 = 0,
         smoke_ms: u32 = 0,
         /// v0.4.5：窗口控制探针结果（CI 硬断言）
@@ -1291,7 +1291,7 @@ fn Backend(comptime config: Config) type {
                 .{ .name = "drain:", .imp = imp(&onDrain), .types = "v@:@" },
             });
             _ = objc.defineClass("ZiltDownloadDelegate", null, &.{
-                .{ .name = "download:decideDestinationUsingResponse:suggestedFilename:completionHandler:", .imp = imp(&onDecideDestination), .types = "v@:@@@" },
+                .{ .name = "download:decideDestinationUsingResponse:suggestedFilename:completionHandler:", .imp = imp(&onDecideDestination), .types = "v@:@@@@" },
                 .{ .name = "downloadDidFinish:", .imp = imp(&onDownloadFinished), .types = "v@:@" },
                 .{ .name = "download:didFailWithError:", .imp = imp(&onDownloadFailed), .types = "v@:@@" },
             });
@@ -1680,7 +1680,7 @@ fn Backend(comptime config: Config) type {
             const urls = objc.msgSend(*const fn (Id, Sel, Id, ?Id) callconv(.c) ?Id)(pb, objc.sel("readObjectsForClasses:options:"), cls_arr, @as(?Id, null)) orelse return false;
             const n: c_ulong = msg0(c_ulong, urls, "count");
             if (n == 0) return false;
-            var list = std.ArrayListUnmanaged(u8){};
+            var list: std.ArrayListUnmanaged(u8) = .empty;
             defer list.deinit(inst.alloc);
             list.append(inst.alloc, '{') catch return false;
             list.appendSlice(inst.alloc, "\"paths\":[") catch return false;
