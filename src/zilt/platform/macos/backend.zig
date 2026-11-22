@@ -481,7 +481,8 @@ fn Backend(comptime config: Config) type {
         /// v0.4.8：WKWebView 行为面。只实现真正落地的能力，其余返回明确的 NotAvailable，
         /// 不伪装成功（下载/媒体权限需 block 回调，随 v0.4.8 后续批次补）。
         fn webviewRequest(self: *Self, window_id: u32, alloc: std.mem.Allocator, req: webview.Request) anyerror![]u8 {
-            const wv = self.webviewFor(window_id) orelse return error.WebViewNotAvailable;
+            const wv = self.webviewFor(window_id);
+            if (@intFromPtr(wv) == 0) return error.WebViewNotAvailable;
             switch (req) {
                 .reload => {
                     _ = objc.msgSend(*const fn (Id, Sel) callconv(.c) void)(wv, objc.sel("reload"));
