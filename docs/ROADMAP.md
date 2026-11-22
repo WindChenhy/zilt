@@ -2,7 +2,7 @@
 
 > 制定日期：2026-11-20。修订：2026-11-21（Linux 专项复核：L1–L8 入图，macOS 顺延）。
 > 基线：**v0.3.19**（git 31b3109，测试体系收口）。
-> 当前：**v0.4.5**（2026-11-22，macOS 多窗口 + 窗口控制全量 + 标题栏三态/透明已取证；
+> 当前：**v0.4.6**（2026-11-22，macOS 外观与窗口行为收尾：材质/主题/Dock/事件面/状态持久化/拖动接线；
 > v0.4.5–v0.4.9 为 macOS 能力面切片，见下）。
 > 对标：**Wails v3.1.0 stable（2026-11-01）+ v3.2.0-nightly**、**Tauri 2.12.x**（2026-11 最新，2.12.x 仅 bugfix）。
 > 历史说明：原 docs/ 文档（v0.1–v0.3 逐版本记录、调研报告、WebView2 ABI 笔记、ADR）已随文档清理移除，
@@ -418,7 +418,22 @@ Wayland 回退路径文档化；既有冒烟/单测全量回归（Windows 侧零
 Dock 徽标/激活策略、拖动区域命中、窗口事件面（moved/resized/focus/blur/close_requested）、
 `window_state` 持久化 归入 v0.4.6，与桌面集成合并交付；编号不变。
 
-### v0.4.6 — macOS 桌面集成
+### v0.4.6 — macOS 外观与窗口行为收尾 ✅ 完成（2026-11-22）
+
+本版交付（macos-15-arm64 硬断言取证：vibrancy / theme / dock / state / drag 均 grep
+-qF 强制）：
+
+- 材质：`config.vibrancy`（sidebar/hud/window → AppKit 7/13/12），NSVisualEffectView
+  垫在 webview 下、关 opaque
+- 明暗主题：`effectiveAppearance` 读写 + 循环比对发 `themeChanged{appearance}`
+- Dock：`dockTile` 徽标读写
+- 窗口事件面：windowMoved / windowResized / windowFocus / windowBlur（didMove/
+  didResize/didBecomeKey/didResignKey，注意入参是 NSNotification）
+- window_state：`$HOME/.zilt-window-<app_id>.json` 存 frame，创建时 setFrame:display: 恢复
+- 拖动区域：`data-zilt-drag-region` → runtime startDragging → `.start_dragging`
+  → performWindowDragWithEvent:（只认真实 leftMouseDown；CI 仅验接线，实际拖动需人工）
+
+### v0.4.7 — macOS 桌面集成
 
 > 含自 v0.4.5 顺延的外观与窗口行为收尾（材质/明暗主题/Dock/拖动区域/事件面/状态持久化）。
 
@@ -437,7 +452,7 @@ Dock 徽标/激活策略、拖动区域命中、窗口事件面（moved/resized/
 **验收**：菜单/托盘/对话框/剪贴板/通知/快捷键逐项冒烟（需交互的用脚本化 UI 或
 单元测试替代）+ 深链/单实例/自启在 CI 上脚本化验证。
 
-### v0.4.7 — macOS WebView 深度
+### v0.4.8 — macOS WebView 深度
 
 目标：补齐 WebView 行为面（下载/打印/截图/缩放/拖放/权限）。
 
@@ -458,7 +473,7 @@ Dock 徽标/激活策略、拖动区域命中、窗口事件面（moved/resized/
 
 **验收**：下载/打印/截图/缩放/拖放/权限各自冒烟；截图与 PDF 产物上传 artifact。
 
-### v0.4.8 — macOS 分发、安全与更新
+### v0.4.9 — macOS 分发、安全与更新
 
 目标：可分发（签名/公证/DMG/universal）+ 安全存储 + 更新器。
 
@@ -478,7 +493,7 @@ Dock 徽标/激活策略、拖动区域命中、窗口事件面（moved/resized/
 **验收**：`codesign --verify --deep --strict` + `spctl -a -vv` + `stapler validate`；
 DMG 挂载安装；更新器端到端（旧版→新版）；Keychain 单测。
 
-### v0.4.9 — macOS 对等与打磨
+### v0.4.10 — macOS 对等与打磨
 
 目标：平台能力与 Win/Linux 对齐收口 + 文档/CI 矩阵。
 

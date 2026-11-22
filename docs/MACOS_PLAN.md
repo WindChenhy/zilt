@@ -38,7 +38,7 @@
 4. 测试策略：纯逻辑（加速键解析、路径映射、事件分类）放跨平台单测；ObjC 行为一律
    走 CI 冒烟日志断言（现有六段锚点的模式延续）。
 
-## 2. v0.4.5 窗口与外观
+## 2. v0.4.5 窗口与多窗口 / v0.4.6 外观与窗口行为收尾
 
 | 能力 | 参考 | 关键 selector / 方案 | 验收（CI 日志锚点） |
 |---|---|---|---|
@@ -52,7 +52,7 @@
 | 窗口事件面 | tao `window_delegate.rs`（2063 行） | 自建 ZiltWindowDelegate 扩方法：didMove/didResize/didBecomeKey/didResignKey/windowShouldClose（可否决 → close_requested 事件） | 事件计数（对齐 events 命名空间） |
 | 窗口状态持久化 | Zilt 已有 `window_state.zig`（Linux 同源） | macOS 侧 frame 读写接线 | 重启恢复 frame |
 
-## 3. v0.4.6 桌面集成
+## 3. v0.4.7 桌面集成
 
 | 能力 | 参考 | 方案 |
 |---|---|---|
@@ -67,7 +67,7 @@
 | 单实例 | Zilt 已有跨平台实现 | macOS 激活已跑实例（NSWorkspace/本地 socket 转发 argv） |
 | 自启 | wails `autostart_darwin_smappservice.go` | SMAppService（macOS 13+）为主，LSSharedFileList 回退 |
 
-## 4. v0.4.7 WebView 深度（wry 对标）
+## 4. v0.4.8 WebView 深度（wry 对标）
 
 | 能力 | 参考（wry） | 方案与风险 |
 |---|---|---|
@@ -83,7 +83,7 @@
 | 媒体权限 | wry permission 回调 | `requestMediaCapturePermission` + Info.plist 用途串（NSCameraUsageDescription…） |
 | 页内查找 | — | `findString:withConfiguration:completionHandler:`（macOS 11+，Block） |
 
-## 5. v0.4.8 分发与安全（要点）
+## 5. v0.4.9 分发与安全（要点）
 
 - `.app`/DMG：`zilt-pack` 已有 Info.plist 生成（`generateInfoPlist`）→ 补 `.icns`、
   `CFBundleURLTypes`、用途串；DMG 走 `hdiutil`（CI macos-15 可跑）
