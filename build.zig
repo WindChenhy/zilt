@@ -222,8 +222,14 @@ fn linkWindowsLibs(module: *std.Build.Module) void {
 
 pub fn build(b: *std.Build) void {
     // 默认 windows-gnu：Zig 自带 MinGW 导入库，无 MSVC 的机器也能开箱构建。
+    // 仅在 Windows 宿主生效——`.gnu` ABI 对 macOS 非法（native macos-gnu 无法
+    // 提供 libc，CI macos-15 实测），其余宿主走原生探测。
+    const default_target: std.Target.Query = if (@import("builtin").os.tag == .windows)
+        .{ .abi = .gnu }
+    else
+        .{};
     const target = b.standardTargetOptions(.{
-        .default_target = .{ .abi = .gnu },
+        .default_target = default_target,
     });
     const optimize = b.standardOptimizeOption(.{});
 
