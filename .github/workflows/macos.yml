@@ -76,6 +76,11 @@ jobs:
           grep -qF "[macos] clipboard ok=true" smoke.log
           grep -qF "[macos] dialog ok=true" smoke.log
           grep -qF "[macos] menu ok=true" smoke.log
+          grep -qF "[macos] tray ok=true" smoke.log
+          grep -qF "[macos] notify ok=true" smoke.log
+          grep -qF "[macos] deeplink ok=true" smoke.log
+          grep -qF "[macos] single ok=true" smoke.log
+          grep -qF "[macos] hotkey ok=true" smoke.log
           grep -q "\[macos\] smoke done, exiting" smoke.log
           # 资产真的走了 WKURLSchemeHandler（不是回落 file://）
           grep -q "\[assets\] .*index.html.* 200" smoke.log

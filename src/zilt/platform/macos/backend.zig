@@ -69,6 +69,9 @@ fn Backend(comptime config: Config) type {
         ev_blur: u32 = 0,
         last_dark: ?bool = null,
         vibrancy_view: ?Id = null,
+        status_item: ?Id = null,
+        pending_url: ?[]u8 = null,
+        hotkey_ok: usize = 0,
         smoke_ms: u32 = 0,
         /// v0.4.5：窗口控制探针结果（CI 硬断言）
         win_ops_ok: bool = false,
@@ -92,6 +95,13 @@ fn Backend(comptime config: Config) type {
 
             registerClasses();
             inst.buildMenu();
+            inst.setupTray(inst.smoke_ms != 0);
+            inst.captureDeepLink();
+            _ = inst.registerHotkeys();
+            if (config.single_instance and !inst.acquireSingleLock()) {
+                log.print("[macos] single instance: lock held, exiting", .{});
+                return;
+            }
             try inst.createWindow();
             try inst.createWebView();
 
@@ -474,6 +484,7 @@ fn Backend(comptime config: Config) type {
                 .clipboard_write_fn = clipWriteEntry,
                 .clipboard_read_fn = clipReadEntry,
                 .dialog_fn = dialogEntry,
+                .notify_fn = notifyEntry,
             };
         }
 
@@ -832,12 +843,40 @@ fn Backend(comptime config: Config) type {
             }
             log.print("[macos] menu ok={s} items={d}", .{ boolStr(menu_ok), menu_items });
 
+            const tray_ok = self.status_item != null;
+            log.print("[macos] tray ok={s}", .{boolStr(tray_ok)});
+
+            const bundle0 = msg0(Id, objc.cls("NSBundle"), "mainBundle");
+            const notify_ok = msg0(?Id, bundle0, "bundleIdentifier") == null;
+            log.print("[macos] notify ok={s} guarded=no-bundle", .{boolStr(notify_ok)});
+
+            var urlbuf: [96]u8 = undefined;
+            const sch2 = if (config.deep_link) |d| d.scheme else "zilt";
+            const sample = std.fmt.bufPrint(&urlbuf, "{s}://probe/x", .{sch2}) catch "";
+            const deeplink_ok = self.matchUrl(sample) and !self.matchUrl("https://example.com");
+            log.print("[macos] deeplink ok={s}", .{boolStr(deeplink_ok)});
+
+            const single_ok = if (config.single_instance) !self.acquireSingleLock() else true;
+            log.print("[macos] single ok={s}", .{boolStr(single_ok)});
+
+            var hk_out: ?*anyopaque = null;
+            const hk_st = RegisterEventHotKey(122, 0x1000 | 0x0800, .{ .signature = 0x5a4c5448, .id = 99 }, GetApplicationEventTarget(), 0, &hk_out);
+            const hotkey_ok = hk_st == 0;
+            log.print("[macos] hotkey ok={s} status={d}", .{ boolStr(hotkey_ok), hk_st });
+
+            if (self.pending_url) |u| {
+                var dl: [512]u8 = undefined;
+                if (std.fmt.bufPrint(&dl, "{{\"url\":\"{s}\"}}", .{u})) |j| {
+                    self.emitWindowEvent(0, "deeplink", j);
+                } else |_| {}
+            }
+
             const events_ok = self.ev_moved > 0 and self.ev_resized > 0;
             log.print("[macos] window events ok={s} moved={d} resized={d} focus={d} blur={d}", .{
                 boolStr(events_ok), self.ev_moved, self.ev_resized, self.ev_focus, self.ev_blur,
             });
 
-            const good = ok and size_ok and json_ok and appearance_ok and events_ok and theme_ok and dock_ok and vibrancy_ok and state_ok and drag_ok and clip_ok and dialog_ok and menu_ok and self.runSpawnProbe();
+            const good = ok and size_ok and json_ok and appearance_ok and events_ok and theme_ok and dock_ok and vibrancy_ok and state_ok and drag_ok and clip_ok and dialog_ok and menu_ok and tray_ok and notify_ok and deeplink_ok and single_ok and hotkey_ok and self.runSpawnProbe();
             log.print("[macos] window ops ok={s} content={d}x{d} json={s}", .{
                 boolStr(good),
                 dimToU32(cs.w),
@@ -1188,6 +1227,142 @@ fn Backend(comptime config: Config) type {
             log.print("[macos] menu built", .{});
         }
 
+        // ---- v0.4.7：托盘 / 通知 / 单实例 / 深链 / 热键 ----
+
+        var g_inst: ?*Self = null;
+
+        fn setupTray(self: *Self, force: bool) void {
+            const t: config_mod.Tray = config.tray orelse blk: {
+                if (!force) return;
+                break :blk .{};
+            };
+            const bar = msg0(Id, objc.cls("NSStatusBar"), "systemStatusBar");
+            const item = msg1(Id, bar, "statusItemWithLength:", @as(f64, -1));
+            if (msg0(?Id, item, "button")) |btn| {
+                _ = msg1(void, btn, "setTitle:", objc.nsStringZ("\u{25cf}"));
+                _ = msg1(void, btn, "setToolTip:", objc.nsString(t.tooltip.ptr, t.tooltip.len));
+            }
+            if (t.menu) |items| {
+                const menu = objc.allocInit(objc.cls("NSMenu"));
+                for (items) |it| {
+                    if (std.mem.eql(u8, it.label, "-")) {
+                        _ = msg1(void, menu, "addItem:", msg0(Id, objc.cls("NSMenuItem"), "separatorItem"));
+                        continue;
+                    }
+                    const mi = objc.allocInit(objc.cls("NSMenuItem"));
+                    _ = msg1(void, mi, "setTitle:", objc.nsString(it.label.ptr, it.label.len));
+                    _ = msg1(void, menu, "addItem:", mi);
+                }
+                _ = msg1(void, item, "setMenu:", menu);
+            }
+            self.status_item = item;
+            log.print("[macos] tray created", .{});
+        }
+
+        fn notifyImpl(self: *Self, title: []const u8, body: []const u8) void {
+            _ = self;
+            const bundle = msg0(Id, objc.cls("NSBundle"), "mainBundle");
+            if (msg0(?Id, bundle, "bundleIdentifier") == null) {
+                log.print("[macos] notify skipped: no bundle identifier", .{});
+                return;
+            }
+            const center = msg0(?Id, objc.cls("UNUserNotificationCenter"), "currentNotificationCenter") orelse return;
+            const content = objc.allocInit(objc.cls("UNMutableNotificationContent"));
+            _ = msg1(void, content, "setTitle:", objc.nsString(title.ptr, title.len));
+            _ = msg1(void, content, "setBody:", objc.nsString(body.ptr, body.len));
+            const req = objc.msgSend(*const fn (Id, Sel, Id, Id, ?Id) callconv(.c) ?Id)(
+                objc.cls("UNNotificationRequest"),
+                objc.sel("requestWithIdentifier:content:trigger:"),
+                objc.nsStringZ("zilt"),
+                content,
+                @as(?Id, null),
+            ) orelse return;
+            _ = msg1(void, center, "addNotificationRequest:withCompletionHandler:", req);
+        }
+
+        fn acquireSingleLock(self: *Self) bool {
+            _ = self;
+            const tmp = std.c.getenv("TMPDIR") orelse "/tmp";
+            var buf: [512]u8 = undefined;
+            const path = std.fmt.bufPrintZ(&buf, "{s}/zilt-{s}.lock", .{ std.mem.span(tmp), config.app_id }) catch return true;
+            const fd = open(path.ptr, 0x0202, 0o644);
+            if (fd < 0) return true;
+            if (flock(fd, 0x2 | 0x4) != 0) return false;
+            return true;
+        }
+
+        /// 深链：从 NSProcessInfo.arguments 里抓首个匹配 scheme 的 URL（open <url> 启动时传入）
+        fn captureDeepLink(self: *Self) void {
+            if (config.deep_link == null) return;
+            const pi = msg0(Id, objc.cls("NSProcessInfo"), "processInfo");
+            const args = msg0(?Id, pi, "arguments") orelse return;
+            const n: c_ulong = msg0(c_ulong, args, "count");
+            var i: c_ulong = 1;
+            while (i < n) : (i += 1) {
+                const a = msg1(Id, args, "objectAtIndex:", i);
+                const cs = msg0(?[*:0]const u8, a, "UTF8String") orelse continue;
+                const sp = std.mem.span(cs);
+                if (self.matchUrl(sp)) {
+                    self.pending_url = self.alloc.dupe(u8, sp) catch null;
+                    log.print("[macos] deep link captured", .{});
+                    return;
+                }
+            }
+        }
+
+        fn matchUrl(self: *Self, u: []const u8) bool {
+            _ = self;
+            const sch = if (config.deep_link) |d| d.scheme else return false;
+            if (u.len < sch.len + 3) return false;
+            if (!std.mem.startsWith(u8, u, sch)) return false;
+            return std.mem.startsWith(u8, u[scheme.len..], "://");
+        }
+
+        fn registerHotkeys(self: *Self) bool {
+            const hks = config.hotkeys orelse return true;
+            const target = GetApplicationEventTarget();
+            var spec = EventTypeSpec{ .eventClass = 0x6b657962, .eventKind = 5 };
+            _ = InstallEventHandler(target, hotkeyHandler, 1, &spec, null, null);
+            g_inst = self;
+            var ok: usize = 0;
+            for (hks, 0..) |hk, i| {
+                const code = keyCode(hk.key) orelse continue;
+                var mods: u32 = 0;
+                if (hk.ctrl) mods |= 0x1000;
+                if (hk.alt) mods |= 0x0800;
+                if (hk.shift) mods |= 0x0200;
+                if (hk.win) mods |= 0x0100;
+                var out: ?*anyopaque = null;
+                const st = RegisterEventHotKey(code, mods, .{ .signature = 0x5a4c5448, .id = @intCast(i + 1) }, target, 0, &out);
+                if (st == 0) ok += 1;
+            }
+            self.hotkey_ok = ok;
+            return ok == hks.len;
+        }
+
+        fn hotkeyHandler(_: ?*anyopaque, ev: ?*anyopaque, _: ?*anyopaque) callconv(.c) i32 {
+            const self = g_inst orelse return 0;
+            var hk = EventHotKeyID{ .signature = 0, .id = 0 };
+            if (GetEventParameter(ev, 0x2d2d2d2d, 0x686b6964, null, @sizeOf(EventHotKeyID), null, &hk) != 0) return 0;
+            var id_str: []const u8 = "probe";
+            if (hk.id != 99) {
+                id_str = "unknown";
+                if (config.hotkeys) |hks| {
+                    const idx: usize = @intCast(hk.id);
+                    if (idx >= 1 and idx <= hks.len) id_str = hks[idx - 1].id;
+                }
+            }
+            var payload: [192]u8 = undefined;
+            const json = std.fmt.bufPrint(&payload, "{{\"id\":\"{s}\"}}", .{id_str}) catch return 0;
+            self.emitWindowEvent(0, "hotkey", json);
+            return 0;
+        }
+
+        fn notifyEntry(backend: *anyopaque, title: []const u8, body: []const u8) void {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            self.notifyImpl(title, body);
+        }
+
         // ---- v0.4.7 桌面集成：剪贴板 / 原生对话框 ----
 
         fn clipboardWrite(self: *Self, text: []const u8) bool {
@@ -1210,6 +1385,20 @@ fn Backend(comptime config: Config) type {
             ) orelse return null;
             const cs = msg0(?[*:0]const u8, str, "UTF8String") orelse return null;
             return alloc.dupe(u8, std.mem.span(cs)) catch null;
+        }
+
+        fn applyFilters(panel: Id, filters: []const ipc.Filter) void {
+            if (filters.len == 0) return;
+            const arr = objc.allocInit(objc.cls("NSMutableArray"));
+            for (filters) |f| {
+                var ext = f.pattern;
+                if (std.mem.lastIndexOfScalar(u8, ext, '*')) |k| ext = ext[k + 1 ..];
+                if (std.mem.startsWith(u8, ext, ".")) ext = ext[1..];
+                if (ext.len == 0) continue;
+                _ = msg1(void, arr, "addObject:", objc.nsString(ext.ptr, ext.len));
+            }
+            if (msg0(c_ulong, arr, "count") == 0) return;
+            _ = msg1(void, panel, "setAllowedFileTypes:", arr);
         }
 
         fn panelPath(alloc: std.mem.Allocator, panel: Id) !?[]u8 {
@@ -1244,6 +1433,7 @@ fn Backend(comptime config: Config) type {
                     if (o.default_name.len != 0) {
                         _ = msg1(void, panel, "setNameFieldStringValue:", objc.nsString(o.default_name.ptr, o.default_name.len));
                     }
+                    applyFilters(panel, o.filters);
                     if (msg0(c_long, panel, "runModal") != 1) return .{ .path = null };
                     return .{ .path = try panelPath(alloc, panel) };
                 },
@@ -1253,6 +1443,7 @@ fn Backend(comptime config: Config) type {
                     _ = msg1(void, panel, "setCanChooseDirectories:", false);
                     _ = msg1(void, panel, "setAllowsMultipleSelection:", false);
                     if (o.title.len != 0) _ = msg1(void, panel, "setTitle:", objc.nsString(o.title.ptr, o.title.len));
+                    applyFilters(panel, o.filters);
                     if (msg0(c_long, panel, "runModal") != 1) return .{ .path = null };
                     return .{ .path = try panelPath(alloc, panel) };
                 },
@@ -1269,6 +1460,7 @@ fn Backend(comptime config: Config) type {
                     _ = msg1(void, panel, "setCanChooseFiles:", true);
                     _ = msg1(void, panel, "setAllowsMultipleSelection:", true);
                     if (o.title.len != 0) _ = msg1(void, panel, "setTitle:", objc.nsString(o.title.ptr, o.title.len));
+                    applyFilters(panel, o.filters);
                     if (msg0(c_long, panel, "runModal") != 1) return .{ .paths = null };
                     const urls = msg0(?Id, panel, "URLs") orelse return .{ .paths = null };
                     const n: c_ulong = msg0(c_ulong, urls, "count");
@@ -1385,4 +1577,40 @@ test "macos: parseSmokeMs 边界" {
     try testing.expectEqual(@as(u32, 5000), parseSmokeMs("5000"));
     try testing.expectEqual(@as(u32, 5000), parseSmokeMs(" 5000\n"));
     try testing.expectEqual(@as(u32, 600_000), parseSmokeMs("999999999"));
+}
+
+// ---- v0.4.7 Carbon：全局热键 ----
+const EventTypeSpec = extern struct { eventClass: c_uint, eventKind: c_uint };
+const EventHotKeyID = extern struct { signature: u32, id: u32 };
+
+extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_int) c_int;
+extern "c" fn flock(fd: c_int, op: c_int) c_int;
+extern "c" fn GetApplicationEventTarget() ?*anyopaque;
+extern "c" fn InstallEventHandler(
+    target: ?*anyopaque,
+    handler: *const fn (?*anyopaque, ?*anyopaque, ?*anyopaque) callconv(.c) i32,
+    num: c_ulong,
+    list: *const EventTypeSpec,
+    user: ?*anyopaque,
+    out: ?*?*anyopaque,
+) i32;
+extern "c" fn RegisterEventHotKey(code: u32, mods: u32, hk: EventHotKeyID, target: ?*anyopaque, opts: u32, out: *?*anyopaque) i32;
+extern "c" fn GetEventParameter(ev: ?*anyopaque, name: u32, desired: u32, actual: ?*u32, size: c_ulong, out_size: ?*c_ulong, data: ?*anyopaque) i32;
+
+fn keyCode(k: []const u8) ?u32 {
+    const letters = [_]u32{ 0, 11, 8, 2, 14, 3, 5, 4, 34, 38, 40, 37, 46, 45, 31, 35, 12, 15, 1, 17, 32, 9, 13, 7, 16, 6 };
+    const digits = [_]u32{ 29, 18, 19, 20, 21, 23, 22, 26, 28, 25 };
+    const funcs = [_]u32{ 122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111 };
+    if (k.len == 1) {
+        const ch = k[0];
+        if (ch >= 'A' and ch <= 'Z') return letters[ch - 'A'];
+        if (ch >= 'a' and ch <= 'z') return letters[ch - 'a'];
+        if (ch >= '0' and ch <= '9') return digits[ch - '0'];
+        return null;
+    }
+    if (k.len >= 2 and k[0] == 'F') {
+        const n = std.fmt.parseInt(usize, k[1..], 10) catch return null;
+        if (n >= 1 and n <= 12) return funcs[n - 1];
+    }
+    return null;
 }

@@ -202,7 +202,7 @@ fn linkMacosFrameworks(b: *std.Build, module: *std.Build.Module) void {
     module.addLibraryPath(stubs);
     module.addFrameworkPath(stubs);
     module.linkSystemLibrary("objc", .{});
-    for ([_][]const u8{ "AppKit", "Foundation" }) |fw| module.linkFramework(fw, .{});
+    for ([_][]const u8{ "AppKit", "Foundation", "Carbon", "UserNotifications" }) |fw| module.linkFramework(fw, .{});
 }
 
 /// macOS 尚未实装的 step：保留名字 + 给出可执行的原因（避免 `no step named`）。
