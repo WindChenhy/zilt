@@ -77,6 +77,7 @@ jobs:
           grep -qF "[macos] dialog ok=true" smoke.log
           grep -qF "[macos] menu ok=true" smoke.log
           grep -qF "[macos] tray ok=true" smoke.log
+          grep -qF "[macos] tray action ok=true" smoke.log
           grep -qF "[macos] notify ok=true" smoke.log
           grep -qF "[macos] deeplink ok=true" smoke.log
           grep -qF "[macos] single ok=true" smoke.log

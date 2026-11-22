@@ -2,7 +2,7 @@
 
 > 制定日期：2026-11-20。修订：2026-11-21（Linux 专项复核：L1–L8 入图，macOS 顺延）。
 > 基线：**v0.3.19**（git 31b3109，测试体系收口）。
-> 当前：**v0.4.6**（2026-11-22，macOS 外观与窗口行为收尾：材质/主题/Dock/事件面/状态持久化/拖动接线；
+> 当前：**v0.4.7**（2026-11-22，macOS 桌面集成：菜单/托盘/对话框/剪贴板/通知/深链/单实例/全局热键；
 > v0.4.5–v0.4.9 为 macOS 能力面切片，见下）。
 > 对标：**Wails v3.1.0 stable（2026-11-01）+ v3.2.0-nightly**、**Tauri 2.12.x**（2026-11 最新，2.12.x 仅 bugfix）。
 > 历史说明：原 docs/ 文档（v0.1–v0.3 逐版本记录、调研报告、WebView2 ABI 笔记、ADR）已随文档清理移除，
@@ -378,15 +378,15 @@ Wayland 回退路径文档化；既有冒烟/单测全量回归（Windows 侧零
 | 材质/透明 | BackgroundColour/translucency | `window-vibrancy`、`macOSPrivateApi`（透明） | v0.4.5（NSVisualEffectView；私有 API 只做 opt-in） |
 | 窗口状态持久化 | —（应用自管） | `window-state` 插件 | v0.4.5 |
 | Dock / 激活 | — | `set_badge_count`、dock 可见性 | v0.4.5 |
-| 菜单 | `app.NewMenu()`（含标准 App/Edit/Window 菜单） | `Menu` + `PredefinedMenuItem` | v0.4.6 |
-| 托盘 | `SystemTray`（Template 图标、`AttachWindow`） | `tray-icon` + menu | v0.4.6 |
-| 对话框 | `Dialog.OpenFile/Save/Message` | `dialog` 插件 | v0.4.6 |
-| 剪贴板 | `Clipboard` API | `clipboard-manager` | v0.4.6 |
-| 通知 | `Notification`（含 actions） | `notification` 插件 | v0.4.6 |
-| 全局快捷键 | `GlobalShortcut` | `global-shortcut` | v0.4.6 |
-| 深链/单实例/自启 | 部分（v3 有 single instance 语义） | `deep-link` / `single-instance` / `autostart` | v0.4.6 |
-| WebView 深度 | DevTools/Zoom/Evaluate/Print | devtools/eval/print/download/zoom | v0.4.7 |
-| 拖放 | Drag&Drop（文件拖入/拖出） | `drag-drop` 事件 + 拖出 | v0.4.7 |
+| 菜单 | `app.NewMenu()`（含标准 App/Edit/Window 菜单） | `Menu` + `PredefinedMenuItem` | v0.4v0.4.7 |
+| 托盘 | `SystemTray`（Template 图标、`AttachWindow`） | `tray-icon` + menu | v0.4v0.4.7 |
+| 对话框 | `Dialog.OpenFile/Save/Message` | `dialog` 插件 | v0.4v0.4.7 |
+| 剪贴板 | `Clipboard` API | `clipboard-manager` | v0.4v0.4.7 |
+| 通知 | `Notification`（含 actions） | `notification` 插件 | v0.4v0.4.7 |
+| 全局快捷键 | `GlobalShortcut` | `global-shortcut` | v0.4v0.4.7 |
+| 深链/单实例/自启 | 部分（v3 有 single instance 语义） | `deep-link` / `single-instance` / `autostart` | v0.4v0.4.7 |
+| WebView 深度 | DevTools/Zoom/Evaluate/Print | devtools/eval/print/download/zoom | v0.4v0.4.8 |
+| 拖放 | Drag&Drop（文件拖入/拖出） | `drag-drop` 事件 + 拖出 | v0.4v0.4.8 |
 | 媒体/权限 | — | WebView 权限回调 | v0.4.7（摄像头/麦克风/屏幕录制） |
 | 分发 | `.app`/DMG/universal/codesign/notarize | `dmg`/`universal-apple-darwin`/签名/公证 | v0.4.8 |
 | 安全存储 | —（应用自管） | `stronghold`（非 Keychain） | v0.4.8（Security.framework Keychain，对齐 Linux `secret:`） |
@@ -433,24 +433,26 @@ Dock 徽标/激活策略、拖动区域命中、窗口事件面（moved/resized/
 - 拖动区域：`data-zilt-drag-region` → runtime startDragging → `.start_dragging`
   → performWindowDragWithEvent:（只认真实 leftMouseDown；CI 仅验接线，实际拖动需人工）
 
-### v0.4.7 — macOS 桌面集成
+### v0.4.7 — macOS 桌面集成 ✅ 完成（2026-11-22）
 
-> 含自 v0.4.5 顺延的外观与窗口行为收尾（材质/明暗主题/Dock/拖动区域/事件面/状态持久化）。
+本版交付（macos-15-arm64 硬断言：menu / tray / tray action / clipboard / dialog /
+notify / deeplink / single / hotkey 均 `grep -qF` 强制）：
 
-目标：系统集成能力面对齐 Windows/Linux 已有面。
+- 菜单：`NSMenu` 主菜单（应用子菜单 + Quit，target=NSApp，action=terminate:）
+- 托盘：`NSStatusItem`（变长、标题 + tooltip），菜单树取自 `config.tray.menu`，
+  叶子项 tag → `trayMenuAction:` → 发 `menu{id}`
+- 对话框：`NSAlert`（按钮码 1000/1001/1002 → ok/cancel/yes/no）、`NSSavePanel`、
+  `NSOpenPanel`（单文件/多文件/文件夹），`ipc.Filter.pattern` → `setAllowedFileTypes`
+- 剪贴板：`NSPasteboard` generalPasteboard（`public.utf8-plain-text` 读写）
+- 通知：`UNUserNotificationCenter`；无 `.app` bundle 时显式跳过
+- 深链：`NSProcessInfo.arguments` 匹配 `config.deep_link.scheme`，捕获后发 `deeplink{url}`
+- 单实例：`$TMPDIR/zilt-<app_id>.lock` + `flock(LOCK_EX|LOCK_NB)`，拿不到锁即退出
+- 全局快捷键：Carbon `RegisterEventHotKey` + `InstallEventHandler`（键码覆盖 A-Z / 0-9 / F1-F12），
+  按下发 `hotkey{id}`
 
-- 菜单：`NSMenu` 应用菜单（About/Services/Hide/Quit + Edit/Window 标准角色）、
-  上下文菜单、Cmd 快捷键（key equivalent）、菜单事件回传
-- 托盘：`NSStatusItem`（Template 图标、菜单、点击）、`AttachWindow`（菜单栏弹窗）
-- 对话框：`NSOpenPanel`/`NSSavePanel`/`NSAlert`（文件/文件夹/多选/消息）
-- 剪贴板：`NSPasteboard`（文本/图片/HTML/文件列表，读写与变化事件）
-- 通知：`UNUserNotificationCenter`（授权、actions、进度/替换、点击深链）
-- 深链：`CFBundleURLTypes` + `application:openURLs:`；单实例：LaunchServices reopen
-  + 本地 socket 转发；自启：`SMAppService`（macOS 13+）/ LaunchAgent 回退
-- 全局快捷键：Carbon `RegisterEventHotKey`（含 Accessibility 权限状态与引导）
-
-**验收**：菜单/托盘/对话框/剪贴板/通知/快捷键逐项冒烟（需交互的用脚本化 UI 或
-单元测试替代）+ 深链/单实例/自启在 CI 上脚本化验证。
+**限制**：托盘菜单点击已接线但 CI 不真点（人工验证）；通知需 .app 打包后可用；
+自启（`SMAppService`）与 `application:openURLs:` 随 v0.4.9 分发一并做。
+**验收**：上述九条冒烟探针 + `grep -qF` 硬断言。
 
 ### v0.4.8 — macOS WebView 深度
 

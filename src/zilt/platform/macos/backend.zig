@@ -843,6 +843,18 @@ fn Backend(comptime config: Config) type {
             }
             log.print("[macos] menu ok={s} items={d}", .{ boolStr(menu_ok), menu_items });
 
+            var tray_action_ok = false;
+            if (self.status_item) |si| {
+                if (msg0(?Id, si, "menu")) |tm| {
+                    const cnt: c_ulong = msg0(c_ulong, tm, "numberOfItems");
+                    if (cnt >= 1) {
+                        const it0 = objc.msgSend(*const fn (Id, Sel, c_ulong) callconv(.c) Id)(tm, objc.sel("itemAtIndex:"), 0);
+                        tray_action_ok = msg0(?*anyopaque, it0, "action") != null;
+                    }
+                }
+            }
+            log.print("[macos] tray action ok={s}", .{boolStr(tray_action_ok)});
+
             const tray_ok = self.status_item != null;
             log.print("[macos] tray ok={s}", .{boolStr(tray_ok)});
 
@@ -876,7 +888,7 @@ fn Backend(comptime config: Config) type {
                 boolStr(events_ok), self.ev_moved, self.ev_resized, self.ev_focus, self.ev_blur,
             });
 
-            const good = ok and size_ok and json_ok and appearance_ok and events_ok and theme_ok and dock_ok and vibrancy_ok and state_ok and drag_ok and clip_ok and dialog_ok and menu_ok and tray_ok and notify_ok and deeplink_ok and single_ok and hotkey_ok and self.runSpawnProbe();
+            const good = ok and size_ok and json_ok and appearance_ok and events_ok and theme_ok and dock_ok and vibrancy_ok and state_ok and drag_ok and clip_ok and dialog_ok and menu_ok and tray_ok and tray_action_ok and notify_ok and deeplink_ok and single_ok and hotkey_ok and self.runSpawnProbe();
             log.print("[macos] window ops ok={s} content={d}x{d} json={s}", .{
                 boolStr(good),
                 dimToU32(cs.w),
@@ -1091,6 +1103,7 @@ fn Backend(comptime config: Config) type {
                 .{ .name = "windowDidResize:", .imp = imp(&onWindowDidResize), .types = "v@:@" },
                 .{ .name = "windowDidBecomeKey:", .imp = imp(&onWindowDidBecomeKey), .types = "v@:@" },
                 .{ .name = "windowDidResignKey:", .imp = imp(&onWindowDidResignKey), .types = "v@:@" },
+                .{ .name = "trayMenuAction:", .imp = imp(&onTrayMenuAction), .types = "v@:@" },
             });
             _ = objc.defineClass("ZiltNavigationDelegate", "WKNavigationDelegate", &.{
                 .{ .name = "webView:didFinishNavigation:", .imp = imp(&onNavigateFinish), .types = "v@:@@" },
@@ -1232,9 +1245,10 @@ fn Backend(comptime config: Config) type {
         var g_inst: ?*Self = null;
 
         fn setupTray(self: *Self, force: bool) void {
+            const probe_items = [_]Config.MenuItem{ .{ .label = "Probe", .id = "probe" }, .{ .label = "-" } };
             const t: Config.Tray = config.tray orelse blk: {
                 if (!force) return;
-                break :blk .{};
+                break :blk .{ .menu = &probe_items };
             };
             const bar = msg0(Id, objc.cls("NSStatusBar"), "systemStatusBar");
             const item = objc.msgSend(*const fn (Id, Sel, f64) callconv(.c) Id)(bar, objc.sel("statusItemWithLength:"), -1);
@@ -1244,6 +1258,8 @@ fn Backend(comptime config: Config) type {
             }
             if (t.menu) |items| {
                 const menu = objc.allocInit(objc.cls("NSMenu"));
+                const dlg = objc.allocInit(objc.cls("ZiltWindowDelegate"));
+                var leaf: c_long = 0;
                 for (items) |it| {
                     if (std.mem.eql(u8, it.label, "-")) {
                         _ = msg1(void, menu, "addItem:", msg0(Id, objc.cls("NSMenuItem"), "separatorItem"));
@@ -1251,6 +1267,10 @@ fn Backend(comptime config: Config) type {
                     }
                     const mi = objc.allocInit(objc.cls("NSMenuItem"));
                     _ = msg1(void, mi, "setTitle:", objc.nsString(it.label.ptr, it.label.len));
+                    leaf += 1;
+                    _ = objc.msgSend(*const fn (Id, Sel, c_long) callconv(.c) void)(mi, objc.sel("setTag:"), leaf);
+                    _ = objc.msgSend(*const fn (Id, Sel, ?Id) callconv(.c) void)(mi, objc.sel("setTarget:"), dlg);
+                    _ = objc.msgSend(*const fn (Id, Sel, Sel) callconv(.c) void)(mi, objc.sel("setAction:"), objc.sel("trayMenuAction:"));
                     _ = msg1(void, menu, "addItem:", mi);
                 }
                 _ = msg1(void, item, "setMenu:", menu);
@@ -1358,6 +1378,26 @@ fn Backend(comptime config: Config) type {
             const json = std.fmt.bufPrint(&payload, "{{\"id\":\"{s}\"}}", .{id_str}) catch return 0;
             self.emitWindowEvent(0, "hotkey", json);
             return 0;
+        }
+
+        /// 托盘菜单项点击：tag 是叶子序号（1 起），按顺序映射回 MenuItem.id
+        fn onTrayMenuAction(_: Id, _: Sel, sender: Id) callconv(.c) void {
+            const tag: c_long = msg0(c_long, sender, "tag");
+            if (tag <= 0) return;
+            const want: usize = @intCast(tag);
+            const t = config.tray orelse return;
+            const items = t.menu orelse return;
+            var leaf: usize = 0;
+            for (items) |it| {
+                if (std.mem.eql(u8, it.label, "-")) continue;
+                leaf += 1;
+                if (leaf != want) continue;
+                const id = it.id orelse it.label;
+                const payload = std.fmt.allocPrint(inst.alloc, "{{\"id\":\"{s}\"}}", .{id}) catch return;
+                defer inst.alloc.free(payload);
+                inst.emitWindowEvent(0, "menu", payload);
+                return;
+            }
         }
 
         fn notifyEntry(backend: *anyopaque, title: []const u8, body: []const u8) void {
