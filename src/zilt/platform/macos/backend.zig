@@ -60,13 +60,15 @@ fn Backend(comptime config: Config) type {
         probe_sent: bool = false,
         ipc_seen: bool = false,
         ipc_ok: bool = false,
+        wins: std.ArrayListUnmanaged(WinState) = .empty,
+        next_win_id: u32 = 1,
         smoke_ms: u32 = 0,
         /// v0.4.5：窗口控制探针结果（CI 硬断言）
         win_ops_ok: bool = false,
         assets: std.StringHashMapUnmanaged([]u8) = .empty,
         /// 跨线程 emit 队列（worker → 主线程 drain；WebKit 只允许主线程 eval）
         out_mutex: std.atomic.Mutex = .unlocked,
-        out_queue: std.ArrayListUnmanaged([]u8) = .empty,
+        out_queue: std.ArrayListUnmanaged(OutItem) = .empty,
 
         fn main() !void {
             inst.smoke_ms = parseSmokeMs(env("ZILT_SMOKE_TEST_MS"));
@@ -98,6 +100,19 @@ fn Backend(comptime config: Config) type {
         // ------------------------------------------------------------------
         const Rect = extern struct { x: f64, y: f64, w: f64, h: f64 };
 
+        /// v0.4.5 多窗口：主窗口沿用 window/webview 字段，附加窗口进 wins（id 从 1 起）
+        const WinState = struct {
+            id: u32,
+            win: Id,
+            webview: Id,
+        };
+
+        /// 跨线程投递项（带目标窗口，drain 时按窗 eval）
+        const OutItem = struct {
+            window_id: u32,
+            json: []u8,
+        };
+
         fn createWindow(self: *Self) !void {
             const raw = msg0(Id, objc.cls("NSWindow"), "alloc");
             // styleMask: titled(1)|closable(2)|miniaturizable(4)|resizable(8)
@@ -128,36 +143,38 @@ fn Backend(comptime config: Config) type {
         }
 
         fn createWebView(self: *Self) !void {
+            self.webview = try self.makeWebView(config.width, config.height);
+            _ = msg1(void, self.window, "setContentView:", self.webview);
+            log.print("[macos] webview created", .{});
+            try self.loadUrlIn(self.webview, null);
+        }
+
+        /// 为一个 NSWindow 建 WKWebView：配置 + runtime 注入 + 消息/导航 delegate + scheme handler
+        fn makeWebView(_: *Self, width: u32, height: u32) !Id {
             const cfg = objc.allocInit(objc.cls("WKWebViewConfiguration"));
             const ucc = objc.allocInit(objc.cls("WKUserContentController"));
-
-            // JS→Zig：window.webkit.messageHandlers.zilt
             _ = objc.msgSend(*const fn (Id, Sel, Id, Id) callconv(.c) void)(
                 ucc,
                 objc.sel("addScriptMessageHandler:name:"),
                 msg0(Id, objc.cls("ZiltMessageHandler"), "new"),
                 objc.nsStringZ("zilt"),
             );
-            // 注入 window.zilt 运行时（document start）
             const us_raw = msg0(Id, objc.cls("WKUserScript"), "alloc");
             const us = objc.msgSend(*const fn (Id, Sel, Id, c_ulong, bool) callconv(.c) Id)(
                 us_raw,
                 objc.sel("initWithSource:injectionTime:forMainFrameOnly:"),
                 objc.nsString(ipc.runtime_js.ptr, ipc.runtime_js.len),
-                0, // WKUserScriptInjectionTimeAtDocumentStart
+                0,
                 false,
             );
             _ = msg1(void, ucc, "addUserScript:", us);
             _ = msg1(void, cfg, "setUserContentController:", ucc);
-
-            // 资产：zilt://app/...
             _ = objc.msgSend(*const fn (Id, Sel, Id, Id) callconv(.c) void)(
                 cfg,
                 objc.sel("setURLSchemeHandler:forURLScheme:"),
                 msg0(Id, objc.cls("ZiltSchemeHandler"), "new"),
                 objc.nsStringZ(scheme),
             );
-
             const wv_raw = msg0(Id, objc.cls("WKWebView"), "alloc");
             const wv = objc.msgSend(*const fn (Id, Sel, Rect, Id) callconv(.c) Id)(
                 wv_raw,
@@ -165,24 +182,25 @@ fn Backend(comptime config: Config) type {
                 .{
                     .x = 0,
                     .y = 0,
-                    .w = @floatFromInt(config.width),
-                    .h = @floatFromInt(config.height),
+                    .w = @floatFromInt(width),
+                    .h = @floatFromInt(height),
                 },
                 cfg,
             );
             if (@intFromPtr(wv) == 0) return error.WebViewCreationFailed;
-            self.webview = wv;
             _ = msg1(void, wv, "setNavigationDelegate:", msg0(Id, objc.cls("ZiltNavigationDelegate"), "new"));
-            _ = msg1(void, self.window, "setContentView:", wv);
-            log.print("[macos] webview created", .{});
+            return wv;
+        }
 
-            const entry = try self.entryUrl();
+        fn loadUrlIn(self: *Self, wv: Id, override: ?[]const u8) !void {
+            const entry = if (override) |u| try self.alloc.dupe(u8, u) else try self.entryUrl();
             defer self.alloc.free(entry);
             const nsurl = msg1(Id, objc.cls("NSURL"), "URLWithString:", objc.nsString(entry.ptr, entry.len));
             const req = msg1(Id, objc.cls("NSURLRequest"), "requestWithURL:", nsurl);
             _ = msg1(void, wv, "loadRequest:", req);
             log.print("[macos] loading {s}", .{entry});
         }
+
 
         /// 入口 URL：默认 `https://zilt.app/...` 映射到自有 scheme；其它 http(s)
         /// （开发服务器）原样加载。
@@ -267,7 +285,7 @@ fn Backend(comptime config: Config) type {
         // ------------------------------------------------------------------
         // IPC
         // ------------------------------------------------------------------
-        fn handleRaw(self: *Self, raw: []const u8) void {
+        fn handleRaw(self: *Self, window_id: u32, raw: []const u8) void {
             var decoded = ipc.decode(self.alloc, raw) catch return;
             defer decoded.deinit();
             switch (decoded.msg) {
@@ -275,25 +293,25 @@ fn Backend(comptime config: Config) type {
                     log.print("[macos] ipc invoke {s} id={d}", .{ inv.method, inv.id });
                     var arena = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena.deinit();
-                    const ctx = self.context(arena.allocator());
+                    const ctx = self.context(arena.allocator(), window_id);
 
                     const result: []const u8 = blk: {
                         if (builtin_cmds.dispatch(ctx, inv.method, inv.args_json)) |maybe| {
                             if (maybe) |json| break :blk json;
                         } else |err| {
                             log.print("[macos] builtin {s} failed: {s}", .{ inv.method, @errorName(err) });
-                            self.reject(inv.id, @errorName(err));
+                            self.reject(window_id, inv.id, @errorName(err));
                             return;
                         }
                         break :blk ipc.dispatch(config.commands, ctx, inv.method, inv.args_json) catch |err| {
                             log.print("[macos] invoke {s} failed: {s}", .{ inv.method, @errorName(err) });
-                            self.reject(inv.id, @errorName(err));
+                            self.reject(window_id, inv.id, @errorName(err));
                             return;
                         };
                     };
                     const resp = ipc.encodeResolve(self.alloc, inv.id, result) catch return;
                     defer self.alloc.free(resp);
-                    self.deliver(resp);
+                    self.deliver(window_id, resp);
                 },
                 .event => |ev| {
                     if (std.mem.eql(u8, ev.name, "__zilt.macosProbe")) {
@@ -307,33 +325,34 @@ fn Backend(comptime config: Config) type {
                     }
                     var arena = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena.deinit();
-                    const ctx = self.context(arena.allocator());
+                    const ctx = self.context(arena.allocator(), window_id);
                     _ = ipc.dispatchEvent(config.events, ctx, ev.name, ev.payload_json);
                 },
                 else => {},
             }
         }
 
-        fn context(self: *Self, alloc: std.mem.Allocator) ipc.Context {
+        fn context(self: *Self, alloc: std.mem.Allocator, window_id: u32) ipc.Context {
             return .{
                 .allocator = alloc,
                 .msg_allocator = self.alloc,
                 .backend = @ptrCast(self),
-                .window_id = 0,
+                .window_id = window_id,
                 .emit_fn = emitEntry,
                 .quit_fn = quitEntry,
                 .window_fn = windowEntry,
                 .window_query_fn = windowQueryEntry,
+                .spawn_window_fn = spawnWindowEntry,
             };
         }
 
-        fn deliver(self: *Self, json: []const u8) void {
+        fn deliver(self: *Self, window_id: u32, json: []const u8) void {
             lockSpin(&self.out_mutex);
             const copy = self.alloc.dupe(u8, json) catch {
                 self.out_mutex.unlock();
                 return;
             };
-            self.out_queue.append(self.alloc, copy) catch {
+            self.out_queue.append(self.alloc, .{ .window_id = window_id, .json = copy }) catch {
                 self.out_mutex.unlock();
                 self.alloc.free(copy);
                 return;
@@ -363,27 +382,27 @@ fn Backend(comptime config: Config) type {
                 else
                     null;
                 self.out_mutex.unlock();
-                const json = item orelse break;
-                defer self.alloc.free(json);
-                const script = std.fmt.allocPrint(self.alloc, "window.__ziltDeliver({s})", .{json}) catch continue;
+                const it = item orelse break;
+                defer self.alloc.free(it.json);
+                const script = std.fmt.allocPrint(self.alloc, "window.__ziltDeliver({s})", .{it.json}) catch continue;
                 defer self.alloc.free(script);
-                self.evalScript(script);
+                self.evalScript(self.webviewFor(it.window_id), script);
             }
         }
 
-        fn evalScript(self: *Self, script: []const u8) void {
+        fn evalScript(_: *Self, wv: Id, script: []const u8) void {
             _ = objc.msgSend(*const fn (Id, Sel, Id, ?*const anyopaque) callconv(.c) void)(
-                self.webview,
+                wv,
                 objc.sel("evaluateJavaScript:completionHandler:"),
                 objc.nsString(script.ptr, script.len),
                 null,
             );
         }
 
-        fn reject(self: *Self, id: u64, err_name: []const u8) void {
+        fn reject(self: *Self, window_id: u32, id: u64, err_name: []const u8) void {
             const resp = ipc.encodeReject(self.alloc, id, err_name) catch return;
             defer self.alloc.free(resp);
-            self.deliver(resp);
+            self.deliver(window_id, resp);
         }
 
         // ------------------------------------------------------------------
@@ -421,12 +440,11 @@ fn Backend(comptime config: Config) type {
 
         fn windowEntry(backend: *anyopaque, window_id: u32, cmd: ipc.WindowCmd) bool {
             const self: *Self = @ptrCast(@alignCast(backend));
-            if (window_id != 0) return false; // 多窗口随 spawn_window_fn 落地
-            return self.applyWindowCmd(cmd);
+            return self.applyWindowCmd(window_id, cmd);
         }
 
-        fn applyWindowCmd(self: *Self, cmd: ipc.WindowCmd) bool {
-            const win = self.window;
+        fn applyWindowCmd(self: *Self, window_id: u32, cmd: ipc.WindowCmd) bool {
+            const win = self.targetWindow(window_id) orelse return false;
             switch (cmd) {
                 .set_title => |t| {
                     _ = msg1(void, win, "setTitle:", objc.nsString(t.ptr, t.len));
@@ -527,11 +545,11 @@ fn Backend(comptime config: Config) type {
         /// 窗口状态 JSON：字段名与 Windows/Linux 对齐；macOS 无对等项的显式标记
         fn windowQueryEntry(backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator) ?[]u8 {
             const self: *Self = @ptrCast(@alignCast(backend));
-            if (window_id != 0) return null;
-            const f = frameOf(self.window);
-            const cs = contentSize(self.window);
-            const mn = objc.msgSend(*const fn (Id, Sel) callconv(.c) Size)(self.window, objc.sel("contentMinSize"));
-            const mx = objc.msgSend(*const fn (Id, Sel) callconv(.c) Size)(self.window, objc.sel("contentMaxSize"));
+            const win = self.targetWindow(window_id) orelse return null;
+            const f = frameOf(win);
+            const cs = contentSize(win);
+            const mn = objc.msgSend(*const fn (Id, Sel) callconv(.c) Size)(win, objc.sel("contentMinSize"));
+            const mx = objc.msgSend(*const fn (Id, Sel) callconv(.c) Size)(win, objc.sel("contentMaxSize"));
             const x: i32 = toI32(f.origin.x);
             const y: i32 = toI32(screenHeight() - (f.origin.y + f.size.h));
             return std.fmt.allocPrint(alloc,
@@ -541,13 +559,13 @@ fn Backend(comptime config: Config) type {
                 y,
                 dimToU32(cs.w),
                 dimToU32(cs.h),
-                boolStr(msg0(bool, self.window, "isVisible")),
-                boolStr(msg0(bool, self.window, "isKeyWindow")),
-                boolStr(msg0(bool, self.window, "isZoomed")),
-                boolStr(msg0(bool, self.window, "isMiniaturized")),
-                boolStr((styleMaskOf(self.window) & mask_fullscreen) != 0),
-                boolStr(msg0(c_long, self.window, "level") > 0),
-                boolStr((styleMaskOf(self.window) & mask_resizable) != 0),
+                boolStr(msg0(bool, win, "isVisible")),
+                boolStr(msg0(bool, win, "isKeyWindow")),
+                boolStr(msg0(bool, win, "isZoomed")),
+                boolStr(msg0(bool, win, "isMiniaturized")),
+                boolStr((styleMaskOf(win) & mask_fullscreen) != 0),
+                boolStr(msg0(c_long, win, "level") > 0),
+                boolStr((styleMaskOf(win) & mask_resizable) != 0),
                 dimToU32(mn.w),
                 dimToU32(mn.h),
                 dimToU32(mx.w),
@@ -557,10 +575,10 @@ fn Backend(comptime config: Config) type {
 
         /// 冒烟探针：窗口控制往返（尺寸 / 标题 / 置顶 / 状态查询）→ CI 硬断言
         fn runWindowOpsProbe(self: *Self) bool {
-            var ok = self.applyWindowCmd(.{ .size = .{ .width = 640, .height = 480 } });
-            ok = self.applyWindowCmd(.{ .set_title = "Zilt Smoke (v0.4.5)" }) and ok;
-            ok = self.applyWindowCmd(.{ .always_on_top = true }) and ok;
-            ok = self.applyWindowCmd(.{ .always_on_top = false }) and ok;
+            var ok = self.applyWindowCmd(0, .{ .size = .{ .width = 640, .height = 480 } });
+            ok = self.applyWindowCmd(0, .{ .set_title = "Zilt Smoke (v0.4.5)" }) and ok;
+            ok = self.applyWindowCmd(0, .{ .always_on_top = true }) and ok;
+            ok = self.applyWindowCmd(0, .{ .always_on_top = false }) and ok;
             const cs = contentSize(self.window);
             const size_ok = @abs(cs.w - 640.0) < 1.0 and @abs(cs.h - 480.0) < 1.0;
             var json_ok = false;
@@ -577,6 +595,78 @@ fn Backend(comptime config: Config) type {
             });
             return good;
         }
+
+        // ------------------------------------------------------------------
+        // v0.4.5 多窗口：id 0 = 主窗口；id 1.. = wins 里的附加窗口
+        // ------------------------------------------------------------------
+        fn targetWindow(self: *Self, window_id: u32) ?Id {
+            if (window_id == 0) return self.window;
+            for (self.wins.items) |it| {
+                if (it.id == window_id) return it.win;
+            }
+            return null;
+        }
+
+        fn webviewFor(self: *Self, window_id: u32) Id {
+            if (window_id == 0) return self.webview;
+            for (self.wins.items) |it| {
+                if (it.id == window_id) return it.webview;
+            }
+            return self.webview;
+        }
+
+        fn windowIdOf(self: *Self, wv: ?Id) u32 {
+            const w = wv orelse return 0;
+            if (w == self.webview) return 0;
+            for (self.wins.items) |it| {
+                if (it.webview == w) return it.id;
+            }
+            return 0;
+        }
+
+        fn newNSWindow(_: *Self, title: []const u8, w: u32, h: u32, resizable: bool) !Id {
+            const raw = msg0(Id, objc.cls("NSWindow"), "alloc");
+            var mask: c_ulong = 1 | 2 | 4;
+            if (resizable) mask |= 8;
+            const win = objc.msgSend(*const fn (Id, Sel, Rect, c_ulong, c_ulong, bool) callconv(.c) Id)(
+                raw,
+                objc.sel("initWithContentRect:styleMask:backing:defer:"),
+                .{
+                    .x = 240,
+                    .y = 240,
+                    .w = @floatFromInt(w),
+                    .h = @floatFromInt(h),
+                },
+                mask,
+                2,
+                false,
+            );
+            if (@intFromPtr(win) == 0) return error.WindowCreationFailed;
+            _ = msg1(void, win, "setTitle:", objc.nsString(title.ptr, title.len));
+            _ = msg1(void, win, "setReleasedWhenClosed:", false);
+            _ = msg1(void, win, "setDelegate:", msg0(Id, objc.cls("ZiltWindowDelegate"), "new"));
+            _ = msg1(void, win, "makeKeyAndOrderFront:", @as(?Id, null));
+            return win;
+        }
+
+        fn spawnWindowEntry(backend: *anyopaque, opts: ipc.WindowOptions) ?u32 {
+            const self: *Self = @ptrCast(@alignCast(backend));
+            if (!isMainThread()) {
+                log.print("[macos] spawn_window off-main-thread → refused", .{});
+                return null;
+            }
+            const win = self.newNSWindow(opts.title, opts.width, opts.height, opts.resizable) catch return null;
+            const wv = self.makeWebView(opts.width, opts.height) catch return null;
+            _ = msg1(void, win, "setContentView:", wv);
+            self.loadUrlIn(wv, opts.url) catch {};
+            const id = self.next_win_id;
+            self.next_win_id += 1;
+            self.wins.append(self.alloc, .{ .id = id, .win = win, .webview = wv }) catch return null;
+            if (!opts.visible) _ = msg1(void, win, "orderOut:", @as(?Id, null));
+            log.print("[macos] window created id={d} {d}x{d}", .{ id, opts.width, opts.height });
+            return id;
+        }
+
 
         // 冒烟：有界 runloop + 页面/IPC 探针
         // ------------------------------------------------------------------
@@ -611,7 +701,7 @@ fn Backend(comptime config: Config) type {
                 }
                 if (self.page_loaded and !self.probe_sent) {
                     self.probe_sent = true;
-                    self.evalScript(probe_js);
+                    self.evalScript(self.webview, probe_js);
                     self.win_ops_ok = self.runWindowOpsProbe();
                     log.print("[macos] probe sent", .{});
                 }
@@ -649,13 +739,28 @@ fn Backend(comptime config: Config) type {
             });
         }
 
-        fn onWindowClose(_: Id, _: Sel, _: Id) callconv(.c) void {
-            log.print("[macos] window closing → terminate", .{});
-            msg1(void, inst.app, "terminate:", @as(?Id, null));
+        fn onWindowClose(_: Id, _: Sel, window: Id) callconv(.c) void {
+            const is_primary = window == inst.window;
+            var idx: ?usize = null;
+            for (inst.wins.items, 0..) |it, i| {
+                if (it.win == window) idx = i;
+            }
+            if (idx) |i| _ = inst.wins.orderedRemove(i);
+            const left = inst.wins.items.len + @as(usize, if (is_primary) 0 else 1);
+            if (left == 0) {
+                log.print("[macos] last window closing → terminate", .{});
+                msg1(void, inst.app, "terminate:", @as(?Id, null));
+            } else {
+                log.print("[macos] window closed, {d} left", .{left});
+            }
         }
 
-        fn onNavigateFinish(_: Id, _: Sel, _: Id, _: Id) callconv(.c) void {
-            inst.page_loaded = true;
+        fn onNavigateFinish(_: Id, _: Sel, view: Id, _: Id) callconv(.c) void {
+            if (view == inst.webview) {
+                inst.page_loaded = true;
+            } else {
+                log.print("[macos] secondary window loaded id={d}", .{inst.windowIdOf(view)});
+            }
             log.print("[macos] page loaded", .{});
         }
 
@@ -673,16 +778,15 @@ fn Backend(comptime config: Config) type {
             const body = msg0(Id, message, "body");
             const json = objc.jsonFromId(inst.alloc, body) orelse return;
             defer inst.alloc.free(json);
-            inst.handleRaw(json);
+            inst.handleRaw(inst.windowIdOf(msg0(?Id, message, "webView")), json);
         }
 
         // ------------------------------------------------------------------
         // 小工具
         // ------------------------------------------------------------------
         fn emitEntry(backend: *anyopaque, window_id: u32, message_json: []const u8) void {
-            _ = window_id;
             const self: *Self = @ptrCast(@alignCast(backend));
-            self.deliver(message_json);
+            self.deliver(window_id, message_json);
         }
 
         fn quitEntry(backend: *anyopaque, code: u8) void {
