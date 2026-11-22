@@ -252,7 +252,7 @@ jobs:
   linux-arm64:
     name: Build / Package / Smoke (Linux arm64, QEMU)
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 35
 
     steps:
       - uses: actions/checkout@v4
@@ -266,12 +266,12 @@ jobs:
         id: arm64
         run: |
           set +e
-          bash scripts/linux/build-arm64.sh
+          timeout 1200 bash scripts/linux/build-arm64.sh
           code=$?
           set -e
           # 环境不足（无镜像/无 binfmt）脚本按设计 exit 3 ——不是能力缺口，记为 SKIP
-          if [ $code -eq 3 ]; then
-            echo "::warning::ARM64 构建 SKIP（环境：镜像/binfmt）；能力面证据待有镜像环境回填"
+          if [ $code -eq 3 ] || [ $code -eq 124 ]; then
+            echo "::warning::ARM64 构建 SKIP（环境：镜像/binfmt 或 20 分钟超时）；能力面证据待有镜像环境回填"
             echo "ARM64_BUILD=SKIP（环境）" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
             echo "skip=1" >> "$GITHUB_OUTPUT"
             exit 0

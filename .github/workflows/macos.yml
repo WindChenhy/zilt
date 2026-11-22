@@ -66,6 +66,7 @@ jobs:
           grep -q "\[macos\] ipc roundtrip greet=true" smoke.log
           grep -qF "[macos] window ops ok=true" smoke.log
           grep -qF "[macos] window spawn ok=true" smoke.log
+          grep -qF "[macos] appearance ok=true" smoke.log
           grep -q "\[macos\] smoke done, exiting" smoke.log
           # 资产真的走了 WKURLSchemeHandler（不是回落 file://）
           grep -q "\[assets\] .*index.html.* 200" smoke.log

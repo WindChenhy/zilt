@@ -113,6 +113,28 @@ fn Backend(comptime config: Config) type {
             json: []u8,
         };
 
+        /// v0.4.5 外观：标题栏三态 + 透明（config 驱动）
+        ///   standard：系统默认；overlay：摘 titled + FullSizeContentView（内容顶到红绿灯）；
+        ///   transparent：标题栏透明；config.transparent 额外关 opaque 并设透明背景。
+        fn applyAppearance(_: *Self, win: Id) void {
+            if (config.titlebar_overlay) {
+                var mask = styleMaskOf(win);
+                mask &= ~@as(c_ulong, 1);
+                mask |= 1 << 15; // NSWindowStyleMaskFullSizeContentView
+                _ = objc.msgSend(*const fn (Id, Sel, c_ulong) callconv(.c) void)(win, objc.sel("setStyleMask:"), mask);
+                _ = msg1(void, win, "setTitlebarAppearsTransparent:", true);
+                _ = msg1(void, win, "setTitleVisibility:", @as(c_long, 1));
+                _ = msg1(void, win, "setMovableByWindowBackground:", true);
+            } else if (config.transparent) {
+                _ = msg1(void, win, "setTitlebarAppearsTransparent:", true);
+            }
+            if (config.transparent) {
+                _ = msg1(void, win, "setOpaque:", false);
+                _ = msg1(void, win, "setBackgroundColor:", msg0(Id, objc.cls("NSColor"), "clearColor"));
+            }
+            log.print("[macos] appearance overlay={} transparent={}", .{ config.titlebar_overlay, config.transparent });
+        }
+
         fn createWindow(self: *Self) !void {
             const raw = msg0(Id, objc.cls("NSWindow"), "alloc");
             // styleMask: titled(1)|closable(2)|miniaturizable(4)|resizable(8)
@@ -137,6 +159,7 @@ fn Backend(comptime config: Config) type {
             _ = msg1(void, win, "setTitle:", objc.nsStringZ(config.title.ptr));
             _ = msg1(void, win, "setReleasedWhenClosed:", false);
             _ = msg1(void, win, "setDelegate:", msg0(Id, objc.cls("ZiltWindowDelegate"), "new"));
+            self.applyAppearance(win);
             _ = msg1(void, win, "makeKeyAndOrderFront:", @as(?Id, null));
             _ = msg1(void, self.app, "activateIgnoringOtherApps:", true);
             log.print("[macos] window created {d}x{d}", .{ config.width, config.height });
@@ -603,7 +626,15 @@ fn Backend(comptime config: Config) type {
                 json_ok = std.mem.indexOf(u8, json, "width") != null;
                 self.alloc.free(json);
             }
-            const good = ok and size_ok and json_ok and self.runSpawnProbe();
+            // 外观：styleMask 切 FullSizeContentView 再还原，断言位确实能读写
+            const mask0 = styleMaskOf(self.window);
+            _ = objc.msgSend(*const fn (Id, Sel, c_ulong) callconv(.c) void)(self.window, objc.sel("setStyleMask:"), mask0 | (1 << 15));
+            const mask1 = styleMaskOf(self.window);
+            _ = objc.msgSend(*const fn (Id, Sel, c_ulong) callconv(.c) void)(self.window, objc.sel("setStyleMask:"), mask0);
+            const appearance_ok = (mask1 & (1 << 15)) != 0;
+            log.print("[macos] appearance ok={s} mask={d}", .{ boolStr(appearance_ok), mask1 });
+
+            const good = ok and size_ok and json_ok and appearance_ok and self.runSpawnProbe();
             log.print("[macos] window ops ok={s} content={d}x{d} json={s}", .{
                 boolStr(good),
                 dimToU32(cs.w),
