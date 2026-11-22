@@ -850,7 +850,9 @@ fn Backend(comptime config: Config) type {
             });
         }
 
-        fn onWindowDidMove(_: Id, _: Sel, window: Id) callconv(.c) void {
+        fn onWindowDidMove(_: Id, _: Sel, note: Id) callconv(.c) void {
+            // 窗口 delegate 的 did*: 传的是 NSNotification，不是 NSWindow
+            const window = msg0(?Id, note, "object") orelse return;
             inst.ev_moved += 1;
             const f = frameOf(window);
             const id = inst.windowIdOfWindow(window);
@@ -863,7 +865,9 @@ fn Backend(comptime config: Config) type {
             inst.emitWindowEvent(id, "windowMoved", payload);
         }
 
-        fn onWindowDidResize(_: Id, _: Sel, window: Id) callconv(.c) void {
+        fn onWindowDidResize(_: Id, _: Sel, note: Id) callconv(.c) void {
+            // 窗口 delegate 的 did*: 传的是 NSNotification，不是 NSWindow
+            const window = msg0(?Id, note, "object") orelse return;
             inst.ev_resized += 1;
             const f = frameOf(window);
             const id = inst.windowIdOfWindow(window);
@@ -876,7 +880,9 @@ fn Backend(comptime config: Config) type {
             inst.emitWindowEvent(id, "windowResized", payload);
         }
 
-        fn onWindowDidBecomeKey(_: Id, _: Sel, window: Id) callconv(.c) void {
+        fn onWindowDidBecomeKey(_: Id, _: Sel, note: Id) callconv(.c) void {
+            // 窗口 delegate 的 did*: 传的是 NSNotification，不是 NSWindow
+            const window = msg0(?Id, note, "object") orelse return;
             inst.ev_focus += 1;
             const id = inst.windowIdOfWindow(window);
             const payload = std.fmt.allocPrint(inst.alloc, "{{\"id\":{d}}}", .{id}) catch return;
@@ -884,7 +890,9 @@ fn Backend(comptime config: Config) type {
             inst.emitWindowEvent(id, "windowFocus", payload);
         }
 
-        fn onWindowDidResignKey(_: Id, _: Sel, window: Id) callconv(.c) void {
+        fn onWindowDidResignKey(_: Id, _: Sel, note: Id) callconv(.c) void {
+            // 窗口 delegate 的 did*: 传的是 NSNotification，不是 NSWindow
+            const window = msg0(?Id, note, "object") orelse return;
             inst.ev_blur += 1;
             const id = inst.windowIdOfWindow(window);
             const payload = std.fmt.allocPrint(inst.alloc, "{{\"id\":{d}}}", .{id}) catch return;
