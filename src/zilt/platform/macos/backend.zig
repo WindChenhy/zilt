@@ -506,6 +506,24 @@ fn Backend(comptime config: Config) type {
             }
         }
 
+        /// NSWindow 的 contentMaxSize 默认是极大的值（近乎 FLT_MAX）——直接
+        /// @intFromFloat 会触发 “integer part of floating point value out of bounds”
+        /// （CI 45029055532 实测）。统一做有限性 + 边界钳制。
+        fn dimToU32(v: f64) u32 {
+            if (!std.math.isFinite(v) or v <= 0) return 0;
+            const r = @round(v);
+            if (r >= 4_000_000_000.0) return 4_000_000_000;
+            return @intFromFloat(r);
+        }
+
+        fn toI32(v: f64) i32 {
+            if (!std.math.isFinite(v)) return 0;
+            const r = @round(v);
+            if (r >= 2_000_000_000.0) return 2_000_000_000;
+            if (r <= -2_000_000_000.0) return -2_000_000_000;
+            return @intFromFloat(r);
+        }
+
         /// 窗口状态 JSON：字段名与 Windows/Linux 对齐；macOS 无对等项的显式标记
         fn windowQueryEntry(backend: *anyopaque, window_id: u32, alloc: std.mem.Allocator) ?[]u8 {
             const self: *Self = @ptrCast(@alignCast(backend));
@@ -514,15 +532,15 @@ fn Backend(comptime config: Config) type {
             const cs = contentSize(self.window);
             const mn = objc.msgSend(*const fn (Id, Sel) callconv(.c) Size)(self.window, objc.sel("contentMinSize"));
             const mx = objc.msgSend(*const fn (Id, Sel) callconv(.c) Size)(self.window, objc.sel("contentMaxSize"));
-            const x: i32 = @intFromFloat(@round(f.origin.x));
-            const y: i32 = @intFromFloat(@round(screenHeight() - (f.origin.y + f.size.h)));
+            const x: i32 = toI32(f.origin.x);
+            const y: i32 = toI32(screenHeight() - (f.origin.y + f.size.h));
             return std.fmt.allocPrint(alloc,
                 \\{{"id":0,"x":{d},"y":{d},"width":{d},"height":{d},"visible":{s},"focused":{s},"zoomed":{s},"iconic":{s},"fullscreen":{s},"always_on_top":{s},"resizable":{s},"decorated":true,"min_width":{d},"min_height":{d},"max_width":{d},"max_height":{d}}}
             , .{
                 x,
                 y,
-                @as(u32, @intFromFloat(@round(cs.w))),
-                @as(u32, @intFromFloat(@round(cs.h))),
+                dimToU32(cs.w),
+                dimToU32(cs.h),
                 boolStr(msg0(bool, self.window, "isVisible")),
                 boolStr(msg0(bool, self.window, "isKeyWindow")),
                 boolStr(msg0(bool, self.window, "isZoomed")),
@@ -530,10 +548,10 @@ fn Backend(comptime config: Config) type {
                 boolStr((styleMaskOf(self.window) & mask_fullscreen) != 0),
                 boolStr(msg0(c_long, self.window, "level") > 0),
                 boolStr((styleMaskOf(self.window) & mask_resizable) != 0),
-                @as(u32, @intFromFloat(@round(mn.w))),
-                @as(u32, @intFromFloat(@round(mn.h))),
-                @as(u32, @intFromFloat(@round(mx.w))),
-                @as(u32, @intFromFloat(@round(mx.h))),
+                dimToU32(mn.w),
+                dimToU32(mn.h),
+                dimToU32(mx.w),
+                dimToU32(mx.h),
             }) catch null;
         }
 
@@ -553,8 +571,8 @@ fn Backend(comptime config: Config) type {
             const good = ok and size_ok and json_ok;
             log.print("[macos] window ops ok={s} content={d}x{d} json={s}", .{
                 boolStr(good),
-                @as(u32, @intFromFloat(@round(cs.w))),
-                @as(u32, @intFromFloat(@round(cs.h))),
+                dimToU32(cs.w),
+                dimToU32(cs.h),
                 boolStr(json_ok),
             });
             return good;
