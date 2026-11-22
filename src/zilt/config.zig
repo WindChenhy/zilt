@@ -22,6 +22,9 @@ pub const Isolation = struct {
     key_hex: []const u8,
 };
 
+/// macOS 窗口材质（NSVisualEffectView）：对应 AppKit 语义材质 sidebar(7)/hud(13)/window(12)
+pub const Vibrancy = enum { sidebar, hud, window };
+
 pub const Config = struct {
     /// 命令命名空间：`pub fn 名字(ctx: Context, args: struct{...}) !结果`（JS→Zig 调用）
     commands: type,
@@ -43,11 +46,15 @@ pub const Config = struct {
     resizable: bool = true,
     /// 是否带原生标题栏/边框
     decorations: bool = true,
+    /// macOS 窗口材质（NSVisualEffectView）：按 AppKit 语义材质 sidebar(7)/hud(13)/window(12)
+
     /// v0.1.23：覆盖式标题栏——客户区覆盖整个窗口（无原生标题栏/边框），前端自绘。
     /// 需要配合 `data-zilt-drag-region` 实现拖动，四边仍可缩放。
     titlebar_overlay: bool = false,
     /// WebView 背景透明（桌面透出）
     transparent: bool = false,
+    /// macOS：窗口材质（null = 不用）
+    vibrancy: ?Vibrancy = null,
     /// 窗口置顶
     always_on_top: bool = false,
     /// 从任务栏/Alt-Tab 隐藏

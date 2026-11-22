@@ -70,6 +70,9 @@ jobs:
           grep -qF "[macos] window events ok=true" smoke.log
           grep -qF "[macos] theme ok=true" smoke.log
           grep -qF "[macos] dock ok=true" smoke.log
+          grep -qF "[macos] vibrancy ok=true" smoke.log
+          grep -qF "[macos] state ok=true" smoke.log
+          grep -qF "[macos] drag ok=true" smoke.log
           grep -q "\[macos\] smoke done, exiting" smoke.log
           # 资产真的走了 WKURLSchemeHandler（不是回落 file://）
           grep -q "\[assets\] .*index.html.* 200" smoke.log

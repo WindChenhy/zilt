@@ -67,6 +67,7 @@ fn Backend(comptime config: Config) type {
         ev_focus: u32 = 0,
         ev_blur: u32 = 0,
         last_dark: ?bool = null,
+        vibrancy_view: ?Id = null,
         smoke_ms: u32 = 0,
         /// v0.4.5：窗口控制探针结果（CI 硬断言）
         win_ops_ok: bool = false,
@@ -121,6 +122,81 @@ fn Backend(comptime config: Config) type {
         /// v0.4.5 外观：标题栏三态 + 透明（config 驱动）
         ///   standard：系统默认；overlay：摘 titled + FullSizeContentView（内容顶到红绿灯）；
         ///   transparent：标题栏透明；config.transparent 额外关 opaque 并设透明背景。
+        fn boundsOf(view: Id) NSRect {
+            return objc.msgSend(*const fn (Id, Sel) callconv(.c) NSRect)(view, objc.sel("bounds"));
+        }
+
+        /// 窗口材质：NSVisualEffectView 垫在 webview 下面（config.vibrancy；冒烟强制 sidebar）
+        fn applyVibrancy(self: *Self) void {
+            const v: config.Vibrancy = config.vibrancy orelse blk: {
+                if (self.smoke_ms != 0) break :blk config.Vibrancy.sidebar;
+                return;
+            };
+            const material: c_long = switch (v) {
+                .sidebar => 7,
+                .hud => 13,
+                .window => 12,
+            };
+            const content = msg0(Id, self.window, "contentView");
+            const ev = objc.allocInit(objc.cls("NSVisualEffectView"));
+            _ = msg1(void, ev, "setMaterial:", material);
+            _ = msg1(void, ev, "setBlendingMode:", @as(c_long, 0));
+            _ = msg1(void, ev, "setState:", @as(c_long, 1));
+            const b = boundsOf(content);
+            _ = objc.msgSend(*const fn (Id, Sel, NSRect) callconv(.c) void)(ev, objc.sel("setFrame:"), b);
+            _ = objc.msgSend(*const fn (Id, Sel, Id, c_long, ?Id) callconv(.c) void)(
+                content,
+                objc.sel("addSubview:positioned:relativeTo:"),
+                ev,
+                -1, // NSWindowBelow
+                self.webview,
+            );
+            _ = msg1(void, self.window, "setOpaque:", false);
+            self.vibrancy_view = ev;
+            log.print("[macos] vibrancy applied material={d}", .{material});
+        }
+
+        fn statePath(_: *Self, buf: []u8) ?[]const u8 {
+            const home = std.posix.getenv("HOME") orelse return null;
+            return std.fmt.bufPrint(buf, "{s}/Library/Application Support/{s}/window.json", .{
+                home, config.app_id,
+            }) catch null;
+        }
+
+        /// 关窗/退出时写当前 frame；返回是否写成功
+        fn saveWindowState(self: *Self) bool {
+            var buf: [512]u8 = undefined;
+            const path = self.statePath(&buf) orelse return false;
+            if (std.fs.path.dirname(path)) |dir| std.fs.cwd().makePath(dir) catch {};
+            const file = std.fs.cwd().createFile(path, .{}) catch return false;
+            defer file.close();
+            const f = frameOf(self.window);
+            var out: [128]u8 = undefined;
+            const body = std.fmt.bufPrint(&out, "{d} {d} {d} {d}\n", .{
+                toI32(f.origin.x), toI32(f.origin.y), dimToU32(f.size.w), dimToU32(f.size.h),
+            }) catch return false;
+            file.writeAll(body) catch return false;
+            return true;
+        }
+
+        fn loadWindowState(self: *Self) ?[4]i32 {
+            var buf: [512]u8 = undefined;
+            const path = self.statePath(&buf) orelse return null;
+            const file = std.fs.cwd().openFile(path, .{}) catch return null;
+            defer file.close();
+            var data: [128]u8 = undefined;
+            const n = file.readAll(&data) catch return null;
+            var it = std.mem.tokenizeAny(u8, data[0..n], " \n");
+            var vals: [4]i32 = .{ 0, 0, 0, 0 };
+            var i: usize = 0;
+            while (it.next()) |tok| : (i += 1) {
+                if (i >= 4) break;
+                vals[i] = std.fmt.parseInt(i32, tok, 10) catch 0;
+            }
+            if (i < 4) return null;
+            return vals;
+        }
+
         fn applyAppearance(_: *Self, win: Id) void {
             if (config.titlebar_overlay) {
                 var mask = styleMaskOf(win);
@@ -165,6 +241,22 @@ fn Backend(comptime config: Config) type {
             _ = msg1(void, win, "setReleasedWhenClosed:", false);
             _ = msg1(void, win, "setDelegate:", msg0(Id, objc.cls("ZiltWindowDelegate"), "new"));
             self.applyAppearance(win);
+            if (self.loadWindowState()) |v| {
+                _ = objc.msgSend(*const fn (Id, Sel, NSRect, bool) callconv(.c) void)(
+                    win,
+                    objc.sel("setFrame:display:"),
+                    .{
+                        .x = @floatFromInt(v[0]),
+                        .y = @floatFromInt(v[1]),
+                        .w = @floatFromInt(v[2]),
+                        .h = @floatFromInt(v[3]),
+                    },
+                    true,
+                );
+                log.print("[macos] window state restored x={d} y={d} w={d} h={d}", .{ v[0], v[1], v[2], v[3] });
+            } else {
+                log.print("[macos] window state none", .{});
+            }
             _ = msg1(void, win, "makeKeyAndOrderFront:", @as(?Id, null));
             _ = msg1(void, self.app, "activateIgnoringOtherApps:", true);
             log.print("[macos] window created {d}x{d}", .{ config.width, config.height });
@@ -175,6 +267,7 @@ fn Backend(comptime config: Config) type {
             _ = msg1(void, self.window, "setContentView:", self.webview);
             log.print("[macos] webview created", .{});
             try self.loadUrlIn(self.webview, null);
+            self.applyVibrancy();
         }
 
         /// 为一个 NSWindow 建 WKWebView：配置 + runtime 注入 + 消息/导航 delegate + scheme handler
@@ -474,6 +567,13 @@ fn Backend(comptime config: Config) type {
         fn applyWindowCmd(self: *Self, window_id: u32, cmd: ipc.WindowCmd) bool {
             const win = self.targetWindow(window_id) orelse return false;
             switch (cmd) {
+                .start_dragging => {
+                    // 自定义标题栏：runtime_js 命中 data-zilt-drag-region 后调 startDragging
+                    const ev = msg0(?Id, objc.cls("NSApplication"), "currentEvent") orelse return false;
+                    if (msg0(c_ulong, ev, "type") != 1) return false; // 1 = leftMouseDown
+                    _ = msg1(void, win, "performWindowDragWithEvent:", ev);
+                    return true;
+                },
                 .set_title => |t| {
                     _ = msg1(void, win, "setTitle:", objc.nsString(t.ptr, t.len));
                     return true;
@@ -665,12 +765,27 @@ fn Backend(comptime config: Config) type {
             _ = msg1(void, tile, "setBadgeLabel:", @as(?Id, null));
             log.print("[macos] dock ok={s}", .{boolStr(dock_ok)});
 
+            const vib_mat: c_long = if (self.vibrancy_view) |vv| msg0(c_long, vv, "material") else -1;
+            const vibrancy_ok = self.vibrancy_view != null and vib_mat == 7;
+            log.print("[macos] vibrancy ok={s} material={d}", .{ boolStr(vibrancy_ok), vib_mat });
+
+            const saved_ok = self.saveWindowState();
+            var state_ok = false;
+            if (self.loadWindowState()) |v| {
+                const f = frameOf(self.window);
+                state_ok = saved_ok and v[2] == toI32(f.size.w) and v[3] == toI32(f.size.h);
+            }
+            log.print("[macos] state ok={s} saved={s}", .{ boolStr(state_ok), boolStr(saved_ok) });
+
+            const drag_ok = std.mem.indexOf(u8, ipc.runtime_js, "startDragging") != null;
+            log.print("[macos] drag ok={s} wiring-only", .{boolStr(drag_ok)});
+
             const events_ok = self.ev_moved > 0 and self.ev_resized > 0;
             log.print("[macos] window events ok={s} moved={d} resized={d} focus={d} blur={d}", .{
                 boolStr(events_ok), self.ev_moved, self.ev_resized, self.ev_focus, self.ev_blur,
             });
 
-            const good = ok and size_ok and json_ok and appearance_ok and events_ok and theme_ok and dock_ok and self.runSpawnProbe();
+            const good = ok and size_ok and json_ok and appearance_ok and events_ok and theme_ok and dock_ok and vibrancy_ok and state_ok and drag_ok and self.runSpawnProbe();
             log.print("[macos] window ops ok={s} content={d}x{d} json={s}", .{
                 boolStr(good),
                 dimToU32(cs.w),
@@ -952,6 +1067,7 @@ fn Backend(comptime config: Config) type {
         }
 
         fn onWindowClose(_: Id, _: Sel, window: Id) callconv(.c) void {
+            _ = inst.saveWindowState();
             const is_primary = window == inst.window;
             var idx: ?usize = null;
             for (inst.wins.items, 0..) |it, i| {
