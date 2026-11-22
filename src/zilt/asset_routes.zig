@@ -27,6 +27,64 @@ pub fn decodePath(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
+/// 从 `scheme://app/...` 取路径（WKURLSchemeHandler 的 URL → 资产路径）。
+/// 只接受空 host 或 `app` host；无路径时视为入口 `/index.html`。
+pub fn pathFromCustomScheme(url: []const u8, scheme: []const u8) ?[]const u8 {
+    // scheme + "://"（scheme 是运行时参数，不能 comptimePrint）
+    if (url.len < scheme.len + 3) return null;
+    if (!std.mem.startsWith(u8, url, scheme)) return null;
+    if (!std.mem.eql(u8, url[scheme.len..][0..3], "://")) return null;
+    const rest = url[scheme.len + 3 ..];
+    if (rest.len == 0) return "/index.html";
+    if (rest[0] == '/') return rest; // scheme:///path
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return "/index.html";
+    const host = rest[0..slash];
+    if (host.len != 0 and !std.mem.eql(u8, host, "app")) return null;
+    const path = rest[slash..];
+    // 去 query/fragment（资产查找只认路径；decodePath 也会去，但先收敛更直观）
+    const end = std.mem.indexOfAny(u8, path, "?#") orelse path.len;
+    const clean = path[0..end];
+    if (clean.len == 0 or std.mem.eql(u8, clean, "/")) return "/index.html";
+    return clean;
+}
+
+/// `config.url` → 自有 scheme 下的入口路径（默认 `/index.html`）。
+/// `https://zilt.app/sub/` → `/sub/`；开发服务器 URL 只取路径部分。
+pub fn appEntryPath(url: []const u8) []const u8 {
+    const idx = std.mem.indexOf(u8, url, "://") orelse return "/index.html";
+    const after = url[idx + 3 ..];
+    const slash = std.mem.indexOfScalar(u8, after, '/') orelse return "/index.html";
+    const p = after[slash..];
+    // 去掉 query/fragment（入口只认路径），再判断是否等同根
+    const end = std.mem.indexOfAny(u8, p, "?#") orelse p.len;
+    const clean = p[0..end];
+    if (clean.len == 0 or std.mem.eql(u8, clean, "/")) return "/index.html";
+    return clean;
+}
+
+/// `config.url` → 实际加载的 URL：
+/// - 内嵌模式（默认 `https://zilt.app/...`）→ `<scheme>://<scheme_host>/<entry>`
+/// - 开发服务器/外部站点（其它 http(s)）→ 原样返回
+pub fn resolveEntryUrl(
+    alloc: std.mem.Allocator,
+    url: []const u8,
+    scheme: []const u8,
+    scheme_host: []const u8,
+    embedded_host: []const u8,
+) ![]u8 {
+    if (std.mem.indexOf(u8, url, "://")) |i| {
+        const rest = url[i + 3 ..];
+        const host_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+        const host = rest[0..host_end];
+        const is_http = std.mem.startsWith(u8, url, "http://") or
+            std.mem.startsWith(u8, url, "https://");
+        if (is_http and !std.mem.eql(u8, host, embedded_host)) {
+            return alloc.dupe(u8, url);
+        }
+    }
+    return std.fmt.allocPrint(alloc, "{s}://{s}{s}", .{ scheme, scheme_host, appEntryPath(url) });
+}
+
 /// 扩展名 → Content-Type（两平台共用；未知类型按二进制流）。
 pub fn contentTypeOf(path: []const u8) []const u8 {
     const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| path[i + 1 ..] else path;
@@ -88,4 +146,43 @@ test "asset path decodes Unicode and rejects traversal" {
     defer t.allocator.free(path);
     try t.expectEqualStrings("/hello world", path);
     for ([_][]const u8{ "/../secret", "/%2e%2e/secret", "/a%2fb", "/a%5cb", "/a%00", "/a:secret", "/a%252fb", "/a./file" }) |bad| try t.expectError(error.InvalidPath, decodePath(t.allocator, bad));
+}
+
+test "pathFromCustomScheme: WKURLSchemeHandler 的 URL → 路径" {
+    try std.testing.expectEqualStrings("/index.html", pathFromCustomScheme("zilt://app/index.html", "zilt").?);
+    try std.testing.expectEqualStrings("/assets/app.js", pathFromCustomScheme("zilt://app/assets/app.js?v=1", "zilt").?);
+    try std.testing.expectEqualStrings("/index.html", pathFromCustomScheme("zilt://app", "zilt").?);
+    try std.testing.expectEqualStrings("/index.html", pathFromCustomScheme("zilt://app/", "zilt").?);
+    try std.testing.expectEqualStrings("/x", pathFromCustomScheme("zilt:///x", "zilt").?);
+    // 非本 scheme / 未知 host → null（调用方回 404，不泄漏其它 origin）
+    try std.testing.expect(pathFromCustomScheme("https://app/index.html", "zilt") == null);
+    try std.testing.expect(pathFromCustomScheme("zilt://other/x", "zilt") == null);
+    try std.testing.expect(pathFromCustomScheme("zilt://evil.com/x", "zilt") == null);
+}
+
+test "appEntryPath: config.url 各形态" {
+    try std.testing.expectEqualStrings("/index.html", appEntryPath("https://zilt.app/index.html"));
+    try std.testing.expectEqualStrings("/index.html", appEntryPath("https://zilt.app"));
+    try std.testing.expectEqualStrings("/index.html", appEntryPath("https://zilt.app/"));
+    try std.testing.expectEqualStrings("/app.html", appEntryPath("https://zilt.app/app.html"));
+    try std.testing.expectEqualStrings("/sub/", appEntryPath("https://zilt.app/sub/"));
+    try std.testing.expectEqualStrings("/index.html", appEntryPath("http://localhost:5173/?debug=1"));
+    try std.testing.expectEqualStrings("/index.html", appEntryPath(""));
+}
+
+test "resolveEntryUrl: 内嵌 vs 开发服务器" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "https://zilt.app/index.html", .want = "zilt://app/index.html" },
+        .{ .in = "https://zilt.app/app.html?x=1", .want = "zilt://app/app.html" },
+        .{ .in = "https://zilt.app", .want = "zilt://app/index.html" },
+        .{ .in = "https://example.com/x", .want = "https://example.com/x" },
+        .{ .in = "http://localhost:5173/", .want = "http://localhost:5173/" },
+        .{ .in = "", .want = "zilt://app/index.html" },
+    };
+    for (cases) |c| {
+        const got = try resolveEntryUrl(a, c.in, "zilt", "app", "zilt.app");
+        defer a.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
 }

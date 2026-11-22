@@ -6,12 +6,15 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.4.3（Linux 发行版可用性——L1a GTK4 构建级兼容：`-Dgtk=gtk4` 双栈，
+**当前状态：v0.4.4（macOS 主链——NSApplication/NSWindow + WKWebView + `zilt://` 资产
+scheme + IPC 双向（`WKScriptMessageHandler` / `evaluateJavaScript`）；无 Mac 硬件的
+开发闭环：Windows 上 `-Dtarget=aarch64-macos` 交叉编译 + CI `macos-15` 真跑）。
+v0.4.3（Linux 发行版可用性——L1a GTK4 构建级兼容：`-Dgtk=gtk4` 双栈，
 GTK 4.14.5 / WebKitGTK 6.0 2.52.6 实测；L3 AppImage 自包含：WebKit 随包 + helper 路径改写，
 「无宿主 WebKit」bwrap/容器实测 95/95；L6 托盘挂窗：XEmbed 自建图标左键 toggle + 贴图标定位 +
 FFM 规避，stalonetray 实测；L4 ARM64 构建链脚本 + CI job（容器验收待 CI）；L5 打包与签名：
 rpmbuild 实构建（bin + 桌面项 + 图标，%post 刷新 desktop db）、AUR PKGBUILD/package() 验证、
-deb `_gpgorigin` 与 rpm `--addsign` 实签实校（含反向对照））**。
+deb `_gpgorigin` 与 rpm `--addsign` 实签实校（含反向对照））。
 v0.4.2（安全与系统集成——H3 Linux 密钥环加密 store（libsecret dlopen，`secret:` 标记）/
 H15 计划通知（进程内 timer + notificationScheduled 事件）/ H16 reparent（WebView 移挂目标窗口）/
 H17 拖出 opt-in）。v0.4.1（网络/IPC/分发深化——H4 channel credit 背压 / H14 断点续传 /
@@ -23,7 +26,7 @@ v0.4.0（H6–H11 / H20 / L2 / L7 / L8 双平台小项收尾）。
 |---|---|---|
 | Windows | ✅ 全栈（v0.1.0–v0.4.3） | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
 | Linux | ✅ 全栈（v0.2.0–v0.4.3，冒烟 95 项） | GTK3 + WebKit2GTK 4.1；`-Dgtk=gtk4` 构建变体 |
-| macOS | 🚧 骨架（v0.4.4）：NSApplication + NSWindow + 交叉编译/CI 闭环；WKWebView/IPC 待补 | WKWebView（手写 ObjC 消息，无 `@cImport`） |
+| macOS | 🚧 主链（v0.4.4）：窗口 + WKWebView + `zilt://` 资产 + IPC 往返；系统集成/分发见 v0.4.5–v0.4.9 | WKWebView（手写 ObjC 消息，无 `@cImport`） |
 
 Windows 能力面（截至 v0.4.3）：窗口/多窗口/覆盖式标题栏/窗口形状 mask/每按钮状态/失焦与 Escape 隐藏/
 窗口级 KeyBindings、WebView2 事件面与 Settings（含 printToPdf、加速键与手势开关）、IPC + 事件 + 流式 channel
@@ -36,7 +39,7 @@ fs（scope/watch/流式）、SQL、store（可选 DPAPI 加密）、http（WinHT
 Linux 复用同一 JS API 面，差异逐版本以「文档化」条目记录（无 SharedBuffer → evaluate 通道、无 PDF 导出 →
 `PdfNotSupported` 等）。
 
-## 能力索引（v0.4.3）
+## 能力索引（v0.4.4）
 
 | 能力组 | 主要入口 | Windows | Linux |
 |---|---|---|---|

@@ -5,5 +5,5 @@ install-name: '/usr/lib/libobjc.A.dylib'
 current-version: 1
 exports:
   - targets: [ arm64-macos, x86_64-macos ]
-    symbols: [ _objc_getClass, _sel_registerName, _objc_msgSend, _objc_msgSendSuper2, _class_getInstanceMethod, _method_getTypeEncoding, _object_getClass ]
+    symbols: [ _objc_getClass, _sel_registerName, _objc_msgSend, _objc_msgSendSuper2, _class_getInstanceMethod, _method_getTypeEncoding, _object_getClass, _objc_allocateClassPair, _objc_registerClassPair, _class_addMethod, _class_addProtocol, _objc_getProtocol ]
 ...

@@ -2,7 +2,8 @@
 
 > 制定日期：2026-11-20。修订：2026-11-21（Linux 专项复核：L1–L8 入图，macOS 顺延）。
 > 基线：**v0.3.19**（git 31b3109，测试体系收口）。
-> 当前：**v0.4.3**（2026-11-21，L1a GTK4 基础 + L3 自包含 AppImage + L6 托盘挂窗完成；L4 脚本/CI 就绪）。
+> 当前：**v0.4.4**（2026-11-22，macOS 主链跑通：窗口 + WKWebView + 资产 scheme + IPC 往返；
+> v0.4.5–v0.4.9 为 macOS 能力面切片，见下）。
 > 对标：**Wails v3.1.0 stable（2026-11-01）+ v3.2.0-nightly**、**Tauri 2.12.x**（2026-11 最新，2.12.x 仅 bugfix）。
 > 历史说明：原 docs/ 文档（v0.1–v0.3 逐版本记录、调研报告、WebView2 ABI 笔记、ADR）已随文档清理移除，
 > 逐版本实施与验收记录见 **git 提交历史**；当前能力索引与平台状态见 [README](../README.md)。
@@ -334,56 +335,157 @@ Wayland 回退路径文档化；既有冒烟/单测全量回归（Windows 侧零
 - **坑位记录**：22.04 与 24.04 共用仓库 `zig-out/`，GTK4 构建会覆盖 GTK3 产物（表现为
   `libgtk-4.so.1: cannot open`）——验收前先确认最后构建的栈
 
-### v0.4.4 — macOS 全栈 I（骨架）
+### v0.4.4 — macOS 全栈 I（主链）✅ 完成（2026-11-22）
 
-目标：macOS 端到端最小可用——窗口 + 资产 + IPC 主链跑通。
+目标：窗口 + 资产 + IPC 主链跑通，且**无 Mac 硬件也能开发**（交叉编译 + CI 真跑）。
 
-- zig-objc 基建：NSApplication/NSWindow/WKWebView/NSWindowDelegate +
-  WKScriptMessageHandler（ObjC block 注册）+ WKURLSchemeHandler（资产服务）
-- IPC：WKScriptMessageHandler（JS→Zig）+ evaluateJavaScript（Zig→JS，Promise 语义）；
-  无 SharedBuffer → 复用 Linux 式 evaluate/base64 通道
-- 窗口模型首切片：创建/标题/尺寸/居中/全屏/多窗口 + 窗口事件面（moved/resized/focus/close）
-- runtime JS 三态传输扩第四态（mac.webkit messageHandlers）
+- `objc.zig`：msgSend 按签名转型、NSString/NSData/NSJSONSerialization、运行时创建
+  ObjC 子类（`objc_allocateClassPair` + `class_addMethod/Protocol`）
+- NSApplication（ActivationPolicy=Regular + `finishLaunching`）+ NSWindow（900×640、
+  标题/置前、close→terminate）
+- WKWebView + `WKURLSchemeHandler`（`zilt://app/...` 资产，复用 `asset_routes` 与
+  `inflate`）+ `WKUserScript` 注入 `ipc.runtime_js`
+- IPC：`WKScriptMessageHandler("zilt")`（JS→Zig，NSJSONSerialization 转 JSON）→
+  `ipc.decode` → builtin/commands → `evaluateJavaScript("window.__ziltDeliver(...)")`
+  （Zig→JS，Promise 语义）
+- 冒烟：`ZILT_SMOKE_TEST_MS` 有界事件泵（NSDate deadline，不依赖 std 时间 API）+
+  页面加载后注入 `greet` 探针（真实 command 往返）+ 日志锚点
+- 构建闭环：`-Dtest-compile-only=true`（测试产物只编译）、`scripts/macos/check.sh`、
+  `stubs/*.tbd`（libobjc + AppKit/Foundation 空桩）；`-Dtarget=aarch64-macos` 在
+  Windows 上产出 arm64 Mach-O
+- CI：`.github/workflows/macos.yml`（`macos-15` arm64）——build + test + 6s 冒烟 +
+  `screencapture` 截图 artifact，六段日志断言
+- 能力表：`.window` / `.ipc_events` / `.asset_server`
 
-**验收**：macOS `zig build test` 链 + 冒烟骨架（greet/add 往返 + 资产 200）；
-无 macOS 环境则 GitHub Actions macOS runner 兜底（§4 R2）。
+**验收记录（2026-11-22，Windows 11 + WSL Ubuntu 22.04；macOS 运行待 CI）**
 
-**起步记录（2026-11-22，无 Mac 硬件的开发闭环）**：
+| 项 | 命令 | 结果 |
+|---|---|---|
+| Windows 单测 | `zig build test` | 389/390（1 skip） |
+| Linux 单测（GTK3） | `zig build test`（22.04） | 306/307（1 skip） |
+| macOS 交叉编译（app） | `bash scripts/macos/check.sh` | PASS，arm64 Mach-O（0xfeedfacf） |
+| macOS 测试产物编译 | `zig build test -Dtarget=aarch64-macos -Dtest-compile-only=true` | PASS |
+| macOS 运行时冒烟 | CI `macos.yml` | 待首次 push（本机无 Mac） |
 
-- **本地交叉编译已打通**：`zig build -Dtarget=aarch64-macos -p .zilt-out/macos` 在 Windows
-  上产出 arm64 Mach-O（`0xfeedfacf` / cputype 12）。Zig 自带 libSystem.tbd 与 Darwin 头，
-  缺的只是 libobjc/AppKit/Foundation 链接面 → 仓库内三份最小 `.tbd` 桩
-  （`src/zilt/platform/macos/stubs/`）。因为走 `objc_msgSend` 动态绑定，类/selector 不是
-  链接符号，框架桩可以为空。真 macOS 宿主（CI）自动绕过桩、用系统 SDK。
-- **测试面只编译不执行**：新增 `-Dtest-compile-only=true`（`test` step 只依赖编译产物）——
-  `zig build test -Dtarget=aarch64-macos -Dtest-compile-only=true` 通过，本机即可捕获
-  类型/ABI/符号错误。封装为 `scripts/macos/check.sh`。
-- **骨架**：`platform/macos/backend.zig` —— NSApplication（activationPolicy=regular）+
-  NSWindow（900×640、标题/置前）+ 有界事件泵（`ZILT_SMOKE_TEST_MS`，deadline 用 NSDate，
-  不依赖 std 时间 API）。`mod.zig` 分支、`interface.zig` 的 `macos_target_capabilities`
-  （只登记已实装的 `.window`）、`build.zig` 的 `is_macos` 分支（此前 `-Dtarget=aarch64-macos`
-  会 panic：`dev` step 重复注册）。
-- **CI**：`.github/workflows/macos.yml`（`macos-15` arm64）——build + test + 4s 冒烟 +
-  `screencapture` 截图 artifact；日志断言 `NSApplication ready` / `window created` /
-  `smoke done, exiting`。这是无 Mac 时唯一的「真跑」环境。
-- **下一步**：WKWebView + `WKURLSchemeHandler` 资产面 → IPC（`WKScriptMessageHandler`）→
-  窗口事件面。
+**macOS 能力对标与版本切片（Wails v3 / Tauri 2，2026-11 复核）**
 
-### v0.4.5 — macOS 全栈 II（系统集成与分发）
+| 能力面 | Wails v3 | Tauri 2 | Zilt 落点 |
+|---|---|---|---|
+| 应用生命周期 | `MacOptions.ActivationPolicy`、`ApplicationShouldTerminateAfterLastWindowClosed` | `RunEvent`、AppHandle exit/restart | v0.4.4 ✅（Regular）/ v0.4.5（Accessory·Prohibited、关窗策略） |
+| 多窗口 | `app.Window.New()`（原生多窗口） | `WebviewWindow` | v0.4.5 |
+| 窗口参数 | Width/Height/Min/Max/AlwaysOnTop/Frameless/HideOnFocusLost | width/height/min/max/alwaysOnTop/visible/decorations | v0.4.5 |
+| 标题栏定制 | Window options（frameless 等） | `titleBarStyle`（Visible/Transparent/Overlay）、`hiddenTitle`、`trafficLightPosition` | v0.4.5 |
+| 材质/透明 | BackgroundColour/translucency | `window-vibrancy`、`macOSPrivateApi`（透明） | v0.4.5（NSVisualEffectView；私有 API 只做 opt-in） |
+| 窗口状态持久化 | —（应用自管） | `window-state` 插件 | v0.4.5 |
+| Dock / 激活 | — | `set_badge_count`、dock 可见性 | v0.4.5 |
+| 菜单 | `app.NewMenu()`（含标准 App/Edit/Window 菜单） | `Menu` + `PredefinedMenuItem` | v0.4.6 |
+| 托盘 | `SystemTray`（Template 图标、`AttachWindow`） | `tray-icon` + menu | v0.4.6 |
+| 对话框 | `Dialog.OpenFile/Save/Message` | `dialog` 插件 | v0.4.6 |
+| 剪贴板 | `Clipboard` API | `clipboard-manager` | v0.4.6 |
+| 通知 | `Notification`（含 actions） | `notification` 插件 | v0.4.6 |
+| 全局快捷键 | `GlobalShortcut` | `global-shortcut` | v0.4.6 |
+| 深链/单实例/自启 | 部分（v3 有 single instance 语义） | `deep-link` / `single-instance` / `autostart` | v0.4.6 |
+| WebView 深度 | DevTools/Zoom/Evaluate/Print | devtools/eval/print/download/zoom | v0.4.7 |
+| 拖放 | Drag&Drop（文件拖入/拖出） | `drag-drop` 事件 + 拖出 | v0.4.7 |
+| 媒体/权限 | — | WebView 权限回调 | v0.4.7（摄像头/麦克风/屏幕录制） |
+| 分发 | `.app`/DMG/universal/codesign/notarize | `dmg`/`universal-apple-darwin`/签名/公证 | v0.4.8 |
+| 安全存储 | —（应用自管） | `stronghold`（非 Keychain） | v0.4.8（Security.framework Keychain，对齐 Linux `secret:`） |
+| 更新器 | 内置 Updater（GitHub/keygen/Sparkle AppCast） | `updater`（appcast） | v0.4.8 |
+| 自动化测试 | — | `tauri-driver` 仅 Win/Linux | v0.4.8（WebKit automation / safaridriver 选型） |
+| 系统信息/Shell/电源/主题 | Environment / Shell / 主题跟随 | `os` / `opener` / `process` | v0.4.9 |
+| 弹性项 | — | — | H18（WML）/ H19（扩展）/ H2（移动端）不进 v0.4.x |
 
-目标：macOS 能力面对齐 Windows/Linux 已有面 + 分发链。
+### v0.4.5 — macOS 窗口与外观
 
-- 系统集成：菜单/托盘（NSStatusItem）/对话框（NSOpenPanel 等）/剪贴板/通知（UNUserNotificationCenter）/
-  Dock 徽标/深链/单实例/自启（LaunchAgent/Launcher）
-- 平台效果：title_bar_style（visible/overlay/transparent）+ traffic_light 位置 +
-  NSVisualEffectView 材质 + 全工作区可见
-- 分发：.app 结构 + DMG（hdiutil）+ codesign + notarization（stapler）+ 更新器 macOS 接线
-- WebDriver（safari/webkit driver 或 CDP 桥选型）
+目标：窗口能力对齐 Wails/Tauri 的 macOS 常用面（多窗口 + 标题栏 + 材质 + 状态）。
 
-**验收**：macOS 冒烟对齐双平台检查面（平台差异项文档化 skip）+ 打包产物
-codesign 验证 + Gatekeeper 实测。
+- 多窗口：`spawn_window_fn` / `windowById`；每窗口一个 WKWebView + scheme handler
+- 窗口控制：min/max size、center、set_position、fullscreen、maximize、always-on-top、
+  show/hide/focus/close（`window_fn` 全量接线）
+- 标题栏：`titleBarStyle`（visible/transparent/overlay）、`hiddenTitle`、红绿灯位置、
+  `titlebar_overlay` 的拖动区域（`data-zilt-drag-region` → `performWindowDragWithEvent:`）
+- 外观：`NSVisualEffectView` 材质（sidebar/hud/window）、透明背景（`macOSPrivateApi`
+  等价 opt-in，默认关）、`NSAppearance` 明暗主题 + 系统主题变更事件
+- 窗口行为：`hideOnFocusLost`、`hideOnEscape`、visible-on-all-workspaces、
+  window level、activation policy（Regular/Accessory/Prohibited）、Dock 徽标/隐藏
+- 窗口事件：moved/resized/focus/blur/minimize/close_requested（+ 去抖与
+  `window_state` 持久化，对齐 Tauri `window-state`）
 
-### v0.4.6+ — 弹性/实验位
+**验收**：多窗口冒烟（开/关/标题/尺寸/置顶）+ 标题栏样式截图 + 状态持久化跨进程。
+
+### v0.4.6 — macOS 桌面集成
+
+目标：系统集成能力面对齐 Windows/Linux 已有面。
+
+- 菜单：`NSMenu` 应用菜单（About/Services/Hide/Quit + Edit/Window 标准角色）、
+  上下文菜单、Cmd 快捷键（key equivalent）、菜单事件回传
+- 托盘：`NSStatusItem`（Template 图标、菜单、点击）、`AttachWindow`（菜单栏弹窗）
+- 对话框：`NSOpenPanel`/`NSSavePanel`/`NSAlert`（文件/文件夹/多选/消息）
+- 剪贴板：`NSPasteboard`（文本/图片/HTML/文件列表，读写与变化事件）
+- 通知：`UNUserNotificationCenter`（授权、actions、进度/替换、点击深链）
+- 深链：`CFBundleURLTypes` + `application:openURLs:`；单实例：LaunchServices reopen
+  + 本地 socket 转发；自启：`SMAppService`（macOS 13+）/ LaunchAgent 回退
+- 全局快捷键：Carbon `RegisterEventHotKey`（含 Accessibility 权限状态与引导）
+
+**验收**：菜单/托盘/对话框/剪贴板/通知/快捷键逐项冒烟（需交互的用脚本化 UI 或
+单元测试替代）+ 深链/单实例/自启在 CI 上脚本化验证。
+
+### v0.4.7 — macOS WebView 深度
+
+目标：补齐 WebView 行为面（下载/打印/截图/缩放/拖放/权限）。
+
+- DevTools：`WKWebView.inspectable`（DEBUG 构建）+ 独立窗口
+- 缩放：`pageZoom` 读写；`window.zilt.webview.zoom/getZoom`
+- 打印：`NSPrintOperation`（WebKit 打印视图）；PDF 导出（`createPDF`）
+- 下载：`WKDownloadDelegate`（目标路径、进度、完成/失败事件）
+- 截图：`takeSnapshotWithConfiguration:completionHandler:` → PNG 回传
+- Cookie/数据分区：`WKHTTPCookieStore`、`WKWebsiteDataStore`（非持久分区对齐
+  `data_partition`）
+- 自定义协议：`config.protocols` → 动态注册 scheme handler（对齐 Linux v0.2.3）
+- JS 对话框：`WKUIDelegate`（alert/confirm/prompt）→ 前端事件或原生面板
+- 拖放：`NSDraggingDestination`（文件拖入 → drag-drop 事件）、`NSDraggingSource`
+  （拖出，对齐 `startDrag`）
+- 媒体权限：`WKUIDelegate requestMediaCapturePermission` + TCC 说明（Info.plist
+  用途字符串 + entitlements）
+- 查找：`findString:withConfiguration:completionHandler:`（对齐 find_in_page）
+
+**验收**：下载/打印/截图/缩放/拖放/权限各自冒烟；截图与 PDF 产物上传 artifact。
+
+### v0.4.8 — macOS 分发、安全与更新
+
+目标：可分发（签名/公证/DMG/universal）+ 安全存储 + 更新器。
+
+- `.app`：Info.plist 全字段（bundle id/版本/URL types/LSMinimumSystemVersion/
+  NSHighResolutionCapable/用途字符串）+ `.icns`
+- DMG：`hdiutil`（含 Applications 链接；背景/布局后置）
+- 签名：codesign（Developer ID Application、hardened runtime、entitlements、
+  `--deep` 校验）；公证：`notarytool submit --wait` + `stapler staple`
+- Universal：x86_64 + arm64 双构建 + `lipo`（需 macOS 宿主）
+- 安全存储：Security.framework Keychain（`kSecClassGenericPassword`，与 Linux
+  libsecret 的 `secret:` 标记同语义）
+- 更新器：Zilt 现有 ed25519 清单 + DMG 替换/Sparkle appcast 选型（对齐 Wails
+  Updater 的 Sparkle AppCast provider）
+- WebDriver：safaridriver / WebKit automation 可行性验证（Tauri 的 tauri-driver
+  不支持 macOS，需自建桥）
+
+**验收**：`codesign --verify --deep --strict` + `spctl -a -vv` + `stapler validate`；
+DMG 挂载安装；更新器端到端（旧版→新版）；Keychain 单测。
+
+### v0.4.9 — macOS 对等与打磨
+
+目标：平台能力与 Win/Linux 对齐收口 + 文档/CI 矩阵。
+
+- 系统信息（sysctl/IOKit）、Shell（`NSWorkspace open`）、电源事件（sleep/wake）、
+  主题（系统明暗）、单实例边缘情况（多用户/快速重启）
+- Accessibility 标签、菜单快捷键冲突检查、VoiceOver 基本可用性
+- 文档：能力矩阵平台列、差异项（透明/私有 API、沙箱、App Store 限制）
+- CI：`macos-15`（arm64）为主；`macos-15-intel` 仅到 2027 前做 x86_64 回归
+  （GitHub 已宣告 Intel 镜像退役路径）
+
+**验收**：macOS 冒烟与 Linux 95 项按平台差异对齐（差异项 skip 且文档化）；
+全部单测 + 冒烟 + 打包链在 CI 绿。
+
+### v0.5+ — 弹性/实验位（不排期）
 
 - **H18** WML（可选，默认不排期）
 - **H19** 浏览器扩展（实验，跟随上游 WebView2 API 稳定度）

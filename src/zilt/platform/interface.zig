@@ -153,10 +153,13 @@ pub const linux_target_capabilities = [_]Capability{
     // v0.3.6 平台差异：binary_ipc（WebView2 SharedBuffer 独占；Linux 走 base64 分块）
 };
 
-/// macOS 目标能力（v0.4.4 骨架：仅窗口创建；WebView/IPC/系统集成分阶段补）。
+/// macOS 目标能力（v0.4.4：窗口 + WKWebView 资产 + IPC 往返；其余分阶段补）。
 /// 只登记**已实装**项——清单与实现漂移是本文件 v0.4.0 L8 专门防的形态。
 pub const macos_target_capabilities = [_]Capability{
     .window,
+    .ipc_events,
+    // 资产经 WKURLSchemeHandler 的 zilt:// scheme 服务（与 Linux 同名）
+    .asset_server,
 };
 
 /// 编译期校验后端契约（`platform/mod.zig` 在本平台后端上调用一次）。

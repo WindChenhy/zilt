@@ -21,7 +21,7 @@ env:
   ZIG_VERSION: "0.17.1"
 
 # v0.4.4：无 Mac 硬件时的「运行环境」。开发在 Windows/Linux 上做交叉编译检查
-# （-Dtarget=aarch64-macos -Dtest-compile-only=true），真正的启动/截图在这里跑。
+# （`bash scripts/macos/check.sh`），真正的启动/WebView/截图在这里跑。
 jobs:
   macos:
     name: Build / Test / Smoke (macOS arm64)
@@ -42,25 +42,31 @@ jobs:
       - name: Unit tests
         run: zig build test
 
-      - name: Smoke (window + bounded runloop + screenshot)
+      - name: Smoke (window + WKWebView + asset + IPC roundtrip + screenshot)
         run: |
           set -euo pipefail
-          rm -f smoke.log shot.png
-          # 冒烟：4s 后退出；日志走 stderr（std.debug.print）
-          ZILT_SMOKE_TEST_MS=4000 ./zig-out/bin/zilt-app > /dev/null 2> smoke.log &
+          rm -f smoke.log shot.png zilt.log
+          # 10s 后退出（WebKit 冷启动留余量）；stderr 是断言来源（std.debug.print），zilt.log 一并留档
+          ZILT_SMOKE_TEST_MS=10000 ./zig-out/bin/zilt-app > /dev/null 2> smoke.log &
           pid=$!
-          sleep 2
+          sleep 4
           # 截图失败不致命（runner 无屏幕录制权限时会黑屏/报错）——日志才是硬断言
           screencapture -x shot.png 2>> smoke.log || true
           if ! wait "$pid"; then
-            echo "::error::zilt-app exited non-zero"
+            echo "::error::zilt-app exited non-zero（见 smoke.log）"
             cat smoke.log
             exit 1
           fi
           cat smoke.log
+          # 主链逐段断言：应用 → 窗口 → WebView → 资产页面 → runtime/IPC 往返
           grep -q "\[macos\] NSApplication ready" smoke.log
           grep -q "\[macos\] window created" smoke.log
+          grep -q "\[macos\] webview created" smoke.log
+          grep -q "\[macos\] page loaded" smoke.log
+          grep -q "\[macos\] ipc roundtrip greet=true" smoke.log
           grep -q "\[macos\] smoke done, exiting" smoke.log
+          # 资产真的走了 WKURLSchemeHandler（不是回落 file://）
+          grep -q "\[assets\] .*index.html.* 200" smoke.log
 
       - name: Upload smoke evidence
         if: always()
@@ -69,5 +75,6 @@ jobs:
           name: macos-smoke
           path: |
             smoke.log
+            zilt.log
             shot.png
           if-no-files-found: warn
