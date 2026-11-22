@@ -509,9 +509,11 @@ fn msg1(comptime R: type, obj: Id, name: [*:0]const u8, arg: anytype) R {
     };
 }
 
-/// 取方法实现的裸指针（class_addMethod 需要）。
+/// 取方法实现的裸指针（class_addMethod 需要）。入参必须是**函数指针**
+/// （`&onXxx`），直接转型——此前 `@ptrCast(&f)` 取到的是「指针的指针」，
+/// WebKit 一调用 IMP 就 Bus error（CI 45023844762 实测）。
 fn imp(comptime f: anytype) *const anyopaque {
-    return @ptrCast(&f);
+    return @ptrCast(f);
 }
 
 /// 0.17 的 std.atomic.Mutex 只有 tryLock（无阻塞 lock）——队列极短，自旋足够。
