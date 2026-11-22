@@ -4066,7 +4066,13 @@ fn Backend(comptime config: Config) type {
         /// 页面加载完成 → 补发挂起的启动深链（一次性）。
         fn flushPendingLaunch(self: *Self) void {
             const launch = self.pending_launch orelse return;
-            if (self.emitLaunch(launch)) self.pending_launch = null;
+            log.print("[deep-link] pending flush attempt (url={s})", .{launch.url orelse "-"});
+            if (self.emitLaunch(launch)) {
+                self.pending_launch = null;
+                log.print("[deep-link] pending flush delivered", .{});
+            } else {
+                log.print("[deep-link] pending flush deferred (page not ready)", .{});
+            }
         }
 
         /// 深链 / 文件关联注册：应用级 .desktop（MimeType=x-scheme-handler/<scheme>

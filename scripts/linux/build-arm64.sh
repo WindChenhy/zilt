@@ -105,8 +105,9 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "镜像未缓存——需要 docker pull（离线环境会失败并 SKIP）"
 fi
 
-# `-i` 必需：container_script 从 stdin 管道喂给 `bash -lc -`（缺 -i 时
-# stdin 关闭 → "bash: -c: option requires an argument"，CI 45023844806 实测）
+# `-i` + `bash -ls`：container_script 从 stdin 管道喂给容器内 bash。
+#   `bash -lc -` 会把末尾 `-` 当「选项结束」标记 → `-c` 缺参数（CI 45025651776 实测
+#   "bash: -c: option requires an argument"）；读 stdin 脚本的开关是 `-s`。
 DOCKER_RUN=(docker run --rm -i --platform linux/arm64
   -v "$PWD":/work -w /work
   -e ZIG_VERSION="$ZIG_VERSION"
@@ -116,7 +117,7 @@ DOCKER_RUN=(docker run --rm -i --platform linux/arm64
   -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)"
   # 构建缓存放容器 /tmp（不污染宿主仓库；zig-cache 跨架构不可复用）
   -e ZIG_LOCAL_CACHE_DIR=/tmp/zc -e ZIG_GLOBAL_CACHE_DIR=/tmp/zg
-  "$IMAGE" bash -lc -)
+  "$IMAGE" bash -ls)
 
 if [ "$CHECK" = 1 ]; then
   echo "NEED_PULL=$NEED_PULL"

@@ -854,7 +854,10 @@ function runSecondWindowProbe() {
     } catch (err) {
       outcome = 'err=' + String(err.message || err);
     }
-    check('shell.open', outcome === 'ok={"ok":true}' || outcome === 'err=ShellExecuteFailed', outcome);
+    // Linux 后端在部分环境返回布尔 true（CI 45025651776 实测 ok=true），早于/平行于
+    // Windows 的 {ok:true} 形态——三种语义都算链路可达
+    check('shell.open', outcome === 'ok={"ok":true}' || outcome === 'ok=true' ||
+      outcome === 'err=ShellExecuteFailed', outcome);
   } catch (e) { check('shell.open', false, String(e.message || e)); }
 
   // ---- v0.2.7：services（Config.services → Registry → JS list/status）----
