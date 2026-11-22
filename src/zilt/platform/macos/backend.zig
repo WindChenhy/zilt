@@ -66,6 +66,7 @@ fn Backend(comptime config: Config) type {
         ev_resized: u32 = 0,
         ev_focus: u32 = 0,
         ev_blur: u32 = 0,
+        last_dark: ?bool = null,
         smoke_ms: u32 = 0,
         /// v0.4.5：窗口控制探针结果（CI 硬断言）
         win_ops_ok: bool = false,
@@ -641,12 +642,35 @@ fn Backend(comptime config: Config) type {
             _ = self.applyWindowCmd(0, .{ .position = .{ .x = 300, .y = 320 } });
             _ = self.applyWindowCmd(0, .{ .size = .{ .width = 620, .height = 460 } });
             self.pumpFor(0.2);
+            const orig_dark = self.isDarkAppearance();
+            self.setDarkAppearance(true);
+            const dark_ok = self.isDarkAppearance();
+            self.setDarkAppearance(false);
+            const light_ok = !self.isDarkAppearance();
+            self.setDarkAppearance(orig_dark);
+            const theme_ok = dark_ok and light_ok;
+            log.print("[macos] theme ok={s} dark={s} light={s}", .{
+                boolStr(theme_ok), boolStr(dark_ok), boolStr(light_ok),
+            });
+
+            const app = msg0(Id, objc.cls("NSApplication"), "sharedApplication");
+            const tile = msg0(Id, app, "dockTile");
+            _ = msg1(void, tile, "setBadgeLabel:", objc.nsStringZ("3"));
+            var dock_ok = false;
+            if (msg0(?Id, tile, "badgeLabel")) |b| {
+                if (msg0(?[*:0]const u8, b, "UTF8String")) |cstr| {
+                    dock_ok = std.mem.eql(u8, std.mem.span(cstr), "3");
+                }
+            }
+            _ = msg1(void, tile, "setBadgeLabel:", @as(?Id, null));
+            log.print("[macos] dock ok={s}", .{boolStr(dock_ok)});
+
             const events_ok = self.ev_moved > 0 and self.ev_resized > 0;
             log.print("[macos] window events ok={s} moved={d} resized={d} focus={d} blur={d}", .{
                 boolStr(events_ok), self.ev_moved, self.ev_resized, self.ev_focus, self.ev_blur,
             });
 
-            const good = ok and size_ok and json_ok and appearance_ok and events_ok and self.runSpawnProbe();
+            const good = ok and size_ok and json_ok and appearance_ok and events_ok and theme_ok and dock_ok and self.runSpawnProbe();
             log.print("[macos] window ops ok={s} content={d}x{d} json={s}", .{
                 boolStr(good),
                 dimToU32(cs.w),
@@ -718,6 +742,23 @@ fn Backend(comptime config: Config) type {
                 @as(?Id, null),
                 false,
             );
+        }
+
+        fn isDarkAppearance(self: *Self) bool {
+            _ = self;
+            const app = msg0(Id, objc.cls("NSApplication"), "sharedApplication");
+            const eff = msg0(?Id, app, "effectiveAppearance") orelse return false;
+            const nm = msg0(?Id, eff, "name") orelse return false;
+            const c = msg0(?[*:0]const u8, nm, "UTF8String") orelse return false;
+            return std.mem.indexOf(u8, std.mem.span(c), "Dark") != null;
+        }
+
+        fn setDarkAppearance(self: *Self, dark: bool) void {
+            _ = self;
+            const app = msg0(Id, objc.cls("NSApplication"), "sharedApplication");
+            const nm: [:0]const u8 = if (dark) "NSAppearanceNameDarkAqua" else "NSAppearanceNameAqua";
+            const ap = msg1(Id, objc.cls("NSAppearance"), "appearanceNamed:", objc.nsStringZ(nm));
+            _ = msg1(void, app, "setAppearance:", ap);
         }
 
         fn pumpFor(self: *Self, seconds: f64) void {
@@ -806,6 +847,16 @@ fn Backend(comptime config: Config) type {
                 )) |ev| {
                     _ = msg1(void, self.app, "sendEvent:", ev);
                 }
+                const cur_dark = self.isDarkAppearance();
+                if (self.last_dark) |prev| {
+                    if (prev != cur_dark) {
+                        self.emitWindowEvent(0, "themeChanged", if (cur_dark)
+                            "{\"appearance\":\"dark\"}"
+                        else
+                            "{\"appearance\":\"light\"}");
+                    }
+                }
+                self.last_dark = cur_dark;
                 if (self.page_loaded and !self.probe_sent) {
                     self.probe_sent = true;
                     self.evalScript(self.webview, probe_js);
