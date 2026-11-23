@@ -252,10 +252,26 @@ pub fn main() !void {
         const app_dir = try pathJoin(alloc, out_dir, try std.fmt.allocPrint(alloc, "{s}.app", .{meta.name}));
         const pf = zilt.pack_formats;
         // v0.5.1：正斜杠布局（Contents/MacOS + Contents/Resources + PkgInfo）。
-        // .icns 字节随 v0.5.2 落地：先建 Resources 目录，plist 暂不引用图标（避免悬空）。
         mkDirs(alloc, try pathJoin(alloc, app_dir, pf.macos_macos_rel));
         mkDirs(alloc, try pathJoin(alloc, app_dir, pf.macos_resources_rel));
+        // v0.5.2：图标 best-effort——zilt.ico 的 PNG 帧 → .icns（16/32/256 可映射，48 跳过）。
+        // 图标缺失/解析失败不阻断 .app 产出（CFBundleIconFile 可选）。
+        var icon_file: ?[]const u8 = null;
+        if (readFileAlloc(alloc, "src/zilt/assets/zilt.ico")) |ico| {
+            const frames = zilt.msix.extractPngFrames(alloc, ico) catch null;
+            if (frames) |fs| {
+                var imgs: std.ArrayList(pf.IcnsImage) = .empty;
+                defer imgs.deinit(alloc);
+                for (fs) |f| try imgs.append(alloc, .{ .width = f.width, .png = f.png });
+                const icns = pf.generateIcns(alloc, imgs.items) catch null;
+                if (icns) |bytes| {
+                    const icon_dst = try pathJoin(alloc, app_dir, try pf.macosIconRelPath(alloc, "AppIcon.icns"));
+                    if (writeFile(alloc, icon_dst, bytes)) icon_file = "AppIcon.icns";
+                }
+            }
+        }
         const plist = try pf.generateInfoPlistOpt(alloc, meta, .{
+            .icon_file = icon_file,
             .url_schemes = &.{"zilt"},
             .camera_usage = "Zilt needs camera access for web video features.",
             .microphone_usage = "Zilt needs microphone access for web audio features.",

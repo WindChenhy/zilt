@@ -331,6 +331,50 @@ pub fn macosIconRelPath(alloc: std.mem.Allocator, icon_file: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "Contents/Resources/{s}", .{icon_file});
 }
 
+/// v0.5.2：.icns 输入帧（width 决定 OSType；png 为 PNG 编码字节）。
+pub const IcnsImage = struct { width: u32, png: []const u8 };
+
+/// 像素宽 → icns OSType（PNG 承载型）。未列出的宽度（如 48）无标准型，跳过。
+fn icnsTypeForWidth(width: u32) ?[4]u8 {
+    return switch (width) {
+        16 => .{ 'i', 'c', 'p', '4' },
+        32 => .{ 'i', 'c', 'p', '5' },
+        64 => .{ 'i', 'c', 'p', '6' },
+        128 => .{ 'i', 'c', '0', '7' },
+        256 => .{ 'i', 'c', '0', '8' },
+        512 => .{ 'i', 'c', '0', '9' },
+        1024 => .{ 'i', 'c', '1', '0' },
+        else => null,
+    };
+}
+
+/// v0.5.2：生成 .icns —— "icns" magic + BE u32 总长（含头）+ 若干条目
+/// （OSType 4cc + BE u32 条目长[含 8 字节条目头] + PNG 字节）。
+/// 无可映射宽度的帧时返回 error.NoIcnsImage（避免产出空图标）。
+pub fn generateIcns(alloc: std.mem.Allocator, images: []const IcnsImage) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    try buf.appendSlice(alloc, "icns");
+    try appendBE32(&buf, alloc, 0); // 总长占位，末尾回填
+    var emitted: usize = 0;
+    for (images) |img| {
+        const ty = icnsTypeForWidth(img.width) orelse continue;
+        try buf.appendSlice(alloc, &ty);
+        try appendBE32(&buf, alloc, @intCast(8 + img.png.len));
+        try buf.appendSlice(alloc, img.png);
+        emitted += 1;
+    }
+    if (emitted == 0) return error.NoIcnsImage;
+    std.mem.writeInt(u32, buf.items[4..8], @intCast(buf.items.len), .big);
+    return buf.toOwnedSlice(alloc);
+}
+
+fn appendBE32(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, v: u32) !void {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, .big);
+    try buf.appendSlice(alloc, &b);
+}
+
 /// AppRun（AppImage；Linux）。
 pub const apprun_script =
     \\#!/bin/sh
@@ -1048,6 +1092,60 @@ test "macOS bundle 常量: PkgInfo + 相对路径（v0.5.1）" {
     try testing.expectEqualStrings("Contents/PkgInfo", macos_pkg_info_rel);
     try testing.expectEqualStrings("Contents/Resources", macos_resources_rel);
     try testing.expectEqualStrings("Contents/MacOS", macos_macos_rel);
+}
+
+test "generateIcns: 单 256 帧 → icns 头 + ic08 条目 + 总长回填（v0.5.2）" {
+    const png = [_]u8{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4 };
+    const icns = try generateIcns(testing.allocator, &.{.{ .width = 256, .png = &png }});
+    defer testing.allocator.free(icns);
+    try testing.expectEqualStrings("icns", icns[0..4]);
+    const total = std.mem.readInt(u32, icns[4..8], .big);
+    try testing.expectEqual(@as(u32, @intCast(icns.len)), total);
+    try testing.expectEqualStrings("ic08", icns[8..12]);
+    const esize = std.mem.readInt(u32, icns[12..16], .big);
+    try testing.expectEqual(@as(u32, @intCast(8 + png.len)), esize);
+    try testing.expectEqualSlices(u8, &png, icns[16..]);
+    try testing.expectEqual(@as(usize, 8 + 8 + png.len), icns.len);
+}
+
+test "generateIcns: width→OSType 映射（16/32/128/256/512/1024）+ 跳过 48（v0.5.2）" {
+    const p = [_]u8{ 0x89, 'P', 'N', 'G' };
+    const imgs = [_]IcnsImage{
+        .{ .width = 16, .png = &p },
+        .{ .width = 32, .png = &p },
+        .{ .width = 48, .png = &p }, // 无标准 OSType → 跳过
+        .{ .width = 128, .png = &p },
+        .{ .width = 256, .png = &p },
+        .{ .width = 512, .png = &p },
+        .{ .width = 1024, .png = &p },
+    };
+    const icns = try generateIcns(testing.allocator, &imgs);
+    defer testing.allocator.free(icns);
+    try testing.expectEqual(@as(usize, 8 + 6 * (8 + p.len)), icns.len);
+    const total = std.mem.readInt(u32, icns[4..8], .big);
+    try testing.expectEqual(@as(u32, @intCast(icns.len)), total);
+    var off: usize = 8;
+    var types: [6][4]u8 = undefined;
+    var n: usize = 0;
+    while (off < icns.len) {
+        @memcpy(types[n][0..4], icns[off..][0..4]);
+        const esz = std.mem.readInt(u32, icns[off + 4 ..][0..4], .big);
+        off += esz;
+        n += 1;
+    }
+    try testing.expectEqual(@as(usize, 6), n);
+    try testing.expectEqualStrings("icp4", &types[0]);
+    try testing.expectEqualStrings("icp5", &types[1]);
+    try testing.expectEqualStrings("ic07", &types[2]);
+    try testing.expectEqualStrings("ic08", &types[3]);
+    try testing.expectEqualStrings("ic09", &types[4]);
+    try testing.expectEqualStrings("ic10", &types[5]);
+}
+
+test "generateIcns: 无可映射宽度 → error.NoIcnsImage（v0.5.2）" {
+    const p = [_]u8{ 0x89, 'P', 'N', 'G' };
+    try testing.expectError(error.NoIcnsImage, generateIcns(testing.allocator, &.{.{ .width = 48, .png = &p }}));
+    try testing.expectError(error.NoIcnsImage, generateIcns(testing.allocator, &.{}));
 }
 
 test "generateDesktopFile/generateRpmSpec: 内容断言" {
