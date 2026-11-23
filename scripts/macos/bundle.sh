@@ -9,7 +9,7 @@ set -eu
 cd "$(dirname "$0")/../.."
 
 OUT="${ZILT_PACK_OUT:-.zilt-out/macos-dist}"
-echo "== 组装 .app + DMG 脚本（out=$OUT）"
+echo "== 组装 .app + DMG 脚本（out=${OUT}）"
 ZILT_PACK_OUT="$OUT" zig build pack
 
 echo "== 执行 hdiutil 产出 DMG"
