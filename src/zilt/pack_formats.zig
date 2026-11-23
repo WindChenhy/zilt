@@ -216,30 +216,119 @@ pub fn buildSigntoolCommand(alloc: std.mem.Allocator, pfx: []const u8, pass: []c
 // macOS .app
 // ---------------------------------------------------------------------------
 
-/// Info.plist（CFBundle* 由 meta 填充；exe 名去 .exe 后缀）。
+/// v0.5.1：Info.plist 可选字段（深链 URL types / TCC 用途串 / 图标 / 分类 / 最低系统）。
+/// 默认值保持与历史 generateInfoPlist 兼容（基础 CFBundle* + 10.13 + 高分屏）。
+pub const PlistOptions = struct {
+    /// Contents/Resources 下图标文件名（如 "AppIcon.icns"）；null = 不写 CFBundleIconFile。
+    icon_file: ?[]const u8 = null,
+    /// 深链 scheme（如 {"zilt"}）→ CFBundleURLTypes；空 = 不写。
+    url_schemes: []const []const u8 = &.{},
+    /// NSCameraUsageDescription（getUserMedia 视频必需，缺失时 macOS 直接终止进程）。
+    camera_usage: ?[]const u8 = null,
+    /// NSMicrophoneUsageDescription（getUserMedia 音频必需）。
+    microphone_usage: ?[]const u8 = null,
+    /// LSApplicationCategoryType（如 "public.app-category.developer-tools"）。
+    category: ?[]const u8 = null,
+    /// LSMinimumSystemVersion。
+    min_system: []const u8 = "10.13",
+    /// CFBundleDevelopmentRegion。
+    development_region: []const u8 = "en",
+};
+
+/// Info.plist（CFBundle* 由 meta 填充；exe 名去 .exe 后缀）。默认 opts 的薄包装。
 pub fn generateInfoPlist(alloc: std.mem.Allocator, meta: PackMeta) ![]u8 {
+    return generateInfoPlistOpt(alloc, meta, .{});
+}
+
+/// v0.5.1：完整 Info.plist——基础 CFBundle* + 可选深链/用途串/图标/分类。
+/// 字符串值经 XML 转义（& < > " '），避免名称/用途串里的 & 损坏 plist。
+pub fn generateInfoPlistOpt(alloc: std.mem.Allocator, meta: PackMeta, opts: PlistOptions) ![]u8 {
     const exe_base = if (std.mem.endsWith(u8, meta.exe_name, ".exe"))
         meta.exe_name[0 .. meta.exe_name.len - 4]
     else
         meta.exe_name;
-    return std.fmt.allocPrint(alloc,
+
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    try buf.appendSlice(alloc,
         \\<?xml version="1.0" encoding="UTF-8"?>
         \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         \\<plist version="1.0">
         \\<dict>
-        \\  <key>CFBundleName</key><string>{s}</string>
-        \\  <key>CFBundleDisplayName</key><string>{s}</string>
-        \\  <key>CFBundleIdentifier</key><string>{s}</string>
-        \\  <key>CFBundleVersion</key><string>{s}</string>
-        \\  <key>CFBundleShortVersionString</key><string>{s}</string>
-        \\  <key>CFBundleExecutable</key><string>{s}</string>
-        \\  <key>CFBundlePackageType</key><string>APPL</string>
-        \\  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-        \\  <key>LSMinimumSystemVersion</key><string>10.13</string>
-        \\  <key>NSHighResolutionCapable</key><true/>
-        \\</dict>
-        \\</plist>
-    , .{ meta.name, meta.name, meta.app_id, meta.version, meta.version, exe_base });
+        \\
+    );
+    try appendKeyString(&buf, alloc, "CFBundleName", meta.name);
+    try appendKeyString(&buf, alloc, "CFBundleDisplayName", meta.name);
+    try appendKeyString(&buf, alloc, "CFBundleIdentifier", meta.app_id);
+    try appendKeyString(&buf, alloc, "CFBundleVersion", meta.version);
+    try appendKeyString(&buf, alloc, "CFBundleShortVersionString", meta.version);
+    try appendKeyString(&buf, alloc, "CFBundleExecutable", exe_base);
+    try appendKeyString(&buf, alloc, "CFBundlePackageType", "APPL");
+    try appendKeyString(&buf, alloc, "CFBundleInfoDictionaryVersion", "6.0");
+    try appendKeyString(&buf, alloc, "CFBundleDevelopmentRegion", opts.development_region);
+    if (opts.icon_file) |icon| try appendKeyString(&buf, alloc, "CFBundleIconFile", icon);
+    try appendKeyString(&buf, alloc, "LSMinimumSystemVersion", opts.min_system);
+    if (opts.category) |cat| try appendKeyString(&buf, alloc, "LSApplicationCategoryType", cat);
+    try buf.appendSlice(alloc, "  <key>NSHighResolutionCapable</key><true/>\n");
+    try buf.appendSlice(alloc, "  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>\n");
+    if (opts.camera_usage) |s| try appendKeyString(&buf, alloc, "NSCameraUsageDescription", s);
+    if (opts.microphone_usage) |s| try appendKeyString(&buf, alloc, "NSMicrophoneUsageDescription", s);
+    if (opts.url_schemes.len > 0) {
+        try buf.appendSlice(alloc, "  <key>CFBundleURLTypes</key>\n  <array>\n    <dict>\n");
+        try appendKeyString(&buf, alloc, "CFBundleURLName", meta.app_id);
+        try buf.appendSlice(alloc, "      <key>CFBundleURLSchemes</key>\n      <array>\n");
+        for (opts.url_schemes) |scheme| {
+            try buf.appendSlice(alloc, "        <string>");
+            try appendXmlEscaped(&buf, alloc, scheme);
+            try buf.appendSlice(alloc, "</string>\n");
+        }
+        try buf.appendSlice(alloc, "      </array>\n    </dict>\n  </array>\n");
+    }
+    try buf.appendSlice(alloc, "</dict>\n</plist>\n");
+    return buf.toOwnedSlice(alloc);
+}
+
+fn appendKeyString(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    try buf.appendSlice(alloc, "  <key>");
+    try buf.appendSlice(alloc, key);
+    try buf.appendSlice(alloc, "</key><string>");
+    try appendXmlEscaped(buf, alloc, value);
+    try buf.appendSlice(alloc, "</string>\n");
+}
+
+fn appendXmlEscaped(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '&' => try buf.appendSlice(alloc, "&amp;"),
+            '<' => try buf.appendSlice(alloc, "&lt;"),
+            '>' => try buf.appendSlice(alloc, "&gt;"),
+            '"' => try buf.appendSlice(alloc, "&quot;"),
+            '\'' => try buf.appendSlice(alloc, "&apos;"),
+            else => try buf.append(alloc, c),
+        }
+    }
+}
+
+/// v0.5.1：.app bundle 内部相对路径恒用正斜杠（macOS 宿主与跨平台生成共用）。
+pub const macos_info_plist_rel = "Contents/Info.plist";
+pub const macos_pkg_info_rel = "Contents/PkgInfo";
+pub const macos_resources_rel = "Contents/Resources";
+pub const macos_macos_rel = "Contents/MacOS";
+/// PkgInfo 内容：APPL + 4 字节签名占位 '????'。
+pub const macos_pkg_info_bytes = "APPL????";
+
+/// Contents/MacOS/<exe_base>（exe 名去 .exe 后缀）。
+pub fn macosExeRelPath(alloc: std.mem.Allocator, meta: PackMeta) ![]u8 {
+    const exe_base = if (std.mem.endsWith(u8, meta.exe_name, ".exe"))
+        meta.exe_name[0 .. meta.exe_name.len - 4]
+    else
+        meta.exe_name;
+    return std.fmt.allocPrint(alloc, "Contents/MacOS/{s}", .{exe_base});
+}
+
+/// Contents/Resources/<icon_file>。
+pub fn macosIconRelPath(alloc: std.mem.Allocator, icon_file: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "Contents/Resources/{s}", .{icon_file});
 }
 
 /// AppRun（AppImage；Linux）。
@@ -889,6 +978,76 @@ test "generateInfoPlist: 字段齐全 + exe 名去后缀" {
     try testing.expect(std.mem.indexOf(u8, plist, "<string>zilt-app</string>") != null);
     try testing.expect(std.mem.indexOf(u8, plist, "<string>0.1.5</string>") != null);
     try testing.expect(std.mem.indexOf(u8, plist, "NSHighResolutionCapable") != null);
+}
+
+test "generateInfoPlistOpt: 深链 URL types + TCC 用途串 + 图标 + 分类 + 区域 + 最低系统（v0.5.1）" {
+    const meta = PackMeta{ .name = "Zilt Demo", .version = "0.5.1", .app_id = "app.zilt.desktop", .exe_name = "zilt-app.exe" };
+    const plist = try generateInfoPlistOpt(testing.allocator, meta, .{
+        .icon_file = "AppIcon.icns",
+        .url_schemes = &.{ "zilt", "zilt-demo" },
+        .camera_usage = "Need camera",
+        .microphone_usage = "Need mic",
+        .category = "public.app-category.developer-tools",
+        .min_system = "11.0",
+        .development_region = "zh_CN",
+    });
+    defer testing.allocator.free(plist);
+    try testing.expect(std.mem.indexOf(u8, plist, "<string>app.zilt.desktop</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<string>zilt-app</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleIconFile</key><string>AppIcon.icns</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleDevelopmentRegion</key><string>zh_CN</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>LSMinimumSystemVersion</key><string>11.0</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>NSCameraUsageDescription</key><string>Need camera</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>NSMicrophoneUsageDescription</key><string>Need mic</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleURLTypes</key>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleURLSchemes</key>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<string>zilt</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<string>zilt-demo</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "NSSupportsAutomaticGraphicsSwitching") != null);
+}
+
+test "generateInfoPlistOpt: 默认 opts 与 generateInfoPlist 等价 + 不写可选字段（向后兼容）" {
+    const meta = PackMeta{ .name = "Zilt Demo", .version = "0.5.1", .app_id = "app.zilt.desktop", .exe_name = "zilt-app" };
+    const a = try generateInfoPlist(testing.allocator, meta);
+    defer testing.allocator.free(a);
+    const b = try generateInfoPlistOpt(testing.allocator, meta, .{});
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings(a, b);
+    try testing.expect(std.mem.indexOf(u8, a, "CFBundleIconFile") == null);
+    try testing.expect(std.mem.indexOf(u8, a, "CFBundleURLTypes") == null);
+    try testing.expect(std.mem.indexOf(u8, a, "NSCameraUsageDescription") == null);
+    try testing.expect(std.mem.indexOf(u8, a, "LSApplicationCategoryType") == null);
+    try testing.expect(std.mem.indexOf(u8, a, "<key>LSMinimumSystemVersion</key><string>10.13</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, a, "<key>CFBundleDevelopmentRegion</key><string>en</string>") != null);
+}
+
+test "generateInfoPlistOpt: XML 转义（& < > \" 防止 plist 损坏/注入）" {
+    const meta = PackMeta{ .name = "A & B <C>", .version = "0.5.1", .app_id = "app.zilt.desktop", .exe_name = "zilt-app" };
+    const plist = try generateInfoPlistOpt(testing.allocator, meta, .{ .camera_usage = "Use \"cam\" & <mic>" });
+    defer testing.allocator.free(plist);
+    try testing.expect(std.mem.indexOf(u8, plist, "A &amp; B &lt;C&gt;") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "Use &quot;cam&quot; &amp; &lt;mic&gt;") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "A & B <C>") == null);
+}
+
+test "macosExeRelPath/macosIconRelPath: 正斜杠布局 + exe 去后缀（v0.5.1）" {
+    const meta = PackMeta{ .name = "Zilt", .version = "0.5.1", .app_id = "app.zilt.desktop", .exe_name = "zilt-app.exe" };
+    const exe_rel = try macosExeRelPath(testing.allocator, meta);
+    defer testing.allocator.free(exe_rel);
+    try testing.expectEqualStrings("Contents/MacOS/zilt-app", exe_rel);
+    try testing.expect(std.mem.indexOf(u8, exe_rel, "\\") == null);
+    const icon_rel = try macosIconRelPath(testing.allocator, "AppIcon.icns");
+    defer testing.allocator.free(icon_rel);
+    try testing.expectEqualStrings("Contents/Resources/AppIcon.icns", icon_rel);
+}
+
+test "macOS bundle 常量: PkgInfo + 相对路径（v0.5.1）" {
+    try testing.expectEqualStrings("APPL????", macos_pkg_info_bytes);
+    try testing.expectEqualStrings("Contents/Info.plist", macos_info_plist_rel);
+    try testing.expectEqualStrings("Contents/PkgInfo", macos_pkg_info_rel);
+    try testing.expectEqualStrings("Contents/Resources", macos_resources_rel);
+    try testing.expectEqualStrings("Contents/MacOS", macos_macos_rel);
 }
 
 test "generateDesktopFile/generateRpmSpec: 内容断言" {

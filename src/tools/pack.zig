@@ -250,17 +250,21 @@ pub fn main() !void {
         const exe_src = exe_path orelse return error.ExeArgRequired;
         const exe_bytes = readFileAlloc(alloc, exe_src) orelse return error.ExeReadFailed;
         const app_dir = try pathJoin(alloc, out_dir, try std.fmt.allocPrint(alloc, "{s}.app", .{meta.name}));
-        mkDirs(alloc, try pathJoin(alloc, app_dir, "Contents\\MacOS"));
-        const plist = try zilt.pack_formats.generateInfoPlist(alloc, meta);
-        if (!writeFile(alloc, try pathJoin(alloc, app_dir, "Contents\\Info.plist"), plist)) return error.WriteFailed;
-        const exe_dst = try pathJoin(alloc, app_dir, try std.fmt.allocPrint(alloc, "Contents\\MacOS\\{s}", .{try exeBaseName(alloc, meta)}));
+        const pf = zilt.pack_formats;
+        // v0.5.1：正斜杠布局（Contents/MacOS + Contents/Resources + PkgInfo）。
+        // .icns 字节随 v0.5.2 落地：先建 Resources 目录，plist 暂不引用图标（避免悬空）。
+        mkDirs(alloc, try pathJoin(alloc, app_dir, pf.macos_macos_rel));
+        mkDirs(alloc, try pathJoin(alloc, app_dir, pf.macos_resources_rel));
+        const plist = try pf.generateInfoPlistOpt(alloc, meta, .{
+            .url_schemes = &.{"zilt"},
+            .camera_usage = "Zilt needs camera access for web video features.",
+            .microphone_usage = "Zilt needs microphone access for web audio features.",
+            .category = "public.app-category.developer-tools",
+        });
+        if (!writeFile(alloc, try pathJoin(alloc, app_dir, pf.macos_info_plist_rel), plist)) return error.WriteFailed;
+        if (!writeFile(alloc, try pathJoin(alloc, app_dir, pf.macos_pkg_info_rel), pf.macos_pkg_info_bytes)) return error.WriteFailed;
+        const exe_dst = try pathJoin(alloc, app_dir, try pf.macosExeRelPath(alloc, meta));
         if (!writeFile(alloc, exe_dst, exe_bytes)) return error.WriteFailed;
-        const dmg_sh =
-            \\#!/bin/bash
-            \\# DMG 打包（仅 macOS 可执行）：hdiutil create -volname NAME -srcfolder NAME.app -ov -format UDZO NAME.dmg
-            \\
-        ;
-        _ = dmg_sh;
         std.debug.print("[pack] .app bundle -> {s}（DMG 需在 macOS 上执行 hdiutil）\n", .{app_dir});
     } else if (std.mem.eql(u8, target, "appimage")) {
         const exe_src = exe_path orelse return error.ExeArgRequired;
