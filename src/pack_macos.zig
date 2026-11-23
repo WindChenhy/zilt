@@ -1,8 +1,10 @@
-//! macOS 打包编排（v0.5.3）：`ZILT_PACK_OUT=<dir> zig build pack`（macOS 目标）。
+//! macOS 打包编排（v0.5.4）：`ZILT_PACK_OUT=<dir> zig build pack`（macOS 目标）。
 //!
 //! 产物（dist/）：
 //!   - `<name>.app/` —— Contents/MacOS/<exe> + Contents/Resources/AppIcon.icns
 //!     + Info.plist（深链/TCC/分类，pack_formats.generateInfoPlistOpt）+ PkgInfo
+//!   - `entitlements.plist` —— hardened runtime 例外（JIT/网络/相机/麦克风）
+//!   - `codesign.sh` —— codesign .app + verify（ad-hoc 默认；ZILT_MACOS_IDENTITY 注入 Developer ID）
 //!   - `bundle-dmg.sh` —— hdiutil 拖装 DMG 脚本（pack_formats.generateBundleDmgScript，
 //!     仅 macOS 可执行；CI 跑它产出 `<name>.dmg`）
 //!
@@ -135,7 +137,24 @@ pub fn main(init: std.process.Init) !u8 {
     const script_dst = try pathJoin(alloc, out_dir, "bundle-dmg.sh");
     if (!writeFile(alloc, script_dst, dmg_script, 0o755)) return 1;
 
+    // v0.5.4：entitlements.plist（hardened runtime 下授予 WebView JIT/网络/相机/麦克风例外）。
+    const ent = try pf.generateEntitlements(alloc, .{ .camera = true, .audio_input = true });
+    const ent_dst = try pathJoin(alloc, out_dir, "entitlements.plist");
+    if (!writeFile(alloc, ent_dst, ent, 0o644)) return 1;
+
+    // v0.5.4：codesign.sh（ad-hoc 默认无需证书；ZILT_MACOS_IDENTITY 注入 Developer ID 时配安全时间戳）。
+    const identity = getEnv(alloc, "ZILT_MACOS_IDENTITY") orelse "-";
+    const sign_script = try pf.generateCodesignScript(alloc, .{
+        .app_name = try std.fmt.allocPrint(alloc, "{s}.app", .{meta.name}),
+        .entitlements_name = "entitlements.plist",
+        .identity = identity,
+        .timestamp = !std.mem.eql(u8, identity, "-"),
+    });
+    const sign_dst = try pathJoin(alloc, out_dir, "codesign.sh");
+    if (!writeFile(alloc, sign_dst, sign_script, 0o755)) return 1;
+
     std.debug.print("[pack] .app bundle -> {s}\n", .{app_dir});
     std.debug.print("[pack] DMG 脚本 -> {s}（bash 它产出 {s}.dmg）\n", .{ script_dst, meta.name });
+    std.debug.print("[pack] 签名脚本 -> {s}（identity={s}）+ entitlements.plist\n", .{ sign_dst, identity });
     return 0;
 }

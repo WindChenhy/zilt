@@ -420,6 +420,114 @@ fn appendShellEscaped(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []co
     }
 }
 
+/// v0.5.4：hardened runtime 下的 entitlements（WKWebView 需 JIT/无符号可执行内存）。
+pub const EntitlementsOptions = struct {
+    allow_jit: bool = true,
+    allow_unsigned_executable_memory: bool = true,
+    disable_library_validation: bool = false,
+    network_client: bool = true,
+    network_server: bool = false,
+    camera: bool = false,
+    audio_input: bool = false,
+    user_selected_files: bool = true,
+};
+
+/// v0.5.4：生成 entitlements.plist（hardened runtime 下按开关授予 WebView 必需例外）。
+pub fn generateEntitlements(alloc: std.mem.Allocator, opts: EntitlementsOptions) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    try buf.appendSlice(alloc,
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\
+    );
+    if (opts.allow_jit) try appendEntKey(&buf, alloc, "com.apple.security.cs.allow-jit");
+    if (opts.allow_unsigned_executable_memory) try appendEntKey(&buf, alloc, "com.apple.security.cs.allow-unsigned-executable-memory");
+    if (opts.disable_library_validation) try appendEntKey(&buf, alloc, "com.apple.security.cs.disable-library-validation");
+    if (opts.network_client) try appendEntKey(&buf, alloc, "com.apple.security.network.client");
+    if (opts.network_server) try appendEntKey(&buf, alloc, "com.apple.security.network.server");
+    if (opts.camera) try appendEntKey(&buf, alloc, "com.apple.security.device.camera");
+    if (opts.audio_input) try appendEntKey(&buf, alloc, "com.apple.security.device.audio-input");
+    if (opts.user_selected_files) try appendEntKey(&buf, alloc, "com.apple.security.files.user-selected.read-write");
+    try buf.appendSlice(alloc, "</dict>\n</plist>\n");
+    return buf.toOwnedSlice(alloc);
+}
+
+fn appendEntKey(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, key: []const u8) !void {
+    try buf.appendSlice(alloc, "  <key>");
+    try buf.appendSlice(alloc, key);
+    try buf.appendSlice(alloc, "</key><true/>\n");
+}
+
+/// v0.5.4：codesign 命令选项。identity="-" 为 ad-hoc（无需证书）；
+/// Developer ID 签名需 timestamp=true（公证要求安全时间戳）。
+pub const CodesignOptions = struct {
+    identity: []const u8 = "-",
+    app_path: []const u8,
+    entitlements: ?[]const u8 = null,
+    hardened_runtime: bool = true,
+    timestamp: bool = false,
+};
+
+/// v0.5.4：构造 codesign 命令（工具侧执行）。ad-hoc（identity="-"）无需证书；
+/// hardened_runtime → --options runtime；Developer ID 配 timestamp=true 供公证。
+pub fn buildCodesignCommand(alloc: std.mem.Allocator, opts: CodesignOptions) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    try buf.appendSlice(alloc, "codesign --force");
+    if (opts.hardened_runtime) try buf.appendSlice(alloc, " --options runtime");
+    if (opts.entitlements) |e| {
+        try buf.appendSlice(alloc, " --entitlements \"");
+        try buf.appendSlice(alloc, e);
+        try buf.append(alloc, '"');
+    }
+    try buf.appendSlice(alloc, " --sign \"");
+    try buf.appendSlice(alloc, opts.identity);
+    try buf.append(alloc, '"');
+    if (opts.timestamp) try buf.appendSlice(alloc, " --timestamp");
+    try buf.appendSlice(alloc, " \"");
+    try buf.appendSlice(alloc, opts.app_path);
+    try buf.append(alloc, '"');
+    return buf.toOwnedSlice(alloc);
+}
+
+/// v0.5.4：codesign 脚本选项（自定位脚本，放在 dist 目录里执行）。
+pub const CodesignScriptOptions = struct {
+    app_name: []const u8, // "Zilt.app"
+    entitlements_name: []const u8, // "entitlements.plist"
+    identity: []const u8 = "-", // "-" = ad-hoc；Developer ID 由环境注入
+    timestamp: bool = false, // Developer ID 公证需安全时间戳
+};
+
+/// v0.5.4：生成 codesign .app 的 bash 脚本（hardened runtime + entitlements，随后 verify）。
+/// 自定位到所在目录；ad-hoc（identity="-"）无需证书，Developer ID 由环境注入并配 timestamp。
+pub fn generateCodesignScript(alloc: std.mem.Allocator, opts: CodesignScriptOptions) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    try buf.appendSlice(alloc,
+        \\#!/usr/bin/env bash
+        \\# v0.5.4: codesign .app (hardened runtime + entitlements), then verify.
+        \\set -eu
+        \\cd "$(dirname "$0")"
+        \\
+    );
+    const cmd = try buildCodesignCommand(alloc, .{
+        .app_path = opts.app_name,
+        .entitlements = opts.entitlements_name,
+        .identity = opts.identity,
+        .timestamp = opts.timestamp,
+        .hardened_runtime = true,
+    });
+    defer alloc.free(cmd);
+    try buf.appendSlice(alloc, cmd);
+    try buf.appendSlice(alloc, "\ncodesign --verify --deep --strict \"");
+    try appendShellEscaped(&buf, alloc, opts.app_name);
+    try buf.appendSlice(alloc, "\"\necho \"CODESIGN=ok\"\n");
+    return buf.toOwnedSlice(alloc);
+}
+
 /// AppRun（AppImage；Linux）。
 pub const apprun_script =
     \\#!/bin/sh
@@ -1211,6 +1319,70 @@ test "generateBundleDmgScript: hdiutil UDZO + 拖装布局 + 自定位（v0.5.3�
     try testing.expect(std.mem.indexOf(u8, script, "Zilt.app") != null);
     try testing.expect(std.mem.indexOf(u8, script, "Zilt.dmg") != null);
     try testing.expect(std.mem.indexOf(u8, script, "mktemp -d") != null);
+}
+
+test "generateEntitlements: 默认 WebView 键齐全 + 可选键按开关（v0.5.4）" {
+    const ent = try generateEntitlements(testing.allocator, .{});
+    defer testing.allocator.free(ent);
+    try testing.expect(std.mem.indexOf(u8, ent, "<plist version=\"1.0\">") != null);
+    try testing.expect(std.mem.indexOf(u8, ent, "<key>com.apple.security.cs.allow-jit</key><true/>") != null);
+    try testing.expect(std.mem.indexOf(u8, ent, "<key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>") != null);
+    try testing.expect(std.mem.indexOf(u8, ent, "<key>com.apple.security.network.client</key><true/>") != null);
+    try testing.expect(std.mem.indexOf(u8, ent, "<key>com.apple.security.files.user-selected.read-write</key><true/>") != null);
+    // 默认关闭的键不出现
+    try testing.expect(std.mem.indexOf(u8, ent, "com.apple.security.device.camera") == null);
+    try testing.expect(std.mem.indexOf(u8, ent, "com.apple.security.network.server") == null);
+
+    const ent2 = try generateEntitlements(testing.allocator, .{ .camera = true, .audio_input = true, .network_server = true, .allow_jit = false });
+    defer testing.allocator.free(ent2);
+    try testing.expect(std.mem.indexOf(u8, ent2, "<key>com.apple.security.device.camera</key><true/>") != null);
+    try testing.expect(std.mem.indexOf(u8, ent2, "<key>com.apple.security.device.audio-input</key><true/>") != null);
+    try testing.expect(std.mem.indexOf(u8, ent2, "<key>com.apple.security.network.server</key><true/>") != null);
+    try testing.expect(std.mem.indexOf(u8, ent2, "com.apple.security.cs.allow-jit") == null);
+}
+
+test "buildCodesignCommand: ad-hoc 默认 + hardened runtime + Developer ID 时间戳（v0.5.4）" {
+    const adhoc = try buildCodesignCommand(testing.allocator, .{ .app_path = "dist/Zilt.app", .entitlements = "dist/entitlements.plist" });
+    defer testing.allocator.free(adhoc);
+    try testing.expect(std.mem.indexOf(u8, adhoc, "codesign --force") != null);
+    try testing.expect(std.mem.indexOf(u8, adhoc, "--options runtime") != null);
+    try testing.expect(std.mem.indexOf(u8, adhoc, "--entitlements \"dist/entitlements.plist\"") != null);
+    try testing.expect(std.mem.indexOf(u8, adhoc, "--sign \"-\"") != null);
+    try testing.expect(std.mem.indexOf(u8, adhoc, "\"dist/Zilt.app\"") != null);
+    try testing.expect(std.mem.indexOf(u8, adhoc, "--timestamp") == null);
+
+    const devid = try buildCodesignCommand(testing.allocator, .{
+        .identity = "Developer ID Application: Zilt (TEAMID)",
+        .app_path = "dist/Zilt.app",
+        .timestamp = true,
+    });
+    defer testing.allocator.free(devid);
+    try testing.expect(std.mem.indexOf(u8, devid, "--sign \"Developer ID Application: Zilt (TEAMID)\"") != null);
+    try testing.expect(std.mem.indexOf(u8, devid, "--timestamp") != null);
+    try testing.expect(std.mem.indexOf(u8, devid, "--entitlements") == null);
+}
+
+test "generateCodesignScript: 自定位 + ad-hoc 签名 + verify（v0.5.4）" {
+    const script = try generateCodesignScript(testing.allocator, .{ .app_name = "Zilt.app", .entitlements_name = "entitlements.plist" });
+    defer testing.allocator.free(script);
+    try testing.expect(std.mem.startsWith(u8, script, "#!/usr/bin/env bash"));
+    try testing.expect(std.mem.indexOf(u8, script, "cd \"$(dirname \"$0\")\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "codesign --force") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "--options runtime") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "--entitlements \"entitlements.plist\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "--sign \"-\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "codesign --verify --deep --strict \"Zilt.app\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "--timestamp") == null);
+
+    const devid = try generateCodesignScript(testing.allocator, .{
+        .app_name = "Zilt.app",
+        .entitlements_name = "entitlements.plist",
+        .identity = "Developer ID Application: Zilt (TEAMID)",
+        .timestamp = true,
+    });
+    defer testing.allocator.free(devid);
+    try testing.expect(std.mem.indexOf(u8, devid, "--timestamp") != null);
+    try testing.expect(std.mem.indexOf(u8, devid, "--sign \"Developer ID Application: Zilt (TEAMID)\"") != null);
 }
 
 test "generateDesktopFile/generateRpmSpec: 内容断言" {
