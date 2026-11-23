@@ -18,6 +18,9 @@ const builtin_cmds = @import("../../builtin.zig");
 const Config = @import("../../config.zig").Config;
 const config_mod = @import("../../config.zig");
 const objc = @import("objc.zig");
+const keychain = @import("keychain.zig");
+const store_mod = @import("../../store.zig");
+const system_api = @import("../../system_api.zig");
 
 const Id = objc.Id;
 const Sel = objc.Sel;
@@ -84,6 +87,11 @@ fn Backend(comptime config: Config) type {
         /// 跨线程 emit 队列（worker → 主线程 drain；WebKit 只允许主线程 eval）
         out_mutex: std.atomic.Mutex = .unlocked,
         out_queue: std.ArrayListUnmanaged(OutItem) = .empty,
+        /// v0.5.6：store 子系统（appData/store.json + Keychain 加密；对齐 Linux v0.2.3/H3）
+        storage_root: ?[]u8 = null,
+        store: ?store_mod.Store = null,
+        secret: ?keychain.KeychainLib = null,
+        store_ok: bool = false,
 
         fn main() !void {
             inst.smoke_ms = parseSmokeMs(env("ZILT_SMOKE_TEST_MS"));
@@ -109,6 +117,7 @@ fn Backend(comptime config: Config) type {
             }
             try inst.createWindow();
             try inst.createWebView();
+            inst.initStorage();
 
             if (inst.smoke_ms == 0) {
                 // 正常应用：交给 NSApp runloop（阻塞至退出）
@@ -218,6 +227,170 @@ fn Backend(comptime config: Config) type {
             }
             if (i < 4) return null;
             return vals;
+        }
+
+        // ------------------------------------------------------------------
+        // v0.5.6 存储子系统（appData/store.json + Keychain 加密；对齐 Linux）
+        // ------------------------------------------------------------------
+
+        /// 应用数据根：~/Library/Application Support/<app_id>
+        fn appDataRoot(self: *Self) ?[]u8 {
+            const home_z = std.c.getenv("HOME") orelse return null;
+            return std.fmt.allocPrint(self.alloc, "{s}/Library/Application Support/{s}", .{ std.mem.span(home_z), config.app_id }) catch null;
+        }
+
+        /// 递归建目录（NSFileManager withIntermediateDirectories:YES）
+        fn makeDirPath(_: *Self, path: []const u8) void {
+            const fm = msg0(Id, objc.cls("NSFileManager"), "defaultManager");
+            _ = objc.msgSend(*const fn (Id, Sel, Id, bool, ?Id, ?Id) callconv(.c) bool)(
+                fm,
+                objc.sel("createDirectoryAtPath:withIntermediateDirectories:attributes:error:"),
+                objc.nsString(path.ptr, path.len),
+                true,
+                null,
+                null,
+            );
+        }
+
+        /// 读文本文件（Foundation stringWithContentsOfFile，同 loadWindowState）
+        fn readTextFile(self: *Self, path: []const u8) ?[]u8 {
+            const ns = objc.msgSend(*const fn (Id, Sel, Id, c_ulong, ?Id) callconv(.c) ?Id)(
+                objc.cls("NSString"),
+                objc.sel("stringWithContentsOfFile:encoding:error:"),
+                objc.nsString(path.ptr, path.len),
+                4,
+                null,
+            ) orelse return null;
+            const cs = msg0(?[*:0]const u8, ns, "UTF8String") orelse return null;
+            return self.alloc.dupe(u8, std.mem.span(cs)) catch null;
+        }
+
+        /// run() 早期一次：钥匙串开关 + storage_root + store.json 载入。
+        fn initStorage(self: *Self) void {
+            if (config.store_encrypted) {
+                if (keychain.open()) |lib| {
+                    self.secret = lib;
+                    log.print("[store] keychain enabled (encrypted store)", .{});
+                } else {
+                    log.print("[store] store_encrypted=true but keychain unavailable -> plaintext fallback", .{});
+                }
+            }
+            if (self.storage_root != null) return;
+            const root = self.appDataRoot() orelse {
+                log.print("[store] app data root unavailable — store disabled", .{});
+                return;
+            };
+            self.makeDirPath(root);
+            self.storage_root = root;
+            var st = store_mod.Store.init(self.alloc);
+            const store_path = std.fmt.allocPrint(self.alloc, "{s}/store.json", .{root}) catch null;
+            if (store_path) |sp| {
+                defer self.alloc.free(sp);
+                if (self.readTextFile(sp)) |bytes| {
+                    defer self.alloc.free(bytes);
+                    st.fromJson(bytes) catch |err| log.print("[store] parse failed: {s}（从空表开始）", .{@errorName(err)});
+                }
+            }
+            self.store = st;
+            log.print("[store] ready ({d} keys) {s}/store.json", .{ st.count(), root });
+        }
+
+        /// 原子落盘（Foundation writeToFile:atomically:，同 saveWindowState）。
+        fn persistStore(self: *Self) void {
+            const root = self.storage_root orelse return;
+            const st = if (self.store) |*v| v else return;
+            const json = st.toJson(self.alloc) catch return;
+            defer self.alloc.free(json);
+            const path = std.fmt.allocPrint(self.alloc, "{s}/store.json", .{root}) catch return;
+            defer self.alloc.free(path);
+            const ok = objc.msgSend(*const fn (Id, Sel, Id, bool, c_ulong, ?Id) callconv(.c) bool)(
+                objc.nsString(json.ptr, json.len),
+                objc.sel("writeToFile:atomically:encoding:error:"),
+                objc.nsString(path.ptr, path.len),
+                true,
+                4,
+                null,
+            );
+            if (!ok) log.print("[store] persist failed", .{});
+        }
+
+        fn runStoreOp(self: *Self, op: system_api.StoreOp, alloc: std.mem.Allocator) !system_api.Result {
+            const st = if (self.store) |*v| v else return error.StoreNotAvailable;
+            switch (op) {
+                .get => |key| {
+                    const v = st.get(key) orelse return .{ .json = try alloc.dupe(u8, "null") };
+                    // `secret:` 标记 → 值在钥匙串（Keychain lookup）
+                    if (std.mem.startsWith(u8, v, keychain.marker)) {
+                        const lib = self.secret orelse return error.KeyringUnavailable;
+                        const got = keychain.lookupValue(&lib, alloc, config.app_id, key) orelse return error.KeyringUnavailable;
+                        defer alloc.free(got);
+                        return .{ .json = try std.json.Stringify.valueAlloc(alloc, got, .{}) };
+                    }
+                    return .{ .json = try std.json.Stringify.valueAlloc(alloc, v, .{}) };
+                },
+                .set => |kv| {
+                    // 加密模式 + 钥匙串 → 值进钥匙串，store.json 落标记
+                    if (self.secret) |*lib| {
+                        keychain.storeValue(lib, config.app_id, kv.key, kv.value) catch |err| {
+                            log.print("[store] keychain store failed: {s} -> plaintext fallback", .{@errorName(err)});
+                            try st.set(kv.key, kv.value);
+                            self.persistStore();
+                            return .{ .ok = true };
+                        };
+                        try st.set(kv.key, keychain.marker);
+                        self.persistStore();
+                        return .{ .ok = true };
+                    }
+                    try st.set(kv.key, kv.value);
+                    self.persistStore();
+                    return .{ .ok = true };
+                },
+                .remove => |key| {
+                    const removed = st.remove(key);
+                    if (removed) {
+                        if (self.secret) |*lib| _ = keychain.deleteValue(lib, config.app_id, key);
+                        self.persistStore();
+                    }
+                    return .{ .ok = removed };
+                },
+                .keys => {
+                    const keys = try st.keys(alloc);
+                    defer alloc.free(keys);
+                    return .{ .json = try std.json.Stringify.valueAlloc(alloc, keys, .{}) };
+                },
+                .all => return .{ .json = try st.toJson(alloc) },
+            }
+        }
+
+        /// system_fn：本期只接 .store（其余 system_api 面随 v0.5.7+ 对等补）。
+        fn systemEntry(backend_ptr: *anyopaque, window_id: u32, alloc: std.mem.Allocator, req: system_api.Request) anyerror!system_api.Result {
+            const self: *Self = @ptrCast(@alignCast(backend_ptr));
+            _ = window_id;
+            switch (req) {
+                .store => |op| return self.runStoreOp(op, alloc),
+                else => return error.SystemNotAvailable,
+            }
+        }
+
+        /// 冒烟探针：store set/get/remove 往返（CI 硬断言 [macos] store ok=true）。
+        fn runStoreProbe(self: *Self) bool {
+            const alloc = self.alloc;
+            _ = self.runStoreOp(.{ .set = .{ .key = "zilt-smoke", .value = "macos-store" } }, alloc) catch {
+                log.print("[macos] store ok=false", .{});
+                return false;
+            };
+            const get_res = self.runStoreOp(.{ .get = "zilt-smoke" }, alloc) catch {
+                log.print("[macos] store ok=false", .{});
+                return false;
+            };
+            var ok = false;
+            if (get_res == .json) {
+                ok = std.mem.eql(u8, get_res.json, "\"macos-store\"");
+                alloc.free(get_res.json);
+            }
+            _ = self.runStoreOp(.{ .remove = "zilt-smoke" }, alloc) catch {};
+            log.print("[macos] store ok={s}", .{boolStr(ok)});
+            return ok;
         }
 
 
@@ -588,6 +761,7 @@ fn Backend(comptime config: Config) type {
                 .dialog_fn = dialogEntry,
                 .notify_fn = notifyEntry,
                 .webview_request_fn = webviewRequestEntry,
+                .system_fn = systemEntry,
             };
         }
 
@@ -1250,6 +1424,7 @@ fn Backend(comptime config: Config) type {
                     self.probe_sent = true;
                     self.evalScript(self.webview, probe_js);
                     self.win_ops_ok = self.runWindowOpsProbe();
+                    self.store_ok = self.runStoreProbe();
                     log.print("[macos] probe sent", .{});
                 }
                 const left = msg0(f64, deadline, "timeIntervalSinceNow");

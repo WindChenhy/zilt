@@ -110,6 +110,7 @@ test {
     _ = @import("pack_formats.zig"); // v0.2.4：其单测此前从未被编译执行（断言与实现脱节）
     _ = @import("ws.zig");
     _ = @import("store.zig");
+    _ = @import("platform/macos/keychain.zig"); // v0.5.6：宿主可编译（dlopen 经 comptime 守卫）；FFI 往返 CI macos-15 真跑
     _ = @import("fs_api.zig");
     _ = @import("services.zig");
     _ = @import("sql.zig");

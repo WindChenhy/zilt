@@ -160,6 +160,8 @@ pub const macos_target_capabilities = [_]Capability{
     .ipc_events,
     // 资产经 WKURLSchemeHandler 的 zilt:// scheme 服务（与 Linux 同名）
     .asset_server,
+    // v0.5.6：KV 存储（appData/store.json + Keychain 加密；system_fn 接 .store）
+    .store,
 };
 
 /// 编译期校验后端契约（`platform/mod.zig` 在本平台后端上调用一次）。
