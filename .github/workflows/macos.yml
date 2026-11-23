@@ -90,6 +90,7 @@ jobs:
           grep -qF "[macos] webview permission ok=true" smoke.log
           grep -qF "[macos] webview drop ok=true" smoke.log
           grep -qF "[macos] store ok=true" smoke.log
+          grep -qF "[macos] updater ok=true" smoke.log
           grep -q "\[macos\] smoke done, exiting" smoke.log
           # 资产真的走了 WKURLSchemeHandler（不是回落 file://）
           grep -q "\[assets\] .*index.html.* 200" smoke.log

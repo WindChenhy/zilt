@@ -21,6 +21,7 @@ const objc = @import("objc.zig");
 const keychain = @import("keychain.zig");
 const store_mod = @import("../../store.zig");
 const system_api = @import("../../system_api.zig");
+const updater = @import("../../updater.zig");
 
 const Id = objc.Id;
 const Sel = objc.Sel;
@@ -92,6 +93,10 @@ fn Backend(comptime config: Config) type {
         store: ?store_mod.Store = null,
         secret: ?keychain.KeychainLib = null,
         store_ok: bool = false,
+        /// v0.5.7：更新器（复用 ed25519 核心 + .app 束整树 staging；对齐 Linux v0.4.x）
+        updater_env: ?updater.Env = null,
+        updater_url_override: ?[]u8 = null,
+        updater_ok: bool = false,
 
         fn main() !void {
             inst.smoke_ms = parseSmokeMs(env("ZILT_SMOKE_TEST_MS"));
@@ -118,6 +123,7 @@ fn Backend(comptime config: Config) type {
             try inst.createWindow();
             try inst.createWebView();
             inst.initStorage();
+            inst.initUpdater();
 
             if (inst.smoke_ms == 0) {
                 // 正常应用：交给 NSApp runloop（阻塞至退出）
@@ -265,6 +271,18 @@ fn Backend(comptime config: Config) type {
             return self.alloc.dupe(u8, std.mem.span(cs)) catch null;
         }
 
+        /// 写文本文件（Foundation writeToFile:atomically:，同 persistStore）。
+        fn writeTextFile(_: *Self, path: []const u8, data: []const u8) bool {
+            return objc.msgSend(*const fn (Id, Sel, Id, bool, c_ulong, ?Id) callconv(.c) bool)(
+                objc.nsString(data.ptr, data.len),
+                objc.sel("writeToFile:atomically:encoding:error:"),
+                objc.nsString(path.ptr, path.len),
+                true,
+                4,
+                null,
+            );
+        }
+
         /// run() 早期一次：钥匙串开关 + storage_root + store.json 载入。
         fn initStorage(self: *Self) void {
             if (config.store_encrypted) {
@@ -362,12 +380,13 @@ fn Backend(comptime config: Config) type {
             }
         }
 
-        /// system_fn：本期只接 .store（其余 system_api 面随 v0.5.7+ 对等补）。
+        /// system_fn：接 .store + .updater（其余 system_api 面随 v0.5.8+ 对等补）。
         fn systemEntry(backend_ptr: *anyopaque, window_id: u32, alloc: std.mem.Allocator, req: system_api.Request) anyerror!system_api.Result {
             const self: *Self = @ptrCast(@alignCast(backend_ptr));
             _ = window_id;
             switch (req) {
                 .store => |op| return self.runStoreOp(op, alloc),
+                .updater => |op| return self.runUpdaterOp(op, alloc),
                 else => return error.SystemNotAvailable,
             }
         }
@@ -390,6 +409,216 @@ fn Backend(comptime config: Config) type {
             }
             _ = self.runStoreOp(.{ .remove = "zilt-smoke" }, alloc) catch {};
             log.print("[macos] store ok={s}", .{boolStr(ok)});
+            return ok;
+        }
+
+        // ------------------------------------------------------------------
+        // v0.5.7：更新器（复用 ed25519 核心；.app 束整树 staging + 裸二进制回退）
+        // ------------------------------------------------------------------
+
+        /// 当前 exe 路径（0.17 executablePathAlloc 走 Io；per-call Threaded）。
+        fn currentExePath(_: *Self, alloc: std.mem.Allocator) ![]u8 {
+            var threaded: std.Io.Threaded = .init(alloc, .{});
+            defer threaded.deinit();
+            return std.process.executablePathAlloc(threaded.io(), alloc);
+        }
+
+        /// 是否已有暂存备份（.zilt-old）：.app 束查束根备份，裸二进制查 exe 备份。
+        fn hasStagedBackup(self: *Self, exe_path: []const u8) bool {
+            var threaded: std.Io.Threaded = .init(self.alloc, .{});
+            defer threaded.deinit();
+            const target = updater.appBundleRoot(exe_path) orelse exe_path;
+            const old = std.fmt.allocPrint(self.alloc, "{s}.zilt-old", .{target}) catch return false;
+            defer self.alloc.free(old);
+            std.Io.Dir.cwd().access(threaded.io(), old, .{}) catch return false;
+            return true;
+        }
+
+        /// 组装 updater.Env（镜像 Linux buildUpdaterEnv；pk/url 支持 env 覆盖）。
+        fn buildUpdaterEnv(self: *Self, uc: Config.Update) !updater.Env {
+            var pk: [32]u8 = undefined;
+            var pk_from_env = false;
+            if (std.c.getenv("ZILT_UPDATE_PK")) |hex| {
+                const h = std.mem.span(hex);
+                if (h.len == 64) {
+                    _ = std.fmt.hexToBytes(&pk, h) catch return error.InvalidPublicKey;
+                    pk_from_env = true;
+                }
+            }
+            if (!pk_from_env) {
+                if (uc.public_key_hex.len != 64) return error.InvalidPublicKey;
+                _ = std.fmt.hexToBytes(&pk, uc.public_key_hex) catch return error.InvalidPublicKey;
+            }
+            var manifest_url: []const u8 = uc.manifest_url;
+            if (std.c.getenv("ZILT_UPDATE_URL")) |u| {
+                if (self.alloc.dupe(u8, std.mem.span(u))) |owned| {
+                    self.updater_url_override = owned;
+                    manifest_url = owned;
+                } else |_| {}
+            }
+            const channel: updater.UpdateChannel = if (std.mem.eql(u8, uc.channel, "beta")) .beta else .stable;
+            var skipped_version: ?[]const u8 = null;
+            if (self.storage_root) |root| {
+                const skip_path = std.fmt.allocPrint(self.alloc, "{s}/skipped.json", .{root}) catch null;
+                if (skip_path) |sp| {
+                    defer self.alloc.free(sp);
+                    if (self.readTextFile(sp)) |body| {
+                        defer self.alloc.free(body);
+                        if (updater.parseSkipped(self.alloc, body)) |sk| {
+                            skipped_version = self.alloc.dupe(u8, sk.version) catch null;
+                        }
+                    }
+                }
+            }
+            return .{
+                .channel = channel,
+                .manifest_url = manifest_url,
+                .public_key = pk,
+                .current_version = uc.current_version,
+                .exe_path = try self.currentExePath(self.alloc),
+                .github_repo = uc.github_repo,
+                .skipped_version = skipped_version,
+                .exe_name = uc.exe_name,
+                .fetcher = .{ .ctx = @ptrCast(self), .fetchFn = updaterFetchMacos },
+            };
+        }
+
+        /// run() 早期一次：config.update 存在则组装 env（缺失 = 更新器未配置）。
+        fn initUpdater(self: *Self) void {
+            const uc = config.update orelse {
+                log.print("[updater] not configured", .{});
+                return;
+            };
+            self.updater_env = self.buildUpdaterEnv(uc) catch |err| {
+                log.print("[updater] env build failed: {s}", .{@errorName(err)});
+                return;
+            };
+            log.print("[updater] ready (channel={s})", .{@tagName(self.updater_env.?.channel)});
+        }
+
+        fn runUpdaterOp(self: *Self, op: system_api.UpdaterOp, alloc: std.mem.Allocator) !system_api.Result {
+            switch (op) {
+                .info => {
+                    const uenv = self.updater_env orelse return .{ .json = try alloc.dupe(u8, "{\"configured\":false}") };
+                    const exe_path = try self.currentExePath(alloc);
+                    defer alloc.free(exe_path);
+                    const restart_required = self.hasStagedBackup(exe_path);
+                    const url_json = try std.json.Stringify.valueAlloc(alloc, uenv.manifest_url, .{});
+                    defer alloc.free(url_json);
+                    const ver_json = try std.json.Stringify.valueAlloc(alloc, uenv.current_version, .{});
+                    defer alloc.free(ver_json);
+                    return .{ .json = try std.fmt.allocPrint(alloc,
+                        "{{\"configured\":true,\"manifest_url\":{s},\"current_version\":{s},\"channel\":\"{s}\",\"restart_required\":{s}}}",
+                        .{ url_json, ver_json, @tagName(uenv.channel), if (restart_required) "true" else "false" }) };
+                },
+                .check => {
+                    if (self.updater_env == null) return .{ .ok = false };
+                    const t = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, updaterFlow, .{self}) catch |err| {
+                        log.print("[updater] manual check spawn failed: {s}", .{@errorName(err)});
+                        return .{ .ok = false };
+                    };
+                    t.detach();
+                    log.print("[updater] manual check started (from JS)", .{});
+                    return .{ .ok = true };
+                },
+                .skip => |version| {
+                    const root = self.storage_root orelse return .{ .ok = false };
+                    const path = std.fmt.allocPrint(alloc, "{s}/skipped.json", .{root}) catch return .{ .ok = false };
+                    defer alloc.free(path);
+                    const body = try std.fmt.allocPrint(alloc, "{{\"version\":\"{s}\"}}", .{version});
+                    defer alloc.free(body);
+                    if (!self.writeTextFile(path, body)) {
+                        log.print("[updater] skipped.json write failed", .{});
+                        return .{ .ok = false };
+                    }
+                    log.print("[updater] version {s} skipped", .{version});
+                    if (self.updater_env) |*uenv| uenv.skipped_version = self.alloc.dupe(u8, version) catch null;
+                    return .{ .ok = true };
+                },
+            }
+        }
+
+        /// 后台更新流：检查 → 下载验签 → staging（.app 束整树替换 / 裸二进制单文件）。
+        /// v0.5.7 仅全量下载（差分/补丁、auto_restart 见 ADR 诚实缺口）。
+        fn updaterFlow(self: *Self) void {
+            const uenv = self.updater_env orelse return;
+            const ctx = self.context(self.alloc, 0);
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+
+            const m = updater.checkForUpdateEnv(arena.allocator(), uenv) catch |err| {
+                log.print("[updater] check failed: {s}", .{@errorName(err)});
+                ctx.emit("updaterFailed", .{ .stage = "check", .err = @errorName(err) });
+                return;
+            } orelse {
+                log.print("[updater] up to date ({s})", .{uenv.current_version});
+                return;
+            };
+            log.print("[updater] update available: {s} (current {s})", .{ m.version, uenv.current_version });
+            ctx.emit("updateInfo", .{ .version = m.version, .notes = m.notes });
+
+            const artifact = updater.downloadAndVerify(self.alloc, uenv.fetcher, m, uenv.public_key) catch |err| {
+                log.print("[updater] download/verify failed: {s}", .{@errorName(err)});
+                ctx.emit("updaterFailed", .{ .stage = "download", .err = @errorName(err) });
+                return;
+            };
+            defer self.alloc.free(artifact);
+            log.print("[updater] artifact verified ({d} bytes, sha256+ed25519)", .{artifact.len});
+
+            var threaded: std.Io.Threaded = .init(self.alloc, .{});
+            defer threaded.deinit();
+            const io = threaded.io();
+
+            if (updater.appBundleRoot(uenv.exe_path)) |bundle| {
+                // .app 束：解压新束到同级临时目录 → 整束原子替换（codesign 封整束）
+                const tmp = std.fmt.allocPrint(self.alloc, "{s}.zilt-new", .{bundle}) catch {
+                    ctx.emit("updaterFailed", .{ .stage = "stage", .err = "OutOfMemory" });
+                    return;
+                };
+                defer self.alloc.free(tmp);
+                const cwd = std.Io.Dir.cwd();
+                cwd.deleteTree(io, tmp) catch {};
+                defer cwd.deleteTree(io, tmp) catch {};
+                updater.extractZipTree(io, self.alloc, artifact, tmp) catch |err| {
+                    log.print("[updater] extract failed: {s}", .{@errorName(err)});
+                    ctx.emit("updaterFailed", .{ .stage = "stage", .err = @errorName(err) });
+                    return;
+                };
+                const new_app = std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ tmp, std.fs.path.basename(bundle) }) catch {
+                    ctx.emit("updaterFailed", .{ .stage = "stage", .err = "OutOfMemory" });
+                    return;
+                };
+                defer self.alloc.free(new_app);
+                updater.stageAppBundle(io, self.alloc, bundle, new_app) catch |err| {
+                    log.print("[updater] bundle stage failed: {s}", .{@errorName(err)});
+                    ctx.emit("updaterFailed", .{ .stage = "stage", .err = @errorName(err) });
+                    return;
+                };
+            } else {
+                updater.stageUpdate(self.alloc, uenv.exe_path, uenv.exe_name, artifact) catch |err| {
+                    log.print("[updater] stage failed: {s}", .{@errorName(err)});
+                    ctx.emit("updaterFailed", .{ .stage = "stage", .err = @errorName(err) });
+                    return;
+                };
+            }
+            log.print("[updater] staged ✓ {s} — restart to apply", .{m.version});
+            ctx.emit("updateStaged", .{ .version = m.version });
+        }
+
+        /// 冒烟探针：.updater info 往返（CI 硬断言 [macos] updater ok=true）。
+        /// 冒烟无 update 配置 → configured:false；验证 systemEntry→runUpdaterOp→JSON 通路。
+        fn runUpdaterProbe(self: *Self) bool {
+            const alloc = self.alloc;
+            const res = self.runUpdaterOp(.info, alloc) catch {
+                log.print("[macos] updater ok=false", .{});
+                return false;
+            };
+            var ok = false;
+            if (res == .json) {
+                ok = std.mem.indexOf(u8, res.json, "\"configured\":") != null;
+                alloc.free(res.json);
+            }
+            log.print("[macos] updater ok={s}", .{boolStr(ok)});
             return ok;
         }
 
@@ -1425,6 +1654,7 @@ fn Backend(comptime config: Config) type {
                     self.evalScript(self.webview, probe_js);
                     self.win_ops_ok = self.runWindowOpsProbe();
                     self.store_ok = self.runStoreProbe();
+                    self.updater_ok = self.runUpdaterProbe();
                     log.print("[macos] probe sent", .{});
                 }
                 const left = msg0(f64, deadline, "timeIntervalSinceNow");
@@ -2076,6 +2306,27 @@ fn boolStr(v: bool) []const u8 {
 fn env(name: [*:0]const u8) ?[]const u8 {
     const v = std.c.getenv(name) orelse return null;
     return std.mem.span(v);
+}
+
+/// updater.Fetcher 取数实现（std.http.Client；与 Linux updaterFetchLinux 同构，
+/// 两平台共享同一套 updater 决策/验签逻辑）。per-call Io.Threaded，线程安全。
+fn updaterFetchMacos(backend_ptr: *anyopaque, alloc: std.mem.Allocator, url: []const u8) anyerror![]u8 {
+    _ = backend_ptr;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    var client: std.http.Client = .{ .allocator = alloc, .io = threaded.io() };
+    defer client.deinit();
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const result = try client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &aw.writer,
+    });
+    if (result.status != .ok) {
+        log.print("[updater] http {s} -> status {d}", .{ url, @intFromEnum(result.status) });
+        return error.HttpRequestFailed;
+    }
+    return aw.toOwnedSlice();
 }
 
 /// 冒烟时长（毫秒）：非数字/0 → 0（正常运行）；上限 10 分钟防 CI 挂死。

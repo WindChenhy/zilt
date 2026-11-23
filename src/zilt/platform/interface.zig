@@ -162,6 +162,8 @@ pub const macos_target_capabilities = [_]Capability{
     .asset_server,
     // v0.5.6：KV 存储（appData/store.json + Keychain 加密；system_fn 接 .store）
     .store,
+    // v0.5.7：更新器（ed25519 核心复用 + .app 束整树 staging；system_fn 接 .updater）
+    .updater,
 };
 
 /// 编译期校验后端契约（`platform/mod.zig` 在本平台后端上调用一次）。

@@ -359,6 +359,69 @@ pub fn cleanupOld(alloc: std.mem.Allocator, exe_path: []const u8) void {
     _ = std.c.unlink(old_z.ptr);
 }
 
+/// v0.5.7：exe 在 .app 束内（.../X.app/Contents/MacOS/<exe>）时返回束根（X.app 路径）。
+/// 纯逻辑（无 I/O），宿主可单测。裸二进制（dev/CI 冒烟）返回 null。
+pub fn appBundleRoot(exe_path: []const u8) ?[]const u8 {
+    const marker = ".app/Contents/MacOS/";
+    const idx = std.mem.indexOf(u8, exe_path, marker) orelse return null;
+    return exe_path[0 .. idx + ".app".len];
+}
+
+/// v0.5.7：.app 目录束原子替换舞步（跨平台 std.Io）：
+///   X.app → X.app.zilt-old（移开旧束）→ 新束接管 X.app；第二步失败回滚旧束。
+/// 与 stageBytes 同语义，但操作目录（束）而非单文件；重启即生效（rename 原子）。
+pub fn stageAppBundle(io: std.Io, alloc: std.mem.Allocator, app_path: []const u8, new_app_dir: []const u8) !void {
+    const old_path = try std.fmt.allocPrint(alloc, "{s}.zilt-old", .{app_path});
+    defer alloc.free(old_path);
+    const cwd = std.Io.Dir.cwd();
+    // std.Io rename 非覆盖式：先清掉可能残留的旧备份（上次 staged 未 cleanup）
+    cwd.deleteTree(io, old_path) catch {};
+    try cwd.rename(app_path, cwd, old_path, io);
+    cwd.rename(new_app_dir, cwd, app_path, io) catch |err| {
+        cwd.rename(old_path, cwd, app_path, io) catch {};
+        return err;
+    };
+}
+
+/// v0.5.7：把更新包（zip，store 条目）整树解压到 dest_dir（递归建目录）。
+/// macOS .app 束更新用；跨平台 std.Io。逐条目 CRC 校验复用 readZipStoreEntry。
+pub fn extractZipTree(io: std.Io, alloc: std.mem.Allocator, zip_bytes: []const u8, dest_dir: []const u8) !void {
+    if (zip_bytes.len < 22) return error.Corrupted;
+    var eocd: ?usize = null;
+    var i: usize = zip_bytes.len - 22;
+    while (true) : (i -= 1) {
+        if (std.mem.eql(u8, zip_bytes[i..][0..4], &.{ 'P', 'K', 5, 6 })) {
+            eocd = i;
+            break;
+        }
+        if (i == 0) break;
+    }
+    const e = eocd orelse return error.Corrupted;
+    const cd_size = std.mem.readInt(u32, zip_bytes[e + 12 ..][0..4], .little);
+    const cd_start: usize = std.mem.readInt(u32, zip_bytes[e + 16 ..][0..4], .little);
+
+    const cwd = std.Io.Dir.cwd();
+    var pos = cd_start;
+    const cd_end = cd_start + cd_size;
+    while (pos + 46 <= cd_end and pos + 46 <= zip_bytes.len) {
+        if (!std.mem.eql(u8, zip_bytes[pos..][0..4], &.{ 'P', 'K', 1, 2 })) return error.Corrupted;
+        const name_len = std.mem.readInt(u16, zip_bytes[pos + 28 ..][0..2], .little);
+        const extra_len = std.mem.readInt(u16, zip_bytes[pos + 30 ..][0..2], .little);
+        const comment_len = std.mem.readInt(u16, zip_bytes[pos + 32 ..][0..2], .little);
+        const entry_name = zip_bytes[pos + 46 ..][0..name_len];
+        pos += 46 + name_len + extra_len + comment_len;
+        // 目录条目（以 / 结尾）跳过——文件的父目录由 createDirPath 递归建
+        if (entry_name.len == 0 or entry_name[entry_name.len - 1] == '/') continue;
+
+        const content = try bundler.readZipStoreEntry(alloc, zip_bytes, entry_name);
+        defer alloc.free(content);
+        const full = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dest_dir, entry_name });
+        defer alloc.free(full);
+        if (std.fs.path.dirname(full)) |parent| try cwd.createDirPath(io, parent);
+        try cwd.writeFile(io, .{ .sub_path = full, .data = content });
+    }
+}
+
 /// 更新器运行环境（backend 组装后挂到 Context.updater_env）。
 // ---------------------------------------------------------------------------
 // v0.3.4：skipVersion + GitHub Releases provider
@@ -804,4 +867,80 @@ test "v0.3.4: manifestUrlFromGithubRelease（asset 匹配/大小写/缺失）" {
     try std.testing.expectEqualStrings("https://x/zilt-manifest.json", url);
     try std.testing.expect(manifestUrlFromGithubRelease(a, "{\"assets\":[]}") == null);
     try std.testing.expect(manifestUrlFromGithubRelease(a, "garbage") == null);
+}
+
+test "v0.5.7: appBundleRoot 识别 .app 束根 / 裸二进制 null" {
+    try testing.expectEqualStrings(
+        "/Applications/Zilt.app",
+        appBundleRoot("/Applications/Zilt.app/Contents/MacOS/zilt-app").?,
+    );
+    try testing.expectEqualStrings(
+        "/Users/x/Apps/My App.app",
+        appBundleRoot("/Users/x/Apps/My App.app/Contents/MacOS/zilt-app").?,
+    );
+    try testing.expect(appBundleRoot("/usr/local/bin/zilt-app") == null);
+    try testing.expect(appBundleRoot("zig-out/bin/zilt-app") == null);
+}
+
+test "v0.5.7: stageAppBundle 目录束原子替换 + 备份" {
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+
+    const base = ".zilt-utest-appbundle";
+    cwd.deleteTree(io, base) catch {};
+    defer cwd.deleteTree(io, base) catch {};
+
+    const cur = base ++ "/Cur.app";
+    const new = base ++ "/New.app";
+    try cwd.createDirPath(io, cur ++ "/Contents/MacOS");
+    try cwd.createDirPath(io, new ++ "/Contents/MacOS");
+    try cwd.writeFile(io, .{ .sub_path = cur ++ "/Contents/MacOS/exe", .data = "OLD-BUNDLE" });
+    try cwd.writeFile(io, .{ .sub_path = new ++ "/Contents/MacOS/exe", .data = "NEW-BUNDLE" });
+
+    try stageAppBundle(io, alloc, cur, new);
+
+    const got = try cwd.readFileAlloc(io, cur ++ "/Contents/MacOS/exe", alloc, .limited(64));
+    defer alloc.free(got);
+    try testing.expectEqualStrings("NEW-BUNDLE", got);
+
+    const bak = try cwd.readFileAlloc(io, cur ++ ".zilt-old/Contents/MacOS/exe", alloc, .limited(64));
+    defer alloc.free(bak);
+    try testing.expectEqualStrings("OLD-BUNDLE", bak);
+
+    try testing.expectError(error.FileNotFound, cwd.readFileAlloc(io, new ++ "/Contents/MacOS/exe", alloc, .limited(64)));
+}
+
+test "v0.5.7: extractZipTree 整树解压（.app 形态）" {
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+
+    const entries = [_]bundler.ZipEntry{
+        .{ .name = "Zilt.app/Contents/Info.plist", .content = "<plist>new</plist>" },
+        .{ .name = "Zilt.app/Contents/MacOS/zilt-app", .content = "NEW-EXE-BYTES" },
+    };
+    var zip: std.ArrayList(u8) = .empty;
+    defer zip.deinit(alloc);
+    try bundler.writeZip(alloc, &entries, &zip);
+
+    const dest = ".zilt-utest-extract";
+    cwd.deleteTree(io, dest) catch {};
+    defer cwd.deleteTree(io, dest) catch {};
+
+    try extractZipTree(io, alloc, zip.items, dest);
+
+    const exe = cwd.readFileAlloc(io, dest ++ "/Zilt.app/Contents/MacOS/zilt-app", alloc, .limited(64)) catch null;
+    defer if (exe) |e| alloc.free(e);
+    try testing.expect(exe != null);
+    try testing.expectEqualStrings("NEW-EXE-BYTES", exe.?);
+
+    const plist = cwd.readFileAlloc(io, dest ++ "/Zilt.app/Contents/Info.plist", alloc, .limited(64)) catch null;
+    defer if (plist) |p| alloc.free(p);
+    try testing.expect(plist != null);
+    try testing.expectEqualStrings("<plist>new</plist>", plist.?);
 }
