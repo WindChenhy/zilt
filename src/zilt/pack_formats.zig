@@ -528,6 +528,107 @@ pub fn generateCodesignScript(alloc: std.mem.Allocator, opts: CodesignScriptOpti
     return buf.toOwnedSlice(alloc);
 }
 
+/// v0.5.5：lipo 合并选项（Universal binary：arm64 + x86_64）。
+pub const LipoOptions = struct {
+    output: []const u8,
+    inputs: []const []const u8,
+};
+
+/// v0.5.5：构造 lipo -create 命令（合并多架构 slice 成 Universal binary）。
+pub fn buildLipoCommand(alloc: std.mem.Allocator, opts: LipoOptions) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    try buf.appendSlice(alloc, "lipo -create -output \"");
+    try buf.appendSlice(alloc, opts.output);
+    try buf.append(alloc, '"');
+    for (opts.inputs) |in| {
+        try buf.appendSlice(alloc, " \"");
+        try buf.appendSlice(alloc, in);
+        try buf.append(alloc, '"');
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
+/// v0.5.5：公证脚本选项（secrets 从环境读取，缺省跳过；notarytool + stapler）。
+pub const NotarizeOptions = struct {
+    dmg_name: []const u8,
+    apple_id_var: []const u8 = "APPLE_ID",
+    password_var: []const u8 = "APPLE_APP_PASSWORD",
+    team_id_var: []const u8 = "APPLE_TEAM_ID",
+};
+
+/// v0.5.5：生成公证脚本（notarytool submit --wait + stapler staple/validate）。
+/// 自定位；任一 Apple secret 缺省即跳过（exit 0），故 CI 无证书时安全空跑。
+pub fn generateNotarizeScript(alloc: std.mem.Allocator, opts: NotarizeOptions) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    try buf.appendSlice(alloc,
+        \\#!/usr/bin/env bash
+        \\# v0.5.5: notarize DMG (notarytool --wait + stapler). Skip when Apple secrets absent.
+        \\set -eu
+        \\cd "$(dirname "$0")"
+        \\if [ -z "${
+    );
+    try buf.appendSlice(alloc, opts.apple_id_var);
+    try buf.appendSlice(alloc, ":-}\" ] || [ -z \"${");
+    try buf.appendSlice(alloc, opts.password_var);
+    try buf.appendSlice(alloc, ":-}\" ] || [ -z \"${");
+    try buf.appendSlice(alloc, opts.team_id_var);
+    try buf.appendSlice(alloc,
+        \\:-}" ]; then
+        \\  echo "NOTARIZE=skip (Apple secrets absent)"
+        \\  exit 0
+        \\fi
+        \\xcrun notarytool submit "
+    );
+    try appendShellEscaped(&buf, alloc, opts.dmg_name);
+    try buf.appendSlice(alloc, "\" --apple-id \"$");
+    try buf.appendSlice(alloc, opts.apple_id_var);
+    try buf.appendSlice(alloc, "\" --password \"$");
+    try buf.appendSlice(alloc, opts.password_var);
+    try buf.appendSlice(alloc, "\" --team-id \"$");
+    try buf.appendSlice(alloc, opts.team_id_var);
+    try buf.appendSlice(alloc, "\" --wait\nxcrun stapler staple \"");
+    try appendShellEscaped(&buf, alloc, opts.dmg_name);
+    try buf.appendSlice(alloc, "\"\nxcrun stapler validate \"");
+    try appendShellEscaped(&buf, alloc, opts.dmg_name);
+    try buf.appendSlice(alloc, "\"\necho \"NOTARIZE=ok\"\n");
+    return buf.toOwnedSlice(alloc);
+}
+
+/// v0.5.5：Universal 脚本选项（app 内 exe 相对路径；x86_64 slice 由 $1 传入）。
+pub const UniversalScriptOptions = struct {
+    app_exe_rel: []const u8,
+};
+
+/// v0.5.5：生成 Universal 合并脚本（$1=x86_64 slice，与 .app 内 arm64 exe 合并）。
+/// 自定位；lipo 到临时文件后回写 .app exe，chmod 755，lipo -info 校验双架构。
+pub fn generateUniversalScript(alloc: std.mem.Allocator, opts: UniversalScriptOptions) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    try buf.appendSlice(alloc,
+        \\#!/usr/bin/env bash
+        \\# v0.5.5: merge arm64 .app exe with x86_64 slice ($1) into Universal binary.
+        \\set -eu
+        \\cd "$(dirname "$0")"
+        \\X64="${1:?universal.sh needs x86_64 exe path}"
+        \\TMP="$(mktemp)"
+        \\trap 'rm -f "$TMP"' EXIT
+        \\
+    );
+    const lipo = try buildLipoCommand(alloc, .{ .output = "$TMP", .inputs = &.{ opts.app_exe_rel, "$X64" } });
+    defer alloc.free(lipo);
+    try buf.appendSlice(alloc, lipo);
+    try buf.appendSlice(alloc, "\nmv \"$TMP\" \"");
+    try appendShellEscaped(&buf, alloc, opts.app_exe_rel);
+    try buf.appendSlice(alloc, "\"\nchmod 755 \"");
+    try appendShellEscaped(&buf, alloc, opts.app_exe_rel);
+    try buf.appendSlice(alloc, "\"\nlipo -info \"");
+    try appendShellEscaped(&buf, alloc, opts.app_exe_rel);
+    try buf.appendSlice(alloc, "\"\necho \"UNIVERSAL=ok\"\n");
+    return buf.toOwnedSlice(alloc);
+}
+
 /// AppRun（AppImage；Linux）。
 pub const apprun_script =
     \\#!/bin/sh
@@ -1383,6 +1484,37 @@ test "generateCodesignScript: 自定位 + ad-hoc 签名 + verify（v0.5.4）" {
     defer testing.allocator.free(devid);
     try testing.expect(std.mem.indexOf(u8, devid, "--timestamp") != null);
     try testing.expect(std.mem.indexOf(u8, devid, "--sign \"Developer ID Application: Zilt (TEAMID)\"") != null);
+}
+
+test "buildLipoCommand: lipo -create 多输入合并（v0.5.5）" {
+    const cmd = try buildLipoCommand(testing.allocator, .{ .output = "Zilt-universal", .inputs = &.{ "Zilt-arm64", "Zilt-x64" } });
+    defer testing.allocator.free(cmd);
+    try testing.expect(std.mem.indexOf(u8, cmd, "lipo -create -output \"Zilt-universal\"") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "\"Zilt-arm64\"") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "\"Zilt-x64\"") != null);
+}
+
+test "generateNotarizeScript: secrets 缺省跳过 + notarytool --wait + stapler（v0.5.5）" {
+    const script = try generateNotarizeScript(testing.allocator, .{ .dmg_name = "Zilt.dmg" });
+    defer testing.allocator.free(script);
+    try testing.expect(std.mem.startsWith(u8, script, "#!/usr/bin/env bash"));
+    try testing.expect(std.mem.indexOf(u8, script, "cd \"$(dirname \"$0\")\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "${APPLE_ID:-}") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "${APPLE_APP_PASSWORD:-}") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "${APPLE_TEAM_ID:-}") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "xcrun notarytool submit \"Zilt.dmg\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "--wait") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "xcrun stapler staple \"Zilt.dmg\"") != null);
+}
+
+test "generateUniversalScript: 自定位 + lipo 合并 + lipo -info 校验（v0.5.5）" {
+    const script = try generateUniversalScript(testing.allocator, .{ .app_exe_rel = "Zilt.app/Contents/MacOS/zilt-app" });
+    defer testing.allocator.free(script);
+    try testing.expect(std.mem.startsWith(u8, script, "#!/usr/bin/env bash"));
+    try testing.expect(std.mem.indexOf(u8, script, "cd \"$(dirname \"$0\")\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "lipo -create") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "Zilt.app/Contents/MacOS/zilt-app") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "lipo -info") != null);
 }
 
 test "generateDesktopFile/generateRpmSpec: 内容断言" {

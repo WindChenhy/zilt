@@ -1,10 +1,12 @@
-//! macOS 打包编排（v0.5.4）：`ZILT_PACK_OUT=<dir> zig build pack`（macOS 目标）。
+//! macOS 打包编排（v0.5.5）：`ZILT_PACK_OUT=<dir> zig build pack`（macOS 目标）。
 //!
 //! 产物（dist/）：
 //!   - `<name>.app/` —— Contents/MacOS/<exe> + Contents/Resources/AppIcon.icns
 //!     + Info.plist（深链/TCC/分类，pack_formats.generateInfoPlistOpt）+ PkgInfo
 //!   - `entitlements.plist` —— hardened runtime 例外（JIT/网络/相机/麦克风）
 //!   - `codesign.sh` —— codesign .app + verify（ad-hoc 默认；ZILT_MACOS_IDENTITY 注入 Developer ID）
+//!   - `universal.sh` —— lipo 合并 x86_64 slice（$1）成 Universal binary
+//!   - `notarize.sh` —— notarytool submit --wait + stapler（Apple secrets 缺省跳过）
 //!   - `bundle-dmg.sh` —— hdiutil 拖装 DMG 脚本（pack_formats.generateBundleDmgScript，
 //!     仅 macOS 可执行；CI 跑它产出 `<name>.dmg`）
 //!
@@ -153,8 +155,22 @@ pub fn main(init: std.process.Init) !u8 {
     const sign_dst = try pathJoin(alloc, out_dir, "codesign.sh");
     if (!writeFile(alloc, sign_dst, sign_script, 0o755)) return 1;
 
+    // v0.5.5：universal.sh（lipo 合并 x86_64 slice，由 $1 传入）+ notarize.sh（Apple secrets 缺省跳过）。
+    const uni_script = try pf.generateUniversalScript(alloc, .{
+        .app_exe_rel = try std.fmt.allocPrint(alloc, "{s}.app/{s}", .{ meta.name, try pf.macosExeRelPath(alloc, meta) }),
+    });
+    const uni_dst = try pathJoin(alloc, out_dir, "universal.sh");
+    if (!writeFile(alloc, uni_dst, uni_script, 0o755)) return 1;
+
+    const notar_script = try pf.generateNotarizeScript(alloc, .{
+        .dmg_name = try std.fmt.allocPrint(alloc, "{s}.dmg", .{meta.name}),
+    });
+    const notar_dst = try pathJoin(alloc, out_dir, "notarize.sh");
+    if (!writeFile(alloc, notar_dst, notar_script, 0o755)) return 1;
+
     std.debug.print("[pack] .app bundle -> {s}\n", .{app_dir});
     std.debug.print("[pack] DMG 脚本 -> {s}（bash 它产出 {s}.dmg）\n", .{ script_dst, meta.name });
     std.debug.print("[pack] 签名脚本 -> {s}（identity={s}）+ entitlements.plist\n", .{ sign_dst, identity });
+    std.debug.print("[pack] Universal/公证脚本 -> {s} + {s}\n", .{ uni_dst, notar_dst });
     return 0;
 }
