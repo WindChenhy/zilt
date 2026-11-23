@@ -790,8 +790,20 @@ pub fn build(b: *std.Build) void {
         const init_step = b.step("init", "Create a new project from a template (ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=myapp zig build init)");
         init_step.dependOn(&init_run.step);
     } else if (is_macos) {
-        // v0.4.4 骨架：默认 install 产出 zilt-app；.app 打包/init 随后续阶段接
-        _ = macosPendingStep(b, "pack", "macOS .app bundle packaging", "v0.4.4 后段接 pack_formats.generateInfoPlist + hdiutil（需 macOS 宿主）");
+        // v0.5.3：macOS .app 打包 + DMG 脚本（pack_macos.zig，libc 文件操作，同 pack_linux）。
+        // 跟随 query target：只在 macOS 原生（CI）运行；交叉编译检查时仅编译不执行。
+        const pack_macos_mod = b.createModule(.{
+            .root_source_file = b.path("src/pack_macos.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        pack_macos_mod.link_libc = true;
+        const pack_macos_exe = b.addExecutable(.{ .name = "zilt-pack", .root_module = pack_macos_mod });
+        b.installArtifact(pack_macos_exe);
+        const pack_macos_run = b.addRunArtifact(pack_macos_exe);
+        pack_macos_run.addArtifactArg(rel_app); // argv[1] = 应用 exe
+        const pack_macos_step = b.step("pack", "macOS packaging (.app bundle + bundle-dmg.sh; ZILT_PACK_OUT=<dir>)");
+        pack_macos_step.dependOn(&pack_macos_run.step);
         _ = macosPendingStep(b, "init", "Create a new project from a template", "init 工具当前只在 Windows/Linux 分支安装");
     } else {
         // v0.3.1：更新签名/差分工具跨平台——Linux 发布流水线可生成补丁与清单

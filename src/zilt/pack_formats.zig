@@ -375,6 +375,51 @@ fn appendBE32(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, v: u32) !void {
     try buf.appendSlice(alloc, &b);
 }
 
+/// v0.5.3：DMG 打包脚本选项（自定位脚本，放在 dist 目录里执行）。
+pub const DmgScriptOptions = struct {
+    app_name: []const u8, // 如 "Zilt.app"
+    dmg_name: []const u8, // 如 "Zilt.dmg"
+    volname: []const u8, // 挂载卷名，如 "Zilt"
+};
+
+/// v0.5.3：生成拖装 DMG 的 bash 脚本（hdiutil UDZO；.app + /Applications 符号链）。
+/// 脚本自定位到所在目录，故 app/dmg 用相对名即可；名称经 shell 双引号转义防注入。
+pub fn generateBundleDmgScript(alloc: std.mem.Allocator, opts: DmgScriptOptions) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    try buf.appendSlice(alloc,
+        \\#!/usr/bin/env bash
+        \\# v0.5.3：从 .app 生成拖装 DMG（hdiutil，仅 macOS 可执行）。
+        \\set -eu
+        \\cd "$(dirname "$0")"
+        \\STAGE="$(mktemp -d)"
+        \\trap 'rm -rf "$STAGE"' EXIT
+        \\cp -R "
+    );
+    try appendShellEscaped(&buf, alloc, opts.app_name);
+    try buf.appendSlice(alloc, "\" \"$STAGE/\"\nln -s /Applications \"$STAGE/Applications\"\nhdiutil create -volname \"");
+    try appendShellEscaped(&buf, alloc, opts.volname);
+    try buf.appendSlice(alloc, "\" -srcfolder \"$STAGE\" -ov -format UDZO \"");
+    try appendShellEscaped(&buf, alloc, opts.dmg_name);
+    try buf.appendSlice(alloc, "\"\necho \"DMG=");
+    try appendShellEscaped(&buf, alloc, opts.dmg_name);
+    try buf.appendSlice(alloc, "\"\n");
+    return buf.toOwnedSlice(alloc);
+}
+
+/// shell 双引号内的危险字符（\ " $ `）前置反斜杠转义。
+fn appendShellEscaped(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '\\', '"', '$', '`' => {
+                try buf.append(alloc, '\\');
+                try buf.append(alloc, c);
+            },
+            else => try buf.append(alloc, c),
+        }
+    }
+}
+
 /// AppRun（AppImage；Linux）。
 pub const apprun_script =
     \\#!/bin/sh
@@ -1146,6 +1191,26 @@ test "generateIcns: 无可映射宽度 → error.NoIcnsImage（v0.5.2）" {
     const p = [_]u8{ 0x89, 'P', 'N', 'G' };
     try testing.expectError(error.NoIcnsImage, generateIcns(testing.allocator, &.{.{ .width = 48, .png = &p }}));
     try testing.expectError(error.NoIcnsImage, generateIcns(testing.allocator, &.{}));
+}
+
+test "generateBundleDmgScript: hdiutil UDZO + 拖装布局 + 自定位（v0.5.3）" {
+    const script = try generateBundleDmgScript(testing.allocator, .{
+        .app_name = "Zilt.app",
+        .dmg_name = "Zilt.dmg",
+        .volname = "Zilt Demo",
+    });
+    defer testing.allocator.free(script);
+    try testing.expect(std.mem.startsWith(u8, script, "#!/usr/bin/env bash"));
+    try testing.expect(std.mem.indexOf(u8, script, "set -eu") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "cd \"$(dirname \"$0\")\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "hdiutil create") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "-volname \"Zilt Demo\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "-srcfolder") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "-format UDZO") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "ln -s /Applications") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "Zilt.app") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "Zilt.dmg") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "mktemp -d") != null);
 }
 
 test "generateDesktopFile/generateRpmSpec: 内容断言" {

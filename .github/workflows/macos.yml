@@ -103,3 +103,14 @@ jobs:
             zilt.log
             shot.png
           if-no-files-found: warn
+
+      - name: Bundle .app + DMG (hdiutil)
+        run: bash scripts/macos/bundle.sh
+
+      - name: Upload DMG
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: .zilt-out/macos-dist/*.dmg
+          if-no-files-found: warn
