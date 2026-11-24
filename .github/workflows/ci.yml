@@ -245,6 +245,76 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
+  # v0.5.9：GTK4 双栈 CI。webkitgtk-6.0 只在 ubuntu-24.04+ 有 dev 包，
+  # 故与上面的 GTK3 job 分开 runner。默认构建仍是 GTK3（托盘/菜单栏在 4.x 无解），
+  # 本 job 只保证 `-Dgtk=gtk4` 能构建 / 单测 / 冒烟——降级面按 caps 显式 skip。
+  # ---------------------------------------------------------------------------
+  linux-gtk4:
+    name: Build / Test / Smoke (Linux GTK4)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install GTK4 / WebKitGTK 6.0 dev packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libwebkitgtk-6.0-dev pkg-config xvfb openbox \
+            xdg-utils libsqlite3-0 libx11-dev libxext-dev
+
+      - name: Build (GTK4)
+        run: zig build -Dgtk=gtk4
+
+      - name: Unit tests (GTK4)
+        run: zig build test -Dgtk=gtk4
+
+      - name: Test crash triage
+        if: failure()
+        run: |
+          TB=$(ls -t .zig-cache/o/*/test 2>/dev/null | head -1)
+          echo "== direct rerun: $TB =="
+          "$TB" 2>&1 | tail -60 || true
+
+      - name: Smoke (GTK4 under Xvfb + openbox)
+        env:
+          ZILT_LINUX_SMOKE: "1"
+          GDK_BACKEND: x11
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: "1"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          python3 scripts/http_echo.py 8788 > /dev/null 2>&1 &
+          python3 scripts/ws_echo.py 8765 > /dev/null 2>&1 &
+          sleep 1
+          rm -f zilt.log
+          timeout 240 xvfb-run -a --server-args="-screen 0 1280x800x24" bash -c '
+            openbox >/dev/null 2>&1 &
+            sleep 0.5
+            exec ./zig-out/bin/zilt-app
+          '
+          code=$?
+          grep -a "\[linux-smoke\]" zilt.log | tail -2
+          if [ $code -ne 0 ]; then
+            echo "== 逐项失败 =="
+            grep -a "FAIL" zilt.log | tail -40 || true
+            exit $code
+          fi
+
+      - name: Upload GTK4 smoke log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zilt-linux-gtk4-smoke
+          path: zilt.log
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
   # v0.4.3 L4：ARM64 构建链（docker/setup-qemu-action 注册 binfmt →
   # arm64v8/ubuntu:24.04 容器内装 GTK/WebKit + aarch64 Zig → 构建 + 打包；
   # 产物再经 qemu-user 冒烟（dev-arm64-e2e.sh）

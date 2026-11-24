@@ -65,6 +65,50 @@ pub fn menuBarAvailable() bool {
     return !isGtk4();
 }
 
+/// 变体能力表（v0.5.9）：降级面集中登记一处，冒烟脚本据此显式 skip，
+/// 而不是把「GTK4 没有这个面」当成失败。
+pub const Caps = struct {
+    tray: bool,
+    menu_bar: bool,
+    programmatic_drag: bool,
+    cursor_grab: bool,
+    cookie_clear_by_domain: bool,
+    clipboard_read: bool,
+};
+
+pub fn caps() Caps {
+    return .{
+        .tray = true,
+        .menu_bar = true,
+        .programmatic_drag = true,
+        .cursor_grab = true,
+        .cookie_clear_by_domain = true,
+        .clipboard_read = true,
+    };
+}
+
+fn boolStr(b: bool) []const u8 {
+    return if (b) "true" else "false";
+}
+
+/// 冒烟注入载荷（`window.__ziltSmokeCaps`）。缓冲不足 → null。
+pub fn capsJson(buf: []u8) ?[]const u8 {
+    const cp = caps();
+    return std.fmt.bufPrint(
+        buf,
+        "{{\"tray\":{s},\"menu_bar\":{s},\"programmatic_drag\":{s},\"cursor_grab\":{s}," ++
+            "\"cookie_clear_by_domain\":{s},\"clipboard_read\":{s}}}",
+        .{
+            boolStr(cp.tray),
+            boolStr(cp.menu_bar),
+            boolStr(cp.programmatic_drag),
+            boolStr(cp.cursor_grab),
+            boolStr(cp.cookie_clear_by_domain),
+            boolStr(cp.clipboard_read),
+        },
+    ) catch null;
+}
+
 // ---------------------------------------------------------------------------
 // 主循环（gtk_main / gtk_main_quit 在 GTK4 移除）
 // ---------------------------------------------------------------------------
@@ -117,6 +161,12 @@ pub const SyncWait = struct {
         if (self.loop) |lp| c.g_main_loop_run(lp);
         if (self.loop) |lp| c.g_main_loop_unref(lp);
         self.loop = null;
+    }
+
+    /// 交出结果引用（消费方在 xxx_finish 之后 defer 调用）。
+    pub fn releaseResult(self: *SyncWait) void {
+        if (self.result) |r| c.g_object_unref(@ptrCast(r));
+        self.result = null;
     }
 };
 
@@ -603,7 +653,8 @@ pub fn frameExtents(widget: [*c]c.GtkWidget, out: *c.GdkRectangle) bool {
 }
 
 /// 窗口客户区原点（根坐标系）。GTK4：X11 XTranslateCoordinates；Wayland → false。
-pub fn surfaceOrigin(widget: [*c]c.GtkWidget, x: *c_int, y: *c_int) bool {    if (comptime isGtk4()) {
+pub fn surfaceOrigin(widget: [*c]c.GtkWidget, x: *c_int, y: *c_int) bool {
+    if (comptime isGtk4()) {
         const x11 = x11Of(widget) orelse return false;
         var child: c.Window = 0;
         var rx: c_int = 0;
@@ -617,7 +668,6 @@ pub fn surfaceOrigin(widget: [*c]c.GtkWidget, x: *c_int, y: *c_int) bool {    if
     _ = c.gdk_window_get_origin(gdk_win, x, y);
     return true;
 }
-
 
 /// 窗口所在显示器。GTK4 的 monitor_at_surface 面向 GdkSurface。
 pub fn monitorAtSurface(widget: [*c]c.GtkWidget) ?*anyopaque {
@@ -831,7 +881,6 @@ fn wmClassMatchesProcess(dpy: *c.Display, w: c.Window) bool {
     }
     return false;
 }
-
 
 /// 指针 warp（cursor_position op）。GTK4：gdk_device_warp 目标是 GdkSurface。
 pub fn deviceWarp(widget: [*c]c.GtkWidget, pointer: ?*c.GdkDevice, x: c_int, y: c_int) bool {
@@ -1653,7 +1702,7 @@ pub fn destroyDialog(dlg: [*c]c.GtkDialog) void {
 /// 仅 GTK3 使用：GTK4 文件对话框走 fileDialog*Sync 面。
 pub fn nativeDialogRun(native: ?*anyopaque) c.gint {
     if (comptime isGtk4()) {
-            return -1;
+        return -1;
     }
     return c.gtk_native_dialog_run(@ptrCast(@alignCast(native)));
 }
@@ -1903,7 +1952,6 @@ pub fn transparentDrawNeeded() bool {
 // GTK4 无公开的脚本发起拖拽入口 → 调用方返回 DragNotAvailable（文档化）。
 // ---------------------------------------------------------------------------
 
-
 // ---------------------------------------------------------------------------
 // WebKitGTK 6.0 构造器收敛（6.0 移除 *_with_context / *_with_user_content_manager /
 // website_data_manager_new / web_context_new_with_website_data_manager →
@@ -2086,4 +2134,48 @@ test "variant 探测：本构建按 gtk_init 签名判定" {
         try std.testing.expectEqual(Variant.gtk3, variant);
         try std.testing.expect(isGtk3());
     }
+}
+
+test "caps：GTK3 全能力；GTK4 五面降级、剪贴板读两栈都在" {
+    const cp = caps();
+    const full = isGtk3();
+    try std.testing.expectEqual(full, cp.tray);
+    try std.testing.expectEqual(full, cp.menu_bar);
+    try std.testing.expectEqual(full, cp.programmatic_drag);
+    try std.testing.expectEqual(full, cp.cursor_grab);
+    try std.testing.expectEqual(full, cp.cookie_clear_by_domain);
+    try std.testing.expect(cp.clipboard_read);
+}
+
+test "capsJson：冒烟注入载荷六键齐全、值随变体" {
+    var buf: [256]u8 = undefined;
+    const s = capsJson(&buf) orelse return error.BufferTooSmall;
+    inline for (.{
+        "tray", "menu_bar", "programmatic_drag", "cursor_grab", "cookie_clear_by_domain", "clipboard_read",
+    }) |k| {
+        try std.testing.expect(std.mem.indexOf(u8, s, "\"" ++ k ++ "\":") != null);
+    }
+    const tray_lit = if (isGtk3()) "\"tray\":true" else "\"tray\":false";
+    try std.testing.expect(std.mem.indexOf(u8, s, tray_lit) != null);
+}
+
+// GAsyncResult 的生命周期只到 GAsyncReadyCallback 返回为止：回调里不 ref，
+// 消费方随后 xxx_finish(result) 就是 use-after-free，再 unref 就是二次释放
+//（GTK4 剪贴板读面此前被记为「并发读触发 g_task 断言 + 堆破坏」的形态）。
+test "SyncWait：结果引用归 SyncWait——调用方 unref 后仍存活，releaseResult 后析构" {
+    const task = c.g_task_new(null, null, null, null);
+    try std.testing.expect(task != null);
+    c.g_task_return_boolean(@ptrCast(task), 1);
+    var weak: ?*anyopaque = null;
+    c.g_object_add_weak_pointer(@ptrCast(task), @ptrCast(&weak));
+
+    var w = SyncWait.begin();
+    defer if (w.loop) |lp| c.g_main_loop_unref(lp);
+    onAsyncReady(null, @ptrCast(task), @ptrCast(&w));
+    // 调用方交出唯一引用：回调若没自己 ref，对象此刻已析构
+    c.g_object_unref(@ptrCast(task));
+    try std.testing.expect(w.done);
+    try std.testing.expect(weak != null);
+    w.releaseResult();
+    try std.testing.expect(weak == null);
 }
