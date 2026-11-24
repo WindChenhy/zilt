@@ -71,6 +71,8 @@ jobs:
           sleep 4
           # 截图失败不致命（runner 无屏幕录制权限时会黑屏/报错）——日志才是硬断言
           screencapture -x shot.png 2>> smoke.log || true
+          # 锁文件权限位：mode 传错时这里是随机值，后续 open 会 EACCES
+          ls -l "$HOME/Library/Application Support/app.zilt" || true
           if ! wait "$pid"; then
             echo "::error::zilt-app exited non-zero（见 smoke.log）"
             cat smoke.log

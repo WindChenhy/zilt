@@ -2285,8 +2285,11 @@ fn Backend(comptime config: Config) type {
             defer self.alloc.free(root);
             const path = self.lockPath() orelse return true;
             defer self.alloc.free(path);
-            const fd = open(path.ptr, 0x0202, 0o644); // O_RDWR|O_CREAT
-            if (fd < 0) return true;
+            const fd = open(path.ptr, 0x0202, @as(c_int, 0o644)); // O_RDWR|O_CREAT
+            if (fd < 0) {
+                log.print("[macos] single lock open failed errno={d} path={s}", .{ std.c._errno().*, path });
+                return true;
+            }
             if (flock(fd, 0x2 | 0x4) != 0) return false; // LOCK_EX|LOCK_NB
             self.lock_fd = fd;
             return true;
@@ -2304,7 +2307,7 @@ fn Backend(comptime config: Config) type {
             if (self.lock_fd < 0) return false;
             const path = self.lockPath() orelse return false;
             defer self.alloc.free(path);
-            const fd = open(path.ptr, 0x0002, 0o644); // O_RDWR
+            const fd = open(path.ptr, 0x0002); // O_RDWR
             if (fd < 0) return false;
             defer _ = close(fd);
             if (flock(fd, 0x2 | 0x4) == 0) {
@@ -2835,7 +2838,9 @@ fn cfDataU16Le(cf: Id) ?u16 {
     return macos_sysinfo.cfDataToU16Le(cfDataBytes(cf) orelse return null);
 }
 
-extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_int) c_int;
+// open 是可变参数函数：Apple arm64 的可变参数必须走栈，按固定参数声明会把 mode
+// 传成垃圾值（x86_64 走寄存器恰好传对），建出来的锁文件权限随机 → 后续 open 失败。
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
 extern "c" fn flock(fd: c_int, op: c_int) c_int;
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
