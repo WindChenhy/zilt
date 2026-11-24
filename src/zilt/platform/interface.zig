@@ -155,6 +155,8 @@ pub const linux_target_capabilities = [_]Capability{
 
 /// macOS 目标能力（v0.4.4：窗口 + WKWebView 资产 + IPC 往返；其余分阶段补）。
 /// 只登记**已实装**项——清单与实现漂移是本文件 v0.4.0 L8 专门防的形态。
+/// 其余已实装面（多窗口/窗口状态/托盘/菜单/通知/剪贴板/对话框/拖放/下载/深链/热键…）
+/// 随 v0.5.10 的清单审计逐项核对后登记，不在本切片里凭印象补。
 pub const macos_target_capabilities = [_]Capability{
     .window,
     .ipc_events,
@@ -164,6 +166,17 @@ pub const macos_target_capabilities = [_]Capability{
     .store,
     // v0.5.7：更新器（ed25519 核心复用 + .app 束整树 staging；system_fn 接 .updater）
     .updater,
+    // v0.5.8：系统信息（sysctl + NSScreen + IOKit；system_fn 接 .info / .cursor_position）
+    .sysinfo,
+    .monitor_current,
+    // v0.5.8：Shell（NSWorkspace openURL / Finder 选中）
+    .shell,
+    // v0.5.8：电源/会话事件（NSWorkspace 通知；对齐 Linux 载荷 null）
+    .power_events,
+    // v0.5.8：系统明暗切换 → themeChanged（NSDistributedNotificationCenter；此前仅冒烟轮询）
+    .theme,
+    // v0.5.4：单实例（flock）；v0.5.8 锁移到应用数据目录并先于菜单/托盘获取
+    .single_instance,
 };
 
 /// 编译期校验后端契约（`platform/mod.zig` 在本平台后端上调用一次）。

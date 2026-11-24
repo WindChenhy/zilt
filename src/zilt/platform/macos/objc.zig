@@ -13,6 +13,7 @@ pub const Protocol = *anyopaque;
 pub extern "c" fn objc_getClass(name: [*:0]const u8) ?Class;
 pub extern "c" fn sel_registerName(name: [*:0]const u8) ?Sel;
 pub extern "c" fn objc_msgSend() void;
+pub extern "c" fn objc_msgSend_stret() void;
 pub extern "c" fn objc_allocateClassPair(super: ?Class, name: [*:0]const u8, extra: usize) ?Class;
 pub extern "c" fn objc_registerClassPair(cls: Class) void;
 pub extern "c" fn class_addMethod(cls: Class, name: Sel, imp: ?*const anyopaque, types: [*:0]const u8) bool;
@@ -29,6 +30,12 @@ pub fn sel(name: [*:0]const u8) Sel {
 /// 按调用签名转型 objc_msgSend。签名必须与真实 ABI 一致（arm64）。
 pub inline fn msgSend(comptime Sig: type) Sig {
     return @ptrCast(&objc_msgSend);
+}
+
+/// 返回大于 16 字节 struct 的消息在 x86_64 上走 stret（arm64 仍用 msgSend）。
+/// 签名形如 `*const fn (*T, Id, Sel) callconv(.c) void`，首个参数是返回值存储。
+pub inline fn msgSendStret(comptime Sig: type) Sig {
+    return @ptrCast(&objc_msgSend_stret);
 }
 
 pub fn cls(name: [*:0]const u8) Class {

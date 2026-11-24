@@ -1,6 +1,7 @@
 //! 电源/会话事件（v0.3.2）。平台事件码 → 统一事件名的纯函数映射：
 //! - Windows：WM_POWERBROADCAST wParam（PBT_*）与 WM_WTSSESSION_CHANGE wParam（WTS_*）
 //! - Linux：org.freedesktop.login1 的 PrepareForSleep/Lock/Unlock 信号（platform/linux 映射）
+//! - macOS（v0.5.8）：NSWorkspace 的睡眠/唤醒/电源/会话通知（`macWorkspaceEventName`）
 //!
 //! 事件语义（前端 `window.zilt.on(...)`）：
 //! - `powerSuspend`   系统进入睡眠
@@ -56,6 +57,23 @@ pub fn sleepEventName(start: bool) []const u8 {
     return if (start) event_power_suspend else event_power_resume;
 }
 
+/// v0.5.8：macOS NSWorkspace 通知名 → 事件名；不关心的通知返回 null。
+pub fn macWorkspaceEventName(notification: []const u8) ?[]const u8 {
+    const eql = std.mem.eql;
+    return if (eql(u8, notification, "NSWorkspaceWillSleepNotification"))
+        event_power_suspend
+    else if (eql(u8, notification, "NSWorkspaceDidWakeNotification"))
+        event_power_resume
+    else if (eql(u8, notification, "NSWorkspaceSystemPowerStatusDidChangeNotification"))
+        event_power_status
+    else if (eql(u8, notification, "NSWorkspaceSessionDidResignActiveNotification"))
+        event_session_lock
+    else if (eql(u8, notification, "NSWorkspaceSessionDidBecomeActiveNotification"))
+        event_session_unlock
+    else
+        null;
+}
+
 const testing = std.testing;
 
 test "v0.3.2: 电源事件码映射（suspend/resume/status/未知）" {
@@ -73,6 +91,17 @@ test "v0.3.2: 会话事件码映射（lock/unlock/logon/logoff 忽略）" {
     try testing.expect(sessionEventName(WTS_SESSION_LOGON) == null);
     try testing.expect(sessionEventName(WTS_SESSION_LOGOFF) == null);
     try testing.expect(sessionEventName(0) == null);
+}
+
+test "v0.5.8: macOS NSWorkspace 通知映射（sleep/wake/power/session；其余忽略）" {
+    try testing.expectEqualStrings("powerSuspend", macWorkspaceEventName("NSWorkspaceWillSleepNotification").?);
+    try testing.expectEqualStrings("powerResume", macWorkspaceEventName("NSWorkspaceDidWakeNotification").?);
+    try testing.expectEqualStrings("powerStatusChanged", macWorkspaceEventName("NSWorkspaceSystemPowerStatusDidChangeNotification").?);
+    try testing.expectEqualStrings("sessionLock", macWorkspaceEventName("NSWorkspaceSessionDidResignActiveNotification").?);
+    try testing.expectEqualStrings("sessionUnlock", macWorkspaceEventName("NSWorkspaceSessionDidBecomeActiveNotification").?);
+    try testing.expect(macWorkspaceEventName("NSWorkspaceActiveSpaceDidChangeNotification") == null);
+    try testing.expect(macWorkspaceEventName("AppleInterfaceThemeChangedNotification") == null);
+    try testing.expect(macWorkspaceEventName("") == null);
 }
 
 test "v0.3.2: logind sleep 参数映射" {

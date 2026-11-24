@@ -22,11 +22,22 @@ env:
 
 # v0.4.4：无 Mac 硬件时的「运行环境」。开发在 Windows/Linux 上做交叉编译检查
 # （`bash scripts/macos/check.sh`），真正的启动/WebView/截图在这里跑。
+#
+# v0.5.8：双架构矩阵。x86_64 的 Apple ABI 对 >16 字节 struct 返回走 objc_msgSend_stret
+# （arm64 用 objc_msgSend），NSRect/NSScreen/NSProcessInfo 的调用点只有 Intel 真机才验证得到。
 jobs:
   macos:
-    name: Build / Test / Smoke (macOS arm64)
-    runs-on: macos-15
+    name: Build / Test / Smoke (macOS ${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
 
     steps:
       - uses: actions/checkout@v4
@@ -47,8 +58,16 @@ jobs:
           set -euo pipefail
           rm -f smoke.log shot.png zilt.log
           # 10s 后退出（WebKit 冷启动留余量）；stderr 是断言来源（std.debug.print），zilt.log 一并留档
+          rm -f second.log
           ZILT_SMOKE_TEST_MS=10000 ./zig-out/bin/zilt-app > /dev/null 2> smoke.log &
           pid=$!
+          # v0.5.8 单实例：首实例存活期间（第 6 秒）拉起第二实例，它必须在建窗口前退出。
+          # 锁是 flock、随首实例退出而释放——首实例 10 秒退出，第二实例此时必须已经跑完。
+          (
+            sleep 6
+            ZILT_SMOKE_TEST_MS=3000 ./zig-out/bin/zilt-app > /dev/null 2> second.log
+          ) &
+          second_pid=$!
           sleep 4
           # 截图失败不致命（runner 无屏幕录制权限时会黑屏/报错）——日志才是硬断言
           screencapture -x shot.png 2>> smoke.log || true
@@ -58,6 +77,13 @@ jobs:
             exit 1
           fi
           cat smoke.log
+          wait "$second_pid"
+          cat second.log
+          grep -qF "[macos] single instance: lock held, exiting" second.log
+          if grep -qF "window created" second.log; then
+            echo "::error::第二实例在拿到锁之前就建了窗口（单实例锁获取太晚）"
+            exit 1
+          fi
           # 主链逐段断言：应用 → 窗口 → WebView → 资产页面 → runtime/IPC 往返
           grep -q "\[macos\] NSApplication ready" smoke.log
           grep -q "\[macos\] window created" smoke.log
@@ -91,6 +117,13 @@ jobs:
           grep -qF "[macos] webview drop ok=true" smoke.log
           grep -qF "[macos] store ok=true" smoke.log
           grep -qF "[macos] updater ok=true" smoke.log
+          # v0.5.8：系统信息 / 光标 / Shell / 系统事件观察者 / Accessibility 标签
+          grep -qF "[macos] sysinfo ok=true" smoke.log
+          grep -qF "[macos] cursor ok=true" smoke.log
+          grep -qF "[macos] shell ok=true" smoke.log
+          grep -qF "[macos] power ok=true" smoke.log
+          grep -qF "[macos] theme observer ok=true" smoke.log
+          grep -qF "[macos] accessibility ok=true" smoke.log
           grep -q "\[macos\] smoke done, exiting" smoke.log
           # 资产真的走了 WKURLSchemeHandler（不是回落 file://）
           grep -q "\[assets\] .*index.html.* 200" smoke.log
@@ -102,15 +135,17 @@ jobs:
           name: macos-smoke
           path: |
             smoke.log
+            second.log
             zilt.log
             shot.png
           if-no-files-found: warn
 
       - name: Bundle .app + DMG (hdiutil)
+        if: matrix.arch == 'arm64'
         run: bash scripts/macos/bundle.sh
 
       - name: Upload DMG
-        if: always()
+        if: always() && matrix.arch == 'arm64'
         uses: actions/upload-artifact@v4
         with:
           name: macos-dmg

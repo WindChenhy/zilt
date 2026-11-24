@@ -22,6 +22,11 @@ const keychain = @import("keychain.zig");
 const store_mod = @import("../../store.zig");
 const system_api = @import("../../system_api.zig");
 const updater = @import("../../updater.zig");
+const power = @import("../../power.zig");
+const shell_mod = @import("../../shell.zig");
+const sysinfo_mod = @import("../../sysinfo.zig");
+const macos_sysinfo = @import("sysinfo.zig");
+const builtin = @import("builtin");
 
 const Id = objc.Id;
 const Sel = objc.Sel;
@@ -97,6 +102,12 @@ fn Backend(comptime config: Config) type {
         updater_env: ?updater.Env = null,
         updater_url_override: ?[]u8 = null,
         updater_ok: bool = false,
+        /// v0.5.8：系统事件观察者（NSWorkspace 电源/会话 + 分布式主题通知）
+        system_observer: ?Id = null,
+        workspace_notes: u32 = 0,
+        theme_notes: u32 = 0,
+        sys_probe_posted: bool = false,
+        theme_logged: bool = false,
 
         fn main() !void {
             inst.smoke_ms = parseSmokeMs(env("ZILT_SMOKE_TEST_MS"));
@@ -112,18 +123,21 @@ fn Backend(comptime config: Config) type {
             log.print("[macos] NSApplication ready (policy=regular)", .{});
 
             registerClasses();
-            inst.buildMenu();
-            inst.setupTray(inst.smoke_ms != 0);
-            inst.captureDeepLink();
-            _ = inst.registerHotkeys();
+            // v0.5.8：单实例锁先于菜单/托盘/热键——第二实例不该先建一遍托盘再退出
             if (config.single_instance and !inst.acquireSingleLock()) {
                 log.print("[macos] single instance: lock held, exiting", .{});
                 return;
             }
+            inst.buildMenu();
+            inst.setupTray(inst.smoke_ms != 0);
+            inst.captureDeepLink();
+            _ = inst.registerHotkeys();
             try inst.createWindow();
             try inst.createWebView();
             inst.initStorage();
             inst.initUpdater();
+            inst.installSystemObservers();
+            inst.last_dark = inst.isDarkAppearance();
 
             if (inst.smoke_ms == 0) {
                 // 正常应用：交给 NSApp runloop（阻塞至退出）
@@ -155,7 +169,7 @@ fn Backend(comptime config: Config) type {
         ///   standard：系统默认；overlay：摘 titled + FullSizeContentView（内容顶到红绿灯）；
         ///   transparent：标题栏透明；config.transparent 额外关 opaque 并设透明背景。
         fn boundsOf(view: Id) NSRect {
-            return objc.msgSend(*const fn (Id, Sel) callconv(.c) NSRect)(view, objc.sel("bounds"));
+            return structMsg(NSRect, view, "bounds");
         }
 
         /// 窗口材质：NSVisualEffectView 垫在 webview 下面（config.vibrancy；冒烟强制 sidebar）
@@ -380,13 +394,25 @@ fn Backend(comptime config: Config) type {
             }
         }
 
-        /// system_fn：接 .store + .updater（其余 system_api 面随 v0.5.8+ 对等补）。
+        /// system_fn：.store / .updater / .info / .cursor_position / .shell
+        /// （其余 system_api 面随 v0.5.9+ 对等补，降级为 SystemNotAvailable）。
         fn systemEntry(backend_ptr: *anyopaque, window_id: u32, alloc: std.mem.Allocator, req: system_api.Request) anyerror!system_api.Result {
             const self: *Self = @ptrCast(@alignCast(backend_ptr));
-            _ = window_id;
             switch (req) {
                 .store => |op| return self.runStoreOp(op, alloc),
                 .updater => |op| return self.runUpdaterOp(op, alloc),
+                .info => |kind| return .{ .json = try self.collectSystemInfo(kind, alloc, window_id) },
+                // AppKit 光标原点在左下 → 对外语义（左上原点）
+                .cursor_position => {
+                    const p = structMsg(Pt, objc.cls("NSEvent"), "mouseLocation");
+                    return .{ .json = try std.fmt.allocPrint(alloc, "{{\"x\":{d},\"y\":{d}}}", .{
+                        toI32(p.x), macos_sysinfo.flipY(screenHeight(), p.y, 0),
+                    }) };
+                },
+                .shell => |target| {
+                    try self.openShellTarget(target);
+                    return .{ .ok = true };
+                },
                 else => return error.SystemNotAvailable,
             }
         }
@@ -410,6 +436,324 @@ fn Backend(comptime config: Config) type {
             _ = self.runStoreOp(.{ .remove = "zilt-smoke" }, alloc) catch {};
             log.print("[macos] store ok={s}", .{boolStr(ok)});
             return ok;
+        }
+
+        // ------------------------------------------------------------------
+        // v0.5.8：系统信息（sysctl + NSScreen + IOKit）/ Shell / 系统事件观察者
+        // ------------------------------------------------------------------
+
+        /// NSProcessInfo operatingSystemVersion（24 字节 struct → x86_64 走 stret）
+        const OsVersionRaw = extern struct { major: c_long, minor: c_long, patch: c_long };
+
+        fn collectSystemInfo(self: *Self, kind: system_api.InfoKind, alloc: std.mem.Allocator, window_id: u32) ![]u8 {
+            switch (kind) {
+                .os => {
+                    const info = try self.collectOsInfo(alloc);
+                    defer macos_sysinfo.freeOsInfo(alloc, &info);
+                    return sysinfo_mod.osToJson(alloc, info);
+                },
+                .monitors => {
+                    const monitors = try self.collectMonitors(alloc, window_id);
+                    defer alloc.free(monitors);
+                    return sysinfo_mod.monitorsToJson(alloc, monitors);
+                },
+                .all => {
+                    const info = try self.collectOsInfo(alloc);
+                    defer macos_sysinfo.freeOsInfo(alloc, &info);
+                    const os_json = try sysinfo_mod.osToJson(alloc, info);
+                    defer alloc.free(os_json);
+                    const monitors = try self.collectMonitors(alloc, window_id);
+                    defer alloc.free(monitors);
+                    const mons_json = try sysinfo_mod.monitorsToJson(alloc, monitors);
+                    defer alloc.free(mons_json);
+                    return std.fmt.allocPrint(alloc, "{{\"os\":{s},\"monitors\":{s}}}", .{ os_json, mons_json });
+                },
+                .gpu => {
+                    const gpus = try self.collectGpus(alloc);
+                    defer {
+                        for (gpus) |g| macos_sysinfo.freeGpu(alloc, g);
+                        alloc.free(gpus);
+                    }
+                    return sysinfo_mod.gpuToJson(alloc, gpus);
+                },
+            }
+        }
+
+        /// 版本取 kern.osproductversion（不经 10.16 兼容层压平）；没有该 sysctl 的旧系统
+        /// 退回 NSProcessInfo + 内核主版本反推。build 恒 0：macOS 构建号是字母数字串（25B2083）。
+        fn collectOsInfo(self: *Self, alloc: std.mem.Allocator) !sysinfo_mod.OsInfo {
+            var v: macos_sysinfo.Version = .{ .major = 10, .minor = 16 };
+            var known = false;
+            var buf: [64]u8 = undefined;
+            if (sysctlString("kern.osproductversion", &buf)) |product| {
+                if (macos_sysinfo.parseDotted(product)) |parsed| {
+                    v = parsed;
+                    known = true;
+                }
+            }
+            if (!known) {
+                const raw = structMsg(OsVersionRaw, msg0(Id, objc.cls("NSProcessInfo"), "processInfo"), "operatingSystemVersion");
+                v = macos_sysinfo.resolveOsVersion(
+                    @intCast(@max(raw.major, 0)),
+                    @intCast(@max(raw.minor, 0)),
+                    @intCast(@max(raw.patch, 0)),
+                    sysctlString("kern.osrelease", &buf),
+                );
+            }
+            var vbuf: [32]u8 = undefined;
+            const version = try alloc.dupe(u8, try macos_sysinfo.formatVersion(&vbuf, v));
+            errdefer alloc.free(version);
+            return .{
+                .name = "macOS",
+                .version = version,
+                .arch = @tagName(builtin.cpu.arch),
+                .locale = try preferredLocale(alloc),
+                .theme = if (self.isDarkAppearance()) .dark else .light,
+                .accent_color = accentColorArgb(),
+            };
+        }
+
+        fn preferredLocale(alloc: std.mem.Allocator) ![]u8 {
+            const langs = msg0(?Id, objc.cls("NSLocale"), "preferredLanguages") orelse return alloc.dupe(u8, "en-US");
+            const first = msg0(?Id, langs, "firstObject") orelse return alloc.dupe(u8, "en-US");
+            const c = msg0(?[*:0]const u8, first, "UTF8String") orelse return alloc.dupe(u8, "en-US");
+            return macos_sysinfo.formatLocale(alloc, macos_sysinfo.parseLocale(std.mem.span(c)));
+        }
+
+        fn accentColorArgb() u32 {
+            const c = msg0(?Id, objc.cls("NSColor"), "controlAccentColor") orelse return 0;
+            const space = msg0(?Id, objc.cls("NSColorSpace"), "sRGBColorSpace") orelse return 0;
+            const srgb = objc.msgSend(*const fn (Id, Sel, Id) callconv(.c) ?Id)(c, objc.sel("colorUsingColorSpace:"), space) orelse return 0;
+            return macos_sysinfo.packArgb(
+                1,
+                msg0(f64, srgb, "redComponent"),
+                msg0(f64, srgb, "greenComponent"),
+                msg0(f64, srgb, "blueComponent"),
+            );
+        }
+
+        /// NSScreen（单位：点，与窗口坐标一致）。AppKit 全局坐标左下原点 → 左上原点，
+        /// 以主屏高度换算；screens[0] 即主屏（菜单栏所在）。rotation 恒 0（未接 CGDisplayRotation）。
+        fn collectMonitors(self: *Self, alloc: std.mem.Allocator, window_id: u32) ![]sysinfo_mod.Monitor {
+            const screens = msg0(?Id, objc.cls("NSScreen"), "screens") orelse return alloc.alloc(sysinfo_mod.Monitor, 0);
+            const n: usize = @intCast(msg0(c_ulong, screens, "count"));
+            const out = try alloc.alloc(sysinfo_mod.Monitor, n);
+            errdefer alloc.free(out);
+            const primary_h = screenHeight();
+            var current: ?usize = null;
+            if (self.targetWindow(window_id)) |win| {
+                if (msg0(?Id, win, "screen")) |scr| {
+                    const idx = msg1(c_long, screens, "indexOfObject:", scr);
+                    if (idx >= 0) current = @intCast(idx);
+                }
+            }
+            for (0..n) |i| {
+                const scr = msg1(Id, screens, "objectAtIndex:", @as(c_long, @intCast(i)));
+                const f = structMsg(NSRect, scr, "frame");
+                const vf = structMsg(NSRect, scr, "visibleFrame");
+                const scale = msg0(f64, scr, "backingScaleFactor");
+                out[i] = .{
+                    .index = @intCast(i),
+                    .primary = i == 0,
+                    .x = toI32(f.origin.x),
+                    .y = macos_sysinfo.flipY(primary_h, f.origin.y, f.size.h),
+                    .width = dimToU32(f.size.w),
+                    .height = dimToU32(f.size.h),
+                    .work_x = toI32(vf.origin.x),
+                    .work_y = macos_sysinfo.flipY(primary_h, vf.origin.y, vf.size.h),
+                    .work_width = dimToU32(vf.size.w),
+                    .work_height = dimToU32(vf.size.h),
+                    .dpi = macos_sysinfo.dpiFromScale(scale),
+                    .scale = scale,
+                    .current = current == i,
+                };
+            }
+            return out;
+        }
+
+        /// GPU：IOKit IOAccelerator 服务（Apple Silicon 的 AGX* / Intel 机上的独显核显加速器节点）。
+        /// 名字取 model（CFString 或 CFData），缺则用 IOClass；vendor-id 缺失且类名 AGX* 即 Apple；
+        /// VRAM,totals 只在独显上有 → 统一内存的 Apple Silicon 为 0。没有加速器节点 → 空数组。
+        fn collectGpus(self: *Self, alloc: std.mem.Allocator) ![]sysinfo_mod.GpuInfo {
+            _ = self;
+            var list: std.ArrayListUnmanaged(sysinfo_mod.GpuInfo) = .empty;
+            errdefer {
+                for (list.items) |g| macos_sysinfo.freeGpu(alloc, g);
+                list.deinit(alloc);
+            }
+            var it: c_uint = 0;
+            const matching = IOServiceMatching("IOAccelerator") orelse return list.toOwnedSlice(alloc);
+            if (IOServiceGetMatchingServices(0, matching, &it) != 0) return list.toOwnedSlice(alloc);
+            defer _ = IOObjectRelease(it);
+            while (true) {
+                const entry = IOIteratorNext(it);
+                if (entry == 0) break;
+                defer _ = IOObjectRelease(entry);
+
+                var cbuf: [256]u8 = undefined;
+                var mbuf: [256]u8 = undefined;
+                var class_name: []const u8 = "";
+                var props = macos_sysinfo.GpuProps{};
+                if (ioProperty(entry, "IOClass")) |cf| {
+                    defer CFRelease(cf);
+                    if (cfToBuf(cf, &cbuf)) |cn| class_name = cn;
+                }
+                if (ioProperty(entry, "model")) |cf| {
+                    defer CFRelease(cf);
+                    if (cfToBuf(cf, &mbuf)) |m| props.model = m;
+                }
+                if (ioProperty(entry, "vendor-id")) |cf| {
+                    defer CFRelease(cf);
+                    props.vendor_id = cfDataU16Le(cf);
+                } else if (std.mem.startsWith(u8, class_name, "AGX")) {
+                    props.vendor_id = 0x106b;
+                }
+                if (props.model == null and class_name.len > 0) props.model = class_name;
+                if (ioProperty(entry, "VRAM,totals")) |cf| {
+                    defer CFRelease(cf);
+                    if (cfDataBytes(cf)) |bytes| {
+                        if (bytes.len >= 4) props.vram_mb = std.mem.readInt(u32, bytes[0..4], .little) / 1024;
+                    }
+                }
+                const g = try macos_sysinfo.gpuInfo(alloc, props);
+                list.append(alloc, g) catch |e| {
+                    macos_sysinfo.freeGpu(alloc, g);
+                    return e;
+                };
+                log.print("[macos] gpu[{d}] class={s} vendor=0x{x:0>4} vram={d}MB name={s}", .{
+                    list.items.len - 1, class_name, props.vendor_id orelse 0, g.vram_mb, g.name,
+                });
+            }
+            return list.toOwnedSlice(alloc);
+        }
+
+        /// NSWorkspace：url（无 scheme 补 https://）/ path（file URL）/ reveal（Finder 选中）。
+        fn openShellTarget(self: *Self, target: shell_mod.Target) !void {
+            const ws = msg0(Id, objc.cls("NSWorkspace"), "sharedWorkspace");
+            switch (target) {
+                .url => |u| {
+                    const norm = macos_sysinfo.normalizeUrlTarget(self.alloc, u) catch return error.ShellExecuteFailed;
+                    defer self.alloc.free(norm);
+                    const url = msg1(?Id, objc.cls("NSURL"), "URLWithString:", objc.nsString(norm.ptr, norm.len)) orelse
+                        return error.ShellExecuteFailed;
+                    if (!objc.msgSend(*const fn (Id, Sel, Id) callconv(.c) bool)(ws, objc.sel("openURL:"), url))
+                        return error.ShellExecuteFailed;
+                    log.print("[shell] openUrl -> NSWorkspace ({s})", .{norm});
+                },
+                .path => |p| {
+                    const url = msg1(Id, objc.cls("NSURL"), "fileURLWithPath:", objc.nsString(p.ptr, p.len));
+                    if (!objc.msgSend(*const fn (Id, Sel, Id) callconv(.c) bool)(ws, objc.sel("openURL:"), url))
+                        return error.ShellExecuteFailed;
+                    log.print("[shell] openPath -> NSWorkspace ({s})", .{p});
+                },
+                .reveal => |p| {
+                    const url = msg1(Id, objc.cls("NSURL"), "fileURLWithPath:", objc.nsString(p.ptr, p.len));
+                    const arr = objc.msgSend(*const fn (Class, Sel, Id) callconv(.c) Id)(objc.cls("NSArray"), objc.sel("arrayWithObject:"), url);
+                    _ = objc.msgSend(*const fn (Id, Sel, Id) callconv(.c) void)(ws, objc.sel("activateFileViewerSelectingURLs:"), arr);
+                    log.print("[shell] reveal -> Finder ({s})", .{p});
+                },
+            }
+        }
+
+        /// 订阅 NSWorkspace 通知中心（名称传 nil = 全收，映射不到统一事件的直接忽略）
+        /// 与分布式主题通知。正常模式下系统明暗切换由此发 themeChanged。
+        fn installSystemObservers(self: *Self) void {
+            const obs = msg0(Id, objc.cls("ZiltSystemObserver"), "new");
+            self.system_observer = obs;
+            const ws = msg0(Id, objc.cls("NSWorkspace"), "sharedWorkspace");
+            const nc = msg0(Id, ws, "notificationCenter");
+            objc.msgSend(*const fn (Id, Sel, Id, Sel, ?Id, ?Id) callconv(.c) void)(
+                nc,
+                objc.sel("addObserver:selector:name:object:"),
+                obs,
+                objc.sel("onWorkspaceNote:"),
+                @as(?Id, null),
+                @as(?Id, null),
+            );
+            const dnc = msg0(Id, objc.cls("NSDistributedNotificationCenter"), "defaultCenter");
+            objc.msgSend(*const fn (Id, Sel, Id, Sel, ?Id, ?Id) callconv(.c) void)(
+                dnc,
+                objc.sel("addObserver:selector:name:object:"),
+                obs,
+                objc.sel("onThemeNote:"),
+                objc.nsStringZ("AppleInterfaceThemeChangedNotification"),
+                @as(?Id, null),
+            );
+        }
+
+        /// 冒烟探针：.info 四种 + .cursor_position + Shell 解析 + 系统事件观察者接线。
+        /// CI 无法真的睡眠/切系统外观：power 只断言「NSWorkspace 通知到达观察者」，
+        /// theme observer 断言分布式通知回路（smokeLoop 里落 [macos] theme observer ok=），
+        /// Shell 只断言能解析出默认处理程序——不在 runner 上真的打开 URL。
+        fn runSystemProbe(self: *Self) bool {
+            const alloc = self.alloc;
+            var ok = true;
+            const needs = struct {
+                fn has(j: []const u8, needle: []const u8) bool {
+                    return std.mem.indexOf(u8, j, needle) != null;
+                }
+            };
+            if (self.collectSystemInfo(.os, alloc, 0)) |j| {
+                defer alloc.free(j);
+                ok = ok and needs.has(j, "\"name\":\"macOS\"") and !needs.has(j, "\"version\":\"0.0.0\"") and !needs.has(j, "\"locale\":\"\"");
+                log.print("[macos] sysinfo os={s}", .{j});
+            } else |_| ok = false;
+            if (self.collectSystemInfo(.monitors, alloc, 0)) |j| {
+                defer alloc.free(j);
+                ok = ok and needs.has(j, "\"primary\":true") and !needs.has(j, "\"width\":0,") and !needs.has(j, "\"workHeight\":0");
+                log.print("[macos] sysinfo monitors={s}", .{j});
+            } else |_| ok = false;
+            if (self.collectSystemInfo(.gpu, alloc, 0)) |j| {
+                defer alloc.free(j);
+                ok = ok and std.mem.startsWith(u8, j, "[");
+                log.print("[macos] sysinfo gpu={s}", .{j});
+            } else |_| ok = false;
+            if (self.collectSystemInfo(.all, alloc, 0)) |j| {
+                defer alloc.free(j);
+                ok = ok and needs.has(j, "\"os\":") and needs.has(j, "\"monitors\":");
+            } else |_| ok = false;
+            log.print("[macos] sysinfo ok={s}", .{boolStr(ok)});
+
+            var cursor_ok = false;
+            if (systemEntry(@ptrCast(self), 0, alloc, .{ .cursor_position = {} })) |res| {
+                defer alloc.free(res.json);
+                cursor_ok = needs.has(res.json, "\"x\":") and needs.has(res.json, "\"y\":");
+                log.print("[macos] cursor {s}", .{res.json});
+            } else |_| {}
+            log.print("[macos] cursor ok={s}", .{boolStr(cursor_ok)});
+
+            const ws = msg0(Id, objc.cls("NSWorkspace"), "sharedWorkspace");
+            const probe_url = msg1(?Id, objc.cls("NSURL"), "URLWithString:", objc.nsStringZ("https://example.com"));
+            const shell_ok = msg1(?Id, ws, "URLForApplicationToOpenURL:", probe_url) != null;
+            log.print("[macos] shell ok={s} wiring-only", .{boolStr(shell_ok)});
+
+            const nc = msg0(Id, ws, "notificationCenter");
+            objc.msgSend(*const fn (Id, Sel, Id, ?Id) callconv(.c) void)(
+                nc,
+                objc.sel("postNotificationName:object:"),
+                objc.nsStringZ("ZiltSmokeWorkspaceNote"),
+                @as(?Id, null),
+            );
+            const dnc = msg0(Id, objc.cls("NSDistributedNotificationCenter"), "defaultCenter");
+            objc.msgSend(*const fn (Id, Sel, Id, ?Id, ?Id, bool) callconv(.c) void)(
+                dnc,
+                objc.sel("postNotificationName:object:userInfo:deliverImmediately:"),
+                objc.nsStringZ("AppleInterfaceThemeChangedNotification"),
+                @as(?Id, null),
+                @as(?Id, null),
+                true,
+            );
+            self.sys_probe_posted = true;
+            log.print("[macos] power ok={s} wiring-only", .{boolStr(self.workspace_notes >= 1)});
+
+            const label = msg0(?Id, self.webview, "accessibilityLabel");
+            var acc_ok = false;
+            if (label) |l| {
+                if (msg0(?[*:0]const u8, l, "UTF8String")) |c| acc_ok = std.mem.eql(u8, std.mem.span(c), config.title);
+            }
+            log.print("[macos] accessibility ok={s} label={s}", .{ boolStr(acc_ok), config.title });
+
+            return ok and cursor_ok and shell_ok and self.workspace_notes >= 1 and acc_ok;
         }
 
         // ------------------------------------------------------------------
@@ -735,6 +1079,8 @@ fn Backend(comptime config: Config) type {
                 cfg,
             );
             if (@intFromPtr(wv) == 0) return error.WebViewCreationFailed;
+            // Accessibility：VoiceOver 把 WebView 念作窗口标题而不是"web content"
+            _ = msg1(void, wv, "setAccessibilityLabel:", objc.nsString(config.title.ptr, config.title.len));
             _ = msg1(void, wv, "setNavigationDelegate:", msg0(Id, objc.cls("ZiltNavigationDelegate"), "new"));
             _ = msg1(void, wv, "setUIDelegate:", msg0(Id, objc.cls("ZiltUIDelegate"), "new"));
             const drag_types = objc.msgSend(*const fn (Class, Sel, Id) callconv(.c) Id)(objc.cls("NSArray"), objc.sel("arrayWithObject:"), objc.nsStringZ("public.file-url"));
@@ -1068,7 +1414,7 @@ fn Backend(comptime config: Config) type {
         const mask_resizable: c_ulong = 1 << 3;
 
         fn frameOf(win: Id) NSRect {
-            return objc.msgSend(*const fn (Id, Sel) callconv(.c) NSRect)(win, objc.sel("frame"));
+            return structMsg(NSRect, win, "frame");
         }
 
         fn styleMaskOf(win: Id) c_ulong {
@@ -1077,13 +1423,13 @@ fn Backend(comptime config: Config) type {
 
         fn contentSize(win: Id) Size {
             const cv = msg0(?Id, win, "contentView") orelse return .{ .w = 0, .h = 0 };
-            return objc.msgSend(*const fn (Id, Sel) callconv(.c) NSRect)(cv, objc.sel("bounds")).size;
+            return structMsg(NSRect, cv, "bounds").size;
         }
 
         /// 主屏高度（Cocoa 原点在左下）——把对外「左上原点」语义换算过去
         fn screenHeight() f64 {
             const scr = msg0(?Id, objc.cls("NSScreen"), "mainScreen") orelse return 0;
-            return objc.msgSend(*const fn (Id, Sel) callconv(.c) NSRect)(scr, objc.sel("frame")).size.h;
+            return structMsg(NSRect, scr, "frame").size.h;
         }
 
         fn windowEntry(backend: *anyopaque, window_id: u32, cmd: ipc.WindowCmd) bool {
@@ -1545,6 +1891,24 @@ fn Backend(comptime config: Config) type {
             return std.mem.indexOf(u8, std.mem.span(c), "Dark") != null;
         }
 
+        /// 主题变化统一出口：冒烟轮询与分布式通知都走这里（首个基线不发光）。
+        fn onThemeMaybeChanged(self: *Self) void {
+            const cur = self.isDarkAppearance();
+            if (self.last_dark) |prev| {
+                if (prev != cur) self.emitAllEvent("themeChanged", if (cur)
+                    "{\"appearance\":\"dark\"}"
+                else
+                    "{\"appearance\":\"light\"}");
+            }
+            self.last_dark = cur;
+        }
+
+        /// 系统级事件（电源/会话/主题）广播到所有窗口（对齐 Linux：载荷 null）
+        fn emitAllEvent(self: *Self, name: []const u8, payload: []const u8) void {
+            self.emitWindowEvent(0, name, payload);
+            for (self.wins.items) |w| self.emitWindowEvent(w.id, name, payload);
+        }
+
         fn setDarkAppearance(self: *Self, dark: bool) void {
             _ = self;
             const app = msg0(Id, objc.cls("NSApplication"), "sharedApplication");
@@ -1597,6 +1961,7 @@ fn Backend(comptime config: Config) type {
             }
             const win = self.newNSWindow(opts.title, opts.width, opts.height, opts.resizable) catch return null;
             const wv = self.makeWebView(opts.width, opts.height) catch return null;
+            _ = msg1(void, wv, "setAccessibilityLabel:", objc.nsString(opts.title.ptr, opts.title.len));
             _ = msg1(void, win, "setContentView:", wv);
             self.loadUrlIn(wv, opts.url) catch {};
             const id = self.next_win_id;
@@ -1639,27 +2004,24 @@ fn Backend(comptime config: Config) type {
                 )) |ev| {
                     _ = msg1(void, self.app, "sendEvent:", ev);
                 }
-                const cur_dark = self.isDarkAppearance();
-                if (self.last_dark) |prev| {
-                    if (prev != cur_dark) {
-                        self.emitWindowEvent(0, "themeChanged", if (cur_dark)
-                            "{\"appearance\":\"dark\"}"
-                        else
-                            "{\"appearance\":\"light\"}");
-                    }
+                self.onThemeMaybeChanged();
+                if (self.sys_probe_posted and !self.theme_logged and self.theme_notes > 0) {
+                    self.theme_logged = true;
+                    log.print("[macos] theme observer ok=true", .{});
                 }
-                self.last_dark = cur_dark;
                 if (self.page_loaded and !self.probe_sent) {
                     self.probe_sent = true;
                     self.evalScript(self.webview, probe_js);
                     self.win_ops_ok = self.runWindowOpsProbe();
                     self.store_ok = self.runStoreProbe();
                     self.updater_ok = self.runUpdaterProbe();
+                    self.win_ops_ok = self.win_ops_ok and self.runSystemProbe();
                     log.print("[macos] probe sent", .{});
                 }
                 const left = msg0(f64, deadline, "timeIntervalSinceNow");
                 if (left <= 0) break;
             }
+            if (self.sys_probe_posted and !self.theme_logged) log.print("[macos] theme observer ok=false", .{});
             log.print("[macos] smoke done, exiting (loaded={s} ipc={s} greet={s})", .{
                 boolStr(self.page_loaded), boolStr(self.ipc_seen), boolStr(self.ipc_ok),
             });
@@ -1691,6 +2053,10 @@ fn Backend(comptime config: Config) type {
             });
             _ = objc.defineClass("ZiltMessageHandler", "WKScriptMessageHandler", &.{
                 .{ .name = "userContentController:didReceiveScriptMessage:", .imp = imp(&onScriptMessage), .types = "v@:@@" },
+            });
+            _ = objc.defineClass("ZiltSystemObserver", null, &.{
+                .{ .name = "onWorkspaceNote:", .imp = imp(&onWorkspaceNote), .types = "v@:@" },
+                .{ .name = "onThemeNote:", .imp = imp(&onThemeNote), .types = "v@:@" },
             });
             _ = objc.defineClass("ZiltMainQueue", null, &.{
                 .{ .name = "drain:", .imp = imp(&onDrain), .types = "v@:@" },
@@ -1792,6 +2158,20 @@ fn Backend(comptime config: Config) type {
 
         fn onStopTask(_: Id, _: Sel, _: Id, _: Id) callconv(.c) void {}
 
+        fn onWorkspaceNote(_: Id, _: Sel, note: Id) callconv(.c) void {
+            inst.workspace_notes += 1;
+            const nm = msg0(?Id, note, "name") orelse return;
+            const c = msg0(?[*:0]const u8, nm, "UTF8String") orelse return;
+            const name = power.macWorkspaceEventName(std.mem.span(c)) orelse return;
+            log.print("[macos] system event: {s}", .{name});
+            inst.emitAllEvent(name, "null");
+        }
+
+        fn onThemeNote(_: Id, _: Sel, _: Id) callconv(.c) void {
+            inst.theme_notes += 1;
+            inst.onThemeMaybeChanged();
+        }
+
         fn onDrain(_: Id, _: Sel, _: Id) callconv(.c) void {
             inst.drain();
         }
@@ -1890,13 +2270,16 @@ fn Backend(comptime config: Config) type {
             _ = msg1(void, center, "addNotificationRequest:withCompletionHandler:", req);
         }
 
+        /// 单实例锁：~/Library/Application Support/<app_id>/zilt.lock（flock，进程退出即释放）。
+        /// v0.5.8 从 $TMPDIR 迁出——系统会清理临时目录里的旧文件，长跑应用的锁文件
+        /// 被删后新实例重建一个再 flock 就会成功；应用数据目录按用户隔离且不清理。
         fn acquireSingleLock(self: *Self) bool {
-            const tmp = std.c.getenv("TMPDIR") orelse "/tmp";
-            var zbuf: [512]u8 = undefined;
-            const raw = std.fmt.bufPrint(&zbuf, "{s}/zilt-{s}.lock", .{ std.mem.span(tmp), config.app_id }) catch return true;
-            zbuf[raw.len] = 0;
-            const path = zbuf[0..raw.len :0];
-            const fd = open(path.ptr, 0x0202, 0o644);
+            const root = self.appDataRoot() orelse return true;
+            self.makeDirPath(root);
+            defer self.alloc.free(root);
+            const path = std.fmt.allocPrintSentinel(self.alloc, "{s}/zilt.lock", .{root}, 0) catch return true;
+            defer self.alloc.free(path);
+            const fd = open(path.ptr, 0x0202, 0o644); // O_RDWR|O_CREAT
             if (fd < 0) return true;
             if (flock(fd, 0x2 | 0x4) != 0) return false; // LOCK_EX|LOCK_NB
             self.lock_fd = fd;
@@ -2272,6 +2655,17 @@ fn msg1(comptime R: type, obj: Id, name: [*:0]const u8, arg: anytype) R {
     };
 }
 
+/// 返回 struct 的消息：Apple x86_64 ABI 对 >16 字节的 struct 走 stret
+/// （objc_msgSend_stret，返回值经首参指针带回），arm64 走普通 objc_msgSend。
+fn structMsg(comptime T: type, obj: Id, name: [*:0]const u8) T {
+    if (builtin.cpu.arch == .x86_64) {
+        var out: T = undefined;
+        objc.msgSendStret(*const fn (*T, Id, Sel) callconv(.c) void)(&out, obj, objc.sel(name));
+        return out;
+    }
+    return objc.msgSend(*const fn (Id, Sel) callconv(.c) T)(obj, objc.sel(name));
+}
+
 /// 取方法实现的裸指针（class_addMethod 需要）。入参必须是**函数指针**
 /// （`&onXxx`），直接转型——此前 `@ptrCast(&f)` 取到的是「指针的指针」，
 /// WebKit 一调用 IMP 就 Bus error（CI 45023844762 实测）。
@@ -2349,6 +2743,63 @@ test "macos: parseSmokeMs 边界" {
 // ---- v0.4.7 Carbon：全局热键 ----
 const EventTypeSpec = extern struct { eventClass: c_uint, eventKind: c_uint };
 const EventHotKeyID = extern struct { signature: u32, id: u32 };
+
+// ---- v0.5.8：系统信息（sysctl / IOKit / CoreFoundation）----
+extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*anyopaque, newlen: usize) c_int;
+extern "c" fn IOServiceMatching(name: [*:0]const u8) ?Id;
+extern "c" fn IOServiceGetMatchingServices(port: c_uint, matching: Id, existing: *c_uint) c_int;
+extern "c" fn IOIteratorNext(iterator: c_uint) c_uint;
+extern "c" fn IOObjectRelease(obj: c_uint) c_int;
+extern "c" fn IORegistryEntryCreateCFProperty(entry: c_uint, key: Id, allocator: ?Id, options: c_uint) ?Id;
+extern "c" fn CFRelease(cf: Id) void;
+extern "c" fn CFStringCreateWithCString(allocator: ?Id, c_str: [*:0]const u8, encoding: c_uint) ?Id;
+extern "c" fn CFStringGetCString(cf: Id, buf: [*]u8, buf_len: c_long, encoding: c_uint) bool;
+extern "c" fn CFDataGetLength(cf: Id) c_long;
+extern "c" fn CFDataGetBytePtr(cf: Id) ?[*]const u8;
+extern "c" fn CFGetTypeID(cf: Id) c_ulong;
+extern "c" fn CFStringGetTypeID() c_ulong;
+extern "c" fn CFDataGetTypeID() c_ulong;
+
+const kCFStringEncodingUTF8: c_uint = 0x08000100;
+
+/// sysctl 字符串值 → 调用方缓冲（去掉结尾 NUL）；失败/空返回 null。
+fn sysctlString(name: [*:0]const u8, buf: []u8) ?[]const u8 {
+    var len = buf.len;
+    if (sysctlbyname(name, buf.ptr, &len, null, 0) != 0 or len == 0) return null;
+    return std.mem.sliceTo(buf[0..len], 0);
+}
+
+fn ioProperty(entry: c_uint, key: [*:0]const u8) ?Id {
+    const k = CFStringCreateWithCString(null, key, kCFStringEncodingUTF8) orelse return null;
+    defer CFRelease(k);
+    return IORegistryEntryCreateCFProperty(entry, k, null, 0);
+}
+
+/// CFString / CFData 属性值拷进调用方缓冲（放不下或类型不符返回 null）。
+fn cfToBuf(cf: Id, buf: []u8) ?[]const u8 {
+    var tmp: [512]u8 = undefined;
+    const value: []const u8 = if (CFGetTypeID(cf) == CFStringGetTypeID()) blk: {
+        if (!CFStringGetCString(cf, &tmp, tmp.len, kCFStringEncodingUTF8)) return null;
+        break :blk std.mem.sliceTo(&tmp, 0);
+    } else if (CFGetTypeID(cf) == CFDataGetTypeID()) blk: {
+        break :blk macos_sysinfo.cfDataToString(cfDataBytes(cf) orelse return null) orelse return null;
+    } else return null;
+    if (value.len > buf.len) return null;
+    @memcpy(buf[0..value.len], value);
+    return buf[0..value.len];
+}
+
+fn cfDataBytes(cf: Id) ?[]const u8 {
+    if (CFGetTypeID(cf) != CFDataGetTypeID()) return null;
+    const len = CFDataGetLength(cf);
+    if (len <= 0) return null;
+    const p = CFDataGetBytePtr(cf) orelse return null;
+    return p[0..@intCast(len)];
+}
+
+fn cfDataU16Le(cf: Id) ?u16 {
+    return macos_sysinfo.cfDataToU16Le(cfDataBytes(cf) orelse return null);
+}
 
 extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_int) c_int;
 extern "c" fn flock(fd: c_int, op: c_int) c_int;
