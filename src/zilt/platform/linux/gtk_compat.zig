@@ -2167,7 +2167,7 @@ test "SyncWait：结果引用归 SyncWait——调用方 unref 后仍存活，re
     try std.testing.expect(task != null);
     c.g_task_return_boolean(@ptrCast(task), 1);
     var weak: ?*anyopaque = null;
-    c.g_object_add_weak_pointer(@ptrCast(task), @ptrCast(&weak));
+    c.g_object_add_weak_pointer(@ptrCast(@alignCast(task)), @ptrCast(&weak));
 
     var w = SyncWait.begin();
     defer if (w.loop) |lp| c.g_main_loop_unref(lp);
