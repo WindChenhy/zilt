@@ -2196,16 +2196,44 @@ test "capsJson：冒烟注入载荷六键齐全、值随变体" {
 test "SyncWait：结果引用归 SyncWait——调用方 unref 后仍存活，releaseResult 后析构" {
     const task = c.g_task_new(null, null, null, null);
     try std.testing.expect(task != null);
+    const obj: *c.GObject = @ptrCast(@alignCast(task.?));
+    std.debug.print("DIAG glib={d}.{d}.{d} rc_new={d}\n", .{ c.glib_major_version, c.glib_minor_version, c.glib_micro_version, obj.ref_count });
     c.g_task_return_boolean(@ptrCast(task), 1);
+    std.debug.print("DIAG rc_returned={d}\n", .{obj.ref_count});
     var weak: ?*anyopaque = null;
     c.g_object_add_weak_pointer(@ptrCast(@alignCast(task)), @ptrCast(&weak));
+    std.debug.print("DIAG weak_added={any}\n", .{weak != null});
 
     var w = SyncWait.begin();
     defer if (w.loop) |lp| c.g_main_loop_unref(lp);
     onAsyncReady(null, @ptrCast(task), @ptrCast(&w));
+    std.debug.print("DIAG rc_cb={d} held={any}\n", .{ obj.ref_count, w.result != null });
     // 调用方交出唯一引用：回调若没自己 ref，对象此刻已析构
     c.g_object_unref(@ptrCast(task));
+    std.debug.print("DIAG weak_after_unref={any}\n", .{weak != null});
+    if (weak != null) std.debug.print("DIAG rc_unref={d}\n", .{obj.ref_count});
     try std.testing.expect(w.done);
+    try std.testing.expect(weak != null);
+    w.releaseResult();
+    try std.testing.expect(weak == null);
+}
+
+// 诊断对照：换成无异步语义的普通 GObject（GCancellable），隔离 GTask 的
+// return/idle 机制是否才是 weak 变 null 的原因。
+test "DIAG: GCancellable 走同一序列" {
+    const o = c.g_cancellable_new();
+    try std.testing.expect(o != null);
+    const obj: *c.GObject = @ptrCast(@alignCast(o.?));
+    std.debug.print("DIAG2 rc_new={d}\n", .{obj.ref_count});
+    var weak: ?*anyopaque = null;
+    c.g_object_add_weak_pointer(@ptrCast(@alignCast(o)), @ptrCast(&weak));
+    var w = SyncWait.begin();
+    defer if (w.loop) |lp| c.g_main_loop_unref(lp);
+    onAsyncReady(null, @ptrCast(o), @ptrCast(&w));
+    std.debug.print("DIAG2 rc_cb={d} held={any}\n", .{ obj.ref_count, w.result != null });
+    c.g_object_unref(@ptrCast(o));
+    std.debug.print("DIAG2 weak_after_unref={any}\n", .{weak != null});
+    if (weak != null) std.debug.print("DIAG2 rc_unref={d}\n", .{obj.ref_count});
     try std.testing.expect(weak != null);
     w.releaseResult();
     try std.testing.expect(weak == null);
