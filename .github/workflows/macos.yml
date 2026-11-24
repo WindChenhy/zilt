@@ -77,9 +77,13 @@ jobs:
             exit 1
           fi
           cat smoke.log
-          wait "$second_pid"
+          wait "$second_pid" || { echo "::error::第二实例退出码非 0（$?，见 second.log）"; cat second.log; exit 1; }
           cat second.log
-          grep -qF "[macos] single instance: lock held, exiting" second.log
+          # grep 在 set -e 下失败是静默的——显式报出，否则日志里只剩 "exit code 1"
+          grep -qF "[macos] single instance: lock held, exiting" second.log || {
+            echo "::error::second.log 里没有 lock held 行（第二实例没启动，或抢到了锁）"
+            exit 1
+          }
           if grep -qF "window created" second.log; then
             echo "::error::第二实例在拿到锁之前就建了窗口（单实例锁获取太晚）"
             exit 1
@@ -107,6 +111,8 @@ jobs:
           grep -qF "[macos] notify ok=true" smoke.log
           grep -qF "[macos] deeplink ok=true" smoke.log
           grep -qF "[macos] single ok=true" smoke.log
+          # v0.5.8：首实例冒烟全程都还握着锁（换 fd 再 flock 必须失败）
+          grep -qF "[macos] single lock held at exit=true" smoke.log
           grep -qF "[macos] hotkey ok=true" smoke.log
           grep -qF "[macos] webview zoom ok=true" smoke.log
           grep -qF "[macos] webview devtools ok=true" smoke.log
@@ -132,7 +138,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: macos-smoke
+          # 带架构后缀：同名产物在矩阵任务间合并覆盖，后跑完的会盖掉先跑完的现场
+          name: macos-smoke-${{ matrix.arch }}
           path: |
             smoke.log
             second.log

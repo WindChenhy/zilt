@@ -1720,8 +1720,8 @@ fn Backend(comptime config: Config) type {
             const deeplink_ok = self.matchUrl(sample) and !self.matchUrl("https://example.com");
             log.print("[macos] deeplink ok={s}", .{boolStr(deeplink_ok)});
 
-            // BSD flock 是进程级锁，同进程再次 flock 会成功，故只断言“锁已拿住”
-            const single_ok = !config.single_instance or self.lock_fd >= 0;
+            // 换一个 fd 再 flock 必须失败——只看 lock_fd >= 0 发现不了「锁被释放 / 锁的不是这个文件」
+            const single_ok = !config.single_instance or self.singleLockHeld();
             log.print("[macos] single ok={s}", .{boolStr(single_ok)});
 
             var hk_out: ?*anyopaque = null;
@@ -2022,6 +2022,12 @@ fn Backend(comptime config: Config) type {
                 if (left <= 0) break;
             }
             if (self.sys_probe_posted and !self.theme_logged) log.print("[macos] theme observer ok=false", .{});
+            var lock_path_buf: [1024]u8 = undefined;
+            log.print("[macos] single lock held at exit={s} fd={d} path={s}", .{
+                boolStr(self.singleLockHeld()),
+                self.lock_fd,
+                self.lockFdPath(&lock_path_buf) orelse "?",
+            });
             log.print("[macos] smoke done, exiting (loaded={s} ipc={s} greet={s})", .{
                 boolStr(self.page_loaded), boolStr(self.ipc_seen), boolStr(self.ipc_ok),
             });
@@ -2277,13 +2283,41 @@ fn Backend(comptime config: Config) type {
             const root = self.appDataRoot() orelse return true;
             self.makeDirPath(root);
             defer self.alloc.free(root);
-            const path = std.fmt.allocPrintSentinel(self.alloc, "{s}/zilt.lock", .{root}, 0) catch return true;
+            const path = self.lockPath() orelse return true;
             defer self.alloc.free(path);
             const fd = open(path.ptr, 0x0202, 0o644); // O_RDWR|O_CREAT
             if (fd < 0) return true;
             if (flock(fd, 0x2 | 0x4) != 0) return false; // LOCK_EX|LOCK_NB
             self.lock_fd = fd;
             return true;
+        }
+
+        fn lockPath(self: *Self) ?[:0]u8 {
+            const root = self.appDataRoot() orelse return null;
+            defer self.alloc.free(root);
+            return std.fmt.allocPrintSentinel(self.alloc, "{s}/zilt.lock", .{root}, 0) catch null;
+        }
+
+        /// 自检：换一个 open file description 再 flock，必须被自己持有的锁挡住
+        ///（flock 按 open file description 互斥，同进程的另一个 fd 同样冲突）。
+        fn singleLockHeld(self: *Self) bool {
+            if (self.lock_fd < 0) return false;
+            const path = self.lockPath() orelse return false;
+            defer self.alloc.free(path);
+            const fd = open(path.ptr, 0x0002, 0o644); // O_RDWR
+            if (fd < 0) return false;
+            defer _ = close(fd);
+            if (flock(fd, 0x2 | 0x4) == 0) {
+                _ = flock(fd, 0x8); // LOCK_UN
+                return false;
+            }
+            return true;
+        }
+
+        /// F_GETPATH：lock_fd 实际指向的文件（锁文件被删后重建时，这里会与 lockPath 不一致）
+        fn lockFdPath(self: *Self, buf: []u8) ?[]const u8 {
+            if (fcntl(self.lock_fd, 50, buf.ptr) != 0) return null;
+            return std.mem.sliceTo(buf, 0);
         }
 
         /// 深链：从 NSProcessInfo.arguments 里抓首个匹配 scheme 的 URL（open <url> 启动时传入）
@@ -2803,6 +2837,8 @@ fn cfDataU16Le(cf: Id) ?u16 {
 
 extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_int) c_int;
 extern "c" fn flock(fd: c_int, op: c_int) c_int;
+extern "c" fn close(fd: c_int) c_int;
+extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
 extern "c" fn GetApplicationEventTarget() ?*anyopaque;
 extern "c" fn InstallEventHandler(
     target: ?*anyopaque,
