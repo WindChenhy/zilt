@@ -69,6 +69,13 @@ function runSecondWindowProbe() {
   const Z = () => window.zilt;
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  // v0.5.9：变体能力表（后端在注入本脚本前写入；缺省按 GTK3 全能力）。
+  // GTK4 下降级的面走「显式 skip / 断言降级语义」，不当成失败。
+  const CAPS = Object.assign({
+    tray: true, menu_bar: true, programmatic_drag: true,
+    cursor_grab: true, cookie_clear_by_domain: true, clipboard_read: true,
+  }, window.__ziltSmokeCaps || {});
+
   // 1. 命令调用 + 嵌套返回字段
   try {
     const g = await Z().invoke('greet', { name: 'Linux' });
@@ -215,11 +222,16 @@ function runSecondWindowProbe() {
     await wait(80);
     const ignored = (await state()).ignore_cursor === true;
     await W.setIgnoreCursorEvents(false);
+    // GTK4 无 gdk_seat_grab → 抓取面必须稳定返回 false（降级语义也是断言）
+    const grabOk = CAPS.cursor_grab
+      ? (rGrab === true && rUngrab === true)
+      : (rGrab === false && rUngrab === false);
     check('win.polish',
       rCursor === true && rCursor2 === true && rCursorVis === true && rCursorVis2 === true &&
-      rGrab === true && rUngrab === true && rWarp === true && rShadow === true && rShadow2 === true &&
+      grabOk && rWarp === true && rShadow === true && rShadow2 === true &&
       rIgnore === true && ignored,
-      `cursor=${rCursor}/${rCursor2} vis=${rCursorVis}/${rCursorVis2} grab=${rGrab}/${rUngrab} ` +
+      `cursor=${rCursor}/${rCursor2} vis=${rCursorVis}/${rCursorVis2} grab=${rGrab}/${rUngrab}` +
+      `${CAPS.cursor_grab ? '' : ' (grab skipped: GTK4)'} ` +
       `warp=${rWarp} shadow=${rShadow}/${rShadow2} ignore=${rIgnore}/${ignored}`);
 
     // v0.3.0：平台缺省项——防截屏无标准 API（稳定 false，不抛异常）；
@@ -274,10 +286,16 @@ function runSecondWindowProbe() {
       typeof shot === 'string' ? shot.length : String(shot));
 
     // cookies：URL 作用域的读取 + 按域名清理（示例 origin，无网络请求）
+    // GTK4（WebKitGTK 6.0）无 delete_cookies_for_domain → 断言「明确报错」而非静默成功
     const ck = await V.getCookies('https://example.com/');
-    const clearedCookies = await V.clearCookies('https://example.com');
-    check('cookies', ck && Array.isArray(ck.cookies) && clearedCookies !== false,
-      `get=${JSON.stringify(ck).slice(0, 80)} clear=${clearedCookies}`);
+    let clearedCookies = null, clearErr = null;
+    try { clearedCookies = await V.clearCookies('https://example.com'); } catch (e) { clearErr = String(e.message || e); }
+    const clearOk = CAPS.cookie_clear_by_domain
+      ? (clearErr === null && clearedCookies !== false)
+      : clearErr !== null;
+    check('cookies', ck && Array.isArray(ck.cookies) && clearOk,
+      `get=${JSON.stringify(ck).slice(0, 80)} clear=${clearedCookies} err=${clearErr}` +
+      `${CAPS.cookie_clear_by_domain ? '' : ' (by-domain skipped: GTK4)'}`);
   } catch (e) { check('eval', false, String(e.message || e)); }
 
   // ---- v0.2.1 切片 3：多窗口（spawn_window_fn + 窗口注册表）----
@@ -557,7 +575,9 @@ function runSecondWindowProbe() {
   } catch (e) { check('menu.model', false, String(e.message || e)); }
 
   // ---- v0.4.3 L6：托盘挂窗（tray.attach_window——toggle + 指针定位 + 抑制窗）----
-  try {
+  if (!CAPS.tray) {
+    check('tray.attach', true, 'skipped (GTK4: ayatana is GTK3-linked)');
+  } else try {
     const attachResult = await new Promise((resolve) => {
       const timer = setTimeout(() => resolve(null), 5000);
       Z().on('linuxSmokeAttach', (p) => { clearTimeout(timer); resolve(p); });
@@ -1075,7 +1095,12 @@ function runSecondWindowProbe() {
   // ---- v0.3.0：拖出（drag-data-get → text/uri-list）——真实投递需要目标程序；
   //      冒烟断言 begin 被接受、主循环存活（drag-data-get 内容由后端日志佐证）。
   //      放在最后：GTK 拖拽会持有指针 grab，避免影响上面的焦点类断言 ----
-  try {
+  if (!CAPS.programmatic_drag) {
+    // GTK4：GDK 无公开的脚本发起拖拽入口 → 必须 DragNotAvailable（不是静默成功）
+    let err = null;
+    try { await Z().drag.start(['/tmp/zilt-drag-out-a.txt']); } catch (e) { err = String(e.message || e); }
+    check('drag.out', err === 'DragNotAvailable', `skipped (GTK4) err=${err}`);
+  } else try {
     const ok = await Z().drag.start(['/tmp/zilt-drag-out-a.txt', '/tmp/zilt drag b.txt']);
     await wait(150);
     const alive = (await Z().window.state()).id === 1;

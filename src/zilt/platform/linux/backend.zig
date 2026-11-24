@@ -1761,6 +1761,16 @@ fn Backend(comptime config: Config) type {
             self.addUserScriptTo(scripts, ucm, zoom_hotkey_polyfill);
             for (config.init_scripts) |script| self.addUserScriptTo(scripts, ucm, script);
             if (self.smoke) {
+                // v0.5.9：变体能力表先于检查脚本注入——降级面据此显式 skip，
+                // 而不是把「GTK4 没有这个面」记成失败。
+                var caps_buf: [256]u8 = undefined;
+                if (gtk_compat.capsJson(&caps_buf)) |cj| {
+                    const marker = std.fmt.allocPrint(self.allocator, "window.__ziltSmokeCaps = {s};", .{cj}) catch null;
+                    if (marker) |mk| {
+                        defer self.allocator.free(mk);
+                        self.addUserScriptTo(scripts, ucm, mk);
+                    }
+                }
                 self.addUserScriptTo(scripts, ucm, smoke_script);
                 // 冒烟：把注入的启动深链暴露给检查脚本（ZILT_LINUX_SMOKE_DEEPLINK）
                 if (std.c.getenv("ZILT_LINUX_SMOKE_DEEPLINK")) |u| {

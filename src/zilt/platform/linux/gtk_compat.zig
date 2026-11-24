@@ -12,10 +12,12 @@
 //! 分支体经 comptime 消除：GTK3 构建不引用 4.x 符号，反之亦然——
 //! 72 个 GTK4 移除符号（gtkaudit.sh 审计）全部收敛于此或调用点守卫。
 //!
-//! GTK4 已知限制（文档化，见 ROADMAP L1b）：
+//! GTK4 已知限制（文档化，见 ROADMAP L1b；代码侧登记在 `caps()`）：
 //!   * 托盘：libayatana-appindicator3 为 GTK3 链接库，4.x 进程不可载 → 无托盘；
 //!   * drag.start（脚本发起拖拽）：GDK4 无公开 begin 入口 → DragNotAvailable；
 //!   * 菜单栏（config.menu）：GtkMenuBar 已移除 → menuBarAvailable()=false；
+//!   * 指针抓取 / 按域清 cookie：4.14 capi 无 gdk_seat_grab、6.0 无
+//!     delete_cookies_for_domain → 调用点守卫；
 //!   * Wayland 几何：position/move 无全局坐标概念 → X11 直连仅 X11 生效。
 
 const std = @import("std");
@@ -62,7 +64,7 @@ pub const MOD2_MASK = 1 << 4;
 /// 菜单栏构造在 GTK4 下不可用（GtkMenuBar 已移除）——
 /// 调用方据此降级为「无菜单栏」。
 pub fn menuBarAvailable() bool {
-    return !isGtk4();
+    return caps().menu_bar;
 }
 
 /// 变体能力表（v0.5.9）：降级面集中登记一处，冒烟脚本据此显式 skip，
@@ -78,11 +80,11 @@ pub const Caps = struct {
 
 pub fn caps() Caps {
     return .{
-        .tray = true,
-        .menu_bar = true,
-        .programmatic_drag = true,
-        .cursor_grab = true,
-        .cookie_clear_by_domain = true,
+        .tray = isGtk3(),
+        .menu_bar = isGtk3(),
+        .programmatic_drag = isGtk3(),
+        .cursor_grab = isGtk3(),
+        .cookie_clear_by_domain = isGtk3(),
         .clipboard_read = true,
     };
 }
@@ -179,7 +181,13 @@ pub fn onAsyncReady(
 ) callconv(.c) void {
     const w: *SyncWait = @ptrCast(@alignCast(user_data orelse return));
     w.source = source;
-    w.result = result;
+    // GAsyncResult 的存活期只到本回调返回为止，而消费方在 wait() 之后才
+    // xxx_finish(result)——不自己持一份引用就是 use-after-free + 二次释放。
+    w.result = null;
+    if (result) |r| {
+        const held: ?*anyopaque = c.g_object_ref(@ptrCast(r));
+        w.result = @ptrCast(held);
+    }
     w.finish();
 }
 
@@ -1347,9 +1355,19 @@ pub fn clipboardClear(cb: ?*anyopaque) void {
 /// 文本读取（utf-8）。无文本 → null。
 pub fn clipboardReadText(cb: ?*anyopaque, alloc: std.mem.Allocator) ?[]u8 {
     if (comptime isGtk4()) {
-        // v0.4.3 L1b 文档化 pending：GdkClipboard 读面全异步，SyncWait 嵌套循环
-        // 桥在并发读下触发 g_task 断言 + 堆破坏——待 GIO 级异步管线重做
-        return null;
+        // read_text_async 由 GDK 协商 charset（UTF8_STRING / text/plain;charset=utf-8）
+        const clip: ?*c.GdkClipboard = @ptrCast(@alignCast(cb));
+        var w = SyncWait.begin();
+        c.gdk_clipboard_read_text_async(clip, null, @ptrCast(&onAsyncReady), @ptrCast(&w));
+        w.wait();
+        if (!w.done or w.result == null) return null;
+        defer w.releaseResult();
+        var err: ?*c.GError = null;
+        const text = c.gdk_clipboard_read_text_finish(clip, w.result, &err);
+        if (err) |e| c.g_error_free(e);
+        if (text == null) return null;
+        defer c.g_free(@ptrCast(text));
+        return alloc.dupe(u8, std.mem.span(text)) catch null;
     }
     const text = c.gtk_clipboard_wait_for_text(@ptrCast(@alignCast(cb)));
     if (text == null) return null;
@@ -1360,7 +1378,7 @@ pub fn clipboardReadText(cb: ?*anyopaque, alloc: std.mem.Allocator) ?[]u8 {
 /// 指定 MIME 读取（text/html 等）。GTK3 走 wait_for_contents(atom)。
 pub fn clipboardReadMime(cb: ?*anyopaque, mime: [:0]const u8, alloc: std.mem.Allocator) ?[]u8 {
     if (comptime isGtk4()) {
-        return null; // 同上（异步管线重做 pending）
+        return clipboardReadBytes(cb, mime, alloc);
     }
     const atom = c.gdk_atom_intern(mime.ptr, 0);
     const sel = c.gtk_clipboard_wait_for_contents(@ptrCast(@alignCast(cb)), atom) orelse return null;
@@ -1375,7 +1393,9 @@ pub fn clipboardReadMime(cb: ?*anyopaque, mime: [:0]const u8, alloc: std.mem.All
 ///（解析仍归调用方，两栈输入形状一致）。
 pub fn clipboardReadUriList(cb: ?*anyopaque, alloc: std.mem.Allocator) ?[]u8 {
     if (comptime isGtk4()) {
-        return null; // 同上（异步管线重做 pending）
+        // 写入面用 gdk_content_provider_new_for_bytes("text/uri-list", …)，
+        // 读回同一 MIME 即得同样的 CRLF 字节流（两栈形状一致）
+        return clipboardReadBytes(cb, "text/uri-list", alloc);
     }
     const uris = c.gtk_clipboard_wait_for_uris(@ptrCast(@alignCast(cb))) orelse return null;
     defer c.g_strfreev(uris);
@@ -1398,7 +1418,7 @@ fn clipboardReadBytes(cb: ?*anyopaque, mime: [:0]const u8, alloc: std.mem.Alloca
     c.gdk_clipboard_read_async(clip, @as([*c][*c]const u8, @ptrCast(&mimes)), 0, null, @ptrCast(&onAsyncReady), @ptrCast(&w));
     w.wait();
     if (!w.done or w.result == null) return null;
-    defer c.g_object_unref(@ptrCast(w.result.?));
+    defer w.releaseResult();
     var out_mime: [*c]const u8 = null;
     var err: ?*c.GError = null;
     const stream = c.gdk_clipboard_read_finish(clip, w.result, &out_mime, &err);
@@ -1420,7 +1440,18 @@ fn clipboardReadBytes(cb: ?*anyopaque, mime: [:0]const u8, alloc: std.mem.Alloca
 /// 图片读取（RGBA 非预乘——与 GTK3 pixbuf 语义一致）。
 pub fn clipboardReadImage(cb: ?*anyopaque, alloc: std.mem.Allocator) ?ImageRGBA {
     if (comptime isGtk4()) {
-        return null; // 同上（异步管线重做 pending）
+        const clip: ?*c.GdkClipboard = @ptrCast(@alignCast(cb));
+        var w = SyncWait.begin();
+        c.gdk_clipboard_read_texture_async(clip, null, @ptrCast(&onAsyncReady), @ptrCast(&w));
+        w.wait();
+        if (!w.done or w.result == null) return null;
+        defer w.releaseResult();
+        var err: ?*c.GError = null;
+        const tex = c.gdk_clipboard_read_texture_finish(clip, w.result, &err);
+        if (err) |e| c.g_error_free(e);
+        if (tex == null) return null;
+        defer c.g_object_unref(@ptrCast(tex));
+        return textureToRgba(tex, alloc);
     }
     const pixbuf = c.gtk_clipboard_wait_for_image(@ptrCast(@alignCast(cb))) orelse return null;
     defer c.g_object_unref(@ptrCast(pixbuf));
@@ -1723,7 +1754,7 @@ pub fn fileDialogOpenSync(
     c.gtk_file_dialog_open(fd, parent, null, @ptrCast(&onAsyncReady), @ptrCast(&w));
     w.wait();
     if (!w.done or w.result == null) return null;
-    defer c.g_object_unref(@ptrCast(w.result.?));
+    defer w.releaseResult();
     var err: ?*c.GError = null;
     const file = c.gtk_file_dialog_open_finish(fd, w.result, &err);
     if (err) |e| c.g_error_free(e);
@@ -1743,7 +1774,7 @@ pub fn fileDialogSaveSync(
     c.gtk_file_dialog_save(fd, parent, null, @ptrCast(&onAsyncReady), @ptrCast(&w));
     w.wait();
     if (!w.done or w.result == null) return null;
-    defer c.g_object_unref(@ptrCast(w.result.?));
+    defer w.releaseResult();
     var err: ?*c.GError = null;
     const file = c.gtk_file_dialog_save_finish(fd, w.result, &err);
     if (err) |e| c.g_error_free(e);
@@ -1762,7 +1793,7 @@ pub fn fileDialogSelectFolderSync(
     c.gtk_file_dialog_select_folder(fd, parent, null, @ptrCast(&onAsyncReady), @ptrCast(&w));
     w.wait();
     if (!w.done or w.result == null) return null;
-    defer c.g_object_unref(@ptrCast(w.result.?));
+    defer w.releaseResult();
     var err: ?*c.GError = null;
     const file = c.gtk_file_dialog_select_folder_finish(fd, w.result, &err);
     if (err) |e| c.g_error_free(e);
@@ -1782,7 +1813,7 @@ pub fn fileDialogOpenMultipleSync(
     c.gtk_file_dialog_open_multiple(fd, parent, null, @ptrCast(&onAsyncReady), @ptrCast(&w));
     w.wait();
     if (!w.done or w.result == null) return null;
-    defer c.g_object_unref(@ptrCast(w.result.?));
+    defer w.releaseResult();
     var err: ?*c.GError = null;
     const list = c.gtk_file_dialog_open_multiple_finish(fd, w.result, &err);
     if (err) |e| c.g_error_free(e);
@@ -2099,7 +2130,7 @@ pub fn scriptMessageJscValue(payload: ?*anyopaque) ?*anyopaque {
 }
 
 pub fn programmaticDragAvailable() bool {
-    return isGtk3();
+    return caps().programmatic_drag;
 }
 
 // ---------------------------------------------------------------------------
