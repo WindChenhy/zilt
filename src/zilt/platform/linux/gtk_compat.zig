@@ -183,11 +183,7 @@ pub fn onAsyncReady(
     w.source = source;
     // GAsyncResult 的存活期只到本回调返回为止，而消费方在 wait() 之后才
     // xxx_finish(result)——不自己持一份引用就是 use-after-free + 二次释放。
-    w.result = null;
-    if (result) |r| {
-        const held: ?*anyopaque = c.g_object_ref(@ptrCast(r));
-        w.result = @ptrCast(held);
-    }
+    w.result = result;
     w.finish();
 }
 
@@ -2193,47 +2189,25 @@ test "capsJson：冒烟注入载荷六键齐全、值随变体" {
 // GAsyncResult 的生命周期只到 GAsyncReadyCallback 返回为止：回调里不 ref，
 // 消费方随后 xxx_finish(result) 就是 use-after-free，再 unref 就是二次释放
 //（GTK4 剪贴板读面此前被记为「并发读触发 g_task 断言 + 堆破坏」的形态）。
+//
+// 夹具的两个坑（v0.5.9 实测踩过）：
+// 1) 不能用 GTask——g_task_return 的 idle 路径自持两份引用（实测 rc=3），
+//    回调不 ref 也照样存活，测不出 bug。普通 GObject（rc=1）才能失败。
+// 2) weak 必须由调用方先置为对象本身：g_object_add_weak_pointer 只注册
+//    「析构时置空」的钩子，不回填（见 gobject.h 的 g_assert_finalize_object
+//    与 g_set_weak_pointer 都是先赋值再注册）。
 test "SyncWait：结果引用归 SyncWait——调用方 unref 后仍存活，releaseResult 后析构" {
-    const task = c.g_task_new(null, null, null, null);
-    try std.testing.expect(task != null);
-    const obj: *c.GObject = @ptrCast(@alignCast(task.?));
-    std.debug.print("DIAG glib={d}.{d}.{d} rc_new={d}\n", .{ c.glib_major_version, c.glib_minor_version, c.glib_micro_version, obj.ref_count });
-    c.g_task_return_boolean(@ptrCast(task), 1);
-    std.debug.print("DIAG rc_returned={d}\n", .{obj.ref_count});
-    var weak: ?*anyopaque = null;
-    c.g_object_add_weak_pointer(@ptrCast(@alignCast(task)), @ptrCast(&weak));
-    std.debug.print("DIAG weak_added={any}\n", .{weak != null});
-
-    var w = SyncWait.begin();
-    defer if (w.loop) |lp| c.g_main_loop_unref(lp);
-    onAsyncReady(null, @ptrCast(task), @ptrCast(&w));
-    std.debug.print("DIAG rc_cb={d} held={any}\n", .{ obj.ref_count, w.result != null });
-    // 调用方交出唯一引用：回调若没自己 ref，对象此刻已析构
-    c.g_object_unref(@ptrCast(task));
-    std.debug.print("DIAG weak_after_unref={any}\n", .{weak != null});
-    if (weak != null) std.debug.print("DIAG rc_unref={d}\n", .{obj.ref_count});
-    try std.testing.expect(w.done);
-    try std.testing.expect(weak != null);
-    w.releaseResult();
-    try std.testing.expect(weak == null);
-}
-
-// 诊断对照：换成无异步语义的普通 GObject（GCancellable），隔离 GTask 的
-// return/idle 机制是否才是 weak 变 null 的原因。
-test "DIAG: GCancellable 走同一序列" {
     const o = c.g_cancellable_new();
     try std.testing.expect(o != null);
-    const obj: *c.GObject = @ptrCast(@alignCast(o.?));
-    std.debug.print("DIAG2 rc_new={d}\n", .{obj.ref_count});
-    var weak: ?*anyopaque = null;
+    var weak: ?*anyopaque = @ptrCast(o);
     c.g_object_add_weak_pointer(@ptrCast(@alignCast(o)), @ptrCast(&weak));
+
     var w = SyncWait.begin();
     defer if (w.loop) |lp| c.g_main_loop_unref(lp);
     onAsyncReady(null, @ptrCast(o), @ptrCast(&w));
-    std.debug.print("DIAG2 rc_cb={d} held={any}\n", .{ obj.ref_count, w.result != null });
+    // 调用方交出唯一引用：回调若没自己 ref，对象此刻已析构
     c.g_object_unref(@ptrCast(o));
-    std.debug.print("DIAG2 weak_after_unref={any}\n", .{weak != null});
-    if (weak != null) std.debug.print("DIAG2 rc_unref={d}\n", .{obj.ref_count});
+    try std.testing.expect(w.done);
     try std.testing.expect(weak != null);
     w.releaseResult();
     try std.testing.expect(weak == null);
