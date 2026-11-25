@@ -299,6 +299,22 @@ fn ewmhSetState(dpy: *c.Display, xwin: c.Window, prop: [*c]const u8, add: bool) 
     _ = c.XFlush(dpy);
 }
 
+/// EWMH _NET_ACTIVE_WINDOW：请求 WM 激活（并从图标化恢复）窗口。
+/// source=2（pager）绕过 focus-stealing 抑制——openbox 实测对 iconified
+/// 窗口的 XMapRequest 只重排位置、不取消图标化，激活消息才走 deiconify。
+fn ewmhActivate(dpy: *c.Display, xwin: c.Window) void {
+    var ev: c.XEvent = std.mem.zeroes(c.XEvent);
+    ev.xclient.type = c.ClientMessage;
+    ev.xclient.window = xwin;
+    ev.xclient.message_type = internAtom(dpy, "_NET_ACTIVE_WINDOW");
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = 2; // source indication: pager
+    ev.xclient.data.l[1] = 0; // timestamp（0 = 当前）
+    ev.xclient.data.l[2] = 0; // currently active window
+    _ = c.XSendEvent(dpy, rootWindowOf(dpy), c.False, c.SubstructureRedirectMask | c.SubstructureNotifyMask, &ev);
+    _ = c.XFlush(dpy);
+}
+
 // ---------------------------------------------------------------------------
 // 窗口几何 / 状态面（gtk_window_move/resize/get_size/get_position、
 // keep_above/below、iconify/stick/skip_taskbar/accept_focus、
@@ -420,7 +436,7 @@ pub fn setIconic(win: [*c]c.GtkWindow, iconic: bool) void {
         // 未映射失败）。ICCCM 的恢复手势是直接 MapRequest → 先 XMapRaised。
         if (x11Of(@ptrCast(win))) |x11| {
             _ = c.XMapRaised(x11.dpy, x11.xwin);
-            _ = c.XFlush(x11.dpy);
+            ewmhActivate(x11.dpy, x11.xwin);
             return;
         }
         c.gtk_window_present(win);
@@ -1453,7 +1469,8 @@ fn clipboardReadBytes(cb: ?*anyopaque, mime: [:0]const u8, alloc: std.mem.Alloca
     const bytes = c.g_input_stream_read_bytes(stream, 1 << 20, null, &err);
     if (err) |e| c.g_error_free(e);
     if (bytes == null) return null;
-    defer c.g_object_unref(@ptrCast(bytes));
+    // GBytes 不是 GObject（同一类 ABI 误用：g_object_unref 会 GPF）
+    defer c.g_bytes_unref(bytes);
     var size: c.gsize = 0;
     const raw_data = c.g_bytes_get_data(bytes, &size) orelse return null;
     if (size == 0) return null;
@@ -1534,7 +1551,6 @@ pub fn clipboardWriteImage(cb: ?*anyopaque, rgba: []const u8, width: u32, height
         if (width == 0 or height == 0 or rgba.len != @as(usize, width) * height * 4) return false;
         // 非预乘 → 预乘（GDK_MEMORY_R8G8B8A8_PREMULTIPLIED）
         const src = std.heap.c_allocator.dupe(u8, rgba) catch return false;
-        defer std.heap.c_allocator.free(src);
         for (0..@as(usize, width) * height) |i| {
             const px = src[i * 4 ..][0..4];
             const a = px[3];
@@ -1544,10 +1560,11 @@ pub fn clipboardWriteImage(cb: ?*anyopaque, rgba: []const u8, width: u32, height
                 px[2] = @intCast((@as(u32, px[2]) * a + 127) / 255);
             }
         }
+        // g_bytes_new_take 接管 src 内存：不能再 free src，也不能用
+        // g_object_unref 释放 GBytes（会 GPF + 同时留下悬垂像素）
         const bytes = c.g_bytes_new_take(src.ptr, src.len);
-        // g_bytes 接管 src 内存 → 不再 free
+        defer c.g_bytes_unref(bytes);
         const texture = c.gdk_memory_texture_new(@intCast(width), @intCast(height), c.GDK_MEMORY_R8G8B8A8_PREMULTIPLIED, bytes, @intCast(width * 4));
-        c.g_object_unref(@ptrCast(bytes));
         defer c.g_object_unref(@ptrCast(texture));
         c.gdk_clipboard_set_texture(clip, texture);
         clipboardStore(cb);
