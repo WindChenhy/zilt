@@ -2256,13 +2256,11 @@ test "caps：GTK3 全能力；GTK4 六面降级、剪贴板读两栈都在" {
     try std.testing.expect(cp.clipboard_read);
 }
 
-test "capsJson：冒烟注入载荷七键齐全、值随变体" {
+test "capsJson：冒烟注入载荷字段齐全（按 Caps 反射，防漂移）" {
     var buf: [256]u8 = undefined;
     const s = capsJson(&buf) orelse return error.BufferTooSmall;
-    inline for (.{
-        "tray", "menu_bar", "programmatic_drag", "cursor_grab", "cookie_clear_by_domain", "clipboard_read", "screenshot", "hide_show",
-    }) |k| {
-        try std.testing.expect(std.mem.indexOf(u8, s, "\"" ++ k ++ "\":") != null);
+    inline for (std.meta.fields(Caps)) |f| {
+        try std.testing.expect(std.mem.indexOf(u8, s, "\"" ++ f.name ++ "\":") != null);
     }
     const tray_lit = if (isGtk3()) "\"tray\":true" else "\"tray\":false";
     try std.testing.expect(std.mem.indexOf(u8, s, tray_lit) != null);
