@@ -197,7 +197,13 @@ run_body() {
     fi
   fi
 
-  if [ "$FAIL" = 0 ]; then echo "APPIMAGE_E2E=PASS"; else echo "APPIMAGE_E2E=FAIL"; fi
+  if [ "$FAIL" = 0 ]; then
+    echo "APPIMAGE_E2E=PASS"
+    return 0
+  else
+    echo "APPIMAGE_E2E=FAIL"
+    return 1
+  fi
 }
 
 set +e
@@ -207,5 +213,7 @@ set -e
 
 grep -a 'BUILD=\|APPDIR_BYTES\|RUNTIME=\|APPIMAGE_BYTES\|EXTRACTED=\|SANDBOX=\|SANDBOX_SUPPORT\|SANDBOX_SAMPLES\|SANDBOX_ACTIVE\|MASK_COUNT\|SMOKE\[\|ONLY_KNOWN\|KNOWN_FAIL\|NEW_FAIL\|BUNDLED_\|BUNDLE_NOT_USED\|APPIMAGE_E2E=\|MISSING' "$LOG" || true
 if [ "$rc" = 3 ]; then exit 3; fi
-grep -aq 'APPIMAGE_E2E=PASS' "$LOG" && exit 0
+# 以 run_body 的返回值为准（日志 grep 只用于展示；此前 grep 与 rc 双轨，
+# 出现过「打印 PASS 但脚本 exit 1」的假红）。
+if [ "$rc" = 0 ]; then exit 0; fi
 exit 1
