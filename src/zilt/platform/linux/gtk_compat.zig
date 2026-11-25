@@ -77,6 +77,10 @@ pub const Caps = struct {
     cookie_clear_by_domain: bool,
     clipboard_read: bool,
     screenshot: bool,
+    /// GTK3 + openbox/Xvfb：hide 的 focus-out 之后 GDK 会 QueryTree 旧焦点
+    /// frame，WM 已重配时直接 BadWindow abort（连跑三次复现；清焦点/等待
+    /// 均无效）。可见性往返只在 GTK4 冒烟断言，GTK3 由 destroy/close 覆盖。
+    hide_show: bool,
 };
 
 pub fn caps() Caps {
@@ -91,6 +95,7 @@ pub fn caps() Caps {
         // llvmpipe）下 webkit_web_view_get_snapshot 稳定返回
         // FAILED_TO_CREATE —— 冒烟按已知环境差异显式 skip，真机待验。
         .screenshot = isGtk3(),
+        .hide_show = isGtk4(),
     };
 }
 
@@ -104,7 +109,7 @@ pub fn capsJson(buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(
         buf,
         "{{\"tray\":{s},\"menu_bar\":{s},\"programmatic_drag\":{s},\"cursor_grab\":{s}," ++
-            "\"cookie_clear_by_domain\":{s},\"clipboard_read\":{s},\"screenshot\":{s}}}",
+            "\"cookie_clear_by_domain\":{s},\"clipboard_read\":{s},\"screenshot\":{s},\"hide_show\":{s}}}",
         .{
             boolStr(cp.tray),
             boolStr(cp.menu_bar),
@@ -113,6 +118,7 @@ pub fn capsJson(buf: []u8) ?[]const u8 {
             boolStr(cp.cookie_clear_by_domain),
             boolStr(cp.clipboard_read),
             boolStr(cp.screenshot),
+            boolStr(cp.hide_show),
         },
     ) catch null;
 }
@@ -2246,6 +2252,7 @@ test "caps：GTK3 全能力；GTK4 六面降级、剪贴板读两栈都在" {
     try std.testing.expectEqual(full, cp.cursor_grab);
     try std.testing.expectEqual(full, cp.cookie_clear_by_domain);
     try std.testing.expectEqual(full, cp.screenshot);
+    try std.testing.expectEqual(!full, cp.hide_show);
     try std.testing.expect(cp.clipboard_read);
 }
 
@@ -2253,7 +2260,7 @@ test "capsJson：冒烟注入载荷七键齐全、值随变体" {
     var buf: [256]u8 = undefined;
     const s = capsJson(&buf) orelse return error.BufferTooSmall;
     inline for (.{
-        "tray", "menu_bar", "programmatic_drag", "cursor_grab", "cookie_clear_by_domain", "clipboard_read", "screenshot",
+        "tray", "menu_bar", "programmatic_drag", "cursor_grab", "cookie_clear_by_domain", "clipboard_read", "screenshot", "hide_show",
     }) |k| {
         try std.testing.expect(std.mem.indexOf(u8, s, "\"" ++ k ++ "\":") != null);
     }
