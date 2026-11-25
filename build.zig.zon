@@ -1,6 +1,6 @@
 .{
     .name = .zilt,
-    .version = "0.5.9",
+    .version = "0.5.10",
     .fingerprint = 0xfce0fec5d615a840, // zig build 校验值（首次构建生成）
     .minimum_zig_version = "0.17.1",
     .paths = .{

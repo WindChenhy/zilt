@@ -24,9 +24,22 @@ v0.4.0（H6–H11 / H20 / L2 / L7 / L8 双平台小项收尾）。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
-| Windows | ✅ 全栈（v0.1.0–v0.4.3） | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
-| Linux | ✅ 全栈（v0.2.0–v0.4.3，冒烟 95 项） | GTK3 + WebKit2GTK 4.1；`-Dgtk=gtk4` 构建变体 |
-| macOS | 🚧 集成与外观 + WebView 深度（v0.4.8）：多窗口 + 窗口控制 + 标题栏三态/透明 + 材质/主题/Dock + 菜单/托盘/对话框/剪贴板/通知/深链/单实例/热键 + `zilt://` 资产 + IPC 往返；分发与对等打磨见 v0.4.9–v0.4.10 | WKWebView（手写 ObjC 消息，无 `@cImport`） |
+| Windows | ✅ 全栈（v0.1.0–v0.5.9） | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
+| Linux | ✅ 全栈（v0.2.0–v0.5.9，冒烟 95 项） | GTK3 默认 + WebKit2GTK 4.1；`-Dgtk=gtk4` 变体（GTK4 + WebKitGTK 6.0，v0.5.9 起双栈 CI 同跑单测 + 冒烟） |
+| macOS | ✅ 对等收口（v0.4.4–v0.5.8）：主链 + 菜单/托盘/对话框/剪贴板/通知/深链/单实例/热键 + 分发（.app/DMG/codesign/公证/Universal）+ Keychain + 更新器 + 系统信息/Shell/电源/主题 | WKWebView（手写 ObjC 消息，无 `@cImport`） |
+
+**Linux GTK4 变体能力面（v0.5.9 双栈 CI 实测）**
+
+| 能力 | GTK3 | GTK4 | 说明 |
+|---|---|---|---|
+| 窗口/多窗口/WebView/IPC/fs/http/ws | ✅ | ✅ | 单测 + 冒烟 95 项同跑 |
+| 剪贴板读（text/html/files/image） | ✅ | ✅ | v0.5.9 接通 GdkClipboard 异步读面（结果引用归 SyncWait） |
+| 截图 `captureScreenshot` | ✅ | ⚠️ | GTK4 走 GdkTexture 渲染面；Xvfb/无合成器下 WebKit 返回 `FAILED_TO_CREATE`，冒烟显式 skip，真机待验 |
+| 托盘挂窗 / 菜单栏 | ✅ | ❌ | GTK4 下 ayatana 仍是 GTK3 链接；menu bar 4.x 移除（降级为无托盘/无菜单） |
+| 脚本拖拽 / 指针抓取 | ✅ | ❌ | GDK4 移除 `gdk_seat_grab` 与 drag 面；降级返回 `false` / `DragNotAvailable` |
+| 按域清 cookie | ✅ | ❌ | WebKitGTK 6.0 无 `delete_cookies_for_domain`；明确报错而非静默成功 |
+| 文件对话框 | ✅ | ✅ | GTK4 走 `GtkFileDialog` + xdg-desktop-portal（依赖发行版 portal） |
+
 
 Windows 能力面（截至 v0.4.3）：窗口/多窗口/覆盖式标题栏/窗口形状 mask/每按钮状态/失焦与 Escape 隐藏/
 窗口级 KeyBindings、WebView2 事件面与 Settings（含 printToPdf、加速键与手势开关）、IPC + 事件 + 流式 channel
@@ -39,7 +52,10 @@ fs（scope/watch/流式）、SQL、store（可选 DPAPI 加密）、http（WinHT
 Linux 复用同一 JS API 面，差异逐版本以「文档化」条目记录（无 SharedBuffer → evaluate 通道、无 PDF 导出 →
 `PdfNotSupported` 等）。
 
-## 能力索引（v0.4.4）
+## 能力索引（v0.5.9）
+
+> 本表聚焦 Windows / Linux（GTK3 默认）共有的 JS API 面；macOS 能力面见上表平台行与
+> v0.4.4–v0.5.8 版本记录，GTK4 变体的降级项见上方「Linux GTK4 变体能力面」。
 
 | 能力组 | 主要入口 | Windows | Linux |
 |---|---|---|---|
