@@ -359,8 +359,17 @@ pub fn windowGetPosition(win: [*c]c.GtkWindow, x: *c_int, y: *c_int) void {
             var child: c.Window = 0;
             var rx: c_int = 0;
             var ry: c_int = 0;
-            // 对根窗口平移 (0,0) → 返回的即根坐标
+            // 对根窗口平移 (0,0) → 返回的即根坐标（客户区原点）
             _ = c.XTranslateCoordinates(x11.dpy, x11.xwin, rootWindowOf(x11.dpy), 0, 0, &rx, &ry, &child);
+            // GTK3 gtk_window_get_position 报的是含装饰的外框原点；GTK4 的
+            // XTranslateCoordinates 只给客户区原点（实测 openbox 下差 +1,+20）。
+            // 用 _NET_FRAME_EXTENTS 折回外框坐标，两栈语义才一致（setPosition
+            // 的 gtk_window_move 同样是外框坐标）。
+            var ext: c.GdkRectangle = std.mem.zeroes(c.GdkRectangle);
+            if (frameExtents(@ptrCast(win), &ext)) {
+                rx += ext.x;
+                ry += ext.y;
+            }
             x.* = rx;
             y.* = ry;
             return;
@@ -955,7 +964,8 @@ pub fn blankCursorFor(widget: [*c]c.GtkWidget) ?*anyopaque {
         const display = c.gtk_widget_get_display(widget) orelse return null;
         var pixels = [_]u8{ 0, 0, 0, 0 };
         const bytes = c.g_bytes_new_static(&pixels, pixels.len) orelse return null;
-        defer c.g_object_unref(@ptrCast(bytes));
+        // GBytes 不是 GObject：g_object_unref 只会打 critical 并泄漏
+        defer c.g_bytes_unref(bytes);
         const texture = c.gdk_memory_texture_new(1, 1, c.GDK_MEMORY_R8G8B8A8, bytes, 4) orelse return null;
         defer c.g_object_unref(@ptrCast(texture));
         _ = display;

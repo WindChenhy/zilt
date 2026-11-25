@@ -1453,12 +1453,14 @@ fn Backend(comptime config: Config) type {
             self.windows.deinit(self.allocator);
             for (self.partitions.items) |pe| {
                 c.g_object_unref(@ptrCast(pe.ctx));
+                if (pe.session) |s| c.g_object_unref(@ptrCast(s));
                 self.allocator.free(pe.name);
             }
             self.partitions.deinit(self.allocator);
             // v0.2.7：per-window 代理 context（生命周期同 partitions）
             for (self.proxy_ctxs.items) |pe| {
                 c.g_object_unref(@ptrCast(pe.ctx));
+                if (pe.session) |s| c.g_object_unref(@ptrCast(s));
                 self.allocator.free(pe.proxy);
             }
             self.proxy_ctxs.deinit(self.allocator);
@@ -1684,7 +1686,11 @@ fn Backend(comptime config: Config) type {
                 gtk_compat.networkSessionNew(dir_z.ptr, dir_z.ptr)
             else
                 null;
-            defer if (session) |s| c.g_object_unref(@ptrCast(s));
+            // 初始引用归分区表所有（create 的 rc=1 直接转交）。此前这里 defer
+            // unref 再在调用方补 ref——函数返回时 session 已析构，调用方 ref 的是
+            // 悬垂指针：GTK4 冒烟实测 g_object_ref 断言 + g_object_new 收到
+            // invalid unclassed object（WebKitNetworkSession），随后 SIGABRT。
+            errdefer if (session) |s| c.g_object_unref(@ptrCast(s));
             const mgr = if (comptime gtk_compat.isGtk3())
                 gtk_compat.websiteDataManagerNew(dir_z.ptr)
             else
@@ -1700,7 +1706,7 @@ fn Backend(comptime config: Config) type {
                 _ = c.g_signal_connect_data(ctx, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
             }
             log.print("[webviews] partition '{s}' context created ({s})", .{ name, dir });
-            // 注册表持引用（session 单独 ref；ctx 引用归表）
+            // 注册表持引用（session 初始引用 + ctx 引用都归表）
             return .{ .ctx = ctx, .session = session };
         }
 
@@ -3187,9 +3193,11 @@ fn Backend(comptime config: Config) type {
             const cb = gtkClipboard() orelse return error.ClipboardNotAvailable;
             if (comptime gtk_compat.isGtk4()) {
                 const data_g = c.g_bytes_new(bytes.ptr, bytes.len) orelse return error.ClipboardWriteFailed;
-                defer c.g_object_unref(@ptrCast(data_g));
+                defer c.g_bytes_unref(data_g);
                 const text_g = c.g_bytes_new(bytes.ptr, bytes.len) orelse return error.ClipboardWriteFailed;
-                defer c.g_object_unref(@ptrCast(text_g));
+                // GBytes 是 refcount 但不是 GObject——g_object_unref 会走
+                // invalid unclassed object（GTK4 冒烟实测 GPF/SIGABRT）。
+                defer c.g_bytes_unref(text_g);
                 const p_mime = c.gdk_content_provider_new_for_bytes(mime.ptr, data_g) orelse return error.ClipboardWriteFailed;
                 const p_text = c.gdk_content_provider_new_for_bytes("text/plain;charset=utf-8", text_g) orelse return error.ClipboardWriteFailed;
                 var providers = [_][*c]c.GdkContentProvider{ @ptrCast(p_mime), @ptrCast(p_text) };
@@ -5564,9 +5572,10 @@ fn Backend(comptime config: Config) type {
                             log.print("[webviews] child #{d} reuse partition '{s}'", .{ id, pname });
                         } else {
                             pieces = try self.createPartitionContext(pname);
-                            // 注册失败要释放刚建的 context（OOM 路径不留悬挂引用）
+                            // 注册失败要释放刚建的 context/session（OOM 路径不留悬挂引用）
                             const name_copy = self.allocator.dupe(u8, pname) catch |dup_err| {
                                 c.g_object_unref(@ptrCast(pieces.?.ctx));
+                                if (pieces.?.session) |s| c.g_object_unref(@ptrCast(s));
                                 return dup_err;
                             };
                             self.partitions.append(self.allocator, .{
@@ -5576,11 +5585,9 @@ fn Backend(comptime config: Config) type {
                             }) catch |append_err| {
                                 self.allocator.free(name_copy);
                                 c.g_object_unref(@ptrCast(pieces.?.ctx));
+                                if (pieces.?.session) |s| c.g_object_unref(@ptrCast(s));
                                 return append_err;
                             };
-                            if (pieces.?.session) |s| {
-                                _ = c.g_object_ref(@ptrCast(s));
-                            }
                         }
                     }
 
@@ -6515,7 +6522,12 @@ fn Backend(comptime config: Config) type {
                 gtk_compat.networkSessionNew(dir_z.ptr, dir_z.ptr)
             else
                 null;
-            defer if (session) |s| c.g_object_unref(@ptrCast(s));
+            // 与分区表同规则：成功登记后初始引用转交 ProxyEntry；失败路径
+            // （ctx 为空 / dupe / append）由 defer 释放，不留悬垂引用。
+            var session_owned = true;
+            defer if (session_owned) {
+                if (session) |s| c.g_object_unref(@ptrCast(s));
+            };
             const mgr = if (comptime gtk_compat.isGtk3())
                 gtk_compat.websiteDataManagerNew(dir_z.ptr)
             else
@@ -6550,9 +6562,7 @@ fn Backend(comptime config: Config) type {
                 c.g_object_unref(@ptrCast(ctx));
                 return null;
             };
-            if (session) |s| {
-                _ = c.g_object_ref(@ptrCast(s));
-            }
+            session_owned = false;
             log.print("[proxy] webview context ready ({s}, dir={s})", .{ proxy, dir });
             return .{ .ctx = ctx, .session = session };
         }
