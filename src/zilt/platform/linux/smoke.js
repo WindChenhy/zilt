@@ -194,17 +194,25 @@ function runSecondWindowProbe() {
     s = await state();
     check('win.sensitive', disOk && focOk && s.enabled === true && s.focusable === true, `dis=${disOk} foc=${focOk}`);
 
-    // hide/show：可见性往返
-    // 前一拍的 setEnabled/setFocusable 会触发 WM 焦点迁移；立即 hide 在
-    // openbox 下偶发 BadWindow（X 异步请求落到已重配的窗口）。等焦点落定。
-    await wait(150);
-    await W.hide();
-    await wait(50);
-    const hidOk = (await state()).visible === false;
-    await W.show();
-    await wait(50);
-    const showOk = (await state()).visible === true;
-    check('win.vis', hidOk && showOk, `hide=${hidOk} show=${showOk}`);
+    // hide/show：可见性往返。用独立探针窗口测——主窗口在 GTK3+openbox 下
+    // hide 会偶发 GDK BadWindow（XQueryTree 打到 WM 刚重配的 frame），
+    // 探针窗口也能覆盖 window_id 定向路径。
+    try {
+      const vw = await W.create({
+        title: 'vis probe', width: 220, height: 160,
+        label: 'smoke-vis-' + Date.now(), url: 'about:blank',
+      });
+      const vid = vw && vw.id;
+      await wait(150);
+      await W.hide(vid);
+      await wait(80);
+      const hidOk = (await W.state(vid)).visible === false;
+      await W.show(vid);
+      await wait(80);
+      const showOk = (await W.state(vid)).visible === true;
+      await W.close(vid).catch(() => {});
+      check('win.vis', hidOk && showOk, `hide=${hidOk} show=${showOk}`);
+    } catch (e) { check('win.vis', false, String(e.message || e)); }
 
     // minimize/maximize/restore/startDragging：Xvfb 无 WM，只验证命令被接受不崩
     const rMin = await W.minimize();
