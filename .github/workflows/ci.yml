@@ -60,6 +60,15 @@ jobs:
           # 冒烟有 5 项依赖本机 echo 服务（ws/wss/上传/断点续传）；此前 Windows
           # job 从未启动它们——这 5 项必然为 false，冒烟永远不可能全绿。
           $servers = @()
+          # scripts/dev-cert.pem 是本地开发证书（.gitignore）——CI 上没有，
+          # 8766 的 TLS echo 会直接退出。现场生成一天期自签证书。
+          $openssl = (Get-Command openssl -ErrorAction SilentlyContinue).Source
+          if (-not $openssl) { $openssl = "C:\Program Files\Git\usr\bin\openssl.exe" }
+          if (-not (Test-Path $openssl)) { throw "openssl not found (needed for wss echo cert)" }
+          & $openssl req -x509 -newkey rsa:2048 -nodes `
+              -keyout scripts/dev-key.pem -out scripts/dev-cert.pem `
+              -days 1 -subj "/CN=127.0.0.1" 2>$null
+          if ($LASTEXITCODE -ne 0) { throw "openssl cert generation failed" }
           $env:ZILT_WS_TLS = "1"
           $servers += Start-Process python -ArgumentList "scripts/ws_echo.py","8766" -PassThru -WindowStyle Hidden
           Remove-Item Env:ZILT_WS_TLS
@@ -214,7 +223,11 @@ jobs:
             # 已知 CI 环境差异（本机 WSL 95/95；CI runner 无桌面会话/xdg-open 处理器）：
             # deeplink.startup —— pending_launch 未送达前端（CI 45025651776 取证：
             #   "[command-line] 1 args" 与 "[deep-link] launch" 都有，前端 got=null）
-            failed=$(grep -a -o 'failed: [^)]*' zilt.log | tail -1 | sed 's/failed: //' | tr ',' '\n' | tr -d ' ' | sed '/^$/d')
+            # 只认 [linux-smoke] 汇总行括号里的 failed 列表。
+            # 不能用 `grep 'failed: [^)]*' | tail -1`——日志里还有
+            # `[ipc] … failed: UnknownCommand` 之类的行，末行未必是汇总。
+            summary=$(grep -a "\[linux-smoke\]" zilt.log | tail -1)
+            failed=$(printf '%s' "$summary" | sed -n 's/.*failed: \(.*\))/\1/p' | tr ',' '\n' | tr -d ' ' | sed '/^$/d')
             echo "smoke failures: $(printf '%s' "$failed" | tr '\n' ',')"
             new_fail=$(printf '%s\n' "$failed" | grep -vx 'deeplink.startup' | sed '/^$/d' || true)
             if [ -n "$failed" ] && [ -z "$new_fail" ]; then

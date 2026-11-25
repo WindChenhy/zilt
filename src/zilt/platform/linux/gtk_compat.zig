@@ -414,6 +414,15 @@ pub fn setIconic(win: [*c]c.GtkWindow, iconic: bool) void {
             }
             return;
         }
+        // 恢复：XIconifyWindow 绕过了 GTK 状态，GTK 仍认为窗口 mapped，
+        // gtk_window_present 因此不会发 deiconify（实测 GTK4 冒烟里窗口
+        // 留在 openbox 的图标停放点 -620,-380：位置断言错、快照也因窗口
+        // 未映射失败）。ICCCM 的恢复手势是直接 MapRequest → 先 XMapRaised。
+        if (x11Of(@ptrCast(win))) |x11| {
+            _ = c.XMapRaised(x11.dpy, x11.xwin);
+            _ = c.XFlush(x11.dpy);
+            return;
+        }
         c.gtk_window_present(win);
         return;
     }
@@ -1424,7 +1433,11 @@ pub fn clipboardReadUriList(cb: ?*anyopaque, alloc: std.mem.Allocator) ?[]u8 {
 /// GDK4 read_async → GInputStream → 全量字节。
 fn clipboardReadBytes(cb: ?*anyopaque, mime: [:0]const u8, alloc: std.mem.Allocator) ?[]u8 {
     const clip: ?*c.GdkClipboard = @ptrCast(@alignCast(cb));
-    var mimes = [_:null]?[*c]const u8{ mime.ptr, null };
+    // 注意：元素类型必须是 [*c]const u8 而不是 ?[*c]const u8——Zig 的
+    // 可选 C 指针是 16 字节（nullable 包 nullable），C 侧按 8 字节 char*
+    // 读会把第二项当指针 → g_strdupv GPF（GTK4 冒烟实测 SIGABRT）。
+    // [*c] 本身可空，直接放 null 即 NULL 终止。
+    var mimes = [2][*c]const u8{ mime.ptr, null };
     var w = SyncWait.begin();
     c.gdk_clipboard_read_async(clip, @as([*c][*c]const u8, @ptrCast(&mimes)), 0, null, @ptrCast(&onAsyncReady), @ptrCast(&w));
     w.wait();

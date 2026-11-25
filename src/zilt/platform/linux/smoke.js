@@ -369,6 +369,9 @@ function runSecondWindowProbe() {
       label: 'smoke-state-b',
       stateKey: key,
     });
+    // GTK4 的恢复 move 在 map 回调里补发（X11 请求异步）——立即查会读到
+    // WM 的初始落点（实测 58,430），等一拍再取。
+    await wait(300);
     const restored = second && second.id ? await W.state(second.id) : null;
     // v0.3.0：有 WM 时窗口位置受 frame/gravity 影响（实测 openbox 加了标题栏高度），
     // 位置留 32px 容差（默认落点是居中，与 70,50 差得远）；尺寸仍须精确。

@@ -5393,10 +5393,12 @@ fn Backend(comptime config: Config) type {
                 var tex_err: [*c]c.GError = null;
                 const texture = c.webkit_web_view_get_snapshot_finish(view, res, &tex_err);
                 if (tex_err != null or texture == null) {
+                    // GError 的 message 在 free 后失效——先打日志/回传，再释放
                     const message = if (tex_err != null) std.mem.span(tex_err.*.message) else "snapshot failed";
+                    log.print("[snapshot] failed (gtk4): {s}", .{message});
+                    self.emitCdpError(task.win_id, task.rid, message);
                     if (tex_err != null) c.g_error_free(tex_err);
-                    log.print("[snapshot] failed: {s}", .{message});
-                    return self.emitCdpError(task.win_id, task.rid, message);
+                    return;
                 }
                 defer c.g_object_unref(@ptrCast(texture));
                 const bytes = c.gdk_texture_save_to_png_bytes(texture) orelse {
@@ -5410,10 +5412,12 @@ fn Backend(comptime config: Config) type {
                 var surf_err: [*c]c.GError = null;
                 const surface = c.webkit_web_view_get_snapshot_finish(view, res, &surf_err);
                 if (surf_err != null or surface == null) {
+                    // 同上：先消费 message 再 free
                     const message = if (surf_err != null) std.mem.span(surf_err.*.message) else "snapshot failed";
+                    log.print("[snapshot] failed (gtk3): {s}", .{message});
+                    self.emitCdpError(task.win_id, task.rid, message);
                     if (surf_err != null) c.g_error_free(surf_err);
-                    log.print("[snapshot] failed: {s}", .{message});
-                    return self.emitCdpError(task.win_id, task.rid, message);
+                    return;
                 }
                 defer c.cairo_surface_destroy(surface);
                 const sw = c.cairo_image_surface_get_width(surface);
