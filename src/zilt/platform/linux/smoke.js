@@ -1028,8 +1028,10 @@ function runSecondWindowProbe() {
     if (wired && wired.wm) {
       const W = Z().window;
       const state = async () => await W.state();
-      // 先确保窗口 mapped：前面 minimize/restore 的 X 请求是异步的，
-      // 未映射窗口上的 move 会被 GDK 缓存/忽略（GTK4 实测 state 停在 0,0）。
+      // 先确保窗口是普通映射态：前面 minimize/maximize 都是异步 X 请求，
+      // 未映射/最大化窗口上的 move/resize 会被忽略（GTK3 实测 1280x781）。
+      await W.restore();
+      await wait(250);
       await W.show();
       await wait(200);
       // 移动/缩放：先记录事件，再用 state() 校验几何（见下方 frame 偏移说明）

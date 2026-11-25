@@ -2544,11 +2544,15 @@ fn Backend(comptime config: Config) type {
                 .maximize => c.gtk_window_maximize(win),
                 .restore => {
                     // 全屏 → 最大化 → 最小化，逐层退出（与 Windows restore 语义对齐）
+                    // 一律发 unmaximize/unfullscreen：WM 的 maximize 是异步的，
+                    // `gtk_window_is_maximized` 在请求刚发出时仍为 false——按状态
+                    // 判断会漏掉取消，窗口留在最大化（GTK3 冒烟 wm.events 实测
+                    // 1280x781 + setPosition/setSize 全部失效）。
                     if (st.fullscreen) {
                         c.gtk_window_unfullscreen(win);
                         st.fullscreen = false;
                     }
-                    if (c.gtk_window_is_maximized(win) != 0) c.gtk_window_unmaximize(win);
+                    c.gtk_window_unmaximize(win);
                     gtk_compat.setIconic(win, false);
                 },
                 .fullscreen => |on| {
