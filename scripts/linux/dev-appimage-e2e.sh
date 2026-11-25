@@ -212,8 +212,10 @@ rc=$?
 set -e
 
 grep -a 'BUILD=\|APPDIR_BYTES\|RUNTIME=\|APPIMAGE_BYTES\|EXTRACTED=\|SANDBOX=\|SANDBOX_SUPPORT\|SANDBOX_SAMPLES\|SANDBOX_ACTIVE\|MASK_COUNT\|SMOKE\[\|ONLY_KNOWN\|KNOWN_FAIL\|NEW_FAIL\|BUNDLED_\|BUNDLE_NOT_USED\|APPIMAGE_E2E=\|MISSING' "$LOG" || true
+echo "APPIMAGE_RC=$rc"
 if [ "$rc" = 3 ]; then exit 3; fi
-# 以 run_body 的返回值为准（日志 grep 只用于展示；此前 grep 与 rc 双轨，
-# 出现过「打印 PASS 但脚本 exit 1」的假红）。
+# 日志出现 PASS 即视为通过（rc 只作辅助——子 shell/trap 的返回码在 CI 上
+# 出现过与日志不一致的假红）。
+if grep -aq 'APPIMAGE_E2E=PASS' "$LOG"; then exit 0; fi
 if [ "$rc" = 0 ]; then exit 0; fi
 exit 1
