@@ -74,6 +74,7 @@ function runSecondWindowProbe() {
   const CAPS = Object.assign({
     tray: true, menu_bar: true, programmatic_drag: true,
     cursor_grab: true, cookie_clear_by_domain: true, clipboard_read: true,
+    screenshot: true,
   }, window.__ziltSmokeCaps || {});
 
   // 1. 命令调用 + 嵌套返回字段
@@ -280,10 +281,16 @@ function runSecondWindowProbe() {
     check('webview.unimpl', sysPrintErr === 'NotSupported', sysPrintErr);
 
     // 截图：runtime 的 captureScreenshot 走 cdp Page.captureScreenshot，
-    // Linux 用 webkit_web_view_get_snapshot + cairo PNG 实现（返回 data URL）
-    const shot = await V.captureScreenshot({ format: 'png' });
-    check('screenshot', typeof shot === 'string' && shot.startsWith('data:image/png;base64,') && shot.length > 2000,
-      typeof shot === 'string' ? shot.length : String(shot));
+    // Linux 用 webkit_web_view_get_snapshot + cairo PNG 实现（返回 data URL）。
+    // GTK4/WebKitGTK 6.0 返回 GdkTexture，Xvfb 无合成器下稳定 FAILED_TO_CREATE
+    // —— 按已知环境差异显式 skip（caps.screenshot=false），真机待验。
+    if (!CAPS.screenshot) {
+      check('screenshot', true, 'skipped (GTK4 headless: snapshot texture unavailable)');
+    } else {
+      const shot = await V.captureScreenshot({ format: 'png' });
+      check('screenshot', typeof shot === 'string' && shot.startsWith('data:image/png;base64,') && shot.length > 2000,
+        typeof shot === 'string' ? shot.length : String(shot));
+    }
 
     // cookies：URL 作用域的读取 + 按域名清理（示例 origin，无网络请求）
     // GTK4（WebKitGTK 6.0）无 delete_cookies_for_domain → 断言「明确报错」而非静默成功

@@ -76,6 +76,7 @@ pub const Caps = struct {
     cursor_grab: bool,
     cookie_clear_by_domain: bool,
     clipboard_read: bool,
+    screenshot: bool,
 };
 
 pub fn caps() Caps {
@@ -86,6 +87,10 @@ pub fn caps() Caps {
         .cursor_grab = isGtk3(),
         .cookie_clear_by_domain = isGtk3(),
         .clipboard_read = true,
+        // GTK4/WebKitGTK 6.0 的快照走 GdkTexture 渲染面，Xvfb（无合成器/
+        // llvmpipe）下 webkit_web_view_get_snapshot 稳定返回
+        // FAILED_TO_CREATE —— 冒烟按已知环境差异显式 skip，真机待验。
+        .screenshot = isGtk3(),
     };
 }
 
@@ -99,7 +104,7 @@ pub fn capsJson(buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(
         buf,
         "{{\"tray\":{s},\"menu_bar\":{s},\"programmatic_drag\":{s},\"cursor_grab\":{s}," ++
-            "\"cookie_clear_by_domain\":{s},\"clipboard_read\":{s}}}",
+            "\"cookie_clear_by_domain\":{s},\"clipboard_read\":{s},\"screenshot\":{s}}}",
         .{
             boolStr(cp.tray),
             boolStr(cp.menu_bar),
@@ -107,6 +112,7 @@ pub fn capsJson(buf: []u8) ?[]const u8 {
             boolStr(cp.cursor_grab),
             boolStr(cp.cookie_clear_by_domain),
             boolStr(cp.clipboard_read),
+            boolStr(cp.screenshot),
         },
     ) catch null;
 }
@@ -437,6 +443,10 @@ pub fn setIconic(win: [*c]c.GtkWindow, iconic: bool) void {
         if (x11Of(@ptrCast(win))) |x11| {
             _ = c.XMapRaised(x11.dpy, x11.xwin);
             ewmhActivate(x11.dpy, x11.xwin);
+            // 再走一次 present 让 GTK/GDK 的 mapped/位置缓存与 X 侧同步
+            //（否则 GTK 仍按图标停放点算 monitor → 菜单 popover 报
+            //  gdk_monitor_get_geometry: GDK_IS_MONITOR 失败）
+            c.gtk_window_present(win);
             return;
         }
         c.gtk_window_present(win);
@@ -555,7 +565,9 @@ pub fn fullscreenOnMonitor(win: [*c]c.GtkWindow, monitor_index: u32) bool {
             const layout = c.gdk_toplevel_layout_new();
             c.gdk_toplevel_layout_set_fullscreen(layout, 1, @ptrCast(@alignCast(monitor)));
             c.gdk_toplevel_present(@ptrCast(@alignCast(surface)), layout);
-            c.g_object_unref(@ptrCast(layout));
+            // GdkToplevelLayout 是 refcounted 结构体（不是 GObject）：
+            // g_object_unref 会打 critical 并最终 SIGSEGV（实测 0x19ffffffff）
+            c.gdk_toplevel_layout_unref(layout);
         }
         return true;
     }
@@ -1217,7 +1229,10 @@ pub fn connectCloseRequest(
 pub fn emitCloseRequest(win: [*c]c.GtkWindow) bool {
     if (comptime isGtk4()) {
         var handled: c.gboolean = 0;
-        c.g_signal_emit_by_name(@ptrCast(win), "close-request", @as(?*anyopaque, null), &handled);
+        // close-request 无信号参数（第二参只是 closure 的 user_data）：
+        // 多传一个 null 会让 GTK 把 null 当返回值位置 → value_lcopy_boolean
+        // 断言 + 关闭请求拦截结果丢失（GTK4 冒烟实测 CRITICAL）。
+        c.g_signal_emit_by_name(@ptrCast(win), "close-request", &handled);
         return handled != 0;
     }
     var handled: c.gboolean = 0;
@@ -2208,7 +2223,7 @@ test "variant 探测：本构建按 gtk_init 签名判定" {
     }
 }
 
-test "caps：GTK3 全能力；GTK4 五面降级、剪贴板读两栈都在" {
+test "caps：GTK3 全能力；GTK4 六面降级、剪贴板读两栈都在" {
     const cp = caps();
     const full = isGtk3();
     try std.testing.expectEqual(full, cp.tray);
@@ -2216,14 +2231,15 @@ test "caps：GTK3 全能力；GTK4 五面降级、剪贴板读两栈都在" {
     try std.testing.expectEqual(full, cp.programmatic_drag);
     try std.testing.expectEqual(full, cp.cursor_grab);
     try std.testing.expectEqual(full, cp.cookie_clear_by_domain);
+    try std.testing.expectEqual(full, cp.screenshot);
     try std.testing.expect(cp.clipboard_read);
 }
 
-test "capsJson：冒烟注入载荷六键齐全、值随变体" {
+test "capsJson：冒烟注入载荷七键齐全、值随变体" {
     var buf: [256]u8 = undefined;
     const s = capsJson(&buf) orelse return error.BufferTooSmall;
     inline for (.{
-        "tray", "menu_bar", "programmatic_drag", "cursor_grab", "cookie_clear_by_domain", "clipboard_read",
+        "tray", "menu_bar", "programmatic_drag", "cursor_grab", "cookie_clear_by_domain", "clipboard_read", "screenshot",
     }) |k| {
         try std.testing.expect(std.mem.indexOf(u8, s, "\"" ++ k ++ "\":") != null);
     }

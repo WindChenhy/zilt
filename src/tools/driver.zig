@@ -494,6 +494,13 @@ fn createSession(alloc: std.mem.Allocator, io_ctx: *IoCtx, opts: Options) ![]u8 
         };
         break;
     }
+    // 还要等 WebView2 的调试端口就绪：driver 的 /status 只说明驱动自己起来了，
+    // POST /session 时 WebView2 若还没开 9223，msedgedriver 返回
+    // 「session not created」（响应里没有 sessionId，表现为 NoSessionId）。
+    if (!waitPort(io_ctx, opts.debug_port, opts.startup_timeout_ms)) {
+        log.fail("debug port {d} not ready after {d}ms", .{ opts.debug_port, opts.startup_timeout_ms });
+        return error.DebugPortNotReady;
+    }
     const body = try std.fmt.allocPrint(alloc,
         \\{{"capabilities":{{"alwaysMatch":{{"browserName":"webview2","ms:edgeOptions":{{"debuggerAddress":"127.0.0.1:{d}","args":["--remote-debugging-port={d}"]}}}}}}}}
     , .{ opts.debug_port, opts.debug_port });
@@ -503,8 +510,30 @@ fn createSession(alloc: std.mem.Allocator, io_ctx: *IoCtx, opts: Options) ![]u8 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, resp, .{});
     defer parsed.deinit();
     const val = parsed.value.object.get("value") orelse return error.BadResponse;
-    const sid = val.object.get("sessionId") orelse return error.NoSessionId;
+    const sid = val.object.get("sessionId") orelse {
+        log.fail("session response: {s}", .{resp[0..@min(resp.len, 600)]});
+        return error.NoSessionId;
+    };
     return alloc.dupe(u8, sid.string);
+}
+
+/// 等一个本地 TCP 端口可连（不读不写）。仅用于确认 WebView2 调试端口就绪。
+fn waitPort(io_ctx: *IoCtx, port: u16, timeout_ms: u32) bool {
+    const io = io_ctx.threaded.io();
+    var waited: u32 = 0;
+    while (waited < timeout_ms) : (waited += 200) {
+        const addr = std.Io.net.IpAddress.resolve(io, "127.0.0.1", port) catch {
+            sleepMs(200);
+            continue;
+        };
+        var stream = addr.connect(io, .{ .mode = .stream }) catch {
+            sleepMs(200);
+            continue;
+        };
+        stream.close(io);
+        return true;
+    }
+    return false;
 }
 
 /// Linux 会话：WebKitWebDriver 自己拉起 browserOptions.binary 指向的应用。
