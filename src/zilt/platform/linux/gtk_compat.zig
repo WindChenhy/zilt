@@ -1733,7 +1733,11 @@ pub fn menuPopupAt(
     // 生命周期归 popover。
     c.g_object_unref(@ptrCast(model));
     c.g_object_unref(@ptrCast(group));
-    // 定位：popover 挂到窗口上，pointing_to 用客户区坐标
+    // 定位：popover 挂到窗口上，pointing_to 用客户区坐标。
+    // GtkPopover 初始是 floating：set_parent 会 sink，若不自留引用，
+    // closed 里 unparent 就会 finalize，随后 unref 是 UAF（GTK4 冒烟实测
+    // gdk_monitor_get_geometry/G_IS_OBJECT 一串 critical）。
+    _ = c.g_object_ref_sink(@ptrCast(popover));
     c.gtk_widget_set_parent(popover, win);
     var rect = c.GdkRectangle{ .x = x, .y = y, .width = 1, .height = 1 };
     c.gtk_popover_set_pointing_to(@ptrCast(@alignCast(popover)), &rect);

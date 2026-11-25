@@ -5638,6 +5638,13 @@ fn Backend(comptime config: Config) type {
 
                     // 布局：作为 overlay child 挂进窗口内容区（位置由
                     // get-child-position 信号按 cv.x/y/width/height 提供）
+                    // GTK4：GtkWidget 初始是 floating，add_overlay 会 sink 掉；
+                    // 若不自留一份引用，remove_overlay 时会直接 finalize，
+                    // 随后的 g_object_unref 就是 UAF（实测 remove 时
+                    // `g_object_unref: assertion G_IS_OBJECT` + 后续堆破坏）。
+                    if (comptime gtk_compat.isGtk4()) {
+                        _ = c.g_object_ref_sink(@ptrCast(view_widget));
+                    }
                     c.gtk_overlay_add_overlay(@ptrCast(w.overlay), view_widget);
                     c.gtk_widget_show(view_widget);
 
