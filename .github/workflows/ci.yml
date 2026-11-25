@@ -195,12 +195,14 @@ jobs:
           sleep 1
           rm -f zilt.log
           # v0.3.0：openbox 提供真实 WM → windowMoved/Resized/Focus 断言生效
+          # 注：本 step 的 shell 带 -e，直接 `timeout …` 失败会在取 $? 前退出，
+          # 下面的已知环境差异白名单就成死代码——必须 `|| code=$?`。
+          code=0
           timeout 240 xvfb-run -a --server-args="-screen 0 1280x800x24" bash -c '
             openbox >/dev/null 2>&1 &
             sleep 0.5
             exec ./zig-out/bin/zilt-app
-          '
-          code=$?
+          ' || code=$?
           grep -a "\[linux-smoke\]" zilt.log | tail -2
           if [ $code -ne 0 ]; then
             # 已知 CI 环境差异（本机 WSL 95/95；CI runner 无桌面会话/xdg-open 处理器）：
@@ -320,12 +322,13 @@ jobs:
           python3 scripts/ws_echo.py 8765 > /dev/null 2>&1 &
           sleep 1
           rm -f zilt.log
+          # 同上：-e 下必须 `|| code=$?`，否则崩溃时下面的逐项失败取证不会执行
+          code=0
           timeout 240 xvfb-run -a --server-args="-screen 0 1280x800x24" bash -c '
             openbox >/dev/null 2>&1 &
             sleep 0.5
             exec ./zig-out/bin/zilt-app
-          '
-          code=$?
+          ' || code=$?
           grep -a "\[linux-smoke\]" zilt.log | tail -2
           if [ $code -ne 0 ]; then
             echo "== 逐项失败 =="
