@@ -1331,6 +1331,10 @@ fn Backend(comptime config: Config) type {
         allocator: std.mem.Allocator,
         /// 窗口注册表（id 从 1 起；主窗口固定 1）
         windows: std.ArrayListUnmanaged(*WinState) = .empty,
+        /// 已销毁窗口的 IPC sink 延迟到进程退出再释放：GTK4 的
+        /// gtk_window_destroy 是异步的，view 可能在 sink 释放后仍发
+        /// decide-policy（实测回调里 sink.backend 已是野指针 → SIGSEGV）。
+        retired_sinks: std.ArrayListUnmanaged(*IpcSink) = .empty,
         next_window_id: u32 = 1,
         /// 已创建的分区 WebContext（同名复用）
         partitions: std.ArrayListUnmanaged(PartitionCtx) = .empty,
@@ -1451,6 +1455,8 @@ fn Backend(comptime config: Config) type {
             // 主循环退出后可能仍有窗口未 destroy（ctx.quit 路径）→ 逐个释放记录
             while (self.windows.items.len != 0) self.freeWindowState(self.windows.items[0]);
             self.windows.deinit(self.allocator);
+            for (self.retired_sinks.items) |s| self.allocator.destroy(s);
+            self.retired_sinks.deinit(self.allocator);
             for (self.partitions.items) |pe| {
                 c.g_object_unref(@ptrCast(pe.ctx));
                 if (pe.session) |s| c.g_object_unref(@ptrCast(s));
@@ -1575,7 +1581,8 @@ fn Backend(comptime config: Config) type {
             // v0.3.9 A4L：窗口级 KeyBindings（id 所有权）
             for (st.key_bindings) |kb| self.allocator.free(kb.id);
             if (st.key_bindings.len > 0) self.allocator.free(st.key_bindings);
-            self.allocator.destroy(st.sink);
+            // sink 不在此释放：view 的异步信号可能晚于窗口销毁（见 retired_sinks）
+            self.retired_sinks.append(self.allocator, st.sink) catch {};
             self.allocator.free(st.label);
             if (st.app_url.len != 0) self.allocator.free(st.app_url);
             if (st.state_key) |key| self.allocator.free(key);

@@ -1028,22 +1028,29 @@ function runSecondWindowProbe() {
     if (wired && wired.wm) {
       const W = Z().window;
       const state = async () => await W.state();
+      // 先确保窗口 mapped：前面 minimize/restore 的 X 请求是异步的，
+      // 未映射窗口上的 move 会被 GDK 缓存/忽略（GTK4 实测 state 停在 0,0）。
+      await W.show();
+      await wait(200);
       // 移动/缩放：先记录事件，再用 state() 校验几何（见下方 frame 偏移说明）
+      // 事件按载荷过滤：队列里可能残留更早的 move（0,19），不能当成这次的结果。
       const moved = await new Promise((resolve) => {
         const off = Z().on('windowMoved', (p) => {
-          if (p.id === 1) { off(); resolve(p); }
+          if (p.id === 1 && Math.abs(p.x - 150) <= 32 && Math.abs(p.y - 120) <= 32) { off(); resolve(p); }
         });
         setTimeout(() => { off(); resolve(null); }, 3000);
         W.setPosition(150, 120).catch(() => {});
       });
+      await wait(150);
       const posAfter = await state();
       const resized = await new Promise((resolve) => {
         const off = Z().on('windowResized', (p) => {
-          if (p.id === 1) { off(); resolve(p); }
+          if (p.id === 1 && p.width === 820 && p.height === 620) { off(); resolve(p); }
         });
         setTimeout(() => { off(); resolve(null); }, 3000);
         W.setSize(820, 620).catch(() => {});
       });
+      await wait(150);
       const sizeAfter = await state();
 
       // 焦点闭环：先确保主窗口是 active，再新建窗口并显式 focus（openbox 的
