@@ -183,7 +183,12 @@ pub fn onAsyncReady(
     w.source = source;
     // GAsyncResult 的存活期只到本回调返回为止，而消费方在 wait() 之后才
     // xxx_finish(result)——不自己持一份引用就是 use-after-free + 二次释放。
-    w.result = result;
+    // 夹具（GCancellable，rc=1）证明缺这一行必然析构：RED 见 e21a326。
+    w.result = null;
+    if (result) |r| {
+        const held: ?*anyopaque = c.g_object_ref(@ptrCast(r));
+        w.result = @ptrCast(held);
+    }
     w.finish();
 }
 
