@@ -195,9 +195,14 @@ function runSecondWindowProbe() {
     check('win.sensitive', disOk && focOk && s.enabled === true && s.focusable === true, `dis=${disOk} foc=${focOk}`);
 
     // hide/show：可见性往返
+    // 前一拍的 setEnabled/setFocusable 会触发 WM 焦点迁移；立即 hide 在
+    // openbox 下偶发 BadWindow（X 异步请求落到已重配的窗口）。等焦点落定。
+    await wait(150);
     await W.hide();
+    await wait(50);
     const hidOk = (await state()).visible === false;
     await W.show();
+    await wait(50);
     const showOk = (await state()).visible === true;
     check('win.vis', hidOk && showOk, `hide=${hidOk} show=${showOk}`);
 
