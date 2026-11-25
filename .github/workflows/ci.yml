@@ -84,7 +84,13 @@ jobs:
           # （CI 45025651776 实测 "smoke exit=" 空值）→ Start-Process -Wait 取 .ExitCode
           $p = Start-Process -FilePath ".\zig-out\bin\zilt-app.exe" -PassThru `
                  -RedirectStandardError smoke_log.txt -NoNewWindow
-          $p.WaitForExit()
+          # 应用内的 90s 定时器依赖主线程消息循环；若某一项同步调用把 UI 线程
+          # 卡住，定时器也不会触发。外层再加一道硬超时，保证 step 不会挂到 job
+          # 的 30 分钟上限，且失败日志能进入 artifact。
+          if (-not $p.WaitForExit(180000)) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            throw "smoke did not exit within 180s (app timer never fired)"
+          }
           $code = $p.ExitCode
           "smoke exit=$code"
           if (Test-Path zilt.log) {
