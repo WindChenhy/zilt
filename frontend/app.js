@@ -876,7 +876,7 @@ async function runChecks() {
     try {
       const w = await window.zilt.window.create({
         title: 'proxy probe', url: 'https://zilt.app/index.html', label: 'proxy-probe-' + Date.now(),
-        width: 300, height: 200, proxy: '127.0.0.1:9',
+        width: 300, height: 200, proxy: 'http://127.0.0.1:9',
       });
       const ok = !!w && typeof w.id === 'number';
       setCheck('c-proxy', ok, ok ? `proxy window #${w.id} created` : `resp=${JSON.stringify(w)}`);

@@ -2163,6 +2163,9 @@ fn Backend(comptime config: Config) type {
             if (view_widget == null and opts.incognito) {
                 if (self.incognitoContext()) |pieces| {
                     view_widget = @ptrCast(@alignCast(gtk_compat.webViewNew(null, pieces.ctx, pieces.session)));
+                    // view 已各自 ref 一份；释放函数转交的初始引用
+                    if (pieces.ctx) |cx| c.g_object_unref(@ptrCast(cx));
+                    if (pieces.session) |s| c.g_object_unref(@ptrCast(s));
                     if (view_widget != null) {
                         st.ucm = c.webkit_web_view_get_user_content_manager(@ptrCast(view_widget));
                         st.incognito = true;
@@ -5404,7 +5407,8 @@ fn Backend(comptime config: Config) type {
                 const bytes = c.gdk_texture_save_to_png_bytes(texture) orelse {
                     return self.emitCdpError(task.win_id, task.rid, "png encode failed");
                 };
-                defer c.g_object_unref(@ptrCast(bytes));
+                // GBytes 非 GObject
+                defer c.g_bytes_unref(bytes);
                 var bsize: c.gsize = 0;
                 raw = @constCast(@ptrCast(c.g_bytes_get_data(bytes, &bsize)));
                 size = @intCast(bsize);
@@ -6579,14 +6583,16 @@ fn Backend(comptime config: Config) type {
                 gtk_compat.networkSessionNewEphemeral()
             else
                 null;
-            defer if (session) |s| c.g_object_unref(@ptrCast(s));
             const mgr = if (comptime gtk_compat.isGtk3())
                 gtk_compat.websiteDataManagerNewEphemeral()
             else
                 null;
             defer if (mgr) |m| c.g_object_unref(@ptrCast(m));
             const ctx: ?*c.WebKitWebContext = @ptrCast(@alignCast(gtk_compat.webContextNewWithManager(mgr)));
-            if (ctx == null) return null;
+            if (ctx == null) {
+                if (session) |s| c.g_object_unref(@ptrCast(s));
+                return null;
+            }
             c.webkit_web_context_register_uri_scheme(ctx, scheme, Self.onSchemeRequest, self, null);
             if (comptime gtk_compat.isGtk4()) {
                 _ = c.g_signal_connect_data(session, "download-started", @ptrCast(&Self.onDownloadStarted), self, null, 0);
@@ -6595,7 +6601,9 @@ fn Backend(comptime config: Config) type {
             }
             self.registerProtocolSchemes(ctx);
             log.print("[incognito] ephemeral web context ready", .{});
-            // 无痕 context 不缓存——ctx/session 交由 view 持引用（g_object_new 已 ref）
+            // 无痕 context 不缓存——初始引用转交调用方，webViewNew 后由调用方
+            // 释放（view 自己持一份）。此前在这里 defer unref，返回的 session
+            // 已析构：g_object_new 收到 invalid unclassed object（GTK4 冒烟实证）。
             return .{ .ctx = ctx, .session = session };
         }
 
@@ -7885,8 +7893,9 @@ fn Backend(comptime config: Config) type {
             }
 
             if (!req.follow_redirects) {
-                // libsoup3 的 SoupMessage:follow-redirects 属性（缺失时 GLib 记警告但不崩）
-                c.g_object_set(@ptrCast(msg), "follow-redirects", @as(c.gboolean, 0), @as(?*anyopaque, null));
+                // libsoup3 移除了 SoupMessage:follow-redirects 属性（3.6+ 会打
+                // "has no property named 'follow-redirects'"）；禁用重定向走标志位。
+                c.soup_message_set_flags(msg, c.SOUP_MESSAGE_NO_REDIRECT);
             }
             if (req.insecure_tls) {
                 _ = c.g_signal_connect_data(@ptrCast(msg), "accept-certificate", @ptrCast(&onHttpAcceptCert), null, null, 0);
