@@ -57,7 +57,28 @@ jobs:
 
       - name: Smoke test (GUI checks)
         run: |
-          $env:ZILT_SMOKE_TEST_MS = "30000"
+          # 冒烟有 5 项依赖本机 echo 服务（ws/wss/上传/断点续传）；此前 Windows
+          # job 从未启动它们——这 5 项必然为 false，冒烟永远不可能全绿。
+          $servers = @()
+          $env:ZILT_WS_TLS = "1"
+          $servers += Start-Process python -ArgumentList "scripts/ws_echo.py","8766" -PassThru -WindowStyle Hidden
+          Remove-Item Env:ZILT_WS_TLS
+          $servers += Start-Process python -ArgumentList "scripts/ws_echo.py","8765" -PassThru -WindowStyle Hidden
+          $servers += Start-Process python -ArgumentList "scripts/http_echo.py","8788" -PassThru -WindowStyle Hidden
+          # 端口就绪再启动应用（固定 sleep 在慢 runner 上不可靠）
+          foreach ($port in 8765,8766,8788) {
+            $ready = $false
+            for ($i = 0; $i -lt 100 -and -not $ready; $i++) {
+              try {
+                $c = New-Object Net.Sockets.TcpClient
+                $c.Connect("127.0.0.1", $port); $c.Close(); $ready = $true
+              } catch { Start-Sleep -Milliseconds 200 }
+            }
+            if (-not $ready) { throw "echo server :$port not ready" }
+          }
+          # 30s 是 95 项检查在慢 runner 上的硬上限（实测超过）——安全网放宽，
+          # 正常路径由前端 app.quit(0) 收尾，不靠这个定时器。
+          $env:ZILT_SMOKE_TEST_MS = "90000"
           $env:ZILT_SMOKE_EXIT = "1"
           # GUI 子系统 exe：PowerShell 的 & 调用不等待退出、$LASTEXITCODE 为空
           # （CI 45025651776 实测 "smoke exit=" 空值）→ Start-Process -Wait 取 .ExitCode
@@ -66,8 +87,14 @@ jobs:
           $p.WaitForExit()
           $code = $p.ExitCode
           "smoke exit=$code"
-          if (Test-Path zilt.log) { "== zilt.log tail =="; Get-Content zilt.log -Tail 40 }
-          Get-Content smoke_log.txt | Select-String "\[smoke\]" | Select-Object -Last 2
+          if (Test-Path zilt.log) {
+            "== smoke summary =="
+            Select-String -Path zilt.log -Pattern "\[smoke\]" | Select-Object -Last 4
+            "== zilt.log tail =="
+            Get-Content zilt.log -Tail 20
+          }
+          if (Test-Path smoke_log.txt) { "== stderr tail =="; Get-Content smoke_log.txt -Tail 20 }
+          $servers | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
           if ($code -ne 0) { throw "smoke failed with exit $code" }
 
       # 单测在 CI 上静默崩溃（无 FAIL 摘要）时，直跑测试二进制拿真实栈
