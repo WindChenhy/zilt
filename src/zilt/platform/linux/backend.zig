@@ -2571,7 +2571,7 @@ fn Backend(comptime config: Config) type {
                     st.geom_y = p.y;
                 },
                 .show => gtk_compat.showAll(widget),
-                .hide => c.gtk_widget_hide(widget),
+                .hide => gtk_compat.windowHide(win),
                 .focus => c.gtk_window_present(win),
                 .close => {
                     // opt-in：直接发 close-request / delete-event（变体收敛于 compat；

@@ -375,6 +375,16 @@ pub fn windowGetSize(win: [*c]c.GtkWindow, width: *c_int, height: *c_int) void {
     c.gtk_window_get_size(win, width, height);
 }
 
+/// 窗口隐藏。GTK3：先清焦点再 hide——openbox 会在 hide 的 focus-out 之后
+/// 异步 QueryTree 旧焦点窗口，若 frame 已被 WM 重配，GDK 直接 BadWindow
+/// （GTK3 冒烟偶发，连跑 3 次复现）。GTK4：close 前的 hide 由 close-request 管。
+pub fn windowHide(win: [*c]c.GtkWindow) void {
+    if (comptime isGtk3()) {
+        c.gtk_window_set_focus(win, null);
+    }
+    c.gtk_widget_hide(@ptrCast(win));
+}
+
 pub fn windowGetPosition(win: [*c]c.GtkWindow, x: *c_int, y: *c_int) void {
     if (comptime isGtk4()) {
         if (x11Of(@ptrCast(win))) |x11| {
