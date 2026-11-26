@@ -207,5 +207,13 @@ EOF
 code=$(grep -a '^RESULT=' "$LOG" | tail -1 | sed 's/RESULT=//')
 case "$code" in
   PASS) echo 0 > "$EXIT_FILE"; exit 0 ;;
-  *) echo 1 > "$EXIT_FILE"; exit 1 ;;
+  *)
+    # 诊断：run_body 在 set -eu 下提前退出时不会有 RESULT 行，CI 只剩一句 exit 1。
+    # 这里把尾部日志回显到 step 输出，否则失败不可见（2026-11-26 定位抖动时踩过）。
+    echo "TRAY_E2E=FAIL reason=no-RESULT-line"
+    tail -80 "$LOG" 2>/dev/null || true
+    echo 1 > "$EXIT_FILE"
+    exit 1
+    ;;
+
 esac
