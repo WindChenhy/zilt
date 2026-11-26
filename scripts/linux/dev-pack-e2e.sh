@@ -19,7 +19,7 @@ export ZILT_LINUX_SMOKE=1
 # 冒烟的 http 检查需要回声服务器（同 dev-smoke.sh）
 python3 scripts/http_echo.py 8788 > /dev/null 2>&1 &
 echo_pid=$!
-trap 'kill $echo_pid 2>/dev/null' EXIT
+trap 'kill $echo_pid 2>/dev/null || true' EXIT
 
 {
   zig build pack

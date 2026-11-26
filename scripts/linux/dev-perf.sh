@@ -17,7 +17,7 @@ python3 scripts/http_echo.py 8788 > /dev/null 2>&1 &
 echo_pid=$!
 python3 scripts/ws_echo.py 8765 > /dev/null 2>&1 &
 ws_pid=$!
-trap 'kill $echo_pid $ws_pid 2>/dev/null' EXIT
+trap 'kill $echo_pid $ws_pid 2>/dev/null || true' EXIT
 
 {
   echo "== build (ReleaseSafe, cached after first run) =="

@@ -39,7 +39,7 @@ mkdir -p .zilt-probe
   echo_pid=$!
   python3 scripts/ws_echo.py 8765 > /tmp/zilt-ws-echo.log 2>&1 &
   ws_pid=$!
-  trap 'kill $echo_pid $ws_pid 2>/dev/null' EXIT
+  trap 'kill $echo_pid $ws_pid 2>/dev/null || true' EXIT
 
   set +e
   # v0.3.0：有 openbox 时在同一 Xvfb 会话里起 WM（windowMoved/Resized/Focus 才

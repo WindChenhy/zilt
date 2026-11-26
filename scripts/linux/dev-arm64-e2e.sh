@@ -42,7 +42,7 @@ run_body() {
 
   python3 scripts/http_echo.py 8788 >/dev/null 2>&1 & EP=$!
   python3 scripts/ws_echo.py 8765 >/dev/null 2>&1 & WP=$!
-  trap 'kill $EP $WP 2>/dev/null' EXIT
+  trap 'kill $EP $WP 2>/dev/null || true' EXIT
 
   check_result() { # $1=exit code $2=label
     local code="$1" label="$2" line failed f

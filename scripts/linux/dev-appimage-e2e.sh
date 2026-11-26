@@ -74,7 +74,7 @@ run_body() {
   ECHO_PID=$!
   python3 scripts/ws_echo.py 8765 >/dev/null 2>&1 &
   WS_PID=$!
-  trap 'kill $ECHO_PID $WS_PID 2>/dev/null' EXIT
+  trap 'kill $ECHO_PID $WS_PID 2>/dev/null || true' EXIT
 
   run_smoke() { # $@ = 命令（可直接 AppRun，也可沙箱包装）
     # ZILT_SMOKE_SANDBOX=1 → 不关 WebKit 沙箱（4c 用）
