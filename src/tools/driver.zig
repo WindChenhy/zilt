@@ -195,7 +195,11 @@ pub fn main(init: std.process.Init) !void {
     // ZILT_AUTOMATION=1 经 env 继承传给应用 → webkit_web_context_set_automation_allowed
     setEnv("ZILT_AUTOMATION", "1");
 
-    var driver_child = spawnProcessLinux(alloc, &.{ driver_path, "--port", std.fmt.allocPrint(alloc, "{d}", .{opts.driver_port}) catch return error.OutOfMemory }, ".") orelse {
+    // v0.5.11：WebKitWebDriver 只认 `--port=<n>` 单参数形式（Ubuntu 24.04 的
+    // webkit2gtk-driver 对 `--port <n>` 直接打 Usage 退出，CI 上表现为 session
+    // 创建前 ABRT）。GOption 对两种写法都接受，故统一改等号形式。
+    const port_arg = std.fmt.allocPrint(alloc, "--port={d}", .{opts.driver_port}) catch return error.OutOfMemory;
+    var driver_child = spawnProcessLinux(alloc, &.{ driver_path, port_arg }, ".") orelse {
         log.fail("spawn WebKitWebDriver failed", .{});
         std.process.exit(1);
     };
