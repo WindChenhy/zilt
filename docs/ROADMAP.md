@@ -45,6 +45,7 @@
 | 三平台能力矩阵 | ✅ | README 平台表 + GTK4 变体能力面 + `capsJson` 契约测试 |
 | Linux GTK3 主作业 | ⚠️ | 冒烟 94/95（`deeplink.startup` 为已取证 CI 环境差异，白名单放行）、Tray / AppImage / 增量更新 / headless 全 PASS；真红为 WebDriver E2E：`--port <n>` 被 Usage 拒绝（ae08523 改 `--port=<n>`）后启动成功，但 POST /session 在无 DISPLAY 下挂死 → job 30 min 超时（run 45846936379 cancelled）；f07e97c 已改 `xvfb-run` + 硬超时，待 CI 复核 |
 | Windows 主作业 | ⚠️ | 单测 + 冒烟 **74/74**；WebDriver E2E 红：`msedgedriver 158` 与 runner 的 **WebView2 运行时 157** 版本错配（workflow 取的是 Edge 浏览器版本，不是运行时版本） |
+| CI 可重复性 | ⚠️ | 同一代码基线复跑：run 45846936379（22:25）GTK4 95/95 + Tray PASS；run 45850796425（23:37，仅动 ci.yml）GTK4 `v04` 与 Tray attach 双红——E2E 存在时序 flake（`v04`：`state()` 在 surface 重建期取到 0×0；Tray：Xvfb/stalonetray 时序）。收口前需去 flake 或加受控重试，不能以单次绿判定 |
 | **L1b：GTK4 默认化** | ❌ 未做 | `build.zig` 的 `-Dgtk` 仍默认 `gtk3`；GTK4 变体有 5 处能力缺口（见下），不是翻默认值的工程量 |
 
 ### L1b 剩余工作（GTK4 转默认的前置）
@@ -59,8 +60,10 @@
 
 **v0.5 收口判据**：上表全绿 + Linux 三作业（GTK3 / GTK4 / arm64）全绿。
 
-**现状（2026-11-26）**：**未收口** —— L1b 未做；Linux 侧 WebDriver 无 DISPLAY 挂死（f07e97c 已修待复核）、
-Windows 侧驱动与 WebView2 运行时版本错配（未修）——两处均为 CI 环境问题，不是产品缺陷。
+**现状（2026-11-26）**：**未收口** —— L1b 未做；CI 侧还有三件：Linux WebDriver 无 DISPLAY 挂死
+（f07e97c 已改 `xvfb-run`，待复核）、Windows 驱动与 WebView2 运行时版本错配（未修）、
+E2E 时序 flake（同一基线复跑会在 GTK4 `v04` / Tray attach 上翻红）。前两件是环境问题，
+第三件决定「全绿」是否可复现——三者都不动产品代码。
 
 **结论**：按 D11，L1b 未完成前不启动 v0.6。v0.6 的范围（flavors / 绑定 codegen / WML / 基准 / 模板）
 与 GTK 栈无关，技术上可并行；阻塞点只是「v0.5 的对等目标要不要带着 L1b 一起收」——两条路径待拍板
