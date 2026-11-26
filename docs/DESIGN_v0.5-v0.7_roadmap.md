@@ -216,6 +216,10 @@
 - **Q7（0.6 flavors 语法）**：`--config` JSON merge-patch（Tauri 同语义）vs Zig comptime 变体？与现有 `Config` 衔接方式。
 - **Q8（流程）**：分支命名 `feature/update/vX.Y` + PR 合并（沿用文化）？每版本实施前是否各出 `DESIGN_vX.Y_*.md`？
 - **Q9（0.5 ARM64/CI）**：本轮是否建立 remote / 触发 CI `linux-arm64` 首跑（本机 WSL 无外网）？
+- **Q10（0.5 收口 vs L1b，2026-11-26 回填时新增）**：L1b（GTK4 默认化）剩余五项（托盘 SNI / 菜单栏 / 拖出 /
+  按域清 cookie / 截图真机验证），是否仍作为 v0.5 的收口前置？
+  **A**：先做 L1b 再开 v0.6；**B**：L1b 移出 v0.5（GTK4 继续作为 CI 覆盖的 opt-in 变体），v0.5 以 CI 全绿收口，
+  L1b 作为 **v0.6.1** 独立切片。影响：A 推迟 DX 工作；B 默认栈仍是 GTK3（能力最全），GTK4 默认化顺延一个 minor。
 
 ---
 

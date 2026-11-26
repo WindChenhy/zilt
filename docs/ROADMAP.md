@@ -2,8 +2,8 @@
 
 > 制定日期：2026-11-20。修订：2026-11-21（Linux 专项复核：L1–L8 入图，macOS 顺延）。
 > 基线：**v0.3.19**（git 31b3109，测试体系收口）。
-> 当前：**v0.5.10**（tag v0.5.10 → 2cc76da，2026-11-26）。v0.4.5–v0.4.9 是 macOS 能力面切片；
-> v0.5.x 交付进度见上节「版本状态」。
+> 当前：**v0.5.10**（tag v0.5.10 → 2cc76da，2026-11-26）+ **v0.5.11 CI 收口**（未发版，4e91872 / c0102c9 / ae08523 / f07e97c 待 CI 复核）。
+> v0.4.5–v0.4.9 是 macOS 能力面切片；v0.5.x 交付台账与收口判定见下节「版本状态」。
 > 对标：**Wails v3.1.0 stable（2026-11-01）+ v3.2.0-nightly**、**Tauri 2.12.x**（2026-11 最新，2.12.x 仅 bugfix）。
 > 历史说明：原 docs/ 文档（v0.1–v0.3 逐版本记录、调研报告、WebView2 ABI 笔记、ADR）已随文档清理移除，
 > 逐版本实施与验收记录见 **git 提交历史**；当前能力索引与平台状态见 [README](../README.md)。
@@ -13,26 +13,60 @@
 ## 版本状态（2026-11-26 回填）
 
 > 0.5–0.7 的 spec of record 是 [DESIGN_v0.5-v0.7_roadmap.md](DESIGN_v0.5-v0.7_roadmap.md)（2026-11-23 制定，基线 v0.4.8）；
-> 本节只回填实际交付进度，范围/验收/风险/待决策以该文档为准。
+> 本节回填 v0.5.x 的实际交付台账与收口判定，范围/验收/风险/待决策以该文档为准。
 
 主轴承序：v0.5 桌面三平台对等收口 → v0.6 DX·配置·弹性 → v0.7 第三方插件生态；
 移动端（iOS/Android）移出本轮留 1.x；不冻结 API、不冲 1.0。
 
-| v0.5 子项 | 状态 | 证据 |
+### v0.5.x 逐版本交付（2026-11-23 → 2026-11-26）
+
+| 版本 | 主题 | 交付 |
 |---|---|---|
-| macOS 分发与安全（.app / DMG / codesign / 公证 / Universal / Keychain / 更新器） | ✅ 完成（v0.4.4–v0.5.8） | README 能力索引；更新器选型见 `ADR_v0.5.7_macos_updater.md` |
-| Linux GTK4 变体（双栈 CI） | ✅ 完成（v0.5.9–v0.5.10） | CI `linux-gtk4`：单测 + 95 项冒烟；`capsJson` 反射契约测试防漂移 |
-| ARM64 实跑（L4） | ✅ 完成 | CI `linux-arm64`（Docker + QEMU + ELF 断言） |
-| 三平台能力矩阵 | ✅ 完成 | README 能力索引 + `capsJson` 测试 |
-| **L1b：GTK4 默认化（4.x UI 面重写）** | ⏳ **未做** | `build.zig` 的 `-Dgtk` 仍默认 `gtk3`；按 §L1b 审计表逐子系统移植 70 个移除符号 |
+| v0.5.1 | macOS `.app` 骨架 | Info.plist 全字段 + `Contents/{MacOS,Resources}` 正确布局 |
+| v0.5.2 | 图标 | `.icns` 生成 + bundle 接线 |
+| v0.5.3 | DMG | `pack_macos` + `hdiutil` 脚本 + CI 产物 |
+| v0.5.4 | 签名 | codesign + entitlements + hardened runtime |
+| v0.5.5 | 公证 / 通用二进制 | `notarytool` + `stapler`；Universal（`lipo`） |
+| v0.5.6 | 安全存储 | Security.framework Keychain + `store` 子系统 |
+| v0.5.7 | 更新器 | ed25519 核心复用 + `.app` 整树 staging（[ADR](ADR_v0.5.7_macos_updater.md)） |
+| v0.5.8 | 对等打磨 | 系统信息 / Shell / 电源与主题事件 / 单实例边缘 + Intel 回归 |
+| v0.5.9 | Linux GTK4 变体 | 双栈 CI 同跑（单测 + 95 项冒烟）；GdkClipboard 读面；变体能力表 |
+| v0.5.10 | 能力矩阵 | `capsJson` 反射契约测试 + GTK4 稳定性修复 + 版本号 |
+| v0.5.11（未发版） | CI 收口 | E2E EXIT trap 吞码（4e91872）、Tray E2E 取证（c0102c9）、WebKitWebDriver `--port=<n>`（ae08523）、WebDriver E2E 走 `xvfb-run` + 240s 硬超时（f07e97c） |
+
+### v0.5 收口清单
+
+| 子项 | 状态 | 证据 / 缺口 |
+|---|---|---|
+| macOS 分发与安全（v0.5.1–v0.5.7） | ✅ | `macos.yml` 全绿；codesign / 公证 / Universal / Keychain / 更新器；选型见 ADR |
+| macOS 对等打磨（v0.5.8） | ✅ | sysinfo / Shell / 电源 / 主题 / 单实例冒烟硬断言 |
+| Linux GTK4 **变体**（v0.5.9–v0.5.10） | ✅ | CI `linux-gtk4` 单测 + **95/95** 冒烟（run 45846936379） |
+| ARM64 实跑（L4） | ✅ | CI `linux-arm64`（Docker + QEMU + ELF 断言）通过（run 45845260239 / 45846936379） |
+| 三平台能力矩阵 | ✅ | README 平台表 + GTK4 变体能力面 + `capsJson` 契约测试 |
+| Linux GTK3 主作业 | ⚠️ | 冒烟 94/95（`deeplink.startup` 为已取证 CI 环境差异，白名单放行）、Tray / AppImage / 增量更新 / headless 全 PASS；真红为 WebDriver E2E：`--port <n>` 被 Usage 拒绝（ae08523 改 `--port=<n>`）后启动成功，但 POST /session 在无 DISPLAY 下挂死 → job 30 min 超时（run 45846936379 cancelled）；f07e97c 已改 `xvfb-run` + 硬超时，待 CI 复核 |
+| Windows 主作业 | ⚠️ | 单测 + 冒烟 **74/74**；WebDriver E2E 红：`msedgedriver 158` 与 runner 的 **WebView2 运行时 157** 版本错配（workflow 取的是 Edge 浏览器版本，不是运行时版本） |
+| **L1b：GTK4 默认化** | ❌ 未做 | `build.zig` 的 `-Dgtk` 仍默认 `gtk3`；GTK4 变体有 5 处能力缺口（见下），不是翻默认值的工程量 |
+
+### L1b 剩余工作（GTK4 转默认的前置）
+
+| 缺口 | GTK3 现状 | GTK4 约束 | 处置 |
+|---|---|---|---|
+| 托盘 | GtkStatusIcon（XEmbed）+ libayatana SNI | 4.x 移除 GtkStatusIcon；libayatana 链 GTK3，同进程不可混 | 自实现 D-Bus SNI（GDBus + DBusMenu），或明确降级 |
+| 菜单栏 | GtkMenuBar | 4.x 移除 | 改 GtkPopoverMenuBar（popover 菜单模型已可复用） |
+| 拖出 / 指针抓取 | `gtk_drag_*` / `gdk_seat_grab` | GDK4 移除该面 | 改 GtkDragSource，或保持 `DragNotAvailable` 并文档化 |
+| 按域清 cookie | WebKitGTK 4.1 API | WebKitGTK 6.0 无 `delete_cookies_for_domain` | 枚举全量 cookie 过滤删除 |
+| 截图 | X11 抓取 | GdkTexture 渲染面；Xvfb/无合成器下 `FAILED_TO_CREATE` | 真机 / 离屏路径验证 |
 
 **v0.5 收口判据**：上表全绿 + Linux 三作业（GTK3 / GTK4 / arm64）全绿。
-当前 L1b 未做 → v0.5 未收口，v0.6 不启动：v0.6 的绑定 codegen / WML / flavors 都以
-「GTK4 为默认栈」为前提，提前做会在双栈维护面上返工。
 
-已知遗留（2026-11-26）：`AppImage self-contained E2E` 在 v0.5.10 提交上稳定红，
-实为脚本 EXIT trap 的 `kill` 在 `bash -e` 下覆盖了 `exit 0` 的退出码（日志已
-`APPIMAGE_E2E=PASS` + `APPIMAGE_RC=0`）；六个 E2E 脚本已统一加 `|| true`，待 CI 复核。
+**现状（2026-11-26）**：**未收口** —— L1b 未做；Linux 侧 WebDriver 无 DISPLAY 挂死（f07e97c 已修待复核）、
+Windows 侧驱动与 WebView2 运行时版本错配（未修）——两处均为 CI 环境问题，不是产品缺陷。
+
+**结论**：按 D11，L1b 未完成前不启动 v0.6。v0.6 的范围（flavors / 绑定 codegen / WML / 基准 / 模板）
+与 GTK 栈无关，技术上可并行；阻塞点只是「v0.5 的对等目标要不要带着 L1b 一起收」——两条路径待拍板
+（DESIGN §6 Q10）：**A** 先做 L1b 五项再开 v0.6.0；**B** L1b 移出 v0.5（GTK4 继续作为 CI 覆盖的 opt-in 变体），
+v0.5.11 CI 转绿即收口、v0.6.0 启动，L1b 作为 **v0.6.1** 独立切片（不与 DX 主题混版）。
+
 ## 0. 差距分析结论
 
 ### 0.1 已持平/领先维度（不动作）
