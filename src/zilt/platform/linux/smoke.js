@@ -1044,31 +1044,47 @@ function runSecondWindowProbe() {
     const wired = await Z().invoke('__zilt.linuxSmokeWired', {});
     if (wired && wired.wm) {
       const W = Z().window;
-      const state = async () => await W.state();
+      const state = async (id) => (id === undefined ? await W.state() : await W.state(id));
       // 先确保窗口是普通映射态：前面 minimize/maximize 都是异步 X 请求，
       // 未映射/最大化窗口上的 move/resize 会被忽略（GTK3 实测 1280x781）。
       await W.restore();
-      await wait(250);
       await W.show();
-      await wait(200);
+      // v0.5.11：openbox 的 unminimize/unmaximize 是异步的——restore/show 还没
+      // 落定时发来的 XMoveWindow/XResizeWindow 会被 WM 丢弃，窗口停在旧位置
+      //（GTK4 实测 128,141，windowMoved 整段收不到）。先等窗口回到普通映射态。
+      for (let t = 0; t < 20; t++) {
+        const s = await state(1).catch(() => null);
+        if (s && s.visible && !s.iconic && !s.zoomed) break;
+        // restore 本身也可能被 WM 丢掉（异步）——只要还停在 iconic/zoomed 就再发一次
+        if (s && (s.iconic || s.zoomed)) await W.restore();
+        await wait(100);
+      }
       // 移动/缩放：先记录事件，再用 state() 校验几何（见下方 frame 偏移说明）
       // 事件按载荷过滤：队列里可能残留更早的 move（0,19），不能当成这次的结果。
-      const moved = await new Promise((resolve) => {
-        const off = Z().on('windowMoved', (p) => {
-          if (p.id === 1 && Math.abs(p.x - 150) <= 64 && Math.abs(p.y - 120) <= 64) { off(); resolve(p); }
-        });
-        setTimeout(() => { off(); resolve(null); }, 3000);
-        W.setPosition(150, 120).catch(() => {});
-      });
+      // 请求可能被 WM 丢弃（见上）→ 重发，最多 3 次；事件仍必须真实到达。
+      const awaitEvent = async (name, pred, fire) => {
+        for (let a = 0; a < 3; a++) {
+          const got = await new Promise((resolve) => {
+            const off = Z().on(name, (p) => { if (pred(p)) { off(); resolve(p); } });
+            setTimeout(() => { off(); resolve(null); }, 1200);
+            try { fire(); } catch (_) {}
+          });
+          if (got) return got;
+        }
+        return null;
+      };
+      const moved = await awaitEvent(
+        'windowMoved',
+        (p) => p.id === 1 && Math.abs(p.x - 150) <= 64 && Math.abs(p.y - 120) <= 64,
+        () => { W.setPosition(150, 120).catch(() => {}); },
+      );
       await wait(150);
       const posAfter = await state();
-      const resized = await new Promise((resolve) => {
-        const off = Z().on('windowResized', (p) => {
-          if (p.id === 1 && p.width === 820 && p.height === 620) { off(); resolve(p); }
-        });
-        setTimeout(() => { off(); resolve(null); }, 3000);
-        W.setSize(820, 620).catch(() => {});
-      });
+      const resized = await awaitEvent(
+        'windowResized',
+        (p) => p.id === 1 && p.width === 820 && p.height === 620,
+        () => { W.setSize(820, 620).catch(() => {}); },
+      );
       await wait(150);
       const sizeAfter = await state();
 
