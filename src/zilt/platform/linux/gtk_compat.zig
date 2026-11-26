@@ -2268,7 +2268,8 @@ test "caps：GTK3 全能力；GTK4 六面降级、剪贴板读两栈都在" {
 test "capsJson：冒烟注入载荷字段齐全（按 Caps 反射，防漂移）" {
     var buf: [256]u8 = undefined;
     const s = capsJson(&buf) orelse return error.BufferTooSmall;
-    inline for (std.meta.fields(Caps)) |f| {
+    // v0.5.11：Zig 0.17.1 把 std.meta.fields 改成 @compileError（@typeInfo 替代）。
+    inline for (@typeInfo(Caps).@"struct".fields) |f| {
         try std.testing.expect(std.mem.indexOf(u8, s, "\"" ++ f.name ++ "\":") != null);
     }
     const tray_lit = if (isGtk3()) "\"tray\":true" else "\"tray\":false";
