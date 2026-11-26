@@ -1049,7 +1049,7 @@ function runSecondWindowProbe() {
       // 未映射/最大化窗口上的 move/resize 会被忽略（GTK3 实测 1280x781）。
       await W.restore();
       await W.show();
-      // v0.5.11：openbox 的 unminimize/unmaximize 是异步的——restore/show 还没
+      // v0.5.10：openbox 的 unminimize/unmaximize 是异步的——restore/show 还没
       // 落定时发来的 XMoveWindow/XResizeWindow 会被 WM 丢弃，窗口停在旧位置
       //（GTK4 实测 128,141，windowMoved 整段收不到）。先等窗口回到普通映射态。
       for (let t = 0; t < 20; t++) {

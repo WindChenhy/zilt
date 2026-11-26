@@ -1,4 +1,4 @@
-﻿//! Linux 平台后端（v0.2.1）：GTK3 + WebKit2GTK 4.1。
+//! Linux 平台后端（v0.2.1）：GTK3 + WebKit2GTK 4.1。
 //!
 //! 本版目标是把 Windows 那套「资产 + IPC」模型在 Linux 上立起来，且**可验证**：
 //!   - 窗口：`gtk_window_new` + `webkit_web_view_new_with_user_content_manager`
@@ -2891,7 +2891,7 @@ fn Backend(comptime config: Config) type {
             var y: c.gint = 0;
             gtk_compat.windowGetPosition(win, &x, &y);
             if (!gtk_compat.surfaceHandleAvailable(win)) {
-                // v0.5.11：surface 正在重建（hide→show / unmaximize）时 X11 直连
+                // v0.5.10：surface 正在重建（hide→show / unmaximize）时 X11 直连
                 // 取不到句柄，windowGetPosition 会写 0,0。回退到轮询缓存的上次几何
                 //（与 windowMoved 载荷同源），不把 0,0 当真实位置报给前端。
                 x = st.geom_x;
