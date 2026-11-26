@@ -2890,6 +2890,13 @@ fn Backend(comptime config: Config) type {
             var x: c.gint = 0;
             var y: c.gint = 0;
             gtk_compat.windowGetPosition(win, &x, &y);
+            if (!gtk_compat.surfaceHandleAvailable(win)) {
+                // v0.5.11：surface 正在重建（hide→show / unmaximize）时 X11 直连
+                // 取不到句柄，windowGetPosition 会写 0,0。回退到轮询缓存的上次几何
+                //（与 windowMoved 载荷同源），不把 0,0 当真实位置报给前端。
+                x = st.geom_x;
+                y = st.geom_y;
+            }
             var width: c.gint = 0;
             var height: c.gint = 0;
             gtk_compat.windowGetSize(win, &width, &height);

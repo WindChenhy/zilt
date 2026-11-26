@@ -419,6 +419,15 @@ pub fn windowGetPosition(win: [*c]c.GtkWindow, x: *c_int, y: *c_int) void {
     c.gtk_window_get_position(win, x, y);
 }
 
+/// GTK4：窗口的 X11 表面此刻是否可解析（surface 已 realize、且属 X11 后端）。
+/// hide→show / unmaximize 期间 GDK 会销毁并重建 surface，这一帧取不到 XID；
+/// 此时 windowGetPosition 会写回 0,0——调用方应回退到上次已知几何，
+/// 而不是把 0,0 当成真实位置报给前端。
+pub fn surfaceHandleAvailable(win: [*c]c.GtkWindow) bool {
+    // 单表达式（comptime 分派）：避免 GTK4 实例化后留下死代码。
+    return if (comptime isGtk4()) x11Of(@ptrCast(win)) != null else true;
+}
+
 pub fn setKeepAbove(win: [*c]c.GtkWindow, on: bool) void {
     if (comptime isGtk4()) {
         // GDK4 无 keep-above 布局位（toplevel layout 仅 maximized/fullscreen/
