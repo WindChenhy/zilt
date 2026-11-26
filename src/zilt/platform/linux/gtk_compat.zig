@@ -2268,9 +2268,10 @@ test "caps：GTK3 全能力；GTK4 六面降级、剪贴板读两栈都在" {
 test "capsJson：冒烟注入载荷字段齐全（按 Caps 反射，防漂移）" {
     var buf: [256]u8 = undefined;
     const s = capsJson(&buf) orelse return error.BufferTooSmall;
-    // v0.5.11：Zig 0.17.1 把 std.meta.fields 改成 @compileError（@typeInfo 替代）。
-    inline for (@typeInfo(Caps).@"struct".fields) |f| {
-        try std.testing.expect(std.mem.indexOf(u8, s, "\"" ++ f.name ++ "\":") != null);
+    // v0.5.11：Zig 0.17.1 把 std.meta.fields 改成 @compileError；Struct 的字段名
+    // 也在 0.16 改名成了 field_names（field 的类型改由 @FieldType 取）。
+    inline for (@typeInfo(Caps).@"struct".field_names) |name| {
+        try std.testing.expect(std.mem.indexOf(u8, s, "\"" ++ name ++ "\":") != null);
     }
     const tray_lit = if (isGtk3()) "\"tray\":true" else "\"tray\":false";
     try std.testing.expect(std.mem.indexOf(u8, s, tray_lit) != null);
