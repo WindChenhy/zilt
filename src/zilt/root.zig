@@ -121,6 +121,7 @@ test {
     _ = @import("ipc.zig");
     _ = @import("bindings.zig");
     _ = @import("bundler.zig");
+    _ = @import("flavor_merge.zig"); // v0.6.0a：RFC 7396 合并引擎
     _ = @import("updater.zig");
     _ = @import("platform/macos/sysinfo.zig"); // v0.5.8：macOS 系统信息/Shell 纯函数（ObjC 采集在 backend，CI macos-15 真跑）
     // 测试补齐（v0.3.18 审计）：以下三模块此前只有 `pub const` 惰性声明，测试从未进入编译图
