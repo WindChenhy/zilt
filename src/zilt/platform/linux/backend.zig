@@ -842,10 +842,6 @@ pub fn run(comptime config: Config) !void {
     if (std.c.getenv("ZILT_AUTOMATION")) |a| {
         if (std.mem.eql(u8, std.mem.span(a), "1")) {
             c.webkit_web_context_set_automation_allowed(wc, 1);
-            // v0.5.11：WebKitWebDriver 建会话时会要一个 browsing context
-            // （automation-session::create-web-view）；不接这个信号，会话以
-            // "failed to create a new browsing context" 失败（CI 46025174459）。
-            _ = c.g_signal_connect_data(wc, "automation-started", @ptrCast(&Self.onAutomationStarted), self, null, 0);
             log.print("[linux] automation allowed (ZILT_AUTOMATION=1)", .{});
         }
     }
@@ -4735,30 +4731,6 @@ fn Backend(comptime config: Config) type {
             if (chosen == null) return null;
             defer c.g_free(@ptrCast(chosen));
             return try self.allocator.dupe(u8, std.mem.span(chosen));
-        }
-
-        fn onAutomationStarted(_: ?*c.WebKitWebContext, session: ?*c.WebKitAutomationSession, user_data: c.gpointer) callconv(.c) void {
-            if (session == null) return;
-            _ = c.g_signal_connect_data(session, "create-web-view", @ptrCast(&Self.onAutomationCreateWebView), user_data, null, 0);
-            log.print("[linux] automation session started (create-web-view wired)", .{});
-        }
-
-        /// WebKitWebDriver 建会话时同步要一个 browsing context。Zilt 的窗口/脚本
-        /// 注入已经完成，直接把主窗口的 view 交出去（ref 一次，由信号接收方持有）；
-        /// 这样 driver 的断言直接跑在真实应用页面上。
-        fn onAutomationCreateWebView(_: ?*c.WebKitAutomationSession, user_data: c.gpointer) callconv(.c) ?*c.WebKitWebView {
-            const self: *Self = @ptrCast(@alignCast(user_data orelse return null));
-            const st = self.windowById(0) orelse {
-                log.print("[linux] automation create-web-view: no main window", .{});
-                return null;
-            };
-            const view = st.view orelse {
-                log.print("[linux] automation create-web-view: main window has no view", .{});
-                return null;
-            };
-            _ = c.g_object_ref(@ptrCast(view));
-            log.print("[linux] automation create-web-view -> main view", .{});
-            return view;
         }
 
         fn onDownloadStarted(_: ?*c.WebKitWebContext, download: ?*c.WebKitDownload, user_data: c.gpointer) callconv(.c) void {
