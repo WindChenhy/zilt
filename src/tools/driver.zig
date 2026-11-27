@@ -568,11 +568,12 @@ fn createSessionLinux(alloc: std.mem.Allocator, io_ctx: *IoCtx, opts: Options) !
     }
     const binary_json = try jsonEscape(alloc, opts.app_exe);
     defer alloc.free(binary_json);
-    // v0.5.11：browserName 必须为空串。Ubuntu 22.04 的 WebKitWebDriver 对非空
-    // browserName（此前写的 "webkitgtk"）直接 Failed to match capabilities，
-    // 返回体没有 sessionId（CI 46022528711 的 NoSessionId；WebKit bug 275953）。
+    // v0.5.11：不要带 browserName。WebKitWebDriver 的 platformCapabilities 是
+    // "MiniBrowser"；只要 alwaysMatch 里出现 browserName（哪怕是空串），
+    // matchCapabilities 就按大小写不敏感比较，不等即 Failed to match
+    // （CI 46023870426 实测空串也被拒；WebKit bug 275953）。
     const body = try std.fmt.allocPrint(alloc,
-        \\{{"capabilities":{{"alwaysMatch":{{"browserName":"","webkitgtk:browserOptions":{{"binary":"{s}","args":[]}}}}}}}}
+        \\{{"capabilities":{{"alwaysMatch":{{"webkitgtk:browserOptions":{{"binary":"{s}","args":[]}}}}}}}}
     , .{binary_json});
     defer alloc.free(body);
     const resp = try httpRequest(alloc, io_ctx, opts.driver_port, "POST", "/session", body);
