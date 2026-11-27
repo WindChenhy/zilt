@@ -472,8 +472,12 @@ function runSecondWindowProbe() {
     // 注意：子页面写入后，主页面的 localStorage 内存缓存需要等跨页面
     // 更新传播（实测立即读会拿到旧缓存 → null），给 300ms 传播时间。
     const writeS = await Z().webviews.eval(sId, `localStorage.setItem('${probeKey}','shared'); localStorage.getItem('${probeKey}')`);
-    await wait(300);
-    const readMain = localStorage.getItem(probeKey);
+    // 300ms 固定等待在慢机/负载下不够（CI 46029010969 main=null）→ 轮询 2s。
+    let readMain = localStorage.getItem(probeKey);
+    for (let i = 0; i < 40 && readMain !== 'shared'; i++) {
+      await wait(50);
+      readMain = localStorage.getItem(probeKey);
+    }
     // 反向：主页面写 → 共享子读（诊断跨页面共享方向）
     const mainKey2 = 'zilt_main_' + Date.now();
     localStorage.setItem(mainKey2, 'from-main');

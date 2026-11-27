@@ -3868,6 +3868,9 @@ fn Backend(comptime config: Config) type {
             win_id: u32,
             x: c_int,
             y: c_int,
+            /// 请求尚未被 WM 采纳时的重试次数（v0.5.11：openbox 忙时 80ms 读到的
+            /// 还是旧原点，按偏移补偿会把窗口推飞——CI 46029010969 到 443,-122）。
+            tries: u8 = 0,
         };
 
         /// v0.5.11：show 之后不能立刻 move —— openbox 等 reparent 型 WM 在窗口
@@ -3909,20 +3912,44 @@ fn Backend(comptime config: Config) type {
 
         fn onTrayPosCorrect(user_data: c.gpointer) callconv(.c) c.gboolean {
             const ctx: *TrayPosCtx = @ptrCast(@alignCast(user_data orelse return G_SOURCE_REMOVE));
-            defer std.heap.c_allocator.destroy(ctx);
-            const st = ctx.backend.windowById(ctx.win_id) orelse return G_SOURCE_REMOVE;
+            const st = ctx.backend.windowById(ctx.win_id) orelse {
+                std.heap.c_allocator.destroy(ctx);
+                return G_SOURCE_REMOVE;
+            };
             const widget: [*c]c.GtkWidget = @ptrCast(st.win);
             var ox: c_int = 0;
             var oy: c_int = 0;
-            if (!gtk_compat.surfaceOrigin(widget, &ox, &oy)) return G_SOURCE_REMOVE;
+            if (!gtk_compat.surfaceOrigin(widget, &ox, &oy)) {
+                std.heap.c_allocator.destroy(ctx);
+                return G_SOURCE_REMOVE;
+            }
             const dx = ctx.x - ox;
             const dy = ctx.y - oy;
+            // 离目标还差 60px 以上 → 不是外框偏移，是 WM 还没采纳/落到了别处：
+            // 重新请求目标位置再等一轮（最多 3 次），绝不按偏移去「补偿」。
+            if (@abs(dx) > 60 or @abs(dy) > 60) {
+                if (ctx.tries < 3) {
+                    ctx.tries += 1;
+                    gtk_compat.windowMove(st.win, ctx.x, ctx.y);
+                    log.print("[tray] attach window #{d} re-request {d},{d} (at {d},{d}, try {d})", .{
+                        st.id, ctx.x, ctx.y, ox, oy, ctx.tries,
+                    });
+                    _ = c.g_timeout_add(140, @ptrCast(&Self.onTrayPosCorrect), @ptrCast(ctx));
+                    return G_SOURCE_REMOVE;
+                }
+                log.print("[tray] attach window #{d} position gave up (at {d},{d}, want {d},{d})", .{
+                    st.id, ox, oy, ctx.x, ctx.y,
+                });
+                std.heap.c_allocator.destroy(ctx);
+                return G_SOURCE_REMOVE;
+            }
             if (dx != 0 or dy != 0) {
                 gtk_compat.windowMove(st.win, ctx.x + dx, ctx.y + dy);
                 log.print("[tray] attach window #{d} position corrected by {d},{d} (was {d},{d})", .{
                     st.id, dx, dy, ox, oy,
                 });
             }
+            std.heap.c_allocator.destroy(ctx);
             return G_SOURCE_REMOVE;
         }
 
