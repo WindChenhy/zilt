@@ -292,7 +292,8 @@ jobs:
           sleep 1
           openbox >/tmp/zilt-wd-openbox.log 2>&1 &
           sleep 1
-          timeout 240 zig build e2e
+          # 直接跑 driver，不经 `zig build e2e` 的 Run step（该层在 CI 上会丢 DISPLAY）
+          timeout 240 ./zig-out/bin/zilt-driver ./zig-out/bin/zilt-app
 
       - name: Template scaffold E2E (init vanilla → build)
         run: |

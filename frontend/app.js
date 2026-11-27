@@ -552,7 +552,13 @@ async function runChecks() {
       const writeB = await window.zilt.webviews.eval(bId, `localStorage.setItem('${probeKey}','beta'); localStorage.getItem('${probeKey}')`);
       const readA2 = await window.zilt.webviews.eval(aId, `localStorage.getItem('${probeKey}')`);
       const writeS = await window.zilt.webviews.eval(sId, `localStorage.setItem('${probeKey}','shared'); localStorage.getItem('${probeKey}')`);
-      const readMain = localStorage.getItem(probeKey);
+      // 共享 Environment 的 localStorage 回流到主页面是异步的（WebView2 进程内
+      // 存储代理），立即读会偶发 null（CI 46017890056 单点失败）→ 轮询 2s。
+      let readMain = localStorage.getItem(probeKey);
+      for (let i = 0; i < 40 && readMain !== 'shared'; i++) {
+        await new Promise((r) => setTimeout(r, 50));
+        readMain = localStorage.getItem(probeKey);
+      }
 
       const listAll = await window.zilt.webviews.list();
       const parts = (listAll || []).map((c) => c.partition).filter((p) => p);

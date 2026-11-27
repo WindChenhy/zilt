@@ -125,6 +125,13 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     };
 
+    // Linux 自动化要求应用继承 DISPLAY；打出来便于区分「driver 没有」与
+    // 「WebKitWebDriver 把环境洗掉了」两种 CI 失败（v0.5.11）。
+    if (builtin.os.tag != .windows) {
+        const disp = std.c.getenv("DISPLAY");
+        log.info("DISPLAY={s}", .{if (disp) |p| std.mem.span(p) else "<unset>"});
+    }
+
     const driver_path = findDriver(alloc, opts) orelse {
         log.info("SKIP — 未找到 WebDriver 实现（WebDriver 不可用）", .{});
         if (builtin.os.tag == .windows) {
