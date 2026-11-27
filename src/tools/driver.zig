@@ -568,8 +568,11 @@ fn createSessionLinux(alloc: std.mem.Allocator, io_ctx: *IoCtx, opts: Options) !
     }
     const binary_json = try jsonEscape(alloc, opts.app_exe);
     defer alloc.free(binary_json);
+    // v0.5.11：browserName 必须为空串。Ubuntu 22.04 的 WebKitWebDriver 对非空
+    // browserName（此前写的 "webkitgtk"）直接 Failed to match capabilities，
+    // 返回体没有 sessionId（CI 46022528711 的 NoSessionId；WebKit bug 275953）。
     const body = try std.fmt.allocPrint(alloc,
-        \\{{"capabilities":{{"alwaysMatch":{{"browserName":"webkitgtk","webkitgtk:browserOptions":{{"binary":"{s}","args":[]}}}}}}}}
+        \\{{"capabilities":{{"alwaysMatch":{{"browserName":"","webkitgtk:browserOptions":{{"binary":"{s}","args":[]}}}}}}}}
     , .{binary_json});
     defer alloc.free(body);
     const resp = try httpRequest(alloc, io_ctx, opts.driver_port, "POST", "/session", body);
@@ -577,7 +580,10 @@ fn createSessionLinux(alloc: std.mem.Allocator, io_ctx: *IoCtx, opts: Options) !
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, resp, .{});
     defer parsed.deinit();
     const val = parsed.value.object.get("value") orelse return error.BadResponse;
-    const sid = val.object.get("sessionId") orelse return error.NoSessionId;
+    const sid = val.object.get("sessionId") orelse {
+        log.fail("session response: {s}", .{resp[0..@min(resp.len, 600)]});
+        return error.NoSessionId;
+    };
     return alloc.dupe(u8, sid.string);
 }
 
