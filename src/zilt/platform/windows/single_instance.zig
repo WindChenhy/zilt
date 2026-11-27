@@ -1,8 +1,21 @@
 //! 单实例保护：命名互斥体。第二实例立即退出（退出码 5）。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const win32 = @import("win32.zig");
 const tray = @import("tray.zig");
+
+/// 拒绝路径在测试里是**预期**的（tamper/plaintext 用例）。Zig 0.16+ 的 build
+/// runner 会把测试进程 stderr 的任何输出当作失败诊断，打印误导性的
+/// "failed command: ... test.exe --listen=-"（即使 0 失败）。
+/// 测试构建降到 debug（warn 门限下不输出），生产仍用 warn。
+fn logReject(comptime fmt: []const u8, args: anytype) void {
+    if (builtin.is_test) {
+        std.log.debug(fmt, args);
+    } else {
+        std.log.warn(fmt, args);
+    }
+}
 
 pub const SECOND_INSTANCE_EXIT_CODE: u8 = 5;
 
@@ -74,12 +87,12 @@ pub fn sealPayload(alloc: std.mem.Allocator, key_hex: []const u8, payload: []con
 /// 验封：校验前缀 + HMAC；成功返回载荷副本（alloc 拥有），失败返回 null。
 pub fn openPayload(alloc: std.mem.Allocator, key_hex: []const u8, sealed: []const u8) ?[]u8 {
     const key = keyFromHex(key_hex) catch {
-        std.log.warn("[single-instance] seal key invalid — payload rejected", .{});
+        logReject("[single-instance] seal key invalid — payload rejected", .{});
         return null;
     };
     const prefix = "zilt1|";
     if (!std.mem.startsWith(u8, sealed, prefix)) {
-        std.log.warn("[single-instance] plaintext payload rejected (sealing required)", .{});
+        logReject("[single-instance] plaintext payload rejected (sealing required)", .{});
         return null;
     }
     // 定长解析：n(32 hex) | s(64 hex) | payload——payload 自身可能含 '|'
@@ -99,7 +112,7 @@ pub fn openPayload(alloc: std.mem.Allocator, key_hex: []const u8, sealed: []cons
     var got: [Hmac.mac_length]u8 = undefined;
     _ = std.fmt.hexToBytes(&got, mac_hex) catch return null;
     if (!std.crypto.timing_safe.eql([Hmac.mac_length]u8, got, want)) {
-        std.log.warn("[single-instance] HMAC mismatch — payload rejected", .{});
+        logReject("[single-instance] HMAC mismatch — payload rejected", .{});
         return null;
     }
     return alloc.dupe(u8, payload) catch null;

@@ -1,5 +1,6 @@
 //! 系统信息采集（v0.1.14，Windows）：OS 版本、架构、区域、主题、强调色、显示器。
 const std = @import("std");
+const builtin = @import("builtin");
 const win32 = @import("win32.zig");
 const sysinfo = @import("../../sysinfo.zig");
 
@@ -421,7 +422,8 @@ pub fn collectGpu(alloc: std.mem.Allocator) ![]sysinfo.GpuInfo {
         if (len == 0) continue;
         const name = std.unicode.utf16LeToUtf8Alloc(alloc, dev.device_string[0..len]) catch continue;
         errdefer alloc.free(name);
-        @import("../../log.zig").print("[gpu] adapter {d}: {s}", .{ i, name });
+        // 测试里不打印：stdout/stderr 会被 Zig build runner 误判为失败诊断。
+        if (!builtin.is_test) @import("../../log.zig").print("[gpu] adapter {d}: {s}", .{ i, name });
         try out.append(alloc, .{
             .name = name,
             .vendor = try alloc.dupe(u8, "unknown"),
