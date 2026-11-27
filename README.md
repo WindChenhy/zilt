@@ -6,13 +6,15 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.4.8（macOS WebView 深度：zoom/inspectable/打印/PDF/下载/媒体权限/文件拖入 + macOS 多窗口 + 窗口控制 + 标题栏三态 + 材质/主题/Dock/事件面/状态持久化 + 菜单/托盘/对话框/剪贴板/通知/深链/单实例/全局热键——NSApplication/NSWindow + WKWebView + `zilt://` 资产
-scheme + IPC 双向（`WKScriptMessageHandler` / `evaluateJavaScript`）；无 Mac 硬件的
-开发闭环：Windows 上 `-Dtarget=aarch64-macos` 交叉编译 + CI `macos-15` 真跑）。
+**当前状态：v0.5.11（2026-11-27，桌面三平台对等收口）** —— macOS 分发/安全/更新器
+（v0.5.1–v0.5.8：`.app`/DMG/codesign/公证/Universal/Keychain/ed25519 更新器 + 系统信息/Shell/电源/主题）、
+Linux GTK4 变体双栈 CI + ARM64 实跑（v0.5.9–v0.5.10）、CI 稳定性收口（v0.5.11：Tray/GTK4 v04/冒烟 partition
+去 flake）。**L1b（GTK4 转默认）与 Linux WebDriver 自动化（`create-web-view`）排入 v0.6.x**；详见
+[docs/ROADMAP.md](docs/ROADMAP.md)。
 v0.4.3（Linux 发行版可用性——L1a GTK4 构建级兼容：`-Dgtk=gtk4` 双栈，
 GTK 4.14.5 / WebKitGTK 6.0 2.52.6 实测；L3 AppImage 自包含：WebKit 随包 + helper 路径改写，
 「无宿主 WebKit」bwrap/容器实测 95/95；L6 托盘挂窗：XEmbed 自建图标左键 toggle + 贴图标定位 +
-FFM 规避，stalonetray 实测；L4 ARM64 构建链脚本 + CI job（容器验收待 CI）；L5 打包与签名：
+FFM 规避，stalonetray 实测；L4 ARM64 构建链脚本 + CI job；L5 打包与签名：
 rpmbuild 实构建（bin + 桌面项 + 图标，%post 刷新 desktop db）、AUR PKGBUILD/package() 验证、
 deb `_gpgorigin` 与 rpm `--addsign` 实签实校（含反向对照））。
 v0.4.2（安全与系统集成——H3 Linux 密钥环加密 store（libsecret dlopen，`secret:` 标记）/
@@ -24,11 +26,11 @@ v0.4.0（H6–H11 / H20 / L2 / L7 / L8 双平台小项收尾）。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
-| Windows | ✅ 全栈（v0.1.0–v0.5.9） | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
-| Linux | ✅ 全栈（v0.2.0–v0.5.9，冒烟 95 项） | GTK3 默认 + WebKit2GTK 4.1；`-Dgtk=gtk4` 变体（GTK4 + WebKitGTK 6.0，v0.5.9 起双栈 CI 同跑单测 + 冒烟） |
+| Windows | ✅ 全栈（v0.1.0–v0.5.11） | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
+| Linux | ✅ 全栈（v0.2.0–v0.5.11，冒烟 95 项） | GTK3 默认 + WebKit2GTK 4.1；`-Dgtk=gtk4` 变体（GTK4 + WebKitGTK 6.0，v0.5.9 起双栈 CI 同跑单测 + 冒烟） |
 | macOS | ✅ 对等收口（v0.4.4–v0.5.8）：主链 + 菜单/托盘/对话框/剪贴板/通知/深链/单实例/热键 + 分发（.app/DMG/codesign/公证/Universal）+ Keychain + 更新器 + 系统信息/Shell/电源/主题 | WKWebView（手写 ObjC 消息，无 `@cImport`） |
 
-**Linux GTK4 变体能力面（v0.5.9 双栈 CI 实测）**
+**Linux GTK4 变体能力面（v0.5.11 双栈 CI 实测）**
 
 | 能力 | GTK3 | GTK4 | 说明 |
 |---|---|---|---|
@@ -52,7 +54,7 @@ fs（scope/watch/流式）、SQL、store（可选 DPAPI 加密）、http（WinHT
 Linux 复用同一 JS API 面，差异逐版本以「文档化」条目记录（无 SharedBuffer → evaluate 通道、无 PDF 导出 →
 `PdfNotSupported` 等）。
 
-## 能力索引（v0.5.9）
+## 能力索引（v0.5.11）
 
 > 本表聚焦 Windows / Linux（GTK3 默认）共有的 JS API 面；macOS 能力面见上表平台行与
 > v0.4.4–v0.5.8 版本记录，GTK4 变体的降级项见上方「Linux GTK4 变体能力面」。
