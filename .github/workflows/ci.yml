@@ -91,26 +91,39 @@ jobs:
           $env:ZILT_SMOKE_EXIT = "1"
           # GUI 子系统 exe：PowerShell 的 & 调用不等待退出、$LASTEXITCODE 为空
           # （CI 45025651776 实测 "smoke exit=" 空值）→ Start-Process -Wait 取 .ExitCode
-          $p = Start-Process -FilePath ".\zig-out\bin\zilt-app.exe" -PassThru `
-                 -RedirectStandardError smoke_log.txt -NoNewWindow
-          # 应用内的 90s 定时器依赖主线程消息循环；若某一项同步调用把 UI 线程
-          # 卡住，定时器也不会触发。外层再加一道硬超时，保证 step 不会挂到 job
-          # 的 30 分钟上限，且失败日志能进入 artifact。
-          if (-not $p.WaitForExit(180000)) {
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            throw "smoke did not exit within 180s (app timer never fired)"
+          #
+          # v0.6.0a：WebView2 157 在 runner 上偶发导航失败（web_error_status=14 →
+          # partition 单点红）或控制器不加载（90s 定时器空转）。冒烟整跑重试一次，
+          # 首轮日志另存 *.attempt1 供 artifact；确定性缺陷两轮都会红。
+          $code = 1
+          for ($attempt = 1; $attempt -le 2; $attempt++) {
+            if ($attempt -gt 1) {
+              Copy-Item zilt.log zilt.log.attempt1 -ErrorAction SilentlyContinue
+              Copy-Item smoke_log.txt smoke_log.txt.attempt1 -ErrorAction SilentlyContinue
+              Remove-Item zilt.log, smoke_log.txt -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 3
+            }
+            $p = Start-Process -FilePath ".\zig-out\bin\zilt-app.exe" -PassThru `
+                   -RedirectStandardError smoke_log.txt -NoNewWindow
+            if (-not $p.WaitForExit(180000)) {
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+              $code = 124
+              "smoke attempt=$attempt TIMEOUT (>180s)"
+            } else {
+              $code = $p.ExitCode
+              "smoke attempt=$attempt exit=$code"
+            }
+            if ($code -eq 0) { break }
+            if (Test-Path zilt.log) {
+              "== attempt $attempt smoke summary =="
+              Select-String -Path zilt.log -Pattern "\[smoke\]" | Select-Object -Last 4
+              "== attempt $attempt zilt.log tail =="
+              Get-Content zilt.log -Tail 30
+            }
+            if (Test-Path smoke_log.txt) { "== attempt $attempt stderr tail =="; Get-Content smoke_log.txt -Tail 20 }
           }
-          $code = $p.ExitCode
-          "smoke exit=$code"
-          if (Test-Path zilt.log) {
-            "== smoke summary =="
-            Select-String -Path zilt.log -Pattern "\[smoke\]" | Select-Object -Last 4
-            "== zilt.log tail =="
-            Get-Content zilt.log -Tail 20
-          }
-          if (Test-Path smoke_log.txt) { "== stderr tail =="; Get-Content smoke_log.txt -Tail 20 }
           $servers | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
-          if ($code -ne 0) { throw "smoke failed with exit $code" }
+          if ($code -ne 0) { throw "smoke failed with exit $code (2 attempts)" }
 
       # 单测在 CI 上静默崩溃（无 FAIL 摘要）时，直跑测试二进制拿真实栈
       - name: Test crash triage
@@ -181,9 +194,11 @@ jobs:
           name: logs
           path: |
             smoke_log.txt
+            smoke_log.txt.attempt1
             driver.log
             driver.err
             zilt.log
+            zilt.log.attempt1
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------

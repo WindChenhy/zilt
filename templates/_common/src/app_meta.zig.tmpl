@@ -5,6 +5,8 @@ pub const version = @import("project.zig").version;
 pub const app_id = @import("project.zig").app_id;
 pub const exe_name = @import("project.zig").exe_name;
 pub const external_bin = @import("project.zig").external_bin;
+// v0.6.0a：CLI `zilt info` 会打印 channel；模板暂不接 flavor options，固定 stable。
+pub const channel = "stable";
 
 pub const icon = @import("project.zig").icon;
 pub const frontend = @import("project.zig").frontend;
