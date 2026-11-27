@@ -143,6 +143,9 @@ pub const Identity = struct { app_name: []u8, app_id: []u8, ... };
 - `src/app_meta.zig` 改读 options；Windows PE VERSIONINFO/manifest、`zilt info`、pack 工具随之使用 flavor 身份。
 - `zilt build [--flavor NAME] [--config FILE] [zig build 参数...]` 翻译为 `zig build -Dflavor=... -Dconfig=...`。
 - 验证：`zilt.config.json` 表 + `zilt.beta.json` → `zilt info` 输出 beta 身份；未知 flavor / 重复 app_id 明确报错；`zig build test` 436/438（2 skip）。
+- 模板 `_common/src/app_meta.zig.tmpl` 补 `channel`（模板会复制 `src/tools/cli.zig`，`zilt info` 依赖该字段）；
+  Windows 冒烟因 WebView2 157 runner flake（导航 status=14 / 控制器不加载）整跑重试一次，首轮日志存 `*.attempt1`。
+- CI **run 46040483306 全绿**：Linux（模板/打包/RPM）、GTK4、Windows、arm64、NSIS 全通过。
 
 **决策落地**
 
