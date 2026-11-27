@@ -123,22 +123,23 @@ jobs:
 
       - name: WebDriver E2E (optional — SKIP when driver missing)
         shell: pwsh
+        timeout-minutes: 8
         run: |
           # msedgedriver 必须匹配 **WebView2 运行时**（应用实际用的引擎），不是 Edge 浏览器：
           # runner 上 Edge stable 可能已 158，而 WebView2 仍是 157（CI 45846936379 实测
           # "driver only supports 158 / Current browser version is 157"）。
-          $wvRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft\EdgeWebView\Application'
+          # 注册表 pv 是运行时实际加载的版本，优先于目录扫描（目录里可能并存新旧版本）。
           $ver = $null
-          if (Test-Path $wvRoot) {
-            $wv = Get-ChildItem $wvRoot -Directory -ErrorAction SilentlyContinue |
-                  Where-Object { $_.Name -match '^\d+\.\d+\.' -and (Test-Path (Join-Path $_.FullName 'msedgewebview2.exe')) } |
-                  Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
-            if ($wv) { $ver = $wv.Name }
-          }
+          $key = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          $ver = (Get-ItemProperty $key -ErrorAction SilentlyContinue).pv
           if (-not $ver) {
-            # 回退：EdgeUpdate 客户端注册表里的 WebView2 pv
-            $key = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
-            $ver = (Get-ItemProperty $key -ErrorAction SilentlyContinue).pv
+            $wvRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft\EdgeWebView\Application'
+            if (Test-Path $wvRoot) {
+              $wv = Get-ChildItem $wvRoot -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match '^\d+\.\d+\.' -and (Test-Path (Join-Path $_.FullName 'msedgewebview2.exe')) } |
+                    Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+              if ($wv) { $ver = $wv.Name }
+            }
           }
           if (-not $ver) { Write-Host "WebView2 runtime not found — skipping driver E2E"; exit 0 }
           Write-Host "WebView2 runtime: $ver"
@@ -152,8 +153,20 @@ jobs:
             Write-Host "msedgedriver $ver download failed ($($_.Exception.Message)) — driver E2E SKIP"
             exit 0
           }
-          & .\zig-out\bin\zilt-driver.exe .\zig-out\bin\zilt-app.exe 2>&1 | Tee-Object driver.log
-          $code = $LASTEXITCODE
+          # 重定向到文件 + 硬超时：driver 在 POST /session 无响应时没有读超时，
+          # 直接 `| Tee-Object` 会挂到 job 上限，且日志拿不到（CI 46015265168）。
+          $p = Start-Process -FilePath ".\zig-out\bin\zilt-driver.exe" `
+                 -ArgumentList ".\zig-out\bin\zilt-app.exe" `
+                 -RedirectStandardOutput driver.log -RedirectStandardError driver.err `
+                 -PassThru -NoNewWindow
+          if (-not $p.WaitForExit(360000)) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Write-Host "driver E2E TIMEOUT after 360s"
+            Get-Content driver.log, driver.err -Tail 40 -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Get-Content driver.log, driver.err -Tail 40 -ErrorAction SilentlyContinue
+          $code = $p.ExitCode
           if ($code -eq 3) { Write-Host "driver E2E SKIP (no driver)"; exit 0 }
           if ($code -ne 0) { throw "driver E2E failed with exit $code" }
 
@@ -165,6 +178,7 @@ jobs:
           path: |
             smoke_log.txt
             driver.log
+            driver.err
             zilt.log
           if-no-files-found: ignore
 
@@ -263,14 +277,22 @@ jobs:
       - name: Differential update E2E (patch + rollback/health)
         run: bash scripts/linux/dev-update-e2e.sh
 
-      # v0.5.11：WebKitWebDriver 会自己拉起应用，必须有 DISPLAY（此前直接跑 zig build e2e，
-      # 无 X 时 POST /session 等不到浏览器就挂死）；加 xvfb-run 并给外层硬超时。
+      # v0.5.11：显式起 Xvfb + openbox 并 export DISPLAY。
+      # xvfb-run 下 zig build → driver → WebKitWebDriver → app 这条链在 CI 上
+      # 仍拿不到 DISPLAY（Gtk-WARNING cannot open display → POST /session 挂死），
+      # 与 smoke/tray 步骤用同一套显式 X 环境最稳。
       - name: WebDriver E2E (WebKitWebDriver)
         env:
           GDK_BACKEND: x11
           WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: "1"
           LIBGL_ALWAYS_SOFTWARE: "1"
-        run: timeout 240 xvfb-run -a --server-args="-screen 0 1280x800x24" zig build e2e
+        run: |
+          export DISPLAY=:98
+          Xvfb :98 -screen 0 1280x800x24 >/tmp/zilt-wd-xvfb.log 2>&1 &
+          sleep 1
+          openbox >/tmp/zilt-wd-openbox.log 2>&1 &
+          sleep 1
+          timeout 240 zig build e2e
 
       - name: Template scaffold E2E (init vanilla → build)
         run: |
