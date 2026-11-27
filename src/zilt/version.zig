@@ -8,14 +8,7 @@
 //!   - `zilt --version` 默认值
 pub const version = "0.5.11";
 
-test "version 是 semver 形态（x.y.z）" {
-    const std = @import("std");
-    var it = std.mem.splitScalar(u8, version, '.');
-    var parts: usize = 0;
-    while (it.next()) |p| {
-        try std.testing.expect(p.len > 0);
-        _ = try std.fmt.parseInt(u32, p, 10);
-        parts += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 3), parts);
+test "version 是 semver 形态（允许 -prerelease / +build）" {
+    const vm = @import("flavor_merge.zig");
+    try @import("std").testing.expect(vm.validateSemver(version));
 }
