@@ -109,6 +109,11 @@ const default_checks = [_]Check{
 /// 工具进程的 Io（Threaded 惰性创建；HTTP 客户端/文件/进程 API 都走它）。
 var g_threaded: Io.Threaded = undefined;
 var g_threaded_ready = false;
+/// v0.5.11：`Io.Threaded.init(.{})` 的默认 environ 是**空的**，`Child.spawn`
+/// 会据此给子进程一个空环境——WebKitWebDriver 因此拿不到 DISPLAY，拉起的 app
+/// 直接 `Gtk-WARNING cannot open display`。这里保存 main 收到的完整环境，
+/// spawn 时显式传入（CI 46020253733 定位）。
+var g_environ_map: ?*std.process.Environ.Map = null;
 fn toolIo() Io {
     if (!g_threaded_ready) {
         g_threaded = .init(std.heap.page_allocator, .{});
@@ -124,6 +129,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("error: {s}\n", .{@errorName(e)});
         std.process.exit(2);
     };
+    g_environ_map = init.environ_map;
 
     // Linux 自动化要求应用继承 DISPLAY；打出来便于区分「driver 没有」与
     // 「WebKitWebDriver 把环境洗掉了」两种 CI 失败（v0.5.11）。
@@ -201,6 +207,7 @@ pub fn main(init: std.process.Init) !void {
     // ---- Linux：WebKitWebDriver 自己拉起应用（browserOptions.binary）----
     // ZILT_AUTOMATION=1 经 env 继承传给应用 → webkit_web_context_set_automation_allowed
     setEnv("ZILT_AUTOMATION", "1");
+    if (g_environ_map) |m| m.put("ZILT_AUTOMATION", "1") catch {};
 
     // v0.5.11：WebKitWebDriver 只认 `--port=<n>` 单参数形式（Ubuntu 24.04 的
     // webkit2gtk-driver 对 `--port <n>` 直接打 Usage 退出，CI 上表现为 session
@@ -395,6 +402,7 @@ fn spawnProcessLinux(alloc: std.mem.Allocator, argv: []const []const u8, cwd: []
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
+        .environ_map = g_environ_map,
     }) catch null;
 }
 
