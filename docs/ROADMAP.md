@@ -2,7 +2,7 @@
 
 > 制定日期：2026-11-20。修订：2026-11-21（Linux 专项复核：L1–L8 入图，macOS 顺延）。
 > 基线：**v0.3.19**（git 31b3109，测试体系收口）。
-> 当前：**v0.5.10**（tag v0.5.10 → 2cc76da，2026-11-26）+ **v0.5.11 CI 收口**（未发版，4e91872 / c0102c9 / ae08523 / f07e97c 待 CI 复核）。
+> 当前：**v0.5.11**（tag v0.5.11 → a20483c，2026-11-27；CI run **46032448049** 全绿）。
 > v0.4.5–v0.4.9 是 macOS 能力面切片；v0.5.x 交付台账与收口判定见下节「版本状态」。
 > 对标：**Wails v3.1.0 stable（2026-11-01）+ v3.2.0-nightly**、**Tauri 2.12.x**（2026-11 最新，2.12.x 仅 bugfix）。
 > 历史说明：原 docs/ 文档（v0.1–v0.3 逐版本记录、调研报告、WebView2 ABI 笔记、ADR）已随文档清理移除，
@@ -32,7 +32,7 @@
 | v0.5.8 | 对等打磨 | 系统信息 / Shell / 电源与主题事件 / 单实例边缘 + Intel 回归 |
 | v0.5.9 | Linux GTK4 变体 | 双栈 CI 同跑（单测 + 95 项冒烟）；GdkClipboard 读面；变体能力表 |
 | v0.5.10 | 能力矩阵 | `capsJson` 反射契约测试 + GTK4 稳定性修复 + 版本号 |
-| v0.5.11（未发版） | CI 收口 | E2E EXIT trap 吞码（4e91872）、Tray E2E 取证（c0102c9）、WebKitWebDriver `--port=<n>`（ae08523）、WebDriver E2E 走 `xvfb-run` + 240s 硬超时（f07e97c） |
+| v0.5.11（tag） | CI 收口 | E2E EXIT trap 吞码（4e91872）、Tray 取证（c0102c9）、WebKitWebDriver `--port=<n>`（ae08523）、显式 Xvfb（f07e97c）、Windows driver 按 WebView2 运行时取、driver 显式环境（b851577）、Tray 等 mapped + 校正重试（a23fb67）、模板补 `external_bin`（a20483c）；WebDriver E2E 转 advisory |
 
 ### v0.5 收口清单
 
@@ -62,8 +62,9 @@
 **v0.5 收口判据（D12 修订）**：除 L1b 外的子项全绿 + Linux 三作业（GTK3 / GTK4 / arm64）可复现全绿；
 WebDriver E2E 为 **advisory**（Windows 偶发 attach 挂起、Linux 自动化能力未完成，均不阻塞）。
 
-**现状（2026-11-27）**：**核心门槛已收口** —— 三平台 build / 单测 / 冒烟 / 打包全绿，Linux Tray/AppImage/
-增量更新全绿，ARM64 全绿；WebDriver E2E 以 `continue-on-error` 标黄保留，Linux 自动化缺口记入 v0.6.x。
+**现状（2026-11-27）**：**已收口（tag v0.5.11）** —— CI run 46032448049 全绿：三平台 build / 单测 /
+冒烟 / 打包 + Linux Tray/AppImage/增量更新 + ARM64 + 模板 E2E。WebDriver E2E 以 `continue-on-error`
+标黄保留（Windows attach 偶发挂起、Linux `create-web-view` 未完成），Linux 自动化缺口记入 v0.6.x。
 
 **结论（D12，2026-11-26 拍板）**：**L1b 移出 v0.5**，作为 **v0.6.1** 的独立切片（GTK4 继续是 CI 覆盖的
 opt-in 变体）；v0.5 以「CI 全绿」收口，随后启动 v0.6.0（flavors / DX）。理由：默认 GTK3 是当前能力最全的栈，
