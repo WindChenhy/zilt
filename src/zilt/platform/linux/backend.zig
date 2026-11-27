@@ -3870,6 +3870,43 @@ fn Backend(comptime config: Config) type {
             y: c_int,
         };
 
+        /// v0.5.11：show 之后不能立刻 move —— openbox 等 reparent 型 WM 在窗口
+        /// 还没 map 时会丢弃 ConfigureRequest，窗口退回上次几何（CI 45850796425
+        /// 实测 318,30 → 185,106）。这里轮询到 mapped 再下定位请求，最多等 600ms。
+        const TrayMoveCtx = struct {
+            backend: *Self,
+            win_id: u32,
+            x: c_int,
+            y: c_int,
+            tries: u8 = 0,
+        };
+
+        fn onTrayPendingMove(user_data: c.gpointer) callconv(.c) c.gboolean {
+            const ctx: *TrayMoveCtx = @ptrCast(@alignCast(user_data orelse return G_SOURCE_REMOVE));
+            const st = ctx.backend.windowById(ctx.win_id) orelse {
+                std.heap.c_allocator.destroy(ctx);
+                return G_SOURCE_REMOVE;
+            };
+            const widget: [*c]c.GtkWidget = @ptrCast(st.win);
+            if (c.gtk_widget_get_mapped(widget) == 0 and ctx.tries < 20) {
+                ctx.tries += 1;
+                _ = c.g_timeout_add(30, @ptrCast(&Self.onTrayPendingMove), @ptrCast(ctx));
+                return G_SOURCE_REMOVE;
+            }
+            gtk_compat.windowMove(st.win, ctx.x, ctx.y);
+            st.geom_x = ctx.x;
+            st.geom_y = ctx.y;
+            log.print("[tray] attach window #{d} positioned {d},{d} (mapped={}, tries={d})", .{
+                st.id, ctx.x, ctx.y, c.gtk_widget_get_mapped(widget) != 0, ctx.tries,
+            });
+            if (std.heap.c_allocator.create(TrayPosCtx)) |pc| {
+                pc.* = .{ .backend = ctx.backend, .win_id = ctx.win_id, .x = ctx.x, .y = ctx.y };
+                _ = c.g_timeout_add(80, @ptrCast(&Self.onTrayPosCorrect), @ptrCast(pc));
+            } else |_| {}
+            std.heap.c_allocator.destroy(ctx);
+            return G_SOURCE_REMOVE;
+        }
+
         fn onTrayPosCorrect(user_data: c.gpointer) callconv(.c) c.gboolean {
             const ctx: *TrayPosCtx = @ptrCast(@alignCast(user_data orelse return G_SOURCE_REMOVE));
             defer std.heap.c_allocator.destroy(ctx);
@@ -3970,22 +4007,17 @@ fn Backend(comptime config: Config) type {
             c.gtk_widget_show(widget);
             c.gtk_window_present(w.win);
             // **先 show/present 再 move**：openbox 等 reparent 型 WM 会忽略未映射
-            // 窗口的 move 请求（退化成智能放置/居中；L6 实测 y=95）。
+            // 窗口的 move 请求（退化成智能放置/居中；L6 实测 y=95）。v0.5.11 起
+            // 等到真正 mapped 再下定位请求（CI 上 show 后立即 move 仍会被丢）。
             if (target) |t| {
-                gtk_compat.windowMove(w.win, t[0], t[1]);
-                w.geom_x = t[0];
-                w.geom_y = t[1];
                 // map 后的「恢复启动几何」会盖掉托盘定位（v0.3.0 onMapRestore
                 // 的补 move）——挂窗显示时以托盘锚点为准，撤销待补的恢复。
                 w.restored_geometry = false;
-                // reparent 型 WM（openbox 等）把 ConfigureRequest 当外框位置，
-                // 客户区会偏移标题栏高度（L6 实测 +20px）。同步读几何拿到的是
-                // 旧值（WM 尚未处理请求），因此延后 80ms 校正一次。
-                if (std.heap.c_allocator.create(TrayPosCtx)) |ctx| {
+                if (std.heap.c_allocator.create(TrayMoveCtx)) |ctx| {
                     ctx.* = .{ .backend = self, .win_id = w.id, .x = t[0], .y = t[1] };
-                    _ = c.g_timeout_add(80, @ptrCast(&Self.onTrayPosCorrect), @ptrCast(ctx));
+                    _ = c.g_timeout_add(30, @ptrCast(&Self.onTrayPendingMove), @ptrCast(ctx));
                 } else |_| {}
-                log.print("[tray] attach window #{d} positioned {d},{d} (anchor {d},{d})", .{ w.id, t[0], t[1], anchor_log[0], anchor_log[1] });
+                log.print("[tray] attach window #{d} queued {d},{d} (anchor {d},{d})", .{ w.id, t[0], t[1], anchor_log[0], anchor_log[1] });
             }
             log.print("[tray] attach window #{d} shown", .{w.id});
         }

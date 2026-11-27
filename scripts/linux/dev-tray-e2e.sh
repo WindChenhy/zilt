@@ -138,14 +138,23 @@ EOF
     # 2) 左键 → 显示 + 贴图标定位
     $XT click $((ix + iw / 2)) $((iy + ih / 2)) 1
     if wait_visible "$MAIN" 1 12; then pass "second left click shows window"; else fail "second left click did not show window"; fi
-    sleep 0.4
-    read -r mx my mw mh <<EOF
-$($XT geom "$MAIN")
-EOF
-    echo "main_geom_after=$mx,$my ${mw}x${mh}"
     icon_right=$((ix + iw))
     icon_bottom=$((iy + ih))
     icon_top=$iy
+    # v0.5.11：定位请求现在等 mapped 后才下（最多 600ms）+ 80ms 外框校正，
+    # 固定 sleep 0.4 会采到中间态 → 轮询到锚定或 2.4s 超时再断言。
+    for _ in $(seq 1 16); do
+      read -r mx my mw mh <<EOF
+$($XT geom "$MAIN")
+EOF
+      if [ $((mx + mw)) -ge $((icon_right - 2)) ] && [ $((mx + mw)) -le $((icon_right + 2)) ] \
+        && { { [ "$my" -ge $((icon_bottom + 2)) ] && [ "$my" -le $((icon_bottom + 6)) ]; } \
+          || { [ $((my + mh)) -le $((icon_top - 2)) ] && [ $((my + mh)) -ge $((icon_top - 6)) ]; }; }; then
+        break
+      fi
+      sleep 0.15
+    done
+    echo "main_geom_after=$mx,$my ${mw}x${mh}"
     if [ $((mx + mw)) -ge $((icon_right - 2)) ] && [ $((mx + mw)) -le $((icon_right + 2)) ]; then
       pass "window right edge aligns icon right edge ($((mx + mw)) vs $icon_right)"
     else
@@ -183,6 +192,8 @@ EOF
   kill "$APP_PID" 2>/dev/null || true
   sleep 1
   cp -f zilt.log .zilt-probe/tray-run1.log 2>/dev/null || true
+  echo "=== tray log run1 (grep) ==="
+  grep -a '\[tray\]' .zilt-probe/tray-run1.log | tail -20 || true
 
   echo "=== run 2: focus-follows-mouse 检测（挂窗 hideOnFocusLost 禁用）==="
   start_stack
