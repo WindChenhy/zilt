@@ -130,3 +130,29 @@ pub const Identity = struct { app_name: []u8, app_id: []u8, ... };
 
 > 待拍板：`app_id` 是否允许 flavor 覆盖（推荐允许，且强制唯一）；`version` 是否允许带预发布后缀
 > （`0.6.0-beta.1` 需放宽现有 semver 单测）。实施前确认。
+
+## 9. 实施状态（2026-11-28，0.6.0a）
+
+**已落地**
+
+- `src/zilt/flavor_merge.zig`：RFC 7396 合并、`Identity` 投影、app_id（反向 DNS 形态）、
+  semver（核心 + `-prerelease` + `+build`）、channel 校验；11 个 test 块（合并 6 + 身份/表 5）。
+- `build.zig`：`-Dflavor` / `-Dconfig`；解析 `zilt.config.json` → `zilt.<platform>.json` →
+  `zilt.<flavor>.json` → `-Dconfig`；`flavors` 表校验（app_id 唯一、选中项必须存在）；
+  身份经 `app_meta_opts` 注入（`app_name` / `app_id` / `publisher` / `channel`）。
+- `src/app_meta.zig` 改读 options；Windows PE VERSIONINFO/manifest、`zilt info`、pack 工具随之使用 flavor 身份。
+- `zilt build [--flavor NAME] [--config FILE] [zig build 参数...]` 翻译为 `zig build -Dflavor=... -Dconfig=...`。
+- 验证：`zilt.config.json` 表 + `zilt.beta.json` → `zilt info` 输出 beta 身份；未知 flavor / 重复 app_id 明确报错；`zig build test` 436/438（2 skip）。
+
+**决策落地**
+
+- `app_id` 允许 flavor 覆盖：已实现，并在 `flavors` 表中强制唯一（表存在时）。
+- 版本允许预发布后缀：`validateSemver` 接受 `0.6.0-beta.1`；`project.version` 可直接写预发布版本。
+- **版本覆盖仍缓到 0.6.0b**：运行时 `src/zilt/version.zig` 与 `init` 的占位符提取都依赖字面量，
+  改成 options 会破坏模板生成；0.6.0a 对 `-Dflavor` 里改 `version` 直接报错。
+
+**未做（0.6.0b）**
+
+- `frontend` / `capabilities` / CSP / `window` 默认值纳入 overlay；`exe_name` / `icon` 覆盖。
+- `flavors` 表支持 `extends` 与按表生成 `zilt.<name>.json`（当前文件模式与表模式二选一）。
+- 模板里的 `zilt.<flavor>.json` 示例与「一份代码三种产物」文档。

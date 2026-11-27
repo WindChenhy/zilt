@@ -70,6 +70,14 @@ WebDriver E2E 为 **advisory**（Windows 偶发 attach 挂起、Linux 自动化�
 opt-in 变体）；v0.5 以「CI 全绿」收口，随后启动 v0.6.0（flavors / DX）。理由：默认 GTK3 是当前能力最全的栈，
 GTK4 转默认会先丢掉托盘 / 菜单栏 / 拖出（对等目标反而倒退）；v0.6 的范围与 GTK 栈无关，无需等待。
 
+### v0.6.0a（2026-11-28，进行中）
+
+flavors 落地第一片：RFC 7396 合并引擎 + build 期 `-Dflavor/-Dconfig` 解析 + `flavors` 表唯一性校验 +
+`app_meta` options 投影（打包/`zilt info` 用 flavor 身份）+ `zilt build` 参数转译。
+证据：`zig build test` 436/438（2 skip）；`zilt build --flavor beta info` 输出 beta 身份。
+剩余 0.6.0b：frontend / capabilities / CSP 纳入 overlay、版本覆盖（运行时单源重构）、exe_name/icon。
+详见 [DESIGN_v0.6.0_flavors.md](DESIGN_v0.6.0_flavors.md) §9。
+
 ## 0. 差距分析结论
 
 ### 0.1 已持平/领先维度（不动作）

@@ -60,6 +60,8 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (eql(u8, cmd, "doctor")) return runDoctor(alloc);
     if (eql(u8, cmd, "info")) return runInfo();
+    // v0.6.0a：flavor 语法糖——翻译成 zig build -Dflavor/-Dconfig
+    if (eql(u8, cmd, "build")) return runBuild(init, alloc, args.items[1..]);
     if (eql(u8, cmd, "mcp")) return runMcp(init, alloc, args.items[1..]);
     if (eql(u8, cmd, "icon")) return runIcon(alloc, args.items[1..]);
     if (eql(u8, cmd, "npm-pack")) return runNpmPack(alloc, args.items[1..]);
@@ -97,6 +99,8 @@ fn printHelp() void {
         \\  zilt self-update --manifest <url> --pubkey <64hex> [--github owner/repo]
         \\                 [--channel stable|beta] [--exe-name <name>]
         \\                 CLI 自身经更新器基建更新（ed25519 验签 + 原子替换 + .zilt-old 备份）
+        \\  zilt build [--flavor dev|beta|prod] [--config extra.json] [zig build 参数...]
+        \\                 转译成 zig build -Dflavor=... -Dconfig=...（flavor 文件：zilt.<name>.json）
         \\
         \\构建/运行仍走 zig build:
         \\  zig build           编译应用
@@ -295,12 +299,78 @@ fn runDoctor(alloc: std.mem.Allocator) !u8 {
     return 1;
 }
 
+/// v0.6.0a：`zilt build [--flavor NAME] [--config FILE] [zig build args...]`
+/// 只做参数转译（JSON 解析在 build.zig 配置期），其余原样转发。
+fn runBuild(init: std.process.Init, alloc: std.mem.Allocator, args: []const []u8) u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    argv.append(a, "zig") catch return 1;
+    argv.append(a, "build") catch return 1;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        var opt: ?[]const u8 = null;
+        var val: ?[]const u8 = null;
+
+        if (eqlStr(arg, "--flavor") or eqlStr(arg, "-F")) {
+            opt = "-Dflavor=";
+            if (i + 1 >= args.len) {
+                print("zilt build: --flavor 缺少值\n", .{});
+                return 2;
+            }
+            i += 1;
+            val = args[i];
+        } else if (eqlStr(arg, "--config") or eqlStr(arg, "-C")) {
+            opt = "-Dconfig=";
+            if (i + 1 >= args.len) {
+                print("zilt build: --config 缺少值\n", .{});
+                return 2;
+            }
+            i += 1;
+            val = args[i];
+        } else if (std.mem.startsWith(u8, arg, "--flavor=")) {
+            opt = "-Dflavor=";
+            val = arg["--flavor=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--config=")) {
+            opt = "-Dconfig=";
+            val = arg["--config=".len..];
+        }
+
+        if (opt) |prefix| {
+            argv.append(a, std.fmt.allocPrint(a, "{s}{s}", .{ prefix, val.? }) catch return 1) catch return 1;
+        } else {
+            argv.append(a, arg) catch return 1;
+        }
+    }
+
+    var child = std.process.spawn(init.io, .{
+        .argv = argv.items,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .environ_map = init.environ_map,
+    }) catch |e| {
+        print("zilt build: 启动 zig 失败: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    const term = child.wait(init.io) catch return 1;
+    return switch (term) {
+        .exited => |code| @intCast(code),
+        else => 1,
+    };
+}
+
 fn runInfo() u8 {
     const project = meta;
     print("app_name   {s}\n", .{project.app_name});
     print("publisher  {s}\n", .{project.publisher});
     print("version    {s}\n", .{project.version});
     print("app_id     {s}\n", .{project.app_id});
+    print("channel    {s}\n", .{project.channel});
     print("exe_name   {s}\n", .{project.exe_name});
     print("icon       {s}\n", .{project.icon orelse "(builtin)"});
     const fe = project.frontend;

@@ -1,6 +1,110 @@
 const std = @import("std");
 const project = @import("src/project.zig");
 const codegen = @import("src/tools/frontend_codegen.zig");
+const flavor_merge = @import("src/zilt/flavor_merge.zig");
+
+// v0.6.0a：flavor overlay 解析（RFC 7396）。顺序：
+// project 默认 → zilt.config.json → zilt.<platform>.json → zilt.<flavor>.json → -Dconfig。
+fn flavorPlatform(tag: std.Target.Os.Tag) []const u8 {
+    return switch (tag) {
+        .windows => "windows",
+        .macos => "macos",
+        .linux => "linux",
+        else => "other",
+    };
+}
+
+fn readJsonPatch(b: *std.Build, path: []const u8) ?std.json.Value {
+    const bytes = codegen.readFileAlloc(b.allocator, b.graph.io, path) orelse return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, b.allocator, bytes, .{}) catch {
+        std.debug.print("flavor: {s} 不是合法 JSON\n", .{path});
+        std.process.exit(1);
+    };
+    return parsed.value;
+}
+
+fn baseIdentityValue(alloc: std.mem.Allocator) !std.json.Value {
+    var obj = std.json.ObjectMap.empty;
+    try obj.put(alloc, "app_name", .{ .string = project.app_name });
+    try obj.put(alloc, "app_id", .{ .string = project.app_id });
+    try obj.put(alloc, "version", .{ .string = project.version });
+    try obj.put(alloc, "publisher", .{ .string = project.publisher });
+    try obj.put(alloc, "channel", .{ .string = "stable" });
+    return .{ .object = obj };
+}
+
+fn jsonStr(v: std.json.Value, key: []const u8) []const u8 {
+    const x = v.object.get(key) orelse return "?";
+    return if (x == .string) x.string else "<non-string>";
+}
+
+fn resolveIdentity(
+    b: *std.Build,
+    target_os: std.Target.Os.Tag,
+    flavor: ?[]const u8,
+    config: ?[]const u8,
+) flavor_merge.Identity {
+    var patches: [4]std.json.Value = undefined;
+    var n: usize = 0;
+
+    if (readJsonPatch(b, "zilt.config.json")) |v| {
+        flavor_merge.validateFlavorTable(b.allocator, v, flavor) catch |e| {
+            std.debug.print("flavor: zilt.config.json 的 flavors 表非法（{s}）\n", .{@errorName(e)});
+            std.process.exit(1);
+        };
+        patches[n] = v;
+        n += 1;
+    }
+    const platform_path = b.fmt("zilt.{s}.json", .{flavorPlatform(target_os)});
+    if (readJsonPatch(b, platform_path)) |v| {
+        patches[n] = v;
+        n += 1;
+    }
+    if (flavor) |f| {
+        const path = b.fmt("zilt.{s}.json", .{f});
+        const v = readJsonPatch(b, path) orelse {
+            std.debug.print("flavor: -Dflavor={s} 需要 {s}（文件不存在）\n", .{ f, path });
+            std.process.exit(1);
+        };
+        patches[n] = v;
+        n += 1;
+    }
+    if (config) |p| {
+        const v = readJsonPatch(b, p) orelse {
+            std.debug.print("flavor: -Dconfig={s} 文件不存在\n", .{p});
+            std.process.exit(1);
+        };
+        patches[n] = v;
+        n += 1;
+    }
+
+    const base = baseIdentityValue(b.allocator) catch @panic("OOM");
+    const merged = flavor_merge.mergeAll(b.allocator, base, patches[0..n]) catch @panic("OOM");
+    const fallback = flavor_merge.Identity{
+        .app_name = project.app_name,
+        .app_id = project.app_id,
+        .version = project.version,
+        .publisher = project.publisher,
+        .channel = "stable",
+    };
+    const id = flavor_merge.identityFrom(b.allocator, merged, fallback) catch |e| {
+        std.debug.print("flavor: 身份非法（{s}）——app_id={s} version={s} channel={s}\n", .{
+            @errorName(e),
+            jsonStr(merged, "app_id"),
+            jsonStr(merged, "version"),
+            jsonStr(merged, "channel"),
+        });
+        std.process.exit(1);
+    };
+    if (!std.mem.eql(u8, id.version, project.version)) {
+        std.debug.print(
+            "flavor: version 覆盖暂不支持（0.6.0a）——请求 {s}，框架 {s}；运行时要和 version.zig 单源\n",
+            .{ id.version, project.version },
+        );
+        std.process.exit(1);
+    }
+    return id;
+}
 
 // 版本号一致性：project.zig（打包/PE 资源）与 zilt/version.zig（运行时 window.zilt.version
 // / MCP / zilt --version）是同一版本的两处落点——模块边界决定无法共享同一份声明，
@@ -15,7 +119,7 @@ comptime {
 /// 应用 exe 图标与 VERSIONINFO（Windows PE 资源，v0.1.15）：
 /// 资源脚本在 build 期由 project.zig 插值生成（版本号不会漂移），
 /// manifest 固定在 src/zilt/assets/app.manifest；project.icon 非空时 icon 指向自定义 .ico。
-fn addAppIconResource(b: *std.Build, module: *std.Build.Module, icon_path: ?[]const u8) void {
+fn addAppIconResource(b: *std.Build, module: *std.Build.Module, icon_path: ?[]const u8, id: flavor_merge.Identity) void {
     const res = @import("src/tools/win_res.zig");
     const assets_dir = "src/zilt/assets";
 
@@ -33,9 +137,9 @@ fn addAppIconResource(b: *std.Build, module: *std.Build.Module, icon_path: ?[]co
     // 否则 resinator 不把 include 的 manifest 当依赖，改了 manifest 仍会命中旧缓存
     // （实测：改 manifest 后 exe 内嵌的仍是旧内容）。
     const manifest_text = res.renderManifest(b.allocator, .{
-        .app_name = project.app_name,
-        .publisher = project.publisher,
-        .version = project.version,
+        .app_name = id.app_name,
+        .publisher = id.publisher,
+        .version = id.version,
         .exe_name = project.exe_name,
     }) catch @panic("OOM");
 
@@ -46,9 +150,9 @@ fn addAppIconResource(b: *std.Build, module: *std.Build.Module, icon_path: ?[]co
     ) catch "manifest";
 
     const rc_text = res.renderRc(b.allocator, .{
-        .app_name = project.app_name,
-        .publisher = project.publisher,
-        .version = project.version,
+        .app_name = id.app_name,
+        .publisher = id.publisher,
+        .version = id.version,
         .exe_name = project.exe_name,
         .icon_file = icon_file,
         .manifest_file = "app.manifest",
@@ -245,6 +349,17 @@ pub fn build(b: *std.Build) void {
     const is_linux = target_os == .linux;
     const is_macos = target_os == .macos;
 
+    // v0.6.0a：flavor + merge-patch。身份在配置期解析一次，打包/资源/CLI 共用。
+    const flavor_name = b.option([]const u8, "flavor", "Flavor overlay: loads zilt.<flavor>.json (e.g. dev|beta|prod)");
+    const config_path = b.option([]const u8, "config", "Extra JSON merge-patch file (highest priority)");
+    const identity = resolveIdentity(b, target_os, flavor_name, config_path);
+    const meta_opts_step = b.addOptions();
+    meta_opts_step.addOption([]const u8, "app_name", identity.app_name);
+    meta_opts_step.addOption([]const u8, "app_id", identity.app_id);
+    meta_opts_step.addOption([]const u8, "publisher", identity.publisher);
+    meta_opts_step.addOption([]const u8, "channel", identity.channel);
+    const meta_opts = meta_opts_step.createModule();
+
     // ---- Linux：GTK 变体（v0.2.5）----
     // -Dgtk=gtk4 切换到 GTK4 + WebKitGTK 6.0（Ubuntu 24.04+/Debian 13+）。
     // 本机/22.04 CI 无 webkitgtk-6.0 开发包时，pkg-config 给出可读报错——
@@ -409,7 +524,7 @@ pub fn build(b: *std.Build) void {
         exe.subsystem = .windows;
         // Windows 系统库（Win32 extern 声明所需的导入库）
         linkWindowsLibs(exe_mod);
-        addAppIconResource(b, exe_mod, project.icon);
+        addAppIconResource(b, exe_mod, project.icon, identity);
     } else if (is_linux) {
         linkLinuxWebviewLibs(b, exe_mod);
     }
@@ -628,6 +743,9 @@ pub fn build(b: *std.Build) void {
     // ---- 打包器（exe → dist/ 便携 zip + NSIS 安装器） ----
     const app_meta_mod = b.createModule(.{
         .root_source_file = b.path("src/app_meta.zig"),
+        .imports = &.{
+            .{ .name = "app_meta_opts", .module = meta_opts },
+        },
     });
 
     const rel_app_mod = b.createModule(.{
@@ -647,7 +765,7 @@ pub fn build(b: *std.Build) void {
     if (is_windows) {
         rel_app.subsystem = .windows; // 分发产物无控制台窗口
         linkWindowsLibs(rel_app_mod);
-        addAppIconResource(b, rel_app_mod, project.icon);
+        addAppIconResource(b, rel_app_mod, project.icon, identity);
     } else if (is_linux) {
         linkLinuxWebviewLibs(b, rel_app_mod);
     } else if (is_macos) {
@@ -796,6 +914,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/pack_macos.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "app_meta_opts", .module = meta_opts },
+            },
         });
         pack_macos_mod.link_libc = true;
         const pack_macos_exe = b.addExecutable(.{ .name = "zilt-pack", .root_module = pack_macos_mod });
@@ -820,6 +941,9 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             // 直接路径引用 pack_formats/msix/app_meta（纯模块，不带 GTK 绑定）
+            .imports = &.{
+                .{ .name = "app_meta_opts", .module = meta_opts },
+            },
         });
         pack_linux_mod.link_libc = true;
         const pack_linux_exe = b.addExecutable(.{ .name = "zilt-pack", .root_module = pack_linux_mod });
