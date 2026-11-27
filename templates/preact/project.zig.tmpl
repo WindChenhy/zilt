@@ -6,6 +6,9 @@ pub const version = "{{VERSION}}";
 pub const app_id = "{{APP_ID}}";
 pub const exe_name = "app.exe";
 
+// v0.3.11 E1b：sidecar 外部二进制（<项目根>/bin/<name>-<triple>）；默认无。
+pub const external_bin = [_][]const u8{};
+
 pub const icon: ?[]const u8 = null;
 
 pub const frontend = .{

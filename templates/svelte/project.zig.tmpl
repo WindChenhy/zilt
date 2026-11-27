@@ -6,6 +6,9 @@ pub const version = "{{VERSION}}";
 pub const app_id = "{{APP_ID}}";
 pub const exe_name = "app.exe";
 
+// v0.3.11 E1b：sidecar 外部二进制（<项目根>/bin/<name>-<triple>）；默认无。
+pub const external_bin = [_][]const u8{};
+
 // 应用图标（.ico，相对项目根）。null = 内置 Zig 官方图标（窗口/托盘/exe 资源共用）。
 // 自定义示例：先放入 frontend/app.ico，再改为 "frontend/app.ico"。
 pub const icon: ?[]const u8 = null;
