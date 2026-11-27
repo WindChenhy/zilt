@@ -1342,11 +1342,19 @@ function runSecondWindowProbe() {
   //      不会重跑套件）+ H11 GPU（WSLg 无 drm 卡 → [] 合法）+ H10 badgeCount
   //      （CI/Xvfb 无会话总线 → NotSupported 文档化降级；WSLg 真发）----
   try {
+    // v0.5.11：GTK4 的隐藏窗口不会 allocate（physical_size 恒 0×0），v0.5.10 的
+    // “surface 重建期回退上次几何”也救不了从未 map 过的窗口。改为建可见探针窗
+    // 并轮询到首次 allocate（GTK3 同样适用），避免 Xvfb 慢机上的时序 flake。
     const pw = await Z().window.create({
-      dragDrop: false, javascript: false, visible: false,
+      dragDrop: false, javascript: false, visible: true,
       width: 320, height: 200, label: 'v04-probe-' + Date.now(),
     });
-    const st = pw && pw.id ? await Z().window.state(pw.id) : null;
+    let st = null;
+    for (let i = 0; i < 20 && pw && pw.id; i++) {
+      st = await Z().window.state(pw.id);
+      if (st && st.physical_size && st.physical_size.width > 0) break;
+      await wait(50);
+    }
     const bs = st && st.border_sizes;
     const ps = st && st.physical_size;
     const ok = !!st && st.drag_drop === false && st.javascript === false &&

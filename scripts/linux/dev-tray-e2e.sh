@@ -21,7 +21,11 @@ mkdir -p .zilt-probe
 BUILD=1
 if [ "${1:-}" = "--no-build" ]; then BUILD=0; fi
 
-{
+# v0.5.11：测试主体放进子 shell 并关掉 -e ——
+# 主体里的 `[ -n "$X" ] && break`、`$XT click` 在 set -e 下一旦返回 1 就直接退出，
+# 既不会有 RESULT 行，也跑不到下面的诊断块（CI 上表现为 20 秒空日志红）。
+set +e
+(
   export ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$HOME/.zcache/zilt-linux}"
   export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$HOME/.zcache/zig-global}"
   mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
@@ -106,7 +110,7 @@ if [ "${1:-}" = "--no-build" ]; then BUILD=0; fi
   for _ in $(seq 1 40); do
     MAIN=$($XT findtitle "示例" 2>/dev/null | tail -1 || true)
     ICON=$($XT trayicon 2>/dev/null | head -1 || true)
-    [ -n "$MAIN" ] && [ -n "$ICON" ] && break
+    if [ -n "$MAIN" ] && [ -n "$ICON" ]; then break; fi
     sleep 0.25
   done
   echo "main=$MAIN icon=$ICON"
@@ -167,7 +171,7 @@ $($XT geom "$w")
 EOF
         if [ "$_ww" -lt 400 ] && [ "$_wh" -lt 700 ] && [ "$_ww" -gt 40 ] && [ "$_wh" -gt 40 ]; then echo "$w"; fi
       done | head -1)
-      [ -n "$MENU" ] && break
+      if [ -n "$MENU" ]; then break; fi
       sleep 0.25
     done
     if [ -n "$MENU" ]; then pass "right click opens tray menu (win $MENU)"; else fail "right click menu not detected"; fi
@@ -202,16 +206,18 @@ EOF
 
   if [ "$FAIL" = 0 ]; then echo "RESULT=PASS"; else echo "RESULT=FAIL"; fi
   exit "$FAIL"
-} > "$LOG" 2>&1
+) > "$LOG" 2>&1
+body_rc=$?
+set -e
 
-code=$(grep -a '^RESULT=' "$LOG" | tail -1 | sed 's/RESULT=//')
+code=$(grep -a '^RESULT=' "$LOG" | tail -1 | sed 's/RESULT=//' || true)
 case "$code" in
   PASS) echo 0 > "$EXIT_FILE"; exit 0 ;;
   *)
     # 诊断：run_body 在 set -eu 下提前退出时不会有 RESULT 行，CI 只剩一句 exit 1。
     # 这里把尾部日志回显到 step 输出，否则失败不可见（2026-11-26 定位抖动时踩过）。
-    echo "TRAY_E2E=FAIL reason=no-RESULT-line"
-    tail -80 "$LOG" 2>/dev/null || true
+    echo "TRAY_E2E=FAIL reason=${code:-no-RESULT-line} rc=$body_rc"
+    tail -120 "$LOG" 2>/dev/null || true
     echo 1 > "$EXIT_FILE"
     exit 1
     ;;

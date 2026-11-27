@@ -124,13 +124,24 @@ jobs:
       - name: WebDriver E2E (optional — SKIP when driver missing)
         shell: pwsh
         run: |
-          # msedgedriver 版本必须匹配 runner 的 Edge：按 Edge 版本下载
-          $edge = @(
-            "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            "C:\Program Files\Microsoft\Edge\Application\msedge.exe"
-          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $edge) { Write-Host "Edge not found — skipping driver E2E"; exit 0 }
-          $ver = (Get-Item $edge).VersionInfo.ProductVersion
+          # msedgedriver 必须匹配 **WebView2 运行时**（应用实际用的引擎），不是 Edge 浏览器：
+          # runner 上 Edge stable 可能已 158，而 WebView2 仍是 157（CI 45846936379 实测
+          # "driver only supports 158 / Current browser version is 157"）。
+          $wvRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft\EdgeWebView\Application'
+          $ver = $null
+          if (Test-Path $wvRoot) {
+            $wv = Get-ChildItem $wvRoot -Directory -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -match '^\d+\.\d+\.' -and (Test-Path (Join-Path $_.FullName 'msedgewebview2.exe')) } |
+                  Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+            if ($wv) { $ver = $wv.Name }
+          }
+          if (-not $ver) {
+            # 回退：EdgeUpdate 客户端注册表里的 WebView2 pv
+            $key = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+            $ver = (Get-ItemProperty $key -ErrorAction SilentlyContinue).pv
+          }
+          if (-not $ver) { Write-Host "WebView2 runtime not found — skipping driver E2E"; exit 0 }
+          Write-Host "WebView2 runtime: $ver"
           $dir = "$env:RUNNER_TEMP\edgedriver"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           try {
@@ -138,7 +149,7 @@ jobs:
             Expand-Archive -Force "$dir\driver.zip" -DestinationPath $dir
             $env:ZILT_EDGEDRIVER_PATH = "$dir\msedgedriver.exe"
           } catch {
-            Write-Host "msedgedriver download failed ($($_.Exception.Message)) — driver E2E SKIP"
+            Write-Host "msedgedriver $ver download failed ($($_.Exception.Message)) — driver E2E SKIP"
             exit 0
           }
           & .\zig-out\bin\zilt-driver.exe .\zig-out\bin\zilt-app.exe 2>&1 | Tee-Object driver.log
