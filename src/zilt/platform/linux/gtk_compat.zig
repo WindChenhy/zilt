@@ -16,7 +16,7 @@
 //!   * 托盘：自实现 D-Bus SNI + DBusMenu（sni_tray.zig；libayatana 为 GTK3 链接库）；
 //!   * 菜单栏：GMenu + GtkPopoverMenuBar + GtkShortcutController；
 //!   * drag.start：GDK4 公开的 gdk_drag_begin + GdkContentProvider；
-//!   * 指针抓取：X11 XGrabPointer（Wayland 无对等 → false）；
+//!   * 指针抓取：GDK4 无 seat grab → 明确降级（caps 仍按 GTK3）；
 //!   * 按域清 cookie：6.0 无 delete_cookies_for_domain → 全量枚举过滤删除；
 //!   * 截图：GdkTexture 失败时 X11 XGetImage 回退（Xvfb/无合成器）。
 //!   * Wayland 几何：position/move 无全局坐标概念 → X11 直连仅 X11 生效。
@@ -90,7 +90,9 @@ pub fn caps() Caps {
         .tray = true,
         .menu_bar = true,
         .programmatic_drag = true,
-        .cursor_grab = true,
+        // GTK3 走 gdk_seat_grab；GTK4 无对等（X11 直连与 begin_move_drag 的隐式
+        // 抓取冲突）→ 文档化降级，冒烟按 caps 断言 false。
+        .cursor_grab = isGtk3(),
         .cookie_clear_by_domain = true,
         .clipboard_read = true,
         .screenshot = true,
@@ -959,35 +961,6 @@ fn wmClassMatchesProcess(dpy: *c.Display, w: c.Window) bool {
         start = i + 1;
     }
     return false;
-}
-
-/// 指针抓取/释放（cursor_grab op）。
-/// GTK3 由 backend 走 gdk_seat_grab；GTK4 无该面 → X11 XGrabPointer。
-/// Wayland 无对等 → false（文档化降级）。
-pub fn cursorGrab(widget: [*c]c.GtkWidget, grab: bool) bool {
-    if (comptime isGtk4()) {
-        const x11 = x11Of(widget) orelse return false;
-        if (grab) {
-            // GrabModeAsync = 1（宏）；CurrentTime = 0
-            const status = c.XGrabPointer(
-                x11.dpy,
-                x11.xwin,
-                c.True,
-                @as(c_uint, 0),
-                1,
-                1,
-                x11.xwin,
-                0,
-                0,
-            );
-            _ = c.XFlush(x11.dpy);
-            return status == 0; // GrabSuccess
-        }
-        _ = c.XUngrabPointer(x11.dpy, 0);
-        _ = c.XFlush(x11.dpy);
-        return true;
-    }
-    return false; // GTK3 调用点走既有 gdk_seat_grab
 }
 
 /// 指针 warp（cursor_position op）。GTK4：gdk_device_warp 目标是 GdkSurface。
@@ -2285,7 +2258,7 @@ test "caps：两栈五面对等；hide_show 仅 GTK4" {
     try std.testing.expect(cp.tray);
     try std.testing.expect(cp.menu_bar);
     try std.testing.expect(cp.programmatic_drag);
-    try std.testing.expect(cp.cursor_grab);
+    try std.testing.expectEqual(isGtk3(), cp.cursor_grab);
     try std.testing.expect(cp.cookie_clear_by_domain);
     try std.testing.expect(cp.screenshot);
     try std.testing.expect(cp.clipboard_read);

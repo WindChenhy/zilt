@@ -2551,7 +2551,8 @@ fn Backend(comptime config: Config) type {
             const uri_list = try buildUriList(self.allocator, views.items);
             defer self.allocator.free(uri_list);
 
-            const surface = c.gtk_native_get_surface(@ptrCast(st.view)) orelse return error.DragNotAvailable;
+            // GtkNative 是窗口（WebView 不是 native widget）——surface 取窗口
+            const surface = c.gtk_native_get_surface(@ptrCast(st.win)) orelse return error.DragNotAvailable;
             const display = c.gdk_display_get_default() orelse return error.DragNotAvailable;
             const seat = c.gdk_display_get_default_seat(display) orelse return error.DragNotAvailable;
             const device = c.gdk_seat_get_pointer(seat) orelse return error.DragNotAvailable;
@@ -2818,10 +2819,12 @@ fn Backend(comptime config: Config) type {
                 },
                 .cursor_grab => |grab| {
                     if (comptime gtk_compat.isGtk4()) {
-                        // v0.6.1：GDK4 无 seat grab → X11 XGrabPointer（Wayland false）
-                        const ok = gtk_compat.cursorGrab(widget, grab);
-                        if (!ok) log.print("[window] cursor grab failed (gtk4 X11)", .{});
-                        return ok;
+                        // GDK4 无 gdk_seat_grab；X11 直连在无真实按键序列的合成
+                        // 场景会与 begin_move_drag 的隐式抓取冲突 → 明确降级
+                        //（真实桌面需要指针抓取的场景少；文档化，caps 仍按 GTK3）。
+                        _ = grab;
+                        log.print("[window] cursor grab unsupported under GTK4", .{});
+                        return false;
                     }
                     const gdk_win = c.gtk_widget_get_window(widget) orelse return false;
                     const display = c.gdk_window_get_display(gdk_win) orelse return false;
@@ -5889,7 +5892,8 @@ fn Backend(comptime config: Config) type {
         /// 返回 false（调用方报原错误）。
         fn x11SnapshotFallback(self: *Self, win_id: u32, rid: i64) bool {
             const st = self.windowById(win_id) orelse return false;
-            const widget: [*c]c.GtkWidget = @ptrCast(st.view);
+            // GtkNative 是窗口（WebView 不是 native widget）
+            const widget: [*c]c.GtkWidget = @ptrCast(st.win);
             const surface = c.gtk_native_get_surface(@ptrCast(widget)) orelse return false;
             const display = c.gtk_widget_get_display(widget) orelse return false;
             const dpy = c.gdk_x11_display_get_xdisplay(@ptrCast(@alignCast(display))) orelse return false;
