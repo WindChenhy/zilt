@@ -24,6 +24,13 @@ const log = @import("../../log.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// NUL 结尾副本（Zig 0.17 的 Allocator 已移除 dupeZ；C API 传参需要 sentinel）。
+fn dupeZ(alloc: Allocator, s: []const u8) ![:0]u8 {
+    const buf = try alloc.allocSentinel(u8, s.len, 0);
+    @memcpy(buf, s);
+    return buf;
+}
+
 const item_path = "/StatusNotifierItem";
 const menu_path = "/MenuBar";
 const item_iface = "org.kde.StatusNotifierItem";
@@ -214,7 +221,7 @@ pub const Tray = struct {
                 self.menu_ctx = null;
             }
             if (self.bus_name) |name| {
-                if (self.allocator.dupeZ(u8, name)) |name_z| {
+                if (dupeZ(self.allocator, name)) |name_z| {
                     defer self.allocator.free(name_z);
                     if (c.g_variant_new("(s)", name_z.ptr)) |params| {
                         if (c.g_dbus_connection_call_sync(
@@ -282,7 +289,7 @@ pub const Tray = struct {
 
     fn connect(self: *Tray) void {
         // G_BUS_TYPE_SESSION = 1
-        const conn = c.g_bus_get_sync(1, null) orelse {
+        const conn = c.g_bus_get_sync(1, null, null) orelse {
             log.print("[tray] no session bus — SNI tray disabled", .{});
             return;
         };
@@ -293,7 +300,7 @@ pub const Tray = struct {
         self.bus_name = name;
 
         // 同步占用总线名（避免异步竞态：紧接着的 watcher 注册需要它已生效）
-        const name_z = self.allocator.dupeZ(u8, name) catch return;
+        const name_z = dupeZ(self.allocator, name) catch return;
         defer self.allocator.free(name_z);
         if (c.g_variant_new("(su)", name_z.ptr, @as(c_uint, 4))) |params| {
             const reply = c.g_dbus_connection_call_sync(
@@ -334,11 +341,11 @@ pub const Tray = struct {
     }
 
     fn registerObject(self: *Tray, conn: ?*anyopaque, path: []const u8, xml: []const u8, iface: []const u8, ctx: *Ctx) bool {
-        const xml_z = self.allocator.dupeZ(u8, xml) catch return false;
+        const xml_z = dupeZ(self.allocator, xml) catch return false;
         defer self.allocator.free(xml_z);
-        const path_z = self.allocator.dupeZ(u8, path) catch return false;
+        const path_z = dupeZ(self.allocator, path) catch return false;
         defer self.allocator.free(path_z);
-        const iface_z = self.allocator.dupeZ(u8, iface) catch return false;
+        const iface_z = dupeZ(self.allocator, iface) catch return false;
         defer self.allocator.free(iface_z);
 
         var err: ?*c.GError = null;
@@ -587,7 +594,7 @@ pub const Tray = struct {
     }
 
     fn newString(s: []const u8) ?*c.GVariant {
-        const z = std.heap.c_allocator.dupeZ(u8, s) catch return null;
+        const z = dupeZ(std.heap.c_allocator, s) catch return null;
         defer std.heap.c_allocator.free(z);
         return c.g_variant_new_string(z.ptr);
     }
@@ -671,7 +678,7 @@ pub const Tray = struct {
         const t = c.g_variant_type_new("a{sv}") orelse return null;
         var b: c.GVariantBuilder = undefined;
         c.g_variant_builder_init(&b, t);
-        const label_z = std.heap.c_allocator.dupeZ(u8, if (separator) "" else label) catch {
+        const label_z = dupeZ(std.heap.c_allocator, if (separator) "" else label) catch {
             c.g_variant_type_free(t);
             return null;
         };

@@ -3383,7 +3383,7 @@ fn Backend(comptime config: Config) type {
                     // 顶层叶子：包成单子项子菜单（PopoverMenuBar 顶层只收子菜单）
                     self.appendGtk4Leaf(sub, item, st, group, &next_action);
                 }
-                c.g_menu_append_submenu(menu, label_z.ptr, sub);
+                c.g_menu_append_submenu(menu, label_z.ptr, @ptrCast(sub));
                 c.g_object_unref(@ptrCast(sub)); // append_submenu 持有引用
             }
 
@@ -3412,7 +3412,7 @@ fn Backend(comptime config: Config) type {
             for (items) |item| {
                 if (std.mem.eql(u8, item.label, "-")) {
                     if (section_items > 0) {
-                        c.g_menu_append_section(menu, null, section);
+                        c.g_menu_append_section(menu, null, @ptrCast(section));
                         c.g_object_unref(@ptrCast(section));
                         section = c.g_menu_new() orelse return;
                         section_items = 0;
@@ -3424,7 +3424,7 @@ fn Backend(comptime config: Config) type {
                 if (item.items) |sub_items| {
                     const sub = c.g_menu_new() orelse continue;
                     self.appendGtk4MenuItems(sub, sub_items, st, group, next_action);
-                    c.g_menu_append_submenu(section, label_z.ptr, sub);
+                    c.g_menu_append_submenu(section, label_z.ptr, @ptrCast(sub));
                     c.g_object_unref(@ptrCast(sub));
                 } else {
                     self.appendGtk4Leaf(section, item, st, group, next_action);
@@ -3432,7 +3432,7 @@ fn Backend(comptime config: Config) type {
                 section_items += 1;
             }
             if (section_items > 0) {
-                c.g_menu_append_section(menu, null, section);
+                c.g_menu_append_section(menu, null, @ptrCast(section));
                 c.g_object_unref(@ptrCast(section));
             } else {
                 c.g_object_unref(@ptrCast(section));
@@ -3507,7 +3507,8 @@ fn Backend(comptime config: Config) type {
             _ = self;
             const parsed = parseAccelGtk(accel) orelse return;
             if (st.shortcut_controller == null) {
-                const ctrl = c.gtk_shortcut_controller_new() orelse return;
+                // gtk_shortcut_controller_new 在部分 4.x 头里返回 GtkEventController*
+                const ctrl: *c.GtkShortcutController = @ptrCast(c.gtk_shortcut_controller_new() orelse return);
                 c.gtk_shortcut_controller_set_scope(ctrl, c.GTK_SHORTCUT_SCOPE_GLOBAL);
                 c.gtk_widget_add_controller(@ptrCast(st.win), @ptrCast(@alignCast(ctrl)));
                 st.shortcut_controller = ctrl;
@@ -3517,8 +3518,8 @@ fn Backend(comptime config: Config) type {
             var keyval = parsed.keyval;
             if ((parsed.mods & c.GDK_SHIFT_MASK) == 0) keyval = c.gdk_keyval_to_lower(keyval);
             const trigger = c.gtk_keyval_trigger_new(keyval, parsed.mods) orelse return;
-            // gtk_named_action_new 需要 NUL 结尾
-            const action_nz = std.heap.c_allocator.dupeZ(u8, action) catch return;
+            // gtk_named_action_new 需要 NUL 结尾（0.17 的 Allocator 已移除 dupeZ）
+            const action_nz = dupeZ(std.heap.c_allocator, action) catch return;
             defer std.heap.c_allocator.free(action_nz);
             const shortcut_action = c.gtk_named_action_new(action_nz.ptr) orelse return;
             const shortcut = c.gtk_shortcut_new(trigger, shortcut_action) orelse return;
