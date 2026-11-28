@@ -2958,11 +2958,10 @@ fn Backend(comptime config: Config) type {
 
             var x: c.gint = 0;
             var y: c.gint = 0;
-            gtk_compat.windowGetPosition(win, &x, &y);
-            if (!gtk_compat.surfaceHandleAvailable(win)) {
-                // v0.5.10：surface 正在重建（hide→show / unmaximize）时 X11 直连
-                // 取不到句柄，windowGetPosition 会写 0,0。回退到轮询缓存的上次几何
-                //（与 windowMoved 载荷同源），不把 0,0 当真实位置报给前端。
+            // v0.5.10：surface 正在重建（hide→show / unmaximize）或 X 平移查询
+            // 瞬时失败时回退到轮询缓存的上次几何（与 windowMoved 载荷同源），
+            // 不把 0,0 当真实位置报给前端。
+            if (!gtk_compat.windowGetPosition(win, &x, &y) or !gtk_compat.surfaceHandleAvailable(win)) {
                 x = st.geom_x;
                 y = st.geom_y;
             }
@@ -10085,7 +10084,10 @@ fn Backend(comptime config: Config) type {
             gtk_compat.monitorWorkarea(mon, &work);
             var x: c.gint = 0;
             var y: c.gint = 0;
-            gtk_compat.windowGetPosition(st.win, &x, &y);
+            if (!gtk_compat.windowGetPosition(st.win, &x, &y)) {
+                x = st.geom_x;
+                y = st.geom_y;
+            }
             var w: c.gint = 0;
             var h: c.gint = 0;
             gtk_compat.windowGetSize(st.win, &w, &h);

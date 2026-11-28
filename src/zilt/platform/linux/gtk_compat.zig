@@ -392,32 +392,39 @@ pub fn windowHide(win: [*c]c.GtkWindow) void {
     c.gtk_widget_hide(@ptrCast(win));
 }
 
-pub fn windowGetPosition(win: [*c]c.GtkWindow, x: *c_int, y: *c_int) void {
+/// 返回是否取到真实坐标（GTK4：surface 可解析且 XTranslateCoordinates 成功）。
+/// 失败时调用方应回退到上次已知几何，而不是把 0,0 当作窗口位置。
+pub fn windowGetPosition(win: [*c]c.GtkWindow, x: *c_int, y: *c_int) bool {
     if (comptime isGtk4()) {
-        if (x11Of(@ptrCast(win))) |x11| {
-            var child: c.Window = 0;
-            var rx: c_int = 0;
-            var ry: c_int = 0;
-            // 对根窗口平移 (0,0) → 返回的即根坐标（客户区原点）
-            _ = c.XTranslateCoordinates(x11.dpy, x11.xwin, rootWindowOf(x11.dpy), 0, 0, &rx, &ry, &child);
-            // GTK3 gtk_window_get_position 报的是含装饰的外框原点；GTK4 的
-            // XTranslateCoordinates 只给客户区原点（实测 openbox 下差 +1,+20）。
-            // 用 _NET_FRAME_EXTENTS 折回外框坐标，两栈语义才一致（setPosition
-            // 的 gtk_window_move 同样是外框坐标）。
-            var ext: c.GdkRectangle = std.mem.zeroes(c.GdkRectangle);
-            if (frameExtents(@ptrCast(win), &ext)) {
-                rx += ext.x;
-                ry += ext.y;
-            }
-            x.* = rx;
-            y.* = ry;
-            return;
+        const x11 = x11Of(@ptrCast(win)) orelse {
+            x.* = 0;
+            y.* = 0;
+            return false;
+        };
+        var child: c.Window = 0;
+        var rx: c_int = 0;
+        var ry: c_int = 0;
+        // 对根窗口平移 (0,0) → 返回的即根坐标（客户区原点）
+        if (c.XTranslateCoordinates(x11.dpy, x11.xwin, rootWindowOf(x11.dpy), 0, 0, &rx, &ry, &child) == 0) {
+            x.* = 0;
+            y.* = 0;
+            return false;
         }
-        x.* = 0;
-        y.* = 0;
-        return;
+        // GTK3 gtk_window_get_position 报的是含装饰的外框原点；GTK4 的
+        // XTranslateCoordinates 只给客户区原点（实测 openbox 下差 +1,+20）。
+        // 用 _NET_FRAME_EXTENTS 折回外框坐标，两栈语义才一致（setPosition
+        // 的 gtk_window_move 同样是外框坐标）。
+        var ext: c.GdkRectangle = std.mem.zeroes(c.GdkRectangle);
+        if (frameExtents(@ptrCast(win), &ext)) {
+            rx += ext.x;
+            ry += ext.y;
+        }
+        x.* = rx;
+        y.* = ry;
+        return true;
     }
     c.gtk_window_get_position(win, x, y);
+    return true;
 }
 
 /// GTK4：窗口的 X11 表面此刻是否可解析（surface 已 realize、且属 X11 后端）。
