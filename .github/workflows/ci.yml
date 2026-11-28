@@ -288,7 +288,7 @@ jobs:
       # v0.6.1：GTK4 托盘走 D-Bus SNI（无 XEmbed/GtkStatusIcon）——stalonetray
       # 的 XEmbed 点击路径仅在 GTK3 legacy job 覆盖；GTK4 的 SNI 探针需真实
       # StatusNotifierWatcher（宿主桌面会话），CI 容器无宿主 → 明确 skip。
-      - name: Tray attach E2E (GTK4 SNI: skipped in CI)
+      - name: Tray attach E2E (GTK4 SNI skipped in CI)
         run: echo "SNI tray needs a desktop StatusNotifierWatcher; covered by manual verification (GTK3 XEmbed path runs in linux-gtk3)"
 
       # v0.4.3 L3：AppImage 自包含（WebKit 随包；bwrap/docker 无宿主 WebKit 验证）
