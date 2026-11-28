@@ -87,8 +87,11 @@ fi
 # 5) makepkg 实构建（archlinux 容器；无 docker/镜像 → 跳过）
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   if docker image inspect archlinux:base-devel >/dev/null 2>&1; then
+    # v0.6.1：默认 GTK4；ZILT_E2E_GTK=gtk3 覆盖 legacy 变体
+    AUR_DEPS="gtk4 webkitgtk-6.0 libsoup3"
+    [ "${ZILT_E2E_GTK:-gtk4}" = "gtk3" ] && AUR_DEPS="gtk3 webkit2gtk-4.1 libsoup3"
     docker run --rm -v "$(pwd)":/work -w /work/dist/aur archlinux:base-devel \
-      bash -c "pacman -Sy --noconfirm --needed gtk3 webkit2gtk-4.1 libsoup3 >/dev/null 2>&1; \
+      bash -c "pacman -Sy --noconfirm --needed $AUR_DEPS >/dev/null 2>&1; \
         useradd -m builder && chown -R builder: . && runuser -u builder -- makepkg -sf --noconfirm" \
       && { echo "[pack-aur] makepkg OK (archlinux container)"; ls "$AUR"/*.pkg.tar.* 2>/dev/null || true; }
   else

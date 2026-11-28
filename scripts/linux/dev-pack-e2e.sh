@@ -35,7 +35,13 @@ ok=1
   [ -n "$DEB" ] || { echo "MISSING deb"; ok=0; }
   if [ -n "$DEB" ]; then
     dpkg-deb --info "$DEB" | head -12 || ok=0
-    dpkg-deb --info "$DEB" | grep -aq "Depends: libgtk-3-0, libwebkit2gtk-4.1-0, libsqlite3-0" || { echo "DEPENDS MISSING"; ok=0; }
+    # v0.6.1：默认 GTK4；ZILT_E2E_GTK=gtk3 覆盖 legacy 变体
+    if [ "${ZILT_E2E_GTK:-gtk4}" = "gtk3" ]; then
+      DEB_DEPENDS="Depends: libgtk-3-0, libwebkit2gtk-4.1-0, libsqlite3-0"
+    else
+      DEB_DEPENDS="Depends: libgtk-4-1, libwebkitgtk-6.0-0, libsqlite3-0"
+    fi
+    dpkg-deb --info "$DEB" | grep -aq "$DEB_DEPENDS" || { echo "DEPENDS MISSING (want: $DEB_DEPENDS)"; ok=0; }
     rm -rf /tmp/zilt-deb-x && dpkg-deb -x "$DEB" /tmp/zilt-deb-x || ok=0
     ls -la /tmp/zilt-deb-x/usr/bin/ || ok=0
     ls /tmp/zilt-deb-x/usr/share/applications/ || ok=0

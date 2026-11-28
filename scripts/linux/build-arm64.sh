@@ -55,8 +55,8 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
   build-essential pkg-config ca-certificates curl xz-utils \
-  libgtk-3-dev libwebkit2gtk-4.1-dev libx11-dev libxext-dev \
-  libayatana-appindicator3-dev squashfs-tools >/dev/null
+  libgtk-4-dev libwebkitgtk-6.0-dev libx11-dev libxext-dev \
+  squashfs-tools >/dev/null
 if ! command -v zig >/dev/null 2>&1; then
   curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz"
   tar -xJf /tmp/zig.tar.xz -C /opt

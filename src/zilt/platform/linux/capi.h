@@ -5,7 +5,8 @@
  * 所以这里只做头文件聚合，不放任何逻辑；需要新的 GTK/WebKit API 时
  * 直接改 src/zilt/platform/linux/backend.zig 里的 c.xxx 调用即可。
  *
- * 依赖（Ubuntu/Debian）：libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config
+ * 依赖（Ubuntu/Debian，默认栈）：libgtk-4-dev libwebkitgtk-6.0-dev pkg-config
+ *（GTK3 legacy：-Dgtk=gtk3 + libgtk-3-dev libwebkit2gtk-4.1-dev）
  * 头文件路径由 build.zig 通过 pkg-config --cflags-only-I 注入。
  */
 #pragma once
@@ -36,6 +37,8 @@
 /* 全局快捷键（XGrabKey/XOpenDisplay，v0.2.6）
  * v0.4.3 L1b：窗口形状 mask（GDK4 无 shape API → XShape 直连，链接 libXext） */
 #include <X11/Xlib.h>
+/* v0.6.1：GTK4 截图回退用 XGetImage（XImage 布局/释放路径在 Xutil.h） */
+#include <X11/Xutil.h>
 #include <X11/extensions/shape.h>
 /* v0.3.2：电源/会话事件（GDBus 订阅 org.freedesktop.login1） */
 #include <gio/gio.h>

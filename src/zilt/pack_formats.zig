@@ -23,7 +23,30 @@ pub const PackMeta = struct {
     /// v0.4.3 L5：目标架构（rpm BuildArch / PKGBUILD arch / deb 文件名与 control）。
     /// 取 Zig 的 `builtin.cpu.arch` 语义命名：x86_64 / aarch64。
     arch: []const u8 = "x86_64",
+    /// v0.6.1：Linux 打包依赖按 GTK 变体选择（默认 GTK3 以保持既有测试语义，
+    /// pack_linux 按构建选项显式赋值）。
+    gtk4: bool = false,
 };
+
+/// deb 的 GTK 运行时包名（GTK4 = libgtk-4-1；GTK3 = libgtk-3-0）。
+pub fn gtkDebDep(meta: PackMeta) []const u8 {
+    return if (meta.gtk4) "libgtk-4-1" else "libgtk-3-0";
+}
+
+/// deb 的 WebKit 运行时包名（GTK4 = libwebkitgtk-6.0-0）。
+pub fn webkitDebDep(meta: PackMeta) []const u8 {
+    return if (meta.gtk4) "libwebkitgtk-6.0-0" else "libwebkit2gtk-4.1-0";
+}
+
+/// AUR 的 GTK 包名（Arch：gtk4 / gtk3）。
+pub fn gtkAurDep(meta: PackMeta) []const u8 {
+    return if (meta.gtk4) "gtk4" else "gtk3";
+}
+
+/// AUR 的 WebKit 包名（Arch：webkitgtk-6.0 / webkit2gtk-4.1）。
+pub fn webkitAurDep(meta: PackMeta) []const u8 {
+    return if (meta.gtk4) "webkitgtk-6.0" else "webkit2gtk-4.1";
+}
 
 /// Debian 架构名（与 Zig/rpm 命名不同：amd64 / arm64）。
 pub fn debArch(arch: []const u8) []const u8 {
@@ -658,7 +681,7 @@ pub const apprun_script_bundled =
     \\HERE=$(dirname "$(readlink -f "$0")")
     \\TRIPLET="@TRIPLET@"
     \\export LD_LIBRARY_PATH="$HERE/usr/lib:$HERE/usr/lib/$TRIPLET${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    \\export WEBKIT_INJECTED_BUNDLE_PATH="$HERE/usr/lib/$TRIPLET/webkit2gtk-4.1/injected-bundle"
+    \\export WEBKIT_INJECTED_BUNDLE_PATH="$HERE/usr/lib/$TRIPLET/@WK_HELPERS@/injected-bundle"
     \\[ -d "$HERE/usr/lib/$TRIPLET/gio/modules" ] && export GIO_EXTRA_MODULES="$HERE/usr/lib/$TRIPLET/gio/modules"
     \\[ -d "$HERE/usr/lib/$TRIPLET/gdk-pixbuf-2.0/2.10.0/loaders" ] && export GDK_PIXBUF_MODULEDIR="$HERE/usr/lib/$TRIPLET/gdk-pixbuf-2.0/2.10.0/loaders"
     \\[ -f "$HERE/usr/share/glib-2.0/schemas/gschemas.compiled" ] && export GSETTINGS_SCHEMA_DIR="$HERE/usr/share/glib-2.0/schemas"
@@ -670,9 +693,9 @@ pub const apprun_script_bundled =
     \\mkdir -p "$WK" 2>/dev/null && chmod 700 "$WK" 2>/dev/null
     \\if [ ! -O "$WK" ]; then echo "zilt: unsafe WebKit runtime dir $WK" >&2; exit 1; fi
     \\for f in WebKitWebProcess WebKitNetworkProcess WebKitGPUProcess; do
-    \\  [ -x "$HERE/usr/lib/$TRIPLET/webkit2gtk-4.1/$f" ] && ln -sf "$HERE/usr/lib/$TRIPLET/webkit2gtk-4.1/$f" "$WK/$f" 2>/dev/null
+    \\  [ -x "$HERE/usr/lib/$TRIPLET/@WK_HELPERS@/$f" ] && ln -sf "$HERE/usr/lib/$TRIPLET/@WK_HELPERS@/$f" "$WK/$f" 2>/dev/null
     \\done
-    \\[ -d "$HERE/usr/lib/$TRIPLET/webkit2gtk-4.1/injected-bundle" ] && ln -sfn "$HERE/usr/lib/$TRIPLET/webkit2gtk-4.1/injected-bundle" "$WK/injected-bundle" 2>/dev/null
+    \\[ -d "$HERE/usr/lib/$TRIPLET/@WK_HELPERS@/injected-bundle" ] && ln -sfn "$HERE/usr/lib/$TRIPLET/@WK_HELPERS@/injected-bundle" "$WK/injected-bundle" 2>/dev/null
     \\exec "$HERE/usr/bin/APP_EXE_NAME" "$@"
     \\
 ;
@@ -880,8 +903,8 @@ pub fn generatePkgbuild(alloc: std.mem.Allocator, meta: PackMeta) ![]u8 {
         \\arch=('{s}')
         \\url="https://example.invalid/{s}"
         \\license=('Proprietary')
-        \\depends=('gtk3' 'webkit2gtk-4.1' 'libsoup3')
-        \\optdepends=('libayatana-appindicator3: 托盘图标支持')
+        \\depends=('{s}' '{s}' 'libsoup3')
+        \\optdepends=('libayatana-appindicator3: 托盘图标支持（GTK3）')
         \\source=("$pkgname-$pkgver.tar.gz")
         \\sha256sums=('SKIP')
         \\
@@ -895,7 +918,19 @@ pub fn generatePkgbuild(alloc: std.mem.Allocator, meta: PackMeta) ![]u8 {
         \\    done
         \\}}
         \\
-    , .{ meta.maintainer, meta.maintainer, name, meta.version, meta.description, rpmArch(meta.arch), name, exe_base, exe_base });
+    , .{
+        meta.maintainer,
+        meta.maintainer,
+        name,
+        meta.version,
+        meta.description,
+        rpmArch(meta.arch),
+        name,
+        gtkAurDep(meta),
+        webkitAurDep(meta),
+        exe_base,
+        exe_base,
+    });
 }
 
 /// AUR .SRCINFO（静态生成——makepkg --printsrcinfo 的等价输出，离线可单测）。
@@ -911,15 +946,26 @@ pub fn generateSrcinfo(alloc: std.mem.Allocator, meta: PackMeta) ![]u8 {
         \\url = https://example.invalid/{s}
         \\arch = {s}
         \\license = Proprietary
-        \\depends = gtk3
-        \\depends = webkit2gtk-4.1
+        \\depends = {s}
+        \\depends = {s}
         \\depends = libsoup3
-        \\optdepends = libayatana-appindicator3: 托盘图标支持
+        \\optdepends = libayatana-appindicator3: 托盘图标支持（GTK3）
         \\
         \\source = {s}-bin-{s}.tar.gz
         \\sha256sums = SKIP
         \\
-    , .{ name, name, meta.version, meta.description, name, rpmArch(meta.arch), name, meta.version });
+    , .{
+        name,
+        name,
+        meta.version,
+        meta.description,
+        name,
+        rpmArch(meta.arch),
+        gtkAurDep(meta),
+        webkitAurDep(meta),
+        name,
+        meta.version,
+    });
 }
 
 // ---------------------------------------------------------------------------

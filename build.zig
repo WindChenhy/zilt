@@ -75,7 +75,7 @@ fn pkgConfigIncludeDirs(b: *std.Build, packages: []const []const u8) []const []c
         .cwd = .inherit,
     }) catch {
         @panic("需要 pkg-config 才能构建 Linux 后端：sudo apt install pkg-config " ++
-            "libgtk-3-dev libwebkit2gtk-4.1-dev");
+            "libgtk-4-dev libwebkitgtk-6.0-dev（GTK3 legacy：-Dgtk=gtk3 + libgtk-3-dev libwebkit2gtk-4.1-dev）");
     };
     defer {
         alloc.free(result.stdout);
@@ -86,7 +86,8 @@ fn pkgConfigIncludeDirs(b: *std.Build, packages: []const []const u8) []const []c
             std.mem.join(alloc, " ", packages) catch "?",
             std.mem.trim(u8, result.stderr, " \r\n"),
         });
-        @panic("缺少 GTK/WebKitGTK 开发包：sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev");
+        @panic("缺少 GTK/WebKitGTK 开发包：sudo apt install libgtk-4-dev libwebkitgtk-6.0-dev" ++
+            "（GTK3 legacy：-Dgtk=gtk3 + libgtk-3-dev libwebkit2gtk-4.1-dev）");
     }
 
     var dirs: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -264,6 +265,15 @@ pub fn build(b: *std.Build) void {
     }
     const frontend = resolved.frontend;
 
+    // ---- Linux：GTK 变体（v0.2.5；v0.6.1 起默认 GTK4）----
+    // 默认 GTK4 + WebKitGTK 6.0（Ubuntu 24.04+/Debian 13+）；GTK3 legacy 一周期
+    // 保留（-Dgtk=gtk3）。选项需先于 meta_opts（打包依赖名按变体投影）。
+    const gtk_variant = b.option([]const u8, "gtk", "GTK toolkit variant: gtk4 (default) | gtk3 (legacy)") orelse "gtk4";
+    if (!std.mem.eql(u8, gtk_variant, "gtk3") and !std.mem.eql(u8, gtk_variant, "gtk4")) {
+        std.debug.print("invalid -Dgtk value (expected gtk4|gtk3)\n", .{});
+        @panic("invalid -Dgtk value (expected gtk4|gtk3)");
+    }
+
     const meta_opts_step = b.addOptions();
     meta_opts_step.addOption([]const u8, "flavor", flavor_name orelse "");
     meta_opts_step.addOption([]const u8, "app_name", identity.app_name);
@@ -281,17 +291,11 @@ pub fn build(b: *std.Build) void {
     meta_opts_step.addOption(?[]const u8, "frontend_build_command", frontend.build_command);
     meta_opts_step.addOption(bool, "frontend_dev_proxy", frontend.dev_proxy);
     meta_opts_step.addOption(u32, "frontend_wait_timeout_secs", frontend.wait_timeout_secs);
+    // v0.6.1：打包依赖名（deb/rpm/AUR/AppImage）跟随 GTK 变体
+    meta_opts_step.addOption(bool, "gtk4", is_linux and std.mem.eql(u8, gtk_variant, "gtk4"));
     const meta_opts = meta_opts_step.createModule();
 
-    // ---- Linux：GTK 变体（v0.2.5）----
-    // -Dgtk=gtk4 切换到 GTK4 + WebKitGTK 6.0（Ubuntu 24.04+/Debian 13+）。
-    // 本机/22.04 CI 无 webkitgtk-6.0 开发包时，pkg-config 给出可读报错——
-    // 完整 GTK4 后端（GtkMenuBar 移除/事件模型差异）记录于 v0.2.5。
-    const gtk_variant = b.option([]const u8, "gtk", "GTK toolkit variant: gtk3 (default) | gtk4") orelse "gtk3";
-    if (!std.mem.eql(u8, gtk_variant, "gtk3") and !std.mem.eql(u8, gtk_variant, "gtk4")) {
-        std.debug.print("invalid -Dgtk value (expected gtk3|gtk4)\n", .{});
-        @panic("invalid -Dgtk value (expected gtk3|gtk4)");
-    }
+    // ---- Linux：GTK 变体的 pkg-config 包名 ----
     gtk_pkg_name = if (std.mem.eql(u8, gtk_variant, "gtk4")) "gtk4" else "gtk+-3.0";
     webkit_pkg_name = if (std.mem.eql(u8, gtk_variant, "gtk4")) "webkitgtk-6.0" else "webkit2gtk-4.1";
 

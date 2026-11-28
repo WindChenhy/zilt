@@ -239,15 +239,22 @@ fn runDoctor(alloc: std.mem.Allocator) !u8 {
             print("[info] WiX 3 not cached — fetched automatically on first `zig build pack` (MSI)\n", .{});
         }
     } else {
-        // v0.2.8：Linux 构建链检查（pkg-config 包 + 运行时工具）
-        for ([_][]const u8{ "gtk+-3.0", "webkit2gtk-4.1" }) |pkg| {
+        // v0.2.8 / v0.6.1：Linux 构建链检查（默认 GTK4；GTK3 legacy 一周期）
+        var gtk4_missing: usize = 0;
+        for ([_][]const u8{ "gtk4", "webkitgtk-6.0" }) |pkg| {
             if (pkgConfigExists(alloc, pkg)) {
                 print("[ok]   pkg-config: {s}\n", .{pkg});
             } else {
-                print("[fail] pkg-config: {s} 缺失 — Ubuntu/Debian: sudo apt install {s}\n", .{
-                    pkg, if (std.mem.eql(u8, pkg, "gtk+-3.0")) "libgtk-3-dev" else "libwebkit2gtk-4.1-dev",
-                });
-                issues += 1;
+                print("[fail] pkg-config: {s} 缺失 — 默认 GTK4 构建: sudo apt install libgtk-4-dev libwebkitgtk-6.0-dev\n", .{pkg});
+                gtk4_missing += 1;
+            }
+        }
+        if (gtk4_missing > 0) {
+            issues += gtk4_missing;
+            for ([_][]const u8{ "gtk+-3.0", "webkit2gtk-4.1" }) |pkg| {
+                if (pkgConfigExists(alloc, pkg)) {
+                    print("[info] legacy GTK3 可用: {s}（构建加 -Dgtk=gtk3）\n", .{pkg});
+                }
             }
         }
         if (findInPath(alloc, "xvfb-run")) |p| {

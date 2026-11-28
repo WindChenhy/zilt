@@ -16,11 +16,12 @@
 | 平台 | 状态 | 技术栈 | 证据 |
 |---|---|---|---|
 | Windows | ✅ 全栈（v0.1.0–v0.4.3） | Win32 + WebView2（纯 Zig 手写 COM） | `src/zilt/platform/windows/backend.zig` |
-| Linux | ✅ 全栈（冒烟 95 项）；GTK4 构建变体已通，**默认化未做** | GTK3 + WebKit2GTK 4.1；`-Dgtk=gtk4` | `src/zilt/platform/linux/backend.zig`；`ROADMAP.md:205`（L1b） |
+| Linux | ✅ 全栈（冒烟 95 项）；**GTK4 已默认化（v0.6.1）** | GTK4 + WebKitGTK 6.0（默认）；`-Dgtk=gtk3` legacy | `src/zilt/platform/linux/backend.zig`；`ROADMAP.md`（L1b 收口） |
 | macOS | 🚧 集成/外观/WebView 深度已齐（v0.4.4–v0.4.8）；**分发/安全/更新/对等打磨未做** | WKWebView（手写 ObjC 消息） | `src/zilt/platform/macos/{backend,objc}.zig`；`ROADMAP.md:500`（v0.4.9）、`:520`（v0.4.10） |
 
 - v0.4.x 已完成：v0.4.0–v0.4.8（双平台小项 / 网络 IPC 分发 / 安全系统集成 / Linux 发行版专项 L1a·L3·L5·L6 / macOS 主链·窗口·外观·桌面集成·WebView 深度）。
-- v0.4.x 剩余：**v0.4.9**（macOS 分发/签名/公证/DMG/universal/Keychain/更新器）、**v0.4.10**（macOS 对等打磨）；**L1b**（GTK4 4.x UI 面重写）、**L4**（ARM64 容器实跑，脚本+CI 就绪待首跑）。
+- v0.4.x 剩余：**v0.4.9**（macOS 分发/签名/公证/DMG/universal/Keychain/更新器）、**v0.4.10**（macOS 对等打磨）——
+  已在 v0.5.x 落地；**L1b**（GTK4 4.x UI 面重写）已在 v0.6.1 收口；**L4**（ARM64 容器实跑）已在 v0.5 通过。
 - 现 `ROADMAP.md:534` 的「v0.5+」仅是弹性/实验位停车场（WML H18 / 扩展 H19 / 移动 H2），**无实质 0.5–0.7 规划**——本文填补。
 
 ### 0.2 框架探索结论（Wails v3 / Tauri 2）
@@ -77,7 +78,7 @@
 |---|---|---|---|---|
 | macOS 分发与安全（吸收 v0.4.9） | macOS | 中-大 | `.app` Info.plist 全字段 + `.icns`；DMG `hdiutil`；codesign（Developer ID + hardened runtime + entitlements）+ `notarytool submit --wait` + `stapler`；Universal `lipo`；Keychain（Security.framework，对齐 Linux `secret:`）；更新器 ed25519 清单 + DMG 替换 vs Sparkle appcast **选型 ADR** | `ROADMAP.md:500`；`MACOS_PLAN.md:86` §5 |
 | macOS 对等打磨（吸收 v0.4.10） | macOS | 中 | 系统信息（sysctl/IOKit）/Shell（NSWorkspace）/电源/主题/单实例边缘；Accessibility 标签 + VoiceOver 基本可用；能力矩阵平台列 + 差异文档 | `ROADMAP.md:520` |
-| **GTK4 默认化（L1b）** | Linux | 大 | 按符号审计表（70 个 GTK4 移除符号）逐子系统移植：GdkClipboard↔GtkClipboard、GdkDrag↔gtk_drag_*、GtkPopoverMenu↔GtkMenu、gdk_toplevel↔gtk_window 几何、GtkFileDialog↔GtkFileChooserNative；完成后 `-Dgtk=gtk4` 默认，`-Dgtk=gtk3` legacy 保留一周期（D7）；CI 双栈 job | `ROADMAP.md:205`、`:198`（审计）、`:611`（D7） |
+| **GTK4 默认化（L1b）** ✅ v0.6.1 | Linux | 大 | 已完成：五面补齐（D-Bus SNI 托盘 / GtkPopoverMenuBar / gdk_drag_begin / cookie 过滤 / X11 截图回退）；`-Dgtk=gtk4` 默认，`-Dgtk=gtk3` legacy 保留一周期（D7）；CI 双 job（默认 24.04 GTK4 + legacy 22.04 GTK3） | `ROADMAP.md`（v0.6.1 交付） |
 | **ARM64 实跑（L4）** | Linux | 中 | CI `linux-arm64` job 首次真跑（Docker+QEMU）；`dev-arm64-e2e.sh` qemu 冒烟 + ELF machine 断言回填；deb/AppImage 架构名核对 | `ROADMAP.md:267`、`:281` |
 | 三平台能力矩阵 | 全 | 小-中 | README 能力索引增 macOS 列；差异项（透明/私有 API/沙箱/App Store/无 PDF 等）逐条文档化；契约测试「清单 ⊆ 后端 @hasDecl」防漂移（延续 L8） | `README.md:42`；`ROADMAP.md:78`（L8） |
 
@@ -91,7 +92,7 @@
 
 ### 1.4 风险与依赖
 
-- **R-0.5a（GTK4 UI 重写）**：量级为 4.x UI 面重写（非补丁级，70 符号）；WebKitGTK 6.0 在 22.04/Debian 12 不可用 → gtk3 legacy 必须保留（D7/R6）。分子系统移植 + 双栈 CI 兜底。
+- **R-0.5a（GTK4 UI 重写）** ✅ 已关闭（v0.6.1）：五面移植完成；WebKitGTK 6.0 在 22.04/Debian 12 不可用 → `-Dgtk=gtk3` legacy 保留（D7/R6），CI 双 job 兜底。
 - **R-0.5b（macOS 签名/公证）**：无证书时 CI 只做 ad-hoc + 产物上传（secrets 缺省跳过，沿用 `env.*` 判断）；Universal 需 macOS 宿主。
 - **R-0.5c（更新器选型）**：ed25519+DMG 替换 vs Sparkle appcast → 实施前出 ADR（§6 Q5）。
 - **R-0.5d（ARM64）**：依赖 CI remote 首跑；本机无 arm64 镜像/外网（`ROADMAP.md:283`）。
@@ -194,7 +195,7 @@
 
 | 编号 | 风险 | 缓解 |
 |---|---|---|
-| R-0.5a | GTK4 4.x UI 面重写（70 符号） | 分子系统移植 + 双栈 CI + gtk3 legacy 保留 |
+| R-0.5a | GTK4 4.x UI 面重写（70 符号） | ✅ v0.6.1 收口：五面移植 + 双 job CI + gtk3 legacy 保留 |
 | R-0.5b | macOS 签名/公证证书/宿主依赖 | 无证书 ad-hoc + 产物上传；CI macos-15 |
 | R-0.5c | macOS 更新器选型 | 实施前 ADR（ed25519+DMG vs Sparkle） |
 | R-0.5d | ARM64 本机无外网/镜像 | 以 CI 首跑为准，不伪装本地成功 |

@@ -103,7 +103,8 @@
 //!     单实例转交 E2E：主实例带 `ZILT_LINUX_SMOKE_STAY=<秒>` 存活，第二实例带
 //!     `zilt://…` 参数启动 → exit 5 + 主实例日志 deepLink 事件。
 //!
-//! 依赖（构建期）：pkg-config + libgtk-3-dev + libwebkit2gtk-4.1-dev。
+//! 依赖（构建期）：pkg-config + libgtk-4-dev + libwebkitgtk-6.0-dev（默认栈；
+//! GTK3 legacy：-Dgtk=gtk3 + libgtk-3-dev + libwebkit2gtk-4.1-dev）。
 //! Zig 0.17 移除了 `@cImport`，C 绑定由 `build.zig` 的 `addTranslateC` 从 `capi.h` 生成。
 const std = @import("std");
 
@@ -129,6 +130,7 @@ const notification = @import("../../notification.zig");
 const window_state = @import("window_state.zig");
 const sys = @import("../../sys.zig");
 const gtk_compat = @import("gtk_compat.zig");
+const sni_tray = @import("sni_tray.zig");
 const hotkey_mod = @import("hotkey.zig");
 const portal_hotkey = @import("portal_hotkey.zig");
 const deep_link = @import("deep_link.zig");
@@ -428,6 +430,13 @@ fn trayIconName(path: ?[]const u8) []const u8 {
         if (dot > 0) return base[0..dot];
     }
     return if (base.len > 0) base else "zilt-app";
+}
+
+/// v0.6.1：托盘图标所在目录（SNI IconThemePath；无路径 = null）。
+fn trayIconDir(path: ?[]const u8) ?[]const u8 {
+    const p = path orelse return null;
+    const i = std.mem.lastIndexOfScalar(u8, p, '/') orelse return null;
+    return if (i == 0) "/" else p[0..i];
 }
 
 fn hexVal(ch: u8) ?u8 {
@@ -1088,6 +1097,8 @@ fn Backend(comptime config: Config) type {
             /// v0.2.2：菜单加速键的 GtkAccelGroup（惰性创建；窗口销毁时随 GTK 释放）
             // GTK4 无 GtkAccelGroup（accel 面移除）→ 占位不透明类型
             accel_group: if (gtk_compat.isGtk4()) ?*anyopaque else ?*c.GtkAccelGroup = null,
+            /// v0.6.1：GTK4 菜单加速键（GtkShortcutController，挂窗口；随窗口销毁）
+            shortcut_controller: if (gtk_compat.isGtk4()) ?*c.GtkShortcutController else ?*anyopaque = null,
             /// v0.3.9 A4L：窗口级 KeyBindings（创建时解析好的 keyval/mods；
             /// key-press-event 匹配——菜单 accel 由 GTK accel group 先行消费）
             key_bindings: []const KeyBindEntry = &.{},
@@ -1357,6 +1368,8 @@ fn Backend(comptime config: Config) type {
         app_held: bool = false,
         /// 托盘（libayatana 动态加载；null = 不可用/未配置）
         tray: ?Tray = null,
+        /// v0.6.1 L1b：GTK4 自实现 SNI 托盘（libayatana 为 GTK3 链接库，不可混载）
+        gtk4_tray: ?*sni_tray.Tray = null,
         /// v0.4.0 H10：Unity LauncherEntry 会话总线连接（init 一次性缓存——
         /// script 回调内 g_bus_get_sync 会重入主循环 abort，实测教训）
         unity_bus: ?*anyopaque = null,
@@ -1508,6 +1521,11 @@ fn Backend(comptime config: Config) type {
                 self.tray_status_icon = null;
             }
             if (self.tray) |*t| t.lib.close();
+            if (self.gtk4_tray) |t| {
+                t.close();
+                self.allocator.destroy(t);
+                self.gtk4_tray = null;
+            }
             if (self.gapp) |app| c.g_object_unref(@ptrCast(app));
             if (self.pending_launch) |*launch| launch.deinit(self.allocator);
             if (self.hotkeys) |m| m.deinit();
@@ -2490,13 +2508,9 @@ fn Backend(comptime config: Config) type {
             }
             if (st.drag_files.items.len == 0) return error.NoFiles;
 
-            // GTK4：GDK 无公开的「脚本发起拖拽」入口（GtkDragSource 仅手势驱动；
-            // 低层 gdk_drag_begin 的数据面不走 content provider）→ 文档化 NotAvailable。
-            // 待拖文件列表仍记录（恢复 GTK3 或后续 GDK 级方案时语义不变）。
-            if (comptime !gtk_compat.programmaticDragAvailable()) {
-                log.print("[dnd] drag-out not available under GTK4 (window #{d})", .{st.id});
-                return error.DragNotAvailable;
-            }
+            // v0.6.1 L1b：GTK4 走 GDK4 公开的 gdk_drag_begin + content provider
+            //（GtkDragSource 只有手势入口；GDK 层可直接发起）。
+            if (comptime gtk_compat.isGtk4()) return self.startDragGtk4(st);
             var x: c.gint = 0;
             var y: c.gint = 0;
             if (!gtk_compat.pointerRootPos(@ptrCast(st.view), &x, &y)) {
@@ -2513,6 +2527,58 @@ fn Backend(comptime config: Config) type {
             defer c.gtk_target_list_unref(list);
             _ = c.gtk_drag_begin_with_coordinates(widget, list, c.GDK_ACTION_COPY, 1, null, x, y);
             log.print("[dnd] drag-out started ({d} file(s), window #{d})", .{ st.drag_files.items.len, st.id });
+        }
+
+        /// v0.6.1：GdkDrag 的完成上下文（挂在信号 user_data；dnd-finished 释放）。
+        const DragCtx = struct {
+            drag: ?*c.GdkDrag = null,
+        };
+
+        fn onGdkDragFinished(_: ?*c.GdkDrag, user_data: c.gpointer) callconv(.c) void {
+            const ctx: *DragCtx = @ptrCast(@alignCast(user_data orelse return));
+            if (ctx.drag) |drag| c.g_object_unref(@ptrCast(drag));
+            ctx.drag = null;
+            std.heap.c_allocator.destroy(ctx);
+        }
+
+        /// GTK4 拖出：text/uri-list content provider + gdk_drag_begin。
+        /// Wayland 没有指针事件的隐式 serial，可能直接失败 → DragNotAvailable
+        ///（X11 桌面与 Xvfb 冒烟走真实拖放）。
+        fn startDragGtk4(self: *Self, st: *WinState) !void {
+            var views: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer views.deinit(self.allocator);
+            for (st.drag_files.items) |f| try views.append(self.allocator, f);
+            const uri_list = try buildUriList(self.allocator, views.items);
+            defer self.allocator.free(uri_list);
+
+            const surface = c.gtk_native_get_surface(@ptrCast(st.view)) orelse return error.DragNotAvailable;
+            const display = c.gdk_display_get_default() orelse return error.DragNotAvailable;
+            const seat = c.gdk_display_get_default_seat(display) orelse return error.DragNotAvailable;
+            const device = c.gdk_seat_get_pointer(seat) orelse return error.DragNotAvailable;
+
+            const bytes = c.g_bytes_new(uri_list.ptr, uri_list.len) orelse return error.DragNotAvailable;
+            defer c.g_bytes_unref(bytes);
+            const provider = c.gdk_content_provider_new_for_bytes("text/uri-list", bytes) orelse return error.DragNotAvailable;
+            defer c.g_object_unref(@ptrCast(provider));
+
+            const drag = c.gdk_drag_begin(
+                surface,
+                device,
+                @ptrCast(provider),
+                c.GDK_ACTION_COPY,
+                @as(f64, 0),
+                @as(f64, 0),
+            ) orelse return error.DragNotAvailable;
+
+            const ctx = std.heap.c_allocator.create(DragCtx) catch {
+                c.g_object_unref(@ptrCast(drag));
+                return error.DragNotAvailable;
+            };
+            ctx.* = .{ .drag = drag };
+            // GdkDrag 的完成信号只有 dnd-finished（cancel 是取消通知，不保证时序）；
+            // 单信号释放避免二次回调。
+            _ = c.g_signal_connect_data(@ptrCast(drag), "dnd-finished", @ptrCast(&onGdkDragFinished), ctx, null, 0);
+            log.print("[dnd] drag-out started (gdk, {d} file(s), window #{d})", .{ st.drag_files.items.len, st.id });
         }
 
         // ------------------------------------------------------------------
@@ -2752,9 +2818,10 @@ fn Backend(comptime config: Config) type {
                 },
                 .cursor_grab => |grab| {
                     if (comptime gtk_compat.isGtk4()) {
-                        // 4.14 capi 无 gdk_seat_grab（指针抓取面移除）→ 文档化 skip
-                        log.print("[window] cursor grab unsupported under GTK4 (seat grab removed)", .{});
-                        return false;
+                        // v0.6.1：GDK4 无 seat grab → X11 XGrabPointer（Wayland false）
+                        const ok = gtk_compat.cursorGrab(widget, grab);
+                        if (!ok) log.print("[window] cursor grab failed (gtk4 X11)", .{});
+                        return ok;
                     }
                     const gdk_win = c.gtk_widget_get_window(widget) orelse return false;
                     const display = c.gdk_window_get_display(gdk_win) orelse return false;
@@ -3277,19 +3344,186 @@ fn Backend(comptime config: Config) type {
         // 菜单栏 / 托盘（v0.2.2）
         // ------------------------------------------------------------------
 
-        /// 每窗口菜单栏：config.menu（静态树）→ GtkMenuBar。
-        /// GTK4：GtkMenuBar 已移除 → 恒 null（menuBarAvailable 收敛点）。
+        /// 每窗口菜单栏：config.menu（静态树）。
+        /// GTK3 = GtkMenuBar；GTK4 = GMenu + GtkPopoverMenuBar + 动作组/快捷键。
         fn buildMenuBar(self: *Self, items: []const Config.MenuItem, st: *WinState) [*c]c.GtkWidget {
-            if (comptime gtk_compat.isGtk4()) {
-                log.print("[menu] menu bar unsupported under GTK4 (config.menu ignored)", .{});
-                return null;
-            }
+            if (comptime gtk_compat.isGtk4()) return self.buildMenuBarGtk4(items, st);
             const bar = c.gtk_menu_bar_new();
             if (bar == null) return null;
             self.appendMenuItems(@ptrCast(bar), items, st.id, .menu);
             c.gtk_widget_show_all(bar);
             log.print("[menu] menu bar built ({d} top-level items)", .{items.len});
             return bar;
+        }
+
+        /// v0.6.1 L1b：GTK4 菜单栏。
+        ///
+        /// GtkPopoverMenuBar 只接受 GMenuModel 的**子菜单**作顶层项，动作经
+        /// widget 层级的 GtkApplicationActionGroup 解析。这里：
+        ///   * 每个叶子生成 GSimpleAction（名字 a0/a1…）→ 复用 MenuAction 分发；
+        ///   * GMenu 顶层项为子菜单；子菜单内按 "-" 切 section（分隔语义）；
+        ///   * accel 写 GMenu "accel" 属性（右侧展示）+ GtkShortcutController
+        ///     （GLOBAL scope，真实触发）。
+        fn buildMenuBarGtk4(self: *Self, items: []const Config.MenuItem, st: *WinState) [*c]c.GtkWidget {
+            const group = c.g_simple_action_group_new() orelse return null;
+            defer c.g_object_unref(@ptrCast(group)); // 插入窗口后窗口持有引用
+
+            const menu = c.g_menu_new() orelse return null;
+            defer c.g_object_unref(@ptrCast(menu));
+
+            var next_action: u32 = 0;
+            for (items) |item| {
+                if (std.mem.eql(u8, item.label, "-")) continue; // 顶栏不能放分隔
+                const label_z = dupeZ(self.allocator, item.label) catch continue;
+                defer self.allocator.free(label_z);
+                const sub = c.g_menu_new() orelse continue;
+                if (item.items) |sub_items| {
+                    self.appendGtk4MenuItems(sub, sub_items, st, group, &next_action);
+                } else {
+                    // 顶层叶子：包成单子项子菜单（PopoverMenuBar 顶层只收子菜单）
+                    self.appendGtk4Leaf(sub, item, st, group, &next_action);
+                }
+                c.g_menu_append_submenu(menu, label_z.ptr, sub);
+                c.g_object_unref(@ptrCast(sub)); // append_submenu 持有引用
+            }
+
+            const bar = c.gtk_popover_menu_bar_new_from_model(@ptrCast(@alignCast(menu)));
+            if (bar == null) return null;
+            // 动作组同时挂到菜单栏与窗口：菜单点击按 bar 的 muxer 解析，
+            // 快捷键按窗口 muxer 解析（两者都命中同一组 GSimpleAction）。
+            c.gtk_widget_insert_action_group(@ptrCast(bar), "ziltmenu", @ptrCast(@alignCast(group)));
+            c.gtk_widget_insert_action_group(@ptrCast(st.win), "ziltmenu", @ptrCast(@alignCast(group)));
+            c.gtk_widget_show(@ptrCast(bar));
+            log.print("[menu] popover menu bar built ({d} top-level items)", .{items.len});
+            return bar;
+        }
+
+        /// 子菜单内容：按 "-" 分 section；其余递归/叶子。
+        fn appendGtk4MenuItems(
+            self: *Self,
+            menu: ?*c.GMenu,
+            items: []const Config.MenuItem,
+            st: *WinState,
+            group: ?*anyopaque,
+            next_action: *u32,
+        ) void {
+            var section = c.g_menu_new() orelse return;
+            var section_items: usize = 0;
+            for (items) |item| {
+                if (std.mem.eql(u8, item.label, "-")) {
+                    if (section_items > 0) {
+                        c.g_menu_append_section(menu, null, section);
+                        c.g_object_unref(@ptrCast(section));
+                        section = c.g_menu_new() orelse return;
+                        section_items = 0;
+                    }
+                    continue;
+                }
+                const label_z = dupeZ(self.allocator, item.label) catch continue;
+                defer self.allocator.free(label_z);
+                if (item.items) |sub_items| {
+                    const sub = c.g_menu_new() orelse continue;
+                    self.appendGtk4MenuItems(sub, sub_items, st, group, next_action);
+                    c.g_menu_append_submenu(section, label_z.ptr, sub);
+                    c.g_object_unref(@ptrCast(sub));
+                } else {
+                    self.appendGtk4Leaf(section, item, st, group, next_action);
+                }
+                section_items += 1;
+            }
+            if (section_items > 0) {
+                c.g_menu_append_section(menu, null, section);
+                c.g_object_unref(@ptrCast(section));
+            } else {
+                c.g_object_unref(@ptrCast(section));
+            }
+        }
+
+        /// 叶子：GSimpleAction（MenuAction 分发）+ GMenuItem（可选 accel）。
+        fn appendGtk4Leaf(
+            self: *Self,
+            menu: ?*c.GMenu,
+            item: Config.MenuItem,
+            st: *WinState,
+            group: ?*anyopaque,
+            next_action: *u32,
+        ) void {
+            const label_z = dupeZ(self.allocator, item.label) catch return;
+            defer self.allocator.free(label_z);
+
+            const action_name = std.fmt.allocPrint(self.allocator, "a{d}", .{next_action.*}) catch return;
+            defer self.allocator.free(action_name);
+            next_action.* += 1;
+            const action_name_z = dupeZ(self.allocator, action_name) catch return;
+            defer self.allocator.free(action_name_z);
+
+            // 菜单动作记录（与 GTK3 的 bindMenuItem 同一生命周期表；无 id 项置灰）
+            var full_action: ?[]u8 = null;
+            defer if (full_action) |f| self.allocator.free(f);
+            if (item.id) |id| {
+                const tracked = self.allocator.create(MenuAction) catch return;
+                const id_copy = self.allocator.dupe(u8, id) catch {
+                    self.allocator.destroy(tracked);
+                    return;
+                };
+                const role_copy: ?[]u8 = if (item.role) |r| (self.allocator.dupe(u8, r) catch null) else null;
+                tracked.* = .{ .backend = self, .win_id = st.id, .kind = .menu, .id = id_copy, .role = role_copy };
+                st.menu_actions.append(self.allocator, tracked) catch {
+                    self.allocator.free(id_copy);
+                    if (role_copy) |r| self.allocator.free(r);
+                    self.allocator.destroy(tracked);
+                    return;
+                };
+                const simple = c.g_simple_action_new(action_name_z.ptr, null);
+                if (simple == null) return;
+                _ = c.g_signal_connect_data(@ptrCast(simple), "activate", @ptrCast(&onMenuActionGtk4), tracked, null, 0);
+                c.g_action_map_add_action(@ptrCast(@alignCast(group)), @ptrCast(simple));
+                c.g_object_unref(@ptrCast(simple)); // map 持有引用
+                full_action = std.fmt.allocPrint(self.allocator, "ziltmenu.{s}", .{action_name}) catch return;
+            }
+
+            var action_full_z: ?[:0]u8 = null;
+            if (full_action) |f| action_full_z = dupeZ(self.allocator, f) catch null;
+            defer if (action_full_z) |z| self.allocator.free(z);
+            const menu_item = c.g_menu_item_new(label_z.ptr, if (action_full_z) |z| z.ptr else null);
+            if (menu_item == null) return;
+            defer c.g_object_unref(@ptrCast(menu_item));
+            if (full_action == null) {
+                // 无 id：置灰（GMenu 无 enabled 属性 → 不挂动作 + 显式禁用）
+                c.g_menu_item_set_attribute(menu_item, "enabled", "b", @as(c_int, 0));
+            }
+            if (item.accel) |accel| {
+                if (dupeZ(self.allocator, accel)) |az| {
+                    defer self.allocator.free(az);
+                    c.g_menu_item_set_attribute(menu_item, "accel", "s", az.ptr);
+                } else |_| {}
+                if (full_action) |f| self.attachGtk4Shortcut(st, accel, f);
+            }
+            c.g_menu_append_item(menu, menu_item);
+        }
+
+        /// GTK4 加速键：GtkKeyvalTrigger + GtkNamedAction → GtkShortcutController。
+        fn attachGtk4Shortcut(self: *Self, st: *WinState, accel: []const u8, action: []const u8) void {
+            _ = self;
+            const parsed = parseAccelGtk(accel) orelse return;
+            if (st.shortcut_controller == null) {
+                const ctrl = c.gtk_shortcut_controller_new() orelse return;
+                c.gtk_shortcut_controller_set_scope(ctrl, c.GTK_SHORTCUT_SCOPE_GLOBAL);
+                c.gtk_widget_add_controller(@ptrCast(st.win), @ptrCast(@alignCast(ctrl)));
+                st.shortcut_controller = ctrl;
+            }
+            const controller = st.shortcut_controller orelse return;
+            // parseAccelGtk 统一大写键位；无 Shift 时触发键用小写（真实事件 keyval）
+            var keyval = parsed.keyval;
+            if ((parsed.mods & c.GDK_SHIFT_MASK) == 0) keyval = c.gdk_keyval_to_lower(keyval);
+            const trigger = c.gtk_keyval_trigger_new(keyval, parsed.mods) orelse return;
+            // gtk_named_action_new 需要 NUL 结尾
+            const action_nz = std.heap.c_allocator.dupeZ(u8, action) catch return;
+            defer std.heap.c_allocator.free(action_nz);
+            const shortcut_action = c.gtk_named_action_new(action_nz.ptr) orelse return;
+            const shortcut = c.gtk_shortcut_new(trigger, shortcut_action) orelse return;
+            c.gtk_shortcut_controller_add_shortcut(controller, shortcut);
+            c.g_object_unref(@ptrCast(shortcut));
         }
 
         /// 托盘右键菜单（config.tray.menu）→ GtkMenu。
@@ -3655,9 +3889,27 @@ fn Backend(comptime config: Config) type {
         ///（**可选依赖**：缺失/符号缺失只记日志）。
         fn initTray(self: *Self) void {
             if (comptime gtk_compat.isGtk4()) {
-                // GTK4 限制：libayatana-appindicator3 链接 GTK3，混载会符号冲突。
-                // 托盘面（含 SNI D-Bus 直连方案）记录于 ROADMAP L1b 已知限制。
-                log.print("[tray] tray unavailable under GTK4 (ayatana is GTK3-linked)", .{});
+                // v0.6.1 L1b：libayatana-appindicator3 是 GTK3 链接库（不可混载）
+                // → 自实现 D-Bus SNI + DBusMenu；无会话总线/watcher 时降级。
+                const tray_cfg = config.tray orelse return;
+                const icon_src = tray_cfg.icon orelse config.icon;
+                const created = sni_tray.create(self.allocator, .{
+                    .app_id = config.app_id,
+                    .title = tray_cfg.tooltip,
+                    .icon_name = trayIconName(icon_src),
+                    .icon_dir = trayIconDir(icon_src),
+                    .on_activate = &Self.onSniActivate,
+                    .on_menu = &Self.onSniMenu,
+                    .ctx = self,
+                }) orelse return;
+                if (self.menu_state) |*model| created.setMenu(model.roots.items);
+                self.gtk4_tray = created;
+                log.print("[tray] SNI tray {s} (id={s}, icon={s}, menu={})", .{
+                    if (created.ready) "ready" else "degraded",
+                    config.app_id,
+                    trayIconName(icon_src),
+                    self.menu_state != null,
+                });
                 return;
             }
             const tray_cfg = config.tray orelse return;
@@ -3829,9 +4081,34 @@ fn Backend(comptime config: Config) type {
         }
 
         fn rebuildTrayMenu(self: *Self) void {
-            if (comptime gtk_compat.isGtk4()) return; // 托盘不可用（菜单模型仍可 list/set）
             const model = if (self.menu_state) |*m| m else return;
+            if (comptime gtk_compat.isGtk4()) {
+                // SNI：菜单树直接由模型重建（宿主经 DBusMenu 拉取）
+                if (self.gtk4_tray) |t| t.setMenu(model.roots.items);
+                return;
+            }
             if (self.buildTrayMenuFromModel(model)) |menu| self.setTrayMenu(menu);
+        }
+
+        /// v0.6.1：SNI 左键/次级激活 → 挂窗 toggle（与 XEmbed 同一入口）。
+        fn onSniActivate(user_data: ?*anyopaque) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return));
+            self.toggleAttachedWindow();
+        }
+
+        /// v0.6.1：DBusMenu clicked → menu/trayMenu 事件 + role（与 GtkMenu 同分发）。
+        fn onSniMenu(user_data: ?*anyopaque, node_ptr: ?*anyopaque) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(user_data orelse return));
+            const node: *menu_model.Node = @ptrCast(@alignCast(node_ptr orelse return));
+            if (node.id.len == 0) return;
+            var action = MenuAction{
+                .backend = self,
+                .win_id = 0,
+                .kind = .tray_menu,
+                .id = @constCast(node.id),
+                .role = if (node.role) |r| @constCast(r) else null,
+            };
+            self.dispatchMenuAction(&action);
         }
 
         // ------------------------------------------------------------------
@@ -5223,14 +5500,12 @@ fn Backend(comptime config: Config) type {
                     defer url_buf.deinit(self.allocator);
                     const url = try self.cookieUrl(w, clear.origin, &url_buf);
                     const host = hostOf(url) orelse return error.InvalidCookie;
+                    if (comptime gtk_compat.isGtk4()) {
+                        // v0.6.1：6.0 无 delete_cookies_for_domain → 全量枚举后过滤删除
+                        return self.clearCookiesForDomainGtk4(mgr, host, alloc);
+                    }
                     const host_z = try dupeZ(self.allocator, host);
                     defer self.allocator.free(host_z);
-                    if (comptime gtk_compat.isGtk4()) {
-                        // 6.0 的 CookieManager 无 delete_cookies_for_domain →
-                        // 文档化 NotAvailable（按域清理待 session 级 API 补齐）
-                        alloc.free(host_z);
-                        return error.WebViewCallFailed;
-                    }
                     c.webkit_cookie_manager_delete_cookies_for_domain(mgr, host_z.ptr);
                     log.print("[cookies] cleared domain '{s}'", .{host});
                     return try alloc.dupe(u8, "null");
@@ -5283,6 +5558,74 @@ fn Backend(comptime config: Config) type {
             c.g_main_loop_run(task.loop.?);
             if (task.failed) return error.WebViewCallFailed;
             return try alloc.dupe(u8, "null");
+        }
+
+        /// v0.6.1：按域清 cookie（WebKitGTK 6.0 无 delete_cookies_for_domain）。
+        const AllCookiesTask = struct {
+            backend: *Self,
+            loop: ?*c.GMainLoop = null,
+            list: ?*c.GList = null,
+            failed: bool = false,
+        };
+
+        fn clearCookiesForDomainGtk4(self: *Self, mgr: ?*c.WebKitCookieManager, host: []const u8, alloc: std.mem.Allocator) ![]u8 {
+            var task = AllCookiesTask{ .backend = self };
+            task.loop = c.g_main_loop_new(null, 0) orelse return error.WebViewCallFailed;
+            defer c.g_main_loop_unref(task.loop);
+            c.webkit_cookie_manager_get_all_cookies(mgr, null, allCookiesDone, &task);
+            c.g_main_loop_run(task.loop.?);
+            if (task.failed) return error.WebViewCallFailed;
+            const list = task.list orelse return try alloc.dupe(u8, "null");
+            defer {
+                var node_it: ?*c.GList = list;
+                while (node_it) |node| : (node_it = node.*.next) {
+                    if (node.*.data) |data| c.soup_cookie_free(@ptrCast(data));
+                }
+                c.g_list_free(list);
+            }
+
+            var deleted: usize = 0;
+            var it: ?*c.GList = list;
+            while (it) |node| : (it = node.*.next) {
+                const cookie: ?*c.SoupCookie = @ptrCast(@alignCast(node.*.data));
+                if (cookie == null) continue;
+                const domain_raw = c.soup_cookie_get_domain(cookie);
+                if (domain_raw == null) continue;
+                if (!cookieDomainMatches(std.mem.span(domain_raw), host)) continue;
+                var del = WaitTask{ .backend = self };
+                del.loop = c.g_main_loop_new(null, 0) orelse continue;
+                c.webkit_cookie_manager_delete_cookie(mgr, cookie, null, cookieDeleteDone, &del);
+                c.g_main_loop_run(del.loop.?);
+                c.g_main_loop_unref(del.loop);
+                if (!del.failed) deleted += 1;
+            }
+            log.print("[cookies] cleared domain '{s}' ({d} cookie(s), gtk4)", .{ host, deleted });
+            return try alloc.dupe(u8, "null");
+        }
+
+        fn allCookiesDone(source: [*c]c.GObject, res: ?*c.GAsyncResult, user_data: c.gpointer) callconv(.c) void {
+            const task: *AllCookiesTask = @ptrCast(@alignCast(user_data orelse return));
+            const mgr: ?*c.WebKitCookieManager = @ptrCast(source);
+            var err: [*c]c.GError = null;
+            const list = c.webkit_cookie_manager_get_all_cookies_finish(mgr, res, &err);
+            if (err != null) {
+                c.g_error_free(err);
+                task.failed = true;
+            } else {
+                task.list = list;
+            }
+            if (task.loop) |lp| c.g_main_loop_quit(lp);
+        }
+
+        /// 域匹配：cookie domain（可带前导点）等于 host，或 host 是其子域。
+        fn cookieDomainMatches(cookie_domain: []const u8, host: []const u8) bool {
+            var d = cookie_domain;
+            if (d.len > 0 and d[0] == '.') d = d[1..];
+            if (d.len == 0) return false;
+            if (std.ascii.eqlIgnoreCase(d, host)) return true;
+            return host.len > d.len and
+                std.ascii.endsWithIgnoreCase(host, d) and
+                host[host.len - d.len - 1] == '.';
         }
 
         fn runCookieDelete(self: *Self, mgr: ?*c.WebKitCookieManager, cookie: *c.SoupCookie, alloc: std.mem.Allocator) ![]u8 {
@@ -5473,9 +5816,15 @@ fn Backend(comptime config: Config) type {
                 var tex_err: [*c]c.GError = null;
                 const texture = c.webkit_web_view_get_snapshot_finish(view, res, &tex_err);
                 if (tex_err != null or texture == null) {
-                    // GError 的 message 在 free 后失效——先打日志/回传，再释放
+                    // GError 的 message 在 free 后失效——先打日志，回退/回传后再释放
                     const message = if (tex_err != null) std.mem.span(tex_err.*.message) else "snapshot failed";
                     log.print("[snapshot] failed (gtk4): {s}", .{message});
+                    // v0.6.1：Xvfb/llvmpipe 无合成器 → GdkTexture 快照失败；
+                    // X11 下改抓窗口像素（真机成功时不会走到这里）。
+                    if (self.x11SnapshotFallback(task.win_id, task.rid)) {
+                        if (tex_err != null) c.g_error_free(tex_err);
+                        return;
+                    }
                     self.emitCdpError(task.win_id, task.rid, message);
                     if (tex_err != null) c.g_error_free(tex_err);
                     return;
@@ -5522,6 +5871,64 @@ fn Backend(comptime config: Config) type {
             _ = encoder.encode(encoded, raw[0..size]);
             log.print("[snapshot] {d} bytes -> base64 {d} chars", .{ size, encoded.len });
             self.emitCdpOk(task.win_id, task.rid, encoded);
+        }
+
+        /// v0.6.1：GTK4 截图的 X11 像素回退。
+        ///
+        /// WebKitGTK 6.0 的 `webkit_web_view_get_snapshot` 返回 GdkTexture，
+        /// Xvfb/llvmpipe（无合成器）下稳定 FAILED_TO_CREATE；X11 桌面本身有真实
+        /// 像素，用 XGetImage 抓客户区后经 cairo 编 PNG。Wayland/无效 surface
+        /// 返回 false（调用方报原错误）。
+        fn x11SnapshotFallback(self: *Self, win_id: u32, rid: i64) bool {
+            const st = self.windowById(win_id) orelse return false;
+            const widget: [*c]c.GtkWidget = @ptrCast(st.view);
+            const surface = c.gtk_native_get_surface(@ptrCast(widget)) orelse return false;
+            const display = c.gtk_widget_get_display(widget) orelse return false;
+            const dpy = c.gdk_x11_display_get_xdisplay(@ptrCast(@alignCast(display))) orelse return false;
+            const xwin = c.gdk_x11_surface_get_xid(@ptrCast(@alignCast(surface)));
+            if (xwin == 0) return false;
+            var attrs: c.XWindowAttributes = undefined;
+            if (c.XGetWindowAttributes(dpy, xwin, &attrs) == 0) return false;
+            if (attrs.map_state != c.IsViewable) return false;
+            const width: c_int = @intCast(c.gdk_surface_get_width(surface));
+            const height: c_int = @intCast(c.gdk_surface_get_height(surface));
+            if (width <= 1 or height <= 1) return false;
+
+            // AllPlanes = ~0UL；ZPixmap = 2（宏未保证被 translate-c 收进 c-namespace）
+            const all_planes: c_ulong = ~@as(c_ulong, 0);
+            const image = c.XGetImage(dpy, xwin, 0, 0, @intCast(width), @intCast(height), all_planes, 2);
+            if (image == null) return false;
+            defer {
+                if (image.*.data != null) _ = c.XFree(@ptrCast(image.*.data));
+                _ = c.XFree(@ptrCast(image));
+            }
+            if (image.*.bits_per_pixel != 32) return false;
+            const stride: c_int = @intCast(image.*.bytes_per_line);
+            const format: c_int = if (image.*.depth == 32) c.CAIRO_FORMAT_ARGB32 else c.CAIRO_FORMAT_RGB24;
+            const cairo_surface = c.cairo_image_surface_create_for_data(
+                @ptrCast(image.*.data),
+                format,
+                width,
+                height,
+                stride,
+            );
+            if (cairo_surface == null) return false;
+            defer c.cairo_surface_destroy(cairo_surface);
+
+            const stream = c.g_memory_output_stream_new_resizable() orelse return false;
+            defer c.g_object_unref(@ptrCast(stream));
+            if (c.cairo_surface_write_to_png_stream(cairo_surface, pngWrite, stream) != c.CAIRO_STATUS_SUCCESS) return false;
+            const raw = c.g_memory_output_stream_get_data(@ptrCast(stream));
+            const size: usize = @intCast(c.g_memory_output_stream_get_size(@ptrCast(stream)));
+            if (raw == null or size == 0) return false;
+
+            const encoder = std.base64.standard.Encoder;
+            const encoded = self.allocator.alloc(u8, encoder.calcSize(size)) catch return false;
+            defer self.allocator.free(encoded);
+            _ = encoder.encode(encoded, @as([*]const u8, @ptrCast(raw))[0..size]);
+            log.print("[snapshot] x11 fallback {d}x{d} ({d} bytes)", .{ width, height, size });
+            self.emitCdpOk(win_id, rid, encoded);
+            return true;
         }
 
         /// cairo 的 PNG 写出回调（closure = GMemoryOutputStream）。

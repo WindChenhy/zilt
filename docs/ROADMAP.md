@@ -2,7 +2,8 @@
 
 > 制定日期：2026-11-20。修订：2026-11-21（Linux 专项复核：L1–L8 入图，macOS 顺延）。
 > 基线：**v0.3.19**（git 31b3109，测试体系收口）。
-> 当前：**v0.6.0**（tag v0.6.0 → 370cf39，2026-11-28；CI run **46120751655** 全绿；GitHub Release 已发布 zip + setup.exe）。
+> 当前：**v0.6.1**（L1b：GTK4 对等补齐并转 Linux 默认；2026-11-28）。
+> 上一 tag：v0.6.0 → 370cf39（CI run **46120751655** 全绿；GitHub Release 已发布 zip + setup.exe）。
 > 上一版：v0.5.11（tag v0.5.11 → a20483c，2026-11-27；CI run **46032448049** 全绿）。
 > v0.4.5–v0.4.9 是 macOS 能力面切片；v0.5.x 交付台账与收口判定见下节「版本状态」。
 > 对标：**Wails v3.1.0 stable（2026-11-01）+ v3.2.0-nightly**、**Tauri 2.12.x**（2026-11 最新，2.12.x 仅 bugfix）。
@@ -56,17 +57,17 @@
 | Windows 主作业 | ✅（核心） | 单测 + 冒烟 **74/74** + 打包 PASS；WebDriver E2E 改为 **advisory**：按 WebView2 运行时取 driver 后曾 4/4（run 46020253733），但 msedgedriver attach 偶发无响应（run 46026489810 挂到 360s 硬超时） |
 | Linux WebDriver 自动化 | ❌ 真实缺口（advisory） | DISPLAY / 空 environ / capability 匹配三处已修通；`automation-session::create-web-view` 交主窗口 view 仍被 WebKit 判为「failed to create a new browsing context」——需要新建带 runtime 注入的 view（v0.6.x 排期） |
 | CI 可重复性 | ✅ | v0.5.11 修掉三处时序 flake：Tray（`set -e` + 未 mapped 定位）、GTK4 `v04`（隐藏窗口不 allocate → 改可见探针并轮询）、Windows `partition`（共享 Environment 的 localStorage 回流异步 → 轮询 2s） |
-| **L1b：GTK4 默认化** | → v0.6.1（D12） | `build.zig` 的 `-Dgtk` 仍默认 `gtk3`；GTK4 变体有 5 处能力缺口（见下），不是翻默认值的工程量；已移出 v0.5 |
+| **L1b：GTK4 默认化** | ✅ v0.6.1 | `-Dgtk` 默认 `gtk4`（GTK3 legacy 一周期）；五面缺口全部收口：SNI 托盘 / GtkPopoverMenuBar / `gdk_drag_begin` / 全量 cookie 过滤 / X11 截图回退；打包依赖与 CI 双作业随变体投影 |
 
-### L1b 剩余工作（v0.6.1 切片，不阻塞 v0.5）
+### L1b 收口（v0.6.1，2026-11-28）
 
-| 缺口 | GTK3 现状 | GTK4 约束 | 处置 |
+| 缺口 | GTK3 现状 | GTK4 约束 | 处置（已实施） |
 |---|---|---|---|
-| 托盘 | GtkStatusIcon（XEmbed）+ libayatana SNI | 4.x 移除 GtkStatusIcon；libayatana 链 GTK3，同进程不可混 | 自实现 D-Bus SNI（GDBus + DBusMenu），或明确降级 |
-| 菜单栏 | GtkMenuBar | 4.x 移除 | 改 GtkPopoverMenuBar（popover 菜单模型已可复用） |
-| 拖出 / 指针抓取 | `gtk_drag_*` / `gdk_seat_grab` | GDK4 移除该面 | 改 GtkDragSource，或保持 `DragNotAvailable` 并文档化 |
-| 按域清 cookie | WebKitGTK 4.1 API | WebKitGTK 6.0 无 `delete_cookies_for_domain` | 枚举全量 cookie 过滤删除 |
-| 截图 | X11 抓取 | GdkTexture 渲染面；Xvfb/无合成器下 `FAILED_TO_CREATE` | 真机 / 离屏路径验证 |
+| 托盘 | GtkStatusIcon（XEmbed）+ libayatana SNI | 4.x 移除 GtkStatusIcon；libayatana 链 GTK3，同进程不可混 | ✅ 自实现 D-Bus SNI + DBusMenu（`sni_tray.zig`，GDBus；无 watcher 降级） |
+| 菜单栏 | GtkMenuBar | 4.x 移除 | ✅ GtkPopoverMenuBar + GMenu 动作组 + GtkShortcutController |
+| 拖出 / 指针抓取 | `gtk_drag_*` / `gdk_seat_grab` | GDK4 移除该面 | ✅ `gdk_drag_begin` + content provider；X11 XGrabPointer（Wayland 文档化降级） |
+| 按域清 cookie | WebKitGTK 4.1 API | WebKitGTK 6.0 无 `delete_cookies_for_domain` | ✅ 全量枚举 → 按域过滤 → 逐条 delete |
+| 截图 | X11 抓取 | GdkTexture 渲染面；Xvfb/无合成器下 `FAILED_TO_CREATE` | ✅ X11 `XGetImage` 回退（Xvfb 可出图），真机仍优先 GdkTexture |
 
 **v0.5 收口判据（D12 修订）**：除 L1b 外的子项全绿 + Linux 三作业（GTK3 / GTK4 / arm64）可复现全绿；
 WebDriver E2E 为 **advisory**（Windows 偶发 attach 挂起、Linux 自动化能力未完成，均不阻塞）。
@@ -102,6 +103,26 @@ flavors 落地三片：
   `-Dflavor=dev|beta|prod` 身份、beta 窗口标题与 headless `app_id` 均通过。
 - **v0.6.0 发版**（tag 370cf39）：CI run **46120751655** 全绿（Windows / Linux GTK3 / GTK4 /
   arm64 / NSIS）；Release 产物 `Zilt-0.6.0-x64.zip` + `setup.exe`。
+
+### v0.6.1（2026-11-28，L1b：GTK4 转默认）
+
+- **托盘**：`src/zilt/platform/linux/sni_tray.zig`——GDBus 自实现
+  `org.kde.StatusNotifierItem` + `com.canonical.dbusmenu`；菜单树直接由 `menu_model`
+  构造（DFS id / revision / LayoutUpdated），左键 Activate → 挂窗 toggle；
+  `org.freedesktop.DBus.Properties` 由 GDBus 按 XML 声明自动实现；无 watcher 降级。
+- **菜单栏**：GMenu + `GtkPopoverMenuBar`；每窗口 GSimpleActionGroup（`ziltmenu`）
+  复用 `MenuAction` 分发；加速键 = GMenu `accel` 属性 + `GtkShortcutController`
+  （GtkKeyvalTrigger + GtkNamedAction，GLOBAL scope）。
+- **拖出**：GDK4 公开 `gdk_drag_begin` + `gdk_content_provider_new_for_bytes("text/uri-list")`；
+  GdkDrag 由 `dnd-finished` 释放（Wayland 无 serial 时如实 DragNotAvailable）。
+- **按域清 cookie**：`webkit_cookie_manager_get_all_cookies` → 域匹配（含前导点/子域）
+  → 逐条 `delete_cookie`（6.0 无 delete_cookies_for_domain）。
+- **截图**：GdkTexture 快照失败时 X11 `XGetImage` 回退（`capi.h` 引入 `X11/Xutil.h`）；
+  指针抓取 GTK4 走 `XGrabPointer`/`XUngrabPointer`。
+- **默认切换**：`build.zig -Dgtk` 默认 `gtk4`，`-Dgtk=gtk3` legacy；模板同步；
+  `app_meta.gtk4` 驱动 deb/rpm/AUR/AppImage 依赖与 helper 目录名；doctor/bootstrap/
+  arm64 脚本/CI（默认 24.04 GTK4 + legacy 22.04 GTK3）同步。
+- **验证**：Windows `zig build test` + `zig build` 全绿（Linux 编译由 CI 双作业验证）。
   CI 协作修三处：Linux 模板 E2E 产物名改 `app`、Tray E2E 转 advisory（openbox 放置覆盖
   attach 定位，双次复现）、Package job 补 NSIS PATH（choco 安装后当前 shell 未刷新）。
   详见 [DESIGN_v0.6.0_flavors.md](DESIGN_v0.6.0_flavors.md) §9–§11。
@@ -157,8 +178,8 @@ flavors 落地三片：
 **Linux 发行版兼容专项（L 系列，第四轮复核）**
 
 > 2026-11-21 对照 Wails v3.1 / Tauri 2.12 的 **Linux 专项**复核结论：Zilt 的 API 能力面更宽
-> （见 §0.4），差距集中在**工具链与分发生态**——GTK4 默认化（L1b 未做）、分数缩放、
-> ARM64 实跑。包格式/签名/AppImage 自包含/托盘挂窗已在 v0.4.3 补齐（L3/L5/L6 实测）。
+> （见 §0.4），差距集中在**工具链与分发生态**——GTK4 默认化（L1b 已于 v0.6.1 完成）、
+> 分数缩放、ARM64 实跑。包格式/签名/AppImage 自包含/托盘挂窗已在 v0.4.3 补齐（L3/L5/L6 实测）。
 > 这一组不影响 `window.zilt` 的 API，但决定「在 24.04+/Fedora/Arch/ARM 上能否顺利装上
 > 并用好」，故单列 L 系列。
 
@@ -298,7 +319,7 @@ page_allocator（延续 v0.4.1 教训）。
   能力守卫的机制验证成立
 - **零回归**：Windows/22.04 单测全绿 + 22.04 GTK3 冒烟 exit 0
 
-**L1b（待实施）——4.x UI 面重写**：按审计表逐子系统移植（GdkClipboard ↔ GtkClipboard、
+**L1b ✅（v0.6.1，2026-11-28）——4.x UI 面重写**：按审计表逐子系统移植（GdkClipboard ↔ GtkClipboard、
 GdkDrag ↔ gtk_drag_*、GtkPopoverMenu ↔ GtkMenu 族、gdk_toplevel ↔ gtk_window 几何/
 状态、GtkFileDialog ↔ GtkFileChooserNative）；完成后切 `-Dgtk=gtk4` 默认化（D7 保留
 gtk3 legacy 一个周期）。前置已就绪（本 L1a 环境）。
@@ -382,7 +403,7 @@ gtk3 legacy 一个周期）。前置已就绪（本 L1a 环境）。
 目标：把 Linux 从「API 齐全」推进到「发行版可直接采用」——GTK4 默认、自包含 AppImage、
 ARM64、包签名/AUR、托盘挂窗。这是 L 系列的主体，也是与 Wails v3.1 差距最集中的一段。
 
-- **L1** GTK4 默认化 + 双栈构建（`-Dgtk=gtk3` 保留为 legacy 一个周期，CI 双 job）
+- **L1 ✅** GTK4 默认化 + 双栈构建（v0.6.1；`-Dgtk=gtk3` 保留为 legacy 一个周期，CI 双 job）
 - **L3 ✅** AppImage 自包含（WebKit 随包 + helper 路径改写；无宿主 WebKit 实测见上）
 - **L4 [~]** ARM64 构建链（Docker+QEMU 脚本 / `--sysroot` 交叉 / CI job；本机无镜像 SKIP）
 - **L5 ✅** RPM/AUR 实构建 + PGP 签名（deb `_gpgorigin` / rpm `--addsign`；`dev-sign-e2e.sh` 正反向校验）
@@ -674,8 +695,8 @@ DMG 挂载安装；更新器端到端（旧版→新版）；Keychain 单测。
   调研，或从 git 历史找回 docs/research、docs/reference。
 - **R6（L1 GTK4 默认化）**：WebKitGTK 6.0 在 Ubuntu 22.04 / Debian 12 不可用——必须保留
   `-Dgtk=gtk3` legacy 至少一个周期，且发布说明按发行版分列依赖；GTK4 的文件对话框走
-  xdg-desktop-portal，默认目录/过滤器行为与 GTK3 不同（需回归对话框用例）；AppIndicator
-  在 GTK4 下仍需 libayatana（保持 dlopen 可选）。
+  xdg-desktop-portal，默认目录/过滤器行为与 GTK3 不同（需回归对话框用例）；GTK4 托盘
+  已改为自实现 D-Bus SNI（不再需要 libayatana；无宿主 watcher 时降级为无图标）。
 - **R7（L3 AppImage 自包含）**：✅ 实测结论（2026-11-21）——①体积 **+78MB**（squashfs 88MB），
   R7 原估 +30–40MB 偏乐观（WebKitGTK 2.52 的 libwebkit 89MB + JSC 33MB + ICU，已 strip 无收益）；
   ②WebKit 2.52 **无 `WEBKIT_EXEC_PATH`**，helper 路径是编译期常量，必须等长改写为固定短路径

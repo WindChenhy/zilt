@@ -143,7 +143,8 @@ pub const linux_target_capabilities = [_]Capability{
     .window_mask,           .hide_on_focus_lost, .resize_dragging, .prevent_overflow,
     // v0.4.3 L6：tray_attach_window 实装（XEmbed 托盘：自建 GtkStatusIcon 左键
     // toggle + gtk_status_icon_get_geometry 定位；SNI：secondary activate 目标项
-    // + 指针锚点；FFM 桌面禁用 hideOnFocusLost。GTK4 变体无托盘 → 随 tray 文档化）
+    // + 指针锚点；FFM 桌面禁用 hideOnFocusLost。GTK4（v0.6.1）：自实现 D-Bus SNI，
+    // Activate/SecondaryActivate → 同一 toggle 入口）
     .tray_attach_window,
     // v0.4.0 L8：window_key_bindings 于 v0.3.9 A4L 实装（Linux 清单补齐——
     // 此前清单与实现漂移：有单测有冒烟却未入清单）

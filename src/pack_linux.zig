@@ -200,7 +200,10 @@ fn bundleWebkit(alloc: Allocator, app_dir: []const u8, app_bin: []const u8, meta
         var it = std.mem.splitScalar(u8, exe_out, '\n');
         while (it.next()) |line| {
             const e = pack_formats.parseLddLine(line) orelse continue;
-            if (std.mem.startsWith(u8, e.soname, "libwebkit2gtk-")) {
+            // v0.6.1：GTK3 legacy = libwebkit2gtk-4.1；GTK4 = libwebkitgtk-6.0
+            if (std.mem.startsWith(u8, e.soname, "libwebkit2gtk-") or
+                std.mem.startsWith(u8, e.soname, "libwebkitgtk-"))
+            {
                 webkit_host = e.path;
                 webkit_soname = e.soname;
             }
@@ -219,13 +222,18 @@ fn bundleWebkit(alloc: Allocator, app_dir: []const u8, app_bin: []const u8, meta
 
     // 2) 定位 WebKit：triplet + helper 目录
     const wk_lib_host = webkit_host orelse {
-        std.debug.print("[pack:webkit] 未在 ldd 中找到 libwebkit2gtk——跳过随包\n", .{});
+        std.debug.print("[pack:webkit] 未在 ldd 中找到 libwebkit——跳过随包\n", .{});
         return false;
     };
     const wk_soname = webkit_soname orelse return false;
     const host_libdir = std.fs.path.dirname(wk_lib_host) orelse return false;
     const triplet = std.fs.path.basename(host_libdir);
-    const helpers_host = std.fmt.allocPrint(alloc, "{s}/webkit2gtk-4.1", .{host_libdir}) catch return false;
+    // v0.6.1：helper 目录名跟随 WebKit ABI（GTK3 = webkit2gtk-4.1；GTK4 = webkitgtk-6.0）
+    const helpers_name: []const u8 = if (std.mem.startsWith(u8, wk_soname, "libwebkit2gtk-"))
+        "webkit2gtk-4.1"
+    else
+        "webkitgtk-6.0";
+    const helpers_host = std.fmt.allocPrint(alloc, "{s}/{s}", .{ host_libdir, helpers_name }) catch return false;
     defer alloc.free(helpers_host);
 
     // 3) helper 依赖闭包（helper 是独立可执行文件，不在 libwebkit 的 ldd 里）
@@ -237,7 +245,7 @@ fn bundleWebkit(alloc: Allocator, app_dir: []const u8, app_bin: []const u8, meta
     }
 
     // 4) helper 目录 → AppDir（helper + injected-bundle + 探测文件）
-    const helpers_dst = std.fmt.allocPrint(alloc, "{s}/usr/lib/{s}/webkit2gtk-4.1", .{ app_dir, triplet }) catch return false;
+    const helpers_dst = std.fmt.allocPrint(alloc, "{s}/usr/lib/{s}/{s}", .{ app_dir, triplet, helpers_name }) catch return false;
     defer alloc.free(helpers_dst);
     mkDirs(alloc, helpers_dst);
     if (!copyDirInto(alloc, helpers_host, helpers_dst)) {
@@ -253,7 +261,7 @@ fn bundleWebkit(alloc: Allocator, app_dir: []const u8, app_bin: []const u8, meta
         return false;
     };
     defer alloc.free(bytes);
-    const prefix = std.fmt.allocPrint(alloc, "{s}/webkit2gtk-4.1", .{host_libdir}) catch return false;
+    const prefix = std.fmt.allocPrint(alloc, "{s}/{s}", .{ host_libdir, helpers_name }) catch return false;
     defer alloc.free(prefix);
     const long_needle = std.fmt.allocPrint(alloc, "{s}/injected-bundle/", .{prefix}) catch return false;
     defer alloc.free(long_needle);
@@ -306,6 +314,8 @@ fn fillBundledAppRun(alloc: Allocator, meta: PackMeta, triplet: []const u8, wk_d
     const exe_base = exeBaseName(alloc, meta) catch return null;
     var s = std.mem.replaceOwned(u8, alloc, pack_formats.apprun_script_bundled, "APP_EXE_NAME", exe_base) catch return null;
     s = std.mem.replaceOwned(u8, alloc, s, "@TRIPLET@", triplet) catch return null;
+    // v0.6.1：helper 目录名跟随 GTK 变体（GTK3 = webkit2gtk-4.1；GTK4 = webkitgtk-6.0）
+    s = std.mem.replaceOwned(u8, alloc, s, "@WK_HELPERS@", if (meta.gtk4) "webkitgtk-6.0" else "webkit2gtk-4.1") catch return null;
     s = std.mem.replaceOwned(u8, alloc, s, "WK_DIR", wk_dir) catch return null;
     return s;
 }
@@ -397,6 +407,8 @@ pub fn main() !void {
         .description = app_meta.app_name,
         // v0.4.3 L5：包架构跟随构建目标（ARM64 容器内原生构建 → aarch64）
         .arch = @tagName(@import("builtin").cpu.arch),
+        // v0.6.1：打包依赖名跟随 -Dgtk（默认 GTK4）
+        .gtk4 = app_meta.gtk4,
     };
     const pkg = try pack_formats.debianName(alloc, meta.app_id);
     const desktop_name = try desktopFileName(alloc, pkg);
@@ -447,7 +459,7 @@ pub fn main() !void {
     }
 
     const deb = try pack_formats.buildDebOpt(alloc, meta, exe_bytes.?, .{
-        .depends = &.{ "libgtk-3-0", "libwebkit2gtk-4.1-0", "libsqlite3-0" },
+        .depends = &.{ pack_formats.gtkDebDep(meta), pack_formats.webkitDebDep(meta), "libsqlite3-0" },
         .postinst_lines = &.{mime_line},
         .icon_png = icon_png,
         .extra_files = sidecar_bytes.items,

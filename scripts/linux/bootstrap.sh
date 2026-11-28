@@ -6,7 +6,8 @@
 #   # 或 WSL 从 Windows 侧：
 #   wsl -d Ubuntu-22.04 -u root -- bash /mnt/d/Projects/ZigProjects/Zilt/scripts/linux/bootstrap.sh
 #
-# 做的事：装 GTK3/WebKit2GTK 4.1 开发包 + Zig（默认 0.17.1），最后打印自检表。
+# 做的事：装 GTK4/WebKitGTK 6.0 开发包（默认栈；GTK3 legacy 见 -Dgtk=gtk3）
+# + Zig（默认 0.17.1），最后打印自检表。
 # 幂等：重复执行只会补齐缺失项。
 set -uo pipefail
 
@@ -14,7 +15,7 @@ ZIG_VERSION="${ZIG_VERSION:-0.17.1}"
 ZIG_PREFIX="${ZIG_PREFIX:-/opt/zig}"
 APT_PACKAGES=(
   build-essential pkg-config curl xz-utils
-  libgtk-3-dev libwebkit2gtk-4.1-dev
+  libgtk-4-dev libwebkitgtk-6.0-dev
   xvfb
   # v0.2.6 全局快捷键（X11 头文件，capi.h 硬依赖）+ v0.2.7 shell（xdg-open）
   # v0.2.9 WebDriver E2E（WebKitWebDriver）
@@ -35,7 +36,7 @@ say "系统信息"
 ok "${PRETTY_NAME:-unknown}  kernel=$(uname -r)  arch=$(uname -m)"
 case "${VERSION_ID:-}" in
   22.04|24.04|24.10|25.04|25.10) ;;
-  *) warn "未验证的发行版 ${VERSION_ID:-?}：需要提供 webkit2gtk-4.1 的 dev 包" ;;
+  *) warn "未验证的发行版 ${VERSION_ID:-?}：需要提供 webkitgtk-6.0 的 dev 包（GTK4 默认）" ;;
 esac
 
 say "安装依赖（apt）"
@@ -81,8 +82,8 @@ check_pkg() {
   local mod="$1" label="$2" v
   if v="$(pkg-config --modversion "$mod" 2>/dev/null)"; then ok "$label $v"; else warn "$label 缺失（pkg-config $mod）"; fail=1; fi
 }
-check_pkg gtk+-3.0 "GTK3"
-check_pkg webkit2gtk-4.1 "WebKit2GTK 4.1"
+check_pkg gtk4 "GTK4"
+check_pkg webkitgtk-6.0 "WebKitGTK 6.0"
 command -v xvfb-run >/dev/null 2>&1 && ok "xvfb-run $(xvfb-run --help 2>&1 | head -1 >/dev/null; echo ready)" || { warn "xvfb-run 缺失"; fail=1; }
 command -v zig >/dev/null 2>&1 && ok "zig $(zig version)" || { warn "zig 不在 PATH"; fail=1; }
 

@@ -298,9 +298,8 @@ function runSecondWindowProbe() {
     check('webview.unimpl', sysPrintErr === 'NotSupported', sysPrintErr);
 
     // 截图：runtime 的 captureScreenshot 走 cdp Page.captureScreenshot，
-    // Linux 用 webkit_web_view_get_snapshot + cairo PNG 实现（返回 data URL）。
-    // GTK4/WebKitGTK 6.0 返回 GdkTexture，Xvfb 无合成器下稳定 FAILED_TO_CREATE
-    // —— 按已知环境差异显式 skip（caps.screenshot=false），真机待验。
+    // Linux 用 webkit_web_view_get_snapshot 实现（返回 data URL）。
+    // v0.6.1：GTK4 的 GdkTexture 在 Xvfb 失败时回退 X11 XGetImage —— 两栈均真实断言。
     if (!CAPS.screenshot) {
       check('screenshot', true, 'skipped (GTK4 headless: snapshot texture unavailable)');
     } else {
@@ -310,7 +309,7 @@ function runSecondWindowProbe() {
     }
 
     // cookies：URL 作用域的读取 + 按域名清理（示例 origin，无网络请求）
-    // GTK4（WebKitGTK 6.0）无 delete_cookies_for_domain → 断言「明确报错」而非静默成功
+    // v0.6.1：GTK4 走全量枚举过滤删除（与 GTK3 同语义）
     const ck = await V.getCookies('https://example.com/');
     let clearedCookies = null, clearErr = null;
     try { clearedCookies = await V.clearCookies('https://example.com'); } catch (e) { clearErr = String(e.message || e); }
@@ -607,7 +606,7 @@ function runSecondWindowProbe() {
 
   // ---- v0.4.3 L6：托盘挂窗（tray.attach_window——toggle + 指针定位 + 抑制窗）----
   if (!CAPS.tray) {
-    check('tray.attach', true, 'skipped (GTK4: ayatana is GTK3-linked)');
+    check('tray.attach', true, 'skipped (no tray backend)');
   } else try {
     const attachResult = await new Promise((resolve) => {
       const timer = setTimeout(() => resolve(null), 5000);
@@ -1164,7 +1163,7 @@ function runSecondWindowProbe() {
   //      冒烟断言 begin 被接受、主循环存活（drag-data-get 内容由后端日志佐证）。
   //      放在最后：GTK 拖拽会持有指针 grab，避免影响上面的焦点类断言 ----
   if (!CAPS.programmatic_drag) {
-    // GTK4：GDK 无公开的脚本发起拖拽入口 → 必须 DragNotAvailable（不是静默成功）
+    // Wayland 等无指针 serial 的环境：必须 DragNotAvailable（不是静默成功）
     let err = null;
     try { await Z().drag.start(['/tmp/zilt-drag-out-a.txt']); } catch (e) { err = String(e.message || e); }
     check('drag.out', err === 'DragNotAvailable', `skipped (GTK4) err=${err}`);

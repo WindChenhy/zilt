@@ -41,7 +41,12 @@ set +e
   done
 
   if [ "$BUILD" = 1 ]; then
-    zig build
+    # v0.6.1：本脚本验的是 GTK3 XEmbed 路径（GTK4 托盘走 D-Bus SNI）
+    zig build -Dgtk=gtk3
+  fi
+  if ldd zig-out/bin/zilt-app 2>/dev/null | grep -q 'libgtk-4'; then
+    echo "RESULT=SKIP reason=gtk4-build (XEmbed tray E2E is GTK3-only)"
+    exit 3
   fi
 
   XT="python3 scripts/linux/xtool.py"

@@ -12,12 +12,13 @@
 //! 分支体经 comptime 消除：GTK3 构建不引用 4.x 符号，反之亦然——
 //! 72 个 GTK4 移除符号（gtkaudit.sh 审计）全部收敛于此或调用点守卫。
 //!
-//! GTK4 已知限制（文档化，见 ROADMAP L1b；代码侧登记在 `caps()`）：
-//!   * 托盘：libayatana-appindicator3 为 GTK3 链接库，4.x 进程不可载 → 无托盘；
-//!   * drag.start（脚本发起拖拽）：GDK4 无公开 begin 入口 → DragNotAvailable；
-//!   * 菜单栏（config.menu）：GtkMenuBar 已移除 → menuBarAvailable()=false；
-//!   * 指针抓取 / 按域清 cookie：4.14 capi 无 gdk_seat_grab、6.0 无
-//!     delete_cookies_for_domain → 调用点守卫；
+//! GTK4 对等面（v0.6.1 L1b 收口；代码侧登记在 `caps()`）：
+//!   * 托盘：自实现 D-Bus SNI + DBusMenu（sni_tray.zig；libayatana 为 GTK3 链接库）；
+//!   * 菜单栏：GMenu + GtkPopoverMenuBar + GtkShortcutController；
+//!   * drag.start：GDK4 公开的 gdk_drag_begin + GdkContentProvider；
+//!   * 指针抓取：X11 XGrabPointer（Wayland 无对等 → false）；
+//!   * 按域清 cookie：6.0 无 delete_cookies_for_domain → 全量枚举过滤删除；
+//!   * 截图：GdkTexture 失败时 X11 XGetImage 回退（Xvfb/无合成器）。
 //!   * Wayland 几何：position/move 无全局坐标概念 → X11 直连仅 X11 生效。
 
 const std = @import("std");
@@ -61,8 +62,7 @@ pub fn gtkInit() void {
 pub const MOD1_MASK = 1 << 3;
 pub const MOD2_MASK = 1 << 4;
 
-/// 菜单栏构造在 GTK4 下不可用（GtkMenuBar 已移除）——
-/// 调用方据此降级为「无菜单栏」。
+/// 菜单栏可用性（v0.6.1 起两栈均 true：GTK4 走 GtkPopoverMenuBar）。
 pub fn menuBarAvailable() bool {
     return caps().menu_bar;
 }
@@ -85,16 +85,15 @@ pub const Caps = struct {
 
 pub fn caps() Caps {
     return .{
-        .tray = isGtk3(),
-        .menu_bar = isGtk3(),
-        .programmatic_drag = isGtk3(),
-        .cursor_grab = isGtk3(),
-        .cookie_clear_by_domain = isGtk3(),
+        // v0.6.1 L1b：五面对等收口（GTK4 = SNI/PopoverMenuBar/gdk_drag_begin/
+        // 全量 cookie 过滤/X11 截图回退），不再按变体降级。
+        .tray = true,
+        .menu_bar = true,
+        .programmatic_drag = true,
+        .cursor_grab = true,
+        .cookie_clear_by_domain = true,
         .clipboard_read = true,
-        // GTK4/WebKitGTK 6.0 的快照走 GdkTexture 渲染面，Xvfb（无合成器/
-        // llvmpipe）下 webkit_web_view_get_snapshot 稳定返回
-        // FAILED_TO_CREATE —— 冒烟按已知环境差异显式 skip，真机待验。
-        .screenshot = isGtk3(),
+        .screenshot = true,
         .hide_show = isGtk4(),
     };
 }
@@ -960,6 +959,35 @@ fn wmClassMatchesProcess(dpy: *c.Display, w: c.Window) bool {
         start = i + 1;
     }
     return false;
+}
+
+/// 指针抓取/释放（cursor_grab op）。
+/// GTK3 由 backend 走 gdk_seat_grab；GTK4 无该面 → X11 XGrabPointer。
+/// Wayland 无对等 → false（文档化降级）。
+pub fn cursorGrab(widget: [*c]c.GtkWidget, grab: bool) bool {
+    if (comptime isGtk4()) {
+        const x11 = x11Of(widget) orelse return false;
+        if (grab) {
+            // GrabModeAsync = 1（宏）；CurrentTime = 0
+            const status = c.XGrabPointer(
+                x11.dpy,
+                x11.xwin,
+                c.True,
+                @as(c_uint, 0),
+                1,
+                1,
+                x11.xwin,
+                0,
+                0,
+            );
+            _ = c.XFlush(x11.dpy);
+            return status == 0; // GrabSuccess
+        }
+        _ = c.XUngrabPointer(x11.dpy, 0);
+        _ = c.XFlush(x11.dpy);
+        return true;
+    }
+    return false; // GTK3 调用点走既有 gdk_seat_grab
 }
 
 /// 指针 warp（cursor_position op）。GTK4：gdk_device_warp 目标是 GdkSurface。
@@ -2252,17 +2280,16 @@ test "variant 探测：本构建按 gtk_init 签名判定" {
     }
 }
 
-test "caps：GTK3 全能力；GTK4 六面降级、剪贴板读两栈都在" {
+test "caps：两栈五面对等；hide_show 仅 GTK4" {
     const cp = caps();
-    const full = isGtk3();
-    try std.testing.expectEqual(full, cp.tray);
-    try std.testing.expectEqual(full, cp.menu_bar);
-    try std.testing.expectEqual(full, cp.programmatic_drag);
-    try std.testing.expectEqual(full, cp.cursor_grab);
-    try std.testing.expectEqual(full, cp.cookie_clear_by_domain);
-    try std.testing.expectEqual(full, cp.screenshot);
-    try std.testing.expectEqual(!full, cp.hide_show);
+    try std.testing.expect(cp.tray);
+    try std.testing.expect(cp.menu_bar);
+    try std.testing.expect(cp.programmatic_drag);
+    try std.testing.expect(cp.cursor_grab);
+    try std.testing.expect(cp.cookie_clear_by_domain);
+    try std.testing.expect(cp.screenshot);
     try std.testing.expect(cp.clipboard_read);
+    try std.testing.expectEqual(isGtk4(), cp.hide_show);
 }
 
 test "capsJson：冒烟注入载荷字段齐全（按 Caps 反射，防漂移）" {
@@ -2273,8 +2300,7 @@ test "capsJson：冒烟注入载荷字段齐全（按 Caps 反射，防漂移）
     inline for (@typeInfo(Caps).@"struct".field_names) |name| {
         try std.testing.expect(std.mem.indexOf(u8, s, "\"" ++ name ++ "\":") != null);
     }
-    const tray_lit = if (isGtk3()) "\"tray\":true" else "\"tray\":false";
-    try std.testing.expect(std.mem.indexOf(u8, s, tray_lit) != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"tray\":true") != null);
 }
 
 // GAsyncResult 的生命周期只到 GAsyncReadyCallback 返回为止：回调里不 ref，

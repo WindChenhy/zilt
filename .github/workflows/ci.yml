@@ -206,8 +206,9 @@ jobs:
   #   依赖与本地等价命令见 scripts/linux/bootstrap.sh / dev-smoke.sh
   # ---------------------------------------------------------------------------
   linux-test:
-    name: Build / Test / Smoke (Linux)
-    runs-on: ubuntu-22.04
+    # v0.6.1：Linux 默认栈 = GTK4 + WebKitGTK 6.0（webkitgtk-6.0 dev 包仅 24.04+）
+    name: Build / Test / Smoke (Linux GTK4)
+    runs-on: ubuntu-24.04
     # v0.4.3 L5：新增 rpm/AUR/签名步骤 + AppImage 随包构建，30 min 偏紧
     timeout-minutes: 45
 
@@ -219,13 +220,12 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Install GTK / WebKitGTK dev packages
+      - name: Install GTK4 / WebKitGTK 6.0 dev packages
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config xvfb openbox \
-            libayatana-appindicator3-1 xdg-utils libsqlite3-0 libx11-dev \
-            webkit2gtk-driver stalonetray
+            libgtk-4-dev libwebkitgtk-6.0-dev pkg-config xvfb openbox \
+            xdg-utils libsqlite3-0 libx11-dev libxext-dev
 
       - name: Build
         run: zig build
@@ -285,19 +285,11 @@ jobs:
       - name: Headless / MCP E2E
         run: bash scripts/linux/dev-headless.sh
 
-      # v0.4.3 L3：托盘挂窗（Xvfb + stalonetray XEmbed + XTest 合成点击）
-      # v0.6.0：Xvfb/openbox 放置策略会在 CI 上偶发覆盖 attach 定位（应用日志已 positioned，
-      # X 实测坐标仍被 WM 覆盖；双次重试均复现）→ advisory，失败标黄不阻塞发版。
-      - name: Tray attach E2E (stalonetray)
-        continue-on-error: true
-        run: |
-          for attempt in 1 2; do
-            echo "tray e2e attempt $attempt"
-            if bash scripts/linux/dev-tray-e2e.sh --no-build; then exit 0; fi
-            cp -f .zilt-probe/tray-e2e.log ".zilt-probe/tray-e2e.attempt${attempt}.log" 2>/dev/null || true
-            sleep 2
-          done
-          exit 1
+      # v0.6.1：GTK4 托盘走 D-Bus SNI（无 XEmbed/GtkStatusIcon）——stalonetray
+      # 的 XEmbed 点击路径仅在 GTK3 legacy job 覆盖；GTK4 的 SNI 探针需真实
+      # StatusNotifierWatcher（宿主桌面会话），CI 容器无宿主 → 明确 skip。
+      - name: Tray attach E2E (GTK4 SNI: skipped in CI)
+        run: echo "SNI tray needs a desktop StatusNotifierWatcher; covered by manual verification (GTK3 XEmbed path runs in linux-gtk3)"
 
       # v0.4.3 L3：AppImage 自包含（WebKit 随包；bwrap/docker 无宿主 WebKit 验证）
       - name: AppImage self-contained E2E (no host WebKit)
@@ -365,13 +357,13 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # v0.5.9：GTK4 双栈 CI。webkitgtk-6.0 只在 ubuntu-24.04+ 有 dev 包，
-  # 故与上面的 GTK3 job 分开 runner。默认构建仍是 GTK3（托盘/菜单栏在 4.x 无解），
-  # 本 job 只保证 `-Dgtk=gtk4` 能构建 / 单测 / 冒烟——降级面按 caps 显式 skip。
+  # v0.6.1：GTK3 legacy 变体（一周期）。默认栈已切到 GTK4；本 job 在
+  # ubuntu-22.04 上以 `-Dgtk=gtk3` 保证旧栈可构建/单测/冒烟，并覆盖 XEmbed
+  # 托盘点击路径（stalonetray）。
   # ---------------------------------------------------------------------------
-  linux-gtk4:
-    name: Build / Test / Smoke (Linux GTK4)
-    runs-on: ubuntu-24.04
+  linux-gtk3:
+    name: Build / Test / Smoke (Linux GTK3 legacy)
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
 
     steps:
@@ -382,18 +374,19 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Install GTK4 / WebKitGTK 6.0 dev packages
+      - name: Install GTK3 / WebKit2GTK 4.1 dev packages
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libgtk-4-dev libwebkitgtk-6.0-dev pkg-config xvfb openbox \
-            xdg-utils libsqlite3-0 libx11-dev libxext-dev
+            libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config xvfb openbox \
+            libayatana-appindicator3-1 xdg-utils libsqlite3-0 libx11-dev \
+            webkit2gtk-driver stalonetray
 
-      - name: Build (GTK4)
-        run: zig build -Dgtk=gtk4
+      - name: Build (GTK3 legacy)
+        run: zig build -Dgtk=gtk3
 
-      - name: Unit tests (GTK4)
-        run: zig build test -Dgtk=gtk4
+      - name: Unit tests (GTK3 legacy)
+        run: zig build test -Dgtk=gtk3
 
       - name: Test crash triage
         if: failure()
@@ -402,7 +395,7 @@ jobs:
           echo "== direct rerun: $TB =="
           "$TB" 2>&1 | tail -60 || true
 
-      - name: Smoke (GTK4 under Xvfb + openbox)
+      - name: Smoke (GTK3 legacy under Xvfb + openbox)
         env:
           ZILT_LINUX_SMOKE: "1"
           GDK_BACKEND: x11
@@ -427,11 +420,23 @@ jobs:
             exit $code
           fi
 
-      - name: Upload GTK4 smoke log
+      # v0.6.1：GTK3 legacy 的 XEmbed 托盘点击路径（GTK4 默认 job 走 SNI，CI 无宿主）
+      - name: Tray attach E2E (stalonetray, GTK3 legacy)
+        continue-on-error: true
+        run: |
+          for attempt in 1 2; do
+            echo "tray e2e attempt $attempt"
+            if bash scripts/linux/dev-tray-e2e.sh --no-build; then exit 0; fi
+            cp -f .zilt-probe/tray-e2e.log ".zilt-probe/tray-e2e.attempt${attempt}.log" 2>/dev/null || true
+            sleep 2
+          done
+          exit 1
+
+      - name: Upload GTK3 smoke log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: zilt-linux-gtk4-smoke
+          name: zilt-linux-gtk3-smoke
           path: zilt.log
           if-no-files-found: warn
 

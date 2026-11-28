@@ -6,7 +6,11 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.6.0（2026-11-28，配置 flavors）** —— 0.6.0a–c：RFC 7396 合并引擎 +
+**当前状态：v0.6.1（2026-11-28，GTK4 转默认）** —— L1b 收口：GTK4 五面补齐
+（自实现 D-Bus SNI 托盘 + DBusMenu、GtkPopoverMenuBar 菜单栏、`gdk_drag_begin` 拖出、
+按域 cookie 过滤删除、X11 截图回退 + 指针抓取），Linux 默认栈切到 GTK4 + WebKitGTK 6.0，
+GTK3 保留为 `-Dgtk=gtk3` legacy 一周期；打包依赖/CI/模板随变体投影。
+v0.6.0（2026-11-28，配置 flavors）—— 0.6.0a–c：RFC 7396 合并引擎 +
 `-Dflavor/-Dconfig` + `flavors` 表 `extends`（表/文件模式可组合）+ 版本/身份/exe_name/icon
 单源投影 + `frontend` / `security`（CSP/capabilities）/ `window` overlay + 运行时身份
 （`app_id` / 单实例键 / 更新通道）；仓库与模板共用 `flavor_build` 解析，模板自带
@@ -14,7 +18,8 @@ dev/beta/prod 示例（`zig build -Dflavor=beta` 或 `zilt build --flavor beta`�
 v0.5.11（2026-11-27，桌面三平台对等收口）—— macOS 分发/安全/更新器
 （v0.5.1–v0.5.8：`.app`/DMG/codesign/公证/Universal/Keychain/ed25519 更新器 + 系统信息/Shell/电源/主题）、
 Linux GTK4 变体双栈 CI + ARM64 实跑（v0.5.9–v0.5.10）、CI 稳定性收口（v0.5.11：Tray/GTK4 v04/冒烟 partition
-去 flake）。**L1b（GTK4 转默认）与 Linux WebDriver 自动化（`create-web-view`）排入 v0.6.x**；详见
+去 flake）。L1b（GTK4 转默认）已在 v0.6.1 收口；Linux WebDriver 自动化
+（`create-web-view`）仍为 v0.6.x 待办；详见
 [docs/ROADMAP.md](docs/ROADMAP.md)。
 v0.4.3（Linux 发行版可用性——L1a GTK4 构建级兼容：`-Dgtk=gtk4` 双栈，
 GTK 4.14.5 / WebKitGTK 6.0 2.52.6 实测；L3 AppImage 自包含：WebKit 随包 + helper 路径改写，
@@ -31,20 +36,21 @@ v0.4.0（H6–H11 / H20 / L2 / L7 / L8 双平台小项收尾）。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
-| Windows | ✅ 全栈（v0.1.0–v0.6.0） | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
-| Linux | ✅ 全栈（v0.2.0–v0.6.0，冒烟 95 项） | GTK3 默认 + WebKit2GTK 4.1；`-Dgtk=gtk4` 变体（GTK4 + WebKitGTK 6.0，v0.5.9 起双栈 CI 同跑单测 + 冒烟） |
+| Windows | ✅ 全栈（v0.1.0–v0.6.1） | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
+| Linux | ✅ 全栈（v0.2.0–v0.6.1，冒烟 95 项） | **GTK4 默认 + WebKitGTK 6.0**（v0.6.1）；GTK3 + WebKit2GTK 4.1 legacy 变体 `-Dgtk=gtk3` 一周期 |
 | macOS | ✅ 对等收口（v0.4.4–v0.5.8）：主链 + 菜单/托盘/对话框/剪贴板/通知/深链/单实例/热键 + 分发（.app/DMG/codesign/公证/Universal）+ Keychain + 更新器 + 系统信息/Shell/电源/主题 | WKWebView（手写 ObjC 消息，无 `@cImport`） |
 
-**Linux GTK4 变体能力面（v0.5.11 双栈 CI 实测）**
+**Linux GTK4 能力面（v0.6.1 收口）**
 
 | 能力 | GTK3 | GTK4 | 说明 |
 |---|---|---|---|
 | 窗口/多窗口/WebView/IPC/fs/http/ws | ✅ | ✅ | 单测 + 冒烟 95 项同跑 |
-| 剪贴板读（text/html/files/image） | ✅ | ✅ | v0.5.9 接通 GdkClipboard 异步读面（结果引用归 SyncWait） |
-| 截图 `captureScreenshot` | ✅ | ⚠️ | GTK4 走 GdkTexture 渲染面；Xvfb/无合成器下 WebKit 返回 `FAILED_TO_CREATE`，冒烟显式 skip，真机待验 |
-| 托盘挂窗 / 菜单栏 | ✅ | ❌ | GTK4 下 ayatana 仍是 GTK3 链接；menu bar 4.x 移除（降级为无托盘/无菜单） |
-| 脚本拖拽 / 指针抓取 | ✅ | ❌ | GDK4 移除 `gdk_seat_grab` 与 drag 面；降级返回 `false` / `DragNotAvailable` |
-| 按域清 cookie | ✅ | ❌ | WebKitGTK 6.0 无 `delete_cookies_for_domain`；明确报错而非静默成功 |
+| 剪贴板读（text/html/files/image） | ✅ | ✅ | GdkClipboard 异步读面（结果引用归 SyncWait） |
+| 截图 `captureScreenshot` | ✅ | ✅ | GdkTexture 失败时 X11 `XGetImage` 回退（Xvfb/无合成器可出图） |
+| 托盘 | ✅ | ✅ | GTK4 自实现 D-Bus SNI + DBusMenu（无宿主 watcher 时降级为无图标） |
+| 菜单栏 | ✅ | ✅ | GtkPopoverMenuBar + GMenu 动作组 + GtkShortcutController 加速键 |
+| 脚本拖拽 / 指针抓取 | ✅ | ✅ | GDK4 `gdk_drag_begin` + content provider；指针抓取走 X11 XGrabPointer（Wayland 降级） |
+| 按域清 cookie | ✅ | ✅ | 6.0 无 `delete_cookies_for_domain` → 全量枚举后按域删除 |
 | 文件对话框 | ✅ | ✅ | GTK4 走 `GtkFileDialog` + xdg-desktop-portal（依赖发行版 portal） |
 
 
@@ -59,10 +65,10 @@ fs（scope/watch/流式）、SQL、store（可选 DPAPI 加密）、http（WinHT
 Linux 复用同一 JS API 面，差异逐版本以「文档化」条目记录（无 SharedBuffer → evaluate 通道、无 PDF 导出 →
 `PdfNotSupported` 等）。
 
-## 能力索引（v0.6.0）
+## 能力索引（v0.6.1）
 
-> 本表聚焦 Windows / Linux（GTK3 默认）共有的 JS API 面；macOS 能力面见上表平台行与
-> v0.4.4–v0.5.8 版本记录，GTK4 变体的降级项见上方「Linux GTK4 变体能力面」。
+> 本表聚焦 Windows / Linux（GTK4 默认）共有的 JS API 面；macOS 能力面见上表平台行与
+> v0.4.4–v0.5.8 版本记录；GTK3 legacy 与 Wayland 的差异见上方「Linux GTK4 能力面」。
 
 | 能力组 | 主要入口 | Windows | Linux |
 |---|---|---|---|
@@ -532,7 +538,7 @@ v0.2.9 新增（2026-11-15，Linux 分发与测试收尾）：
 
 v0.2.8 新增（2026-11-15，工具链与 headless）：
 - **`init.zig` 跨平台**：kernel32 手写 extern 全换 `std.Io.Dir` + `Args.Iterator`，Linux 可生成项目
-- **`zilt doctor` Linux 依赖检查**（gtk+-3.0 / webkit2gtk-4.1 / pkg-config）+ Linux headless/MCP 半边
+- **`zilt doctor` Linux 依赖检查**（v0.6.1 起默认 gtk4 / webkitgtk-6.0，缺失回退提示 GTK3 legacy）+ Linux headless/MCP 半边
 - **模板漂移修复**；**验收**：两平台单测全绿，`zig build init` Linux E2E，headless/MCP 全链路 PASS
 
 v0.2.7 新增（2026-11-15，Linux 平台能力对称）：
@@ -708,9 +714,9 @@ capabilities）、`window` 默认值。`app_id` 同时决定数据目录、单�
 要求：Zig 0.17.1+。
 
 - **Windows 10/11**：系统自带 WebView2 运行时，无需安装任何 SDK。
-- **Linux**：GTK3 + WebKit2GTK 4.1 开发包与 `pkg-config`（Debian/Ubuntu：
-  `libgtk-3-dev libwebkit2gtk-4.1-dev libx11-dev`；GTK4 变体改用
-  `libgtk-4-dev libwebkitgtk-6.0-dev` 并加 `-Dgtk=gtk4`）；无显示环境用 `xvfb-run`。
+- **Linux**：GTK4 + WebKitGTK 6.0 开发包与 `pkg-config`（Ubuntu 24.04+/Debian 13+：
+  `libgtk-4-dev libwebkitgtk-6.0-dev libx11-dev libxext-dev`）；GTK3 legacy 一周期：
+  `-Dgtk=gtk3` + `libgtk-3-dev libwebkit2gtk-4.1-dev`；无显示环境用 `xvfb-run`。
 - **macOS**：尚未实现（见平台表）。
 
 ```sh

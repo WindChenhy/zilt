@@ -14,6 +14,8 @@ pub const exe_name = opts.exe_name;
 pub const icon = opts.icon;
 /// v0.6.0b：运行时单实例密封密钥（null = 明文）；VERSIONINFO/清单/数据目录同源。
 pub const single_instance_key = opts.single_instance_key;
+/// v0.6.1：Linux GTK 变体（打包依赖名按变体选择；非 Linux 恒 false）
+pub const gtk4 = opts.gtk4;
 
 pub const frontend = .{
     .dir = opts.frontend_dir,

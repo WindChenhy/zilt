@@ -13,6 +13,20 @@ cd "$(dirname "$0")/../.."
 LOG=".zilt-probe/appimage-last.log"
 mkdir -p .zilt-probe
 
+# v0.6.1：默认 GTK4（libwebkitgtk-6.0），ZILT_E2E_GTK=gtk3 覆盖 legacy 变体。
+GTK_VARIANT="${ZILT_E2E_GTK:-gtk4}"
+if [ "$GTK_VARIANT" = "gtk3" ]; then
+  WK_SONAME="libwebkit2gtk-4.1.so.0"
+  WK_HELPERS="webkit2gtk-4.1"
+  JSC_SONAME="libjavascriptcoregtk-4.1.so.0"
+  DK_IMAGE="${ZILT_APPIMAGE_DOCKER_IMAGE:-ubuntu:22.04}"
+else
+  WK_SONAME="libwebkitgtk-6.0.so.0"
+  WK_HELPERS="webkitgtk-6.0"
+  JSC_SONAME="libjavascriptcoregtk-6.0.so.0"
+  DK_IMAGE="${ZILT_APPIMAGE_DOCKER_IMAGE:-ubuntu:24.04}"
+fi
+
 # 已知失败白名单：v0.4.3 L3 起为空（布局装箱与剪贴板写入的既有缺陷已修，
 # 冒烟 95/95 exit 0）——这里保留机制，后续出现平台差异时按需登记。
 KNOWN_FAILED=""
@@ -30,12 +44,12 @@ run_body() {
     echo "BUILD=bundle_webkit=${ZILT_BUNDLE_WEBKIT}"
     zig build pack || { echo "APPIMAGE_E2E=FAIL reason=pack-failed"; return 1; }
   fi
-  if [ ! -f "$APPDIR/usr/lib/libwebkit2gtk-4.1.so.0" ]; then
+  if [ ! -f "$APPDIR/usr/lib/$WK_SONAME" ]; then
     echo "MISSING_BUNDLED_WEBKIT（用 ZILT_BUNDLE_WEBKIT=1 zig build pack 重建）"
     echo "APPIMAGE_E2E=FAIL reason=not-bundled"
     return 1
   fi
-  if [ ! -x "$APPDIR/usr/lib/$TRIPLET/webkit2gtk-4.1/WebKitWebProcess" ]; then
+  if [ ! -x "$APPDIR/usr/lib/$TRIPLET/$WK_HELPERS/WebKitWebProcess" ]; then
     echo "MISSING_HELPERS"
     echo "APPIMAGE_E2E=FAIL reason=no-helpers"
     return 1
@@ -117,8 +131,8 @@ run_body() {
 
   # ---- 4b) 无宿主 WebKit ----
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 \
-     && docker image inspect "${ZILT_APPIMAGE_DOCKER_IMAGE:-ubuntu:22.04}" >/dev/null 2>&1; then
-    IMG="${ZILT_APPIMAGE_DOCKER_IMAGE:-ubuntu:22.04}"
+     && docker image inspect "$DK_IMAGE" >/dev/null 2>&1; then
+    IMG="$DK_IMAGE"
     echo "SANDBOX=docker image=$IMG"
     code=$(run_smoke docker run --rm --network none \
       -u "$(id -u):$(id -g)" \
@@ -130,13 +144,13 @@ run_body() {
   elif command -v bwrap >/dev/null 2>&1 && bwrap --dev-bind / / true 2>/dev/null; then
     echo "SANDBOX=bwrap（掩掉宿主 libwebkit/libjavascriptcore/helper——与 docker 无 WebKit 等价）"
     MASKS=()
-    for f in /usr/lib/$TRIPLET/libwebkit2gtk-4.1.so.0 /usr/lib/$TRIPLET/libwebkit2gtk-4.1.so.0.*; do
+    for f in /usr/lib/$TRIPLET/$WK_SONAME /usr/lib/$TRIPLET/$WK_SONAME.*; do
       [ -e "$f" ] && MASKS+=(--ro-bind /dev/null "$f")
     done
-    for f in /usr/lib/$TRIPLET/libjavascriptcoregtk-4.1.so.0 /usr/lib/$TRIPLET/libjavascriptcoregtk-4.1.so.0.*; do
+    for f in /usr/lib/$TRIPLET/$JSC_SONAME /usr/lib/$TRIPLET/$JSC_SONAME.*; do
       [ -e "$f" ] && MASKS+=(--ro-bind /dev/null "$f")
     done
-    [ -d /usr/lib/$TRIPLET/webkit2gtk-4.1 ] && MASKS+=(--tmpfs /usr/lib/$TRIPLET/webkit2gtk-4.1)
+    [ -d /usr/lib/$TRIPLET/$WK_HELPERS ] && MASKS+=(--tmpfs /usr/lib/$TRIPLET/$WK_HELPERS)
     echo "MASK_COUNT=${#MASKS[@]}"
     code=$(run_smoke bwrap --dev-bind / / "${MASKS[@]}" "$EXTRACTED")
     check_result "$code" "no-host-webkit" || FAIL=1
@@ -147,7 +161,7 @@ run_body() {
         env LD_DEBUG=libs LD_DEBUG_OUTPUT=/tmp/lddebug GDK_BACKEND=x11 \
             WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 LIBGL_ALWAYS_SOFTWARE=1 \
         "$EXTRACTED" >/dev/null 2>&1 ) || true
-    BUNDLED_HIT=$(grep -h 'libwebkit2gtk' /tmp/lddebug.* 2>/dev/null | grep -c "squashfs-root\|dist")
+    BUNDLED_HIT=$(grep -h "$WK_SONAME" /tmp/lddebug.* 2>/dev/null | grep -c "squashfs-root\|dist")
     echo "BUNDLED_LIBWEBKIT_HITS=$BUNDLED_HIT"
     [ "$BUNDLED_HIT" -gt 0 ] || { echo "BUNDLE_NOT_USED"; FAIL=1; }
   else
@@ -162,7 +176,7 @@ run_body() {
   # 有 bwrapinfo 的发行版（Fedora/Arch 等）上再跑一次**不关沙箱**的冒烟，并采样
   # WebKitWebProcess 的 pid-ns/seccomp——两者都为 0 视为未生效。
   BWRAPINFO=""
-  for cand in "$APPDIR"/usr/lib/*/webkit2gtk-4.1/bwrapinfo.json "$APPDIR"/usr/lib/webkit2gtk-4.1/bwrapinfo.json; do
+  for cand in "$APPDIR"/usr/lib/*/$WK_HELPERS/bwrapinfo.json "$APPDIR"/usr/lib/$WK_HELPERS/bwrapinfo.json; do
     [ -e "$cand" ] && BWRAPINFO="$cand"
   done
   if [ -z "$BWRAPINFO" ]; then
