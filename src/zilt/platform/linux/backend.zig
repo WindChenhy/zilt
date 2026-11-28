@@ -3366,7 +3366,9 @@ fn Backend(comptime config: Config) type {
         ///     （GLOBAL scope，真实触发）。
         fn buildMenuBarGtk4(self: *Self, items: []const Config.MenuItem, st: *WinState) [*c]c.GtkWidget {
             const group = c.g_simple_action_group_new() orelse return null;
-            defer c.g_object_unref(@ptrCast(group)); // 插入窗口后窗口持有引用
+            // 先 sink 成自有引用，再挂到菜单栏/窗口；最后释放本地引用（两处各持一份）
+            _ = c.g_object_ref_sink(@ptrCast(group));
+            defer c.g_object_unref(@ptrCast(group));
 
             const menu = c.g_menu_new() orelse return null;
             defer c.g_object_unref(@ptrCast(menu));
@@ -3477,6 +3479,8 @@ fn Backend(comptime config: Config) type {
                 const simple = c.g_simple_action_new(action_name_z.ptr, null);
                 if (simple == null) return;
                 _ = c.g_signal_connect_data(@ptrCast(simple), "activate", @ptrCast(&onMenuActionGtk4), tracked, null, 0);
+                // 同 shortcut：先 sink 自有引用，交给 action map 后再释放
+                _ = c.g_object_ref_sink(@ptrCast(simple));
                 c.g_action_map_add_action(@ptrCast(@alignCast(group)), @ptrCast(simple));
                 c.g_object_unref(@ptrCast(simple)); // map 持有引用
                 full_action = std.fmt.allocPrint(self.allocator, "ziltmenu.{s}", .{action_name}) catch return;
@@ -3523,6 +3527,9 @@ fn Backend(comptime config: Config) type {
             defer std.heap.c_allocator.free(action_nz);
             const shortcut_action = c.gtk_named_action_new(action_nz.ptr) orelse return;
             const shortcut = c.gtk_shortcut_new(trigger, shortcut_action) orelse return;
+            // GtkShortcutController 以 ref_sink 持有 shortcut（floating）→ 先 sink
+            // 成我们自己的引用，交给 controller 后再释放本地引用（避免提前析构）。
+            _ = c.g_object_ref_sink(@ptrCast(shortcut));
             c.gtk_shortcut_controller_add_shortcut(controller, shortcut);
             c.g_object_unref(@ptrCast(shortcut));
         }
