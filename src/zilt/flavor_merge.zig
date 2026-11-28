@@ -187,6 +187,23 @@ pub const Identity = struct {
     version: []const u8,
     publisher: []const u8,
     channel: []const u8 = "stable",
+    /// 产物名（v0.6.0b）：默认 project.exe_name；Windows 上由 build.zig 补 .exe。
+    exe_name: []const u8 = "zilt-app.exe",
+    /// 窗口/托盘/安装器/PE 资源图标（相对项目根）；null = 内置 Zig 图标。
+    icon: ?[]const u8 = null,
+    /// 单实例密封密钥（64 hex）；null = 明文（兼容）。
+    single_instance_key: ?[]const u8 = null,
+};
+
+/// 前端工程配置（v0.6.0b：overlay 可覆盖；字段与 project.frontend 同形）。
+pub const Frontend = struct {
+    dir: []const u8 = "frontend",
+    dist: []const u8 = "frontend",
+    dev_command: ?[]const u8 = null,
+    dev_url: ?[]const u8 = null,
+    build_command: ?[]const u8 = null,
+    dev_proxy: bool = false,
+    wait_timeout_secs: u32 = 90,
 };
 
 pub const IdentityError = error{
@@ -194,7 +211,50 @@ pub const IdentityError = error{
     InvalidAppId,
     InvalidVersion,
     InvalidChannel,
+    InvalidExeName,
+    InvalidSingleInstanceKey,
+    InvalidIcon,
 };
+
+/// 产物名：非空、无路径分隔符与 Windows 保留字符、不是 . / ..。
+pub fn validateExeName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
+    for (name) |c| {
+        if (c < 0x20 or c == 0x7f) return false;
+        switch (c) {
+            '/', '\\', ':', '*', '?', '"', '<', '>', '|' => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// 图标路径：相对项目根，禁止绝对路径与 `..` 段。
+pub fn validateIconPath(path: []const u8) bool {
+    if (path.len == 0 or path.len > 512) return false;
+    if (path[0] == '/' or path[0] == '\\') return false;
+    if (path.len >= 2 and path[1] == ':') return false;
+    for (path) |c| {
+        if (c < 0x20 or c == 0x7f) return false;
+    }
+    var it = std.mem.tokenizeAny(u8, path, "/\\");
+    var any = false;
+    while (it.next()) |seg| {
+        if (std.mem.eql(u8, seg, "..")) return false;
+        if (seg.len != 0) any = true;
+    }
+    return any;
+}
+
+/// 单实例密封密钥：64 个 hex 字符（32 字节）。
+pub fn validateSingleInstanceKey(key: []const u8) bool {
+    if (key.len != 64) return false;
+    for (key) |c| {
+        if (!std.ascii.isHex(c)) return false;
+    }
+    return true;
+}
 
 /// 反向 DNS 风格：小写字母/数字/`-`，至少一个点，无空段、无首尾点。
 pub fn validateAppId(id: []const u8) bool {
@@ -269,29 +329,91 @@ pub const FlavorTableError = error{
     DuplicateAppId,
     UnknownFlavor,
     InvalidAppId,
+    InvalidExtends,
+    ExtendsCycle,
 };
 
+fn flavorsValue(config: Value) ?Value {
+    if (config != .object) return null;
+    return config.object.get("flavors");
+}
+
+/// 解析单个 flavor 条目（递归 `extends`）：父条目先合并，子条目覆盖。
+/// 返回的 patch 不含 `extends` 键；数组整体替换（RFC 7396）。
+fn resolveFlavorEntry(
+    alloc: std.mem.Allocator,
+    table: ObjectMap,
+    name: []const u8,
+    stack: *std.ArrayListUnmanaged([]const u8),
+) (AllocatorError || FlavorTableError)!Value {
+    for (stack.items) |prev| {
+        if (std.mem.eql(u8, prev, name)) return error.ExtendsCycle;
+    }
+    const entry = table.get(name) orelse return error.UnknownFlavor;
+    if (entry != .object) return error.InvalidFlavorTable;
+
+    try stack.append(alloc, name);
+    defer _ = stack.pop();
+
+    const extends_name: ?[]const u8 = if (entry.object.get("extends")) |ext| blk: {
+        if (ext != .string or ext.string.len == 0) return error.InvalidExtends;
+        break :blk ext.string;
+    } else null;
+
+    var child = ObjectMap.empty;
+    var it = entry.object.iterator();
+    while (it.next()) |kv| {
+        if (std.mem.eql(u8, kv.key_ptr.*, "extends")) continue;
+        try child.put(alloc, try alloc.dupe(u8, kv.key_ptr.*), try clone(alloc, kv.value_ptr.*));
+    }
+
+    const base: Value = if (extends_name) |parent|
+        try resolveFlavorEntry(alloc, table, parent, stack)
+    else
+        .{ .object = ObjectMap.empty };
+
+    return merge(alloc, base, .{ .object = child });
+}
+
+/// `zilt.config.json` 可选 `flavors` 表模式（v0.6.0c）：
+/// 命中 `name` 时返回该 flavor 的 effective patch（含 `extends` 继承），
+/// 无表 / 未指定 flavor 返回 null。表存在但 name 未命中 → UnknownFlavor。
+pub fn flavorTablePatch(
+    alloc: std.mem.Allocator,
+    config: Value,
+    name: ?[]const u8,
+) (AllocatorError || FlavorTableError)!?Value {
+    const selected = name orelse return null;
+    const flavors = flavorsValue(config) orelse return null;
+    if (flavors != .object) return error.InvalidFlavorTable;
+
+    var stack: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer stack.deinit(alloc);
+    return try resolveFlavorEntry(alloc, flavors.object, selected, &stack);
+}
+
 /// `zilt.config.json` 可选的 `flavors` 表：
-/// `{"flavors":{"dev":{"app_id":"app.zilt.dev"},"beta":{"app_id":"app.zilt.beta"}}}`
-/// 有表时：每个 flavor 必须声明唯一 app_id；-Dflavor 必须命中表项（防止拼错名字
-/// 静默产出 base 身份）。无表时走文件模式（zilt.<name>.json），不校验枚举。
+/// `{"flavors":{"dev":{"app_id":"app.zilt.dev"},"beta":{"extends":"dev","app_id":"app.zilt.beta"}}}`
+/// 有表时：每个 flavor 的 effective app_id（含 extends 继承）必须唯一；-Dflavor 必须命中表项
+/// （防止拼错名字静默产出 base 身份）。无表时走文件模式（zilt.<name>.json），不校验枚举。
 pub fn validateFlavorTable(
     alloc: std.mem.Allocator,
     config: Value,
     selected: ?[]const u8,
 ) (AllocatorError || FlavorTableError)!void {
-    if (config != .object) return;
-    const flavors = config.object.get("flavors") orelse return;
+    const flavors = flavorsValue(config) orelse return;
     if (flavors != .object) return error.InvalidFlavorTable;
+    const table = flavors.object;
 
     var seen: std.ArrayListUnmanaged([]const u8) = .empty;
     defer seen.deinit(alloc);
 
-    var it = flavors.object.iterator();
+    var it = table.iterator();
     while (it.next()) |entry| {
-        const item = entry.value_ptr.*;
-        if (item != .object) return error.InvalidFlavorTable;
-        const id_val = item.object.get("app_id") orelse return error.InvalidFlavorTable;
+        var stack: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer stack.deinit(alloc);
+        const resolved = try resolveFlavorEntry(alloc, table, entry.key_ptr.*, &stack);
+        const id_val = resolved.object.get("app_id") orelse return error.InvalidFlavorTable;
         if (id_val != .string or !validateAppId(id_val.string)) return error.InvalidAppId;
         for (seen.items) |prev| {
             if (std.mem.eql(u8, prev, id_val.string)) return error.DuplicateAppId;
@@ -300,8 +422,73 @@ pub fn validateFlavorTable(
     }
 
     if (selected) |name| {
-        if (!flavors.object.contains(name)) return error.UnknownFlavor;
+        if (!table.contains(name)) return error.UnknownFlavor;
     }
+}
+
+test "v0.6.0c flavor table: extends 继承 + 子条目覆盖" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const config = try parse(a,
+        \\{"flavors":{
+        \\ "dev":{"app_id":"app.zilt.dev","app_name":"Zilt Dev","channel":"dev",
+        \\        "window":{"width":1000}},
+        \\ "beta":{"extends":"dev","app_id":"app.zilt.beta","app_name":"Zilt Beta",
+        \\        "window":{"height":720}}
+        \\}}
+    );
+    try validateFlavorTable(a, config, "beta");
+
+    const patch = (try flavorTablePatch(a, config, "beta")).?;
+    try std.testing.expectEqualStrings("app.zilt.beta", patch.object.get("app_id").?.string);
+    try std.testing.expectEqualStrings("Zilt Beta", patch.object.get("app_name").?.string);
+    try std.testing.expectEqualStrings("dev", patch.object.get("channel").?.string);
+    // extends 不作为输出键；window 按对象递归合并
+    try std.testing.expect(patch.object.get("extends") == null);
+    const window = patch.object.get("window").?.object;
+    try std.testing.expectEqual(@as(i64, 1000), window.get("width").?.integer);
+    try std.testing.expectEqual(@as(i64, 720), window.get("height").?.integer);
+
+    // 未选 flavor / 无表 → null
+    try std.testing.expect((try flavorTablePatch(a, config, null)) == null);
+    const no_table = try parse(a, "{\"app_name\":\"Zilt\"}");
+    try std.testing.expect((try flavorTablePatch(a, no_table, "dev")) == null);
+}
+
+test "v0.6.0c flavor table: 循环/缺失父级/继承重复 app_id 明确报错" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cycle = try parse(a,
+        \\{"flavors":{
+        \\ "dev":{"extends":"beta","app_id":"app.zilt.dev"},
+        \\ "beta":{"extends":"dev","app_id":"app.zilt.beta"}
+        \\}}
+    );
+    try std.testing.expectError(error.ExtendsCycle, validateFlavorTable(a, cycle, null));
+    try std.testing.expectError(error.ExtendsCycle, flavorTablePatch(a, cycle, "dev"));
+
+    const missing = try parse(a,
+        \\{"flavors":{"beta":{"extends":"nope","app_id":"app.zilt.beta"}}}
+    );
+    try std.testing.expectError(error.UnknownFlavor, validateFlavorTable(a, missing, null));
+
+    const bad_type = try parse(a,
+        \\{"flavors":{"beta":{"extends":5,"app_id":"app.zilt.beta"}}}
+    );
+    try std.testing.expectError(error.InvalidExtends, validateFlavorTable(a, bad_type, null));
+
+    // beta 继承 dev 但不覆盖 app_id → 与 dev 重复
+    const dup = try parse(a,
+        \\{"flavors":{
+        \\ "dev":{"app_id":"app.zilt.dev"},
+        \\ "beta":{"extends":"dev","app_name":"Beta"}
+        \\}}
+    );
+    try std.testing.expectError(error.DuplicateAppId, validateFlavorTable(a, dup, null));
 }
 
 test "v0.6.0a flavor table: app_id 唯一 + 选中项必须存在" {
@@ -337,6 +524,33 @@ fn stringField(
     return alloc.dupe(u8, v.string);
 }
 
+/// 可选字符串：缺省/null → fallback；字符串原样复制；其它类型报错。
+fn optionalStringField(
+    alloc: std.mem.Allocator,
+    obj: ObjectMap,
+    key: []const u8,
+    fallback: ?[]const u8,
+) (AllocatorError || IdentityError)!?[]const u8 {
+    const v = obj.get(key) orelse return if (fallback) |f| try alloc.dupe(u8, f) else null;
+    if (v == .null) return null;
+    if (v != .string or v.string.len == 0) return error.MissingField;
+    return try alloc.dupe(u8, v.string);
+}
+
+/// `channel` 的别名 `update_channel`（DESIGN §3 用后者；既有实现与 CLI 用前者）。
+fn channelField(
+    alloc: std.mem.Allocator,
+    obj: ObjectMap,
+    fallback: []const u8,
+) (AllocatorError || IdentityError)![]const u8 {
+    if (obj.get("update_channel")) |v| {
+        if (v == .null) return alloc.dupe(u8, fallback);
+        if (v != .string or v.string.len == 0) return error.MissingField;
+        return alloc.dupe(u8, v.string);
+    }
+    return stringField(alloc, obj, "channel", fallback);
+}
+
 const AllocatorError = std.mem.Allocator.Error;
 
 /// 从合并结果取身份；缺失字段用 fallback，非法值返回明确错误（不静默回落）。
@@ -352,12 +566,86 @@ pub fn identityFrom(
         .app_id = try stringField(alloc, obj, "app_id", fallback.app_id),
         .version = try stringField(alloc, obj, "version", fallback.version),
         .publisher = try stringField(alloc, obj, "publisher", fallback.publisher),
-        .channel = try stringField(alloc, obj, "channel", fallback.channel),
+        .channel = try channelField(alloc, obj, fallback.channel),
+        .exe_name = try stringField(alloc, obj, "exe_name", fallback.exe_name),
+        .icon = try optionalStringField(alloc, obj, "icon", fallback.icon),
+        .single_instance_key = try optionalStringField(alloc, obj, "single_instance_key", fallback.single_instance_key),
     };
     if (!validateAppId(id.app_id)) return error.InvalidAppId;
     if (!validateSemver(id.version)) return error.InvalidVersion;
     if (!validateChannel(id.channel)) return error.InvalidChannel;
+    if (!validateExeName(id.exe_name)) return error.InvalidExeName;
+    if (id.icon) |icon| {
+        if (!validateIconPath(icon)) return error.InvalidIcon;
+    }
+    if (id.single_instance_key) |key| {
+        if (!validateSingleInstanceKey(key)) return error.InvalidSingleInstanceKey;
+    }
     return id;
+}
+
+pub const FrontendError = error{
+    InvalidFrontend,
+    MissingField,
+};
+
+/// 从合并结果取前端配置（`frontend` 对象）；缺省字段回落 fallback。
+/// 未知键明确报错（避免拼错后静默使用旧值）。
+pub fn frontendFrom(
+    alloc: std.mem.Allocator,
+    value: Value,
+    fallback: Frontend,
+) (AllocatorError || FrontendError)!Frontend {
+    var out = Frontend{
+        .dir = try alloc.dupe(u8, fallback.dir),
+        .dist = try alloc.dupe(u8, fallback.dist),
+        .dev_command = if (fallback.dev_command) |v| try alloc.dupe(u8, v) else null,
+        .dev_url = if (fallback.dev_url) |v| try alloc.dupe(u8, v) else null,
+        .build_command = if (fallback.build_command) |v| try alloc.dupe(u8, v) else null,
+        .dev_proxy = fallback.dev_proxy,
+        .wait_timeout_secs = fallback.wait_timeout_secs,
+    };
+    if (value == .null) return out;
+    if (value != .object) return error.InvalidFrontend;
+    const obj = value.object;
+
+    var it = obj.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const v = entry.value_ptr.*;
+        if (std.mem.eql(u8, key, "dir")) {
+            if (v != .string or v.string.len == 0) return error.InvalidFrontend;
+            out.dir = try alloc.dupe(u8, v.string);
+        } else if (std.mem.eql(u8, key, "dist")) {
+            if (v != .string or v.string.len == 0) return error.InvalidFrontend;
+            out.dist = try alloc.dupe(u8, v.string);
+        } else if (std.mem.eql(u8, key, "dev_command")) {
+            out.dev_command = try nullableString(alloc, v, error.InvalidFrontend);
+        } else if (std.mem.eql(u8, key, "dev_url")) {
+            out.dev_url = try nullableString(alloc, v, error.InvalidFrontend);
+        } else if (std.mem.eql(u8, key, "build_command")) {
+            out.build_command = try nullableString(alloc, v, error.InvalidFrontend);
+        } else if (std.mem.eql(u8, key, "dev_proxy")) {
+            if (v != .bool) return error.InvalidFrontend;
+            out.dev_proxy = v.bool;
+        } else if (std.mem.eql(u8, key, "wait_timeout_secs")) {
+            if (v != .integer or v.integer <= 0 or v.integer > 86400) return error.InvalidFrontend;
+            out.wait_timeout_secs = @intCast(v.integer);
+        } else {
+            return error.InvalidFrontend;
+        }
+    }
+    return out;
+}
+
+fn nullableString(
+    alloc: std.mem.Allocator,
+    v: Value,
+    comptime err: FrontendError,
+) (AllocatorError || FrontendError)!?[]const u8 {
+    if (v == .null) return null;
+    if (v != .string or v.string.len == 0) return err;
+    return try alloc.dupe(u8, v.string);
 }
 
 test "v0.6.0a identity: 覆盖字段与默认回落" {
@@ -442,4 +730,101 @@ test "v0.6.0a app_id: 反向 DNS 形态" {
     try std.testing.expect(!validateAppId("app..zilt"));
     try std.testing.expect(!validateAppId("App.Zilt"));
     try std.testing.expect(!validateAppId("app.zilt."));
+}
+
+test "v0.6.0b identity: exe_name / icon / single_instance_key 覆盖" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fallback = Identity{
+        .app_name = "Zilt",
+        .app_id = "app.zilt.desktop",
+        .version = "0.6.0",
+        .publisher = "Zilt",
+    };
+    const patch = try parse(a,
+        \\{"exe_name":"zilt-beta","icon":"assets/beta.ico",
+        \\"single_instance_key":"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
+    );
+    const id = try identityFrom(a, patch, fallback);
+    try std.testing.expectEqualStrings("zilt-beta", id.exe_name);
+    try std.testing.expectEqualStrings("assets/beta.ico", id.icon.?);
+    try std.testing.expectEqualStrings(
+        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        id.single_instance_key.?,
+    );
+
+    // update_channel 为 channel 的别名（DESIGN §3 命名）
+    const alias = try parse(a, "{\"update_channel\":\"beta\"}");
+    const id2 = try identityFrom(a, alias, fallback);
+    try std.testing.expectEqualStrings("beta", id2.channel);
+}
+
+test "v0.6.0b identity: 非法 exe_name / icon / 单实例密钥明确报错" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fallback = Identity{
+        .app_name = "Zilt",
+        .app_id = "app.zilt.desktop",
+        .version = "0.6.0",
+        .publisher = "Zilt",
+    };
+
+    try std.testing.expect(!validateExeName(""));
+    try std.testing.expect(!validateExeName("a/b"));
+    try std.testing.expect(!validateExeName("a\\b"));
+    try std.testing.expect(!validateExeName(".."));
+    try std.testing.expect(!validateExeName("a:b"));
+    try std.testing.expect(validateExeName("zilt-app.exe"));
+    try std.testing.expect(validateExeName("zilt beta"));
+
+    try std.testing.expect(!validateSingleInstanceKey("abc"));
+    try std.testing.expect(!validateSingleInstanceKey(
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+    ));
+
+    const bad_exe = try parse(a, "{\"exe_name\":\"../escape\"}");
+    try std.testing.expectError(error.InvalidExeName, identityFrom(a, bad_exe, fallback));
+
+    const bad_key = try parse(a, "{\"single_instance_key\":\"abc\"}");
+    try std.testing.expectError(error.InvalidSingleInstanceKey, identityFrom(a, bad_key, fallback));
+
+    const bad_icon = try parse(a, "{\"icon\":\"../x.ico\"}");
+    try std.testing.expectError(error.InvalidIcon, identityFrom(a, bad_icon, fallback));
+}
+
+test "v0.6.0b frontend: 覆盖字段与未知键拒绝" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fallback = Frontend{
+        .dir = "frontend",
+        .dist = "frontend/dist",
+        .dev_command = "npm run dev",
+        .dev_url = "http://localhost:5173",
+        .build_command = "npm run build",
+        .dev_proxy = false,
+        .wait_timeout_secs = 90,
+    };
+
+    const patch = try parse(a,
+        \\{"dir":"web","dist":"web/dist","dev_url":null,
+        \\"dev_proxy":true,"wait_timeout_secs":120}
+    );
+    const fe = try frontendFrom(a, patch, fallback);
+    try std.testing.expectEqualStrings("web", fe.dir);
+    try std.testing.expectEqualStrings("web/dist", fe.dist);
+    try std.testing.expect(fe.dev_url == null); // 显式 null 覆盖
+    try std.testing.expectEqualStrings("npm run dev", fe.dev_command.?);
+    try std.testing.expect(fe.dev_proxy);
+    try std.testing.expectEqual(@as(u32, 120), fe.wait_timeout_secs);
+
+    const bad_key = try parse(a, "{\"distt\":\"x\"}");
+    try std.testing.expectError(error.InvalidFrontend, frontendFrom(a, bad_key, fallback));
+
+    const bad_timeout = try parse(a, "{\"wait_timeout_secs\":0}");
+    try std.testing.expectError(error.InvalidFrontend, frontendFrom(a, bad_timeout, fallback));
 }

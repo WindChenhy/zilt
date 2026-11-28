@@ -9,6 +9,7 @@ frontend/bindings/
 *.log
 
 .zilt-cache-assets/
+.zilt-cache-flavor/
 # WorkBuddy 会话记忆数据（非项目源码，保留但不纳入版本控制）
 .workbuddy/
 smoke_log.txt

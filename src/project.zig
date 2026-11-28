@@ -3,9 +3,9 @@
 
 pub const app_name = "Zilt";
 pub const publisher = "Zilt";
-/// 运行时版本在 `src/zilt/version.zig`（zilt 模块内）；两处必须一致，
-/// build.zig 顶部有编译期断言强制校验（不一致直接编译失败）。
-pub const version = "0.5.11";
+/// 构建期基础版本（v0.6.0b）：build.zig 以它为 base，可被 flavor overlay 覆盖；
+/// 运行时经 build options 注入 `src/zilt/version.zig`（单一解析结果，不再两处硬编码）。
+pub const version = "0.6.0";
 pub const app_id = "app.zilt.desktop";
 pub const exe_name = "zilt-app.exe";
 

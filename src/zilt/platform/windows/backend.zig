@@ -158,7 +158,11 @@ pub fn run(comptime config: Config) !void {
                 if (config.single_instance_key) |key_hex| {
                     if (payload.len > 0) {
                         var nonce: [16]u8 = undefined;
-                        std.crypto.random.bytes(&nonce);
+                        // v0.6.0b：std.crypto.random 在 Zig 0.17 已移除（该分支此前
+                        // 因 single_instance_key 默认 null 从未被分析——flavor 接线后暴露）。
+                        var nonce_threaded: std.Io.Threaded = .init(alloc, .{});
+                        defer nonce_threaded.deinit();
+                        std.Io.random(nonce_threaded.io(), &nonce);
                         break :blk single_instance.sealPayload(alloc, key_hex, payload, nonce) catch payload;
                     }
                     break :blk payload;

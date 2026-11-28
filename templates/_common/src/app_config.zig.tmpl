@@ -1,14 +1,18 @@
 //! 应用配置（命令/事件/内嵌资产）。资产表由 build.zig codegen 从 frontend dist 生成。
 
 const zilt = @import("zilt");
+// v0.6.0c：flavor overlay 的 window/security patch（构建期生成）
+const flavor = @import("flavor_gen");
 
 pub const commands = @import("commands.zig");
 pub const events = @import("events.zig");
 
 pub const assets = @import("zilt_assets").assets;
-pub const security: zilt.security.Options = .{ .capabilities = &.{.{
+const base_security: zilt.security.Options = .{ .capabilities = &.{.{
     .name = "main-local",
     .commands = &.{"*"},
     .events = &.{"*"},
     .receive_events = &.{"*"},
 }} };
+
+pub const security: zilt.security.Options = flavor.security.apply(base_security);

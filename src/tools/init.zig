@@ -76,15 +76,14 @@ pub fn scaffold(template: []const u8, name: []const u8, dest: ?[]const u8) !void
     // "My Zilt App"/"app.myziltapp"——v0.1.17 修复）
     app_name_value = try displayNameAlloc(alloc, name);
     app_id_value = try appIdAlloc(alloc, name);
-    // v0.2.8：VERSION 占位符取框架当前版本（vendored src/zilt/version.zig 与
-    // project.zig 的编译期一致性断言要求两者相同——此前硬编码 "0.1.0" 会直接
-    // 编译失败，实测踩到）
-    if (readFile("src/zilt/version.zig")) |vz| {
-        defer alloc.free(vz);
-        if (std.mem.indexOf(u8, vz, "pub const version = \"")) |i| {
+    // v0.6.0b：版本占位符改从 `src/project.zig` 提取——运行时 `src/zilt/version.zig`
+    // 已改为读 build options（无字面量），project.zig 是构建期 base 的唯一字面量。
+    if (readFile("src/project.zig")) |pz| {
+        defer alloc.free(pz);
+        if (std.mem.indexOf(u8, pz, "pub const version = \"")) |i| {
             const start = i + "pub const version = \"".len;
-            if (std.mem.indexOfScalarPos(u8, vz, start, '"')) |j| {
-                if (j > start) version_value = try alloc.dupe(u8, vz[start..j]);
+            if (std.mem.indexOfScalarPos(u8, pz, start, '"')) |j| {
+                if (j > start) version_value = try alloc.dupe(u8, pz[start..j]);
             }
         }
     } else |_| {}

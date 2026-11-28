@@ -2,7 +2,8 @@
 
 > 制定日期：2026-11-20。修订：2026-11-21（Linux 专项复核：L1–L8 入图，macOS 顺延）。
 > 基线：**v0.3.19**（git 31b3109，测试体系收口）。
-> 当前：**v0.5.11**（tag v0.5.11 → a20483c，2026-11-27；CI run **46032448049** 全绿）。
+> 当前：**v0.6.0**（2026-11-28，flavors 0.6.0a–c；CI 结果在发版后回填）。
+> 上一版：v0.5.11（tag v0.5.11 → a20483c，2026-11-27；CI run **46032448049** 全绿）。
 > v0.4.5–v0.4.9 是 macOS 能力面切片；v0.5.x 交付台账与收口判定见下节「版本状态」。
 > 对标：**Wails v3.1.0 stable（2026-11-01）+ v3.2.0-nightly**、**Tauri 2.12.x**（2026-11 最新，2.12.x 仅 bugfix）。
 > 历史说明：原 docs/ 文档（v0.1–v0.3 逐版本记录、调研报告、WebView2 ABI 笔记、ADR）已随文档清理移除，
@@ -17,6 +18,14 @@
 
 主轴承序：v0.5 桌面三平台对等收口 → v0.6 DX·配置·弹性 → v0.7 第三方插件生态；
 移动端（iOS/Android）移出本轮留 1.x；不冻结 API、不冲 1.0。
+
+### v0.6.0 逐版本交付（2026-11-27 → 2026-11-28）
+
+| 版本 | 主题 | 交付 |
+|---|---|---|
+| v0.6.0a | flavors 基础 | RFC 7396 合并引擎 + `-Dflavor/-Dconfig` + `flavors` 表校验 + app_meta/CLI 身份投影 |
+| v0.6.0b | 身份与 overlay | 版本单源（project → options → version.zig）+ frontend/security/CSP/capabilities/window overlay + exe_name/icon + 运行时身份 |
+| v0.6.0c | 表继承与模板 | `flavors` 表 `extends` + 表/文件组合 + 模板 dev/beta/prod 示例 + 仓库/模板共用 `flavor_build` |
 
 ### v0.5.x 逐版本交付（2026-11-23 → 2026-11-26）
 
@@ -70,13 +79,28 @@ WebDriver E2E 为 **advisory**（Windows 偶发 attach 挂起、Linux 自动化�
 opt-in 变体）；v0.5 以「CI 全绿」收口，随后启动 v0.6.0（flavors / DX）。理由：默认 GTK3 是当前能力最全的栈，
 GTK4 转默认会先丢掉托盘 / 菜单栏 / 拖出（对等目标反而倒退）；v0.6 的范围与 GTK 栈无关，无需等待。
 
-### v0.6.0a（2026-11-28，进行中）
+### v0.6.0a / v0.6.0b（2026-11-28）
 
-flavors 落地第一片：RFC 7396 合并引擎 + build 期 `-Dflavor/-Dconfig` 解析 + `flavors` 表唯一性校验 +
-`app_meta` options 投影（打包/`zilt info` 用 flavor 身份）+ `zilt build` 参数转译。
-证据：`zig build test` 436/438（2 skip）；`zilt build --flavor beta info` 输出 beta 身份；CI run **46040483306** 全绿（Linux/GTK4/Windows/arm64/打包）。
-剩余 0.6.0b：frontend / capabilities / CSP 纳入 overlay、版本覆盖（运行时单源重构）、exe_name/icon。
-详见 [DESIGN_v0.6.0_flavors.md](DESIGN_v0.6.0_flavors.md) §9。
+flavors 落地三片：
+
+- **0.6.0a**：RFC 7396 合并引擎 + build 期 `-Dflavor/-Dconfig` 解析 + `flavors` 表唯一性校验 +
+  `app_meta` options 投影（打包/`zilt info` 用 flavor 身份）+ `zilt build` 参数转译。
+  证据：`zig build test` 436/438（2 skip）；`zilt build --flavor beta info` 输出 beta 身份；
+  CI run **46040483306** 全绿（Linux/GTK4/Windows/arm64/打包）。
+- **0.6.0b**：版本单源重构（`project.zig` base → build options → `version.zig`；
+  init 占位符改从 project.zig 提取；模板 build.zig 提供 `app_meta_opts`）+ frontend/security/
+  CSP/capabilities/window overlay（`flavor_codegen.zig` 生成 patch 模块）+ `exe_name`/`icon`
+  覆盖 + 运行时身份接线（`app_id` / `single_instance_key` / `update.channel`，数据目录等
+  命名空间随 `app_id`）+ 修复密封单实例分支的 `std.crypto.random`（Zig 0.17 已移除）。
+  验证：`zig build test` **444/446（2 skip）** / `zig build` 全绿；临时 beta overlay 实测身份、版本、产物名、
+  headless `app_id`、窗口标题、capabilities 清单；vanilla 模板脚手架重新生成并构建通过。
+- **0.6.0c**（本次）：`flavors` 表 `extends`（循环/缺失父级/继承重复 app_id 明确报错）+
+  表模式与文件模式组合（表提供身份继承，文件补充 window/security）+ 模板
+  `zilt.config.json` / `zilt.dev|beta|prod.json` 示例 + 仓库与模板共用
+  `src/tools/flavor_build.zig`（解析/投影/模块生成/exe 名归一）+ 模板 app_meta/app_config/
+  main 全量 flavor 驱动。验证：仓库表模式 beta 实测；vanilla 模板默认构建、
+  `-Dflavor=dev|beta|prod` 身份、beta 窗口标题与 headless `app_id` 均通过。
+  详见 [DESIGN_v0.6.0_flavors.md](DESIGN_v0.6.0_flavors.md) §9–§10。
 
 ## 0. 差距分析结论
 

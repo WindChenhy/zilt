@@ -154,8 +154,71 @@ pub const Identity = struct { app_name: []u8, app_id: []u8, ... };
 - **版本覆盖仍缓到 0.6.0b**：运行时 `src/zilt/version.zig` 与 `init` 的占位符提取都依赖字面量，
   改成 options 会破坏模板生成；0.6.0a 对 `-Dflavor` 里改 `version` 直接报错。
 
-**未做（0.6.0b）**
+**0.6.0b 当时的未做项（已在 §10 完成）**
 
 - `frontend` / `capabilities` / CSP / `window` 默认值纳入 overlay；`exe_name` / `icon` 覆盖。
 - `flavors` 表支持 `extends` 与按表生成 `zilt.<name>.json`（当前文件模式与表模式二选一）。
 - 模板里的 `zilt.<flavor>.json` 示例与「一份代码三种产物」文档。
+
+## 10. 实施状态（2026-11-28，0.6.0b）
+
+**已落地**
+
+- **版本单源重构**：`src/project.zig` 保留构建期 base 字面量；build.zig 解析 flavor 后经
+  `app_meta_opts.version` 注入 `src/zilt/version.zig`（运行时 `window.zilt.version` / MCP /
+  `zilt --version` 同一值）。删除 build.zig 的「project.zig ↔ version.zig」字面量一致性断言。
+  `init` 的 `{{VERSION}}` 改从 `src/project.zig` 提取；模板 build.zig 提供同名
+  `app_meta_opts` 模块，vendored `version.zig` 在生成项目里同样可编译。
+- **frontend overlay**：`frontend` 对象支持 `dir` / `dist` / `dev_command` / `dev_url` /
+  `build_command` / `dev_proxy` / `wait_timeout_secs`；build graph（资产扫描、dev step）
+  与 `app_meta.frontend`（`zilt info`）读同一份解析结果。
+- **security / CSP / capabilities overlay**：新增 `src/zilt/flavor_codegen.zig`，把合并后的
+  `security` 对象生成内容寻址模块 `.zilt-cache-flavor/<hash>/flavor.zig`（`security.apply`）；
+  `src/app_config.zig` 在编译期叠加到自身 `base_security`。数组整体替换（RFC 7396），
+  缺省键保留应用声明；未知键/类型错误在配置期直接失败。`zig build` 生成的
+  `capabilities.json` 即最终（含 overlay）清单。
+- **window 默认值 overlay**：`window` 对象支持 `title` / `width` / `height` / `x` / `y` /
+  `visible` / `resizable` / `decorations` / `titlebar_overlay` / `transparent` /
+  `always_on_top` / `skip_taskbar` / `close_requested_event` / `url` / `min_*` / `max_*` /
+  `background_color`；`src/main.zig` 以 `const base: zilt.Config` + `comptime window.apply(base)`
+  应用。实测 beta overlay 的窗口标题/尺寸生效。
+- **exe_name / icon overlay**：`Identity` 增 `exe_name` / `icon` / `single_instance_key`；
+  `exe_name` 决定产物名（Windows 自动补 `.exe`），并贯穿 PE VERSIONINFO、bundle、pack；
+  `icon` 用于 exe 资源与 Linux/macOS 打包图标（仍可用 `ZILT_ICON` / `ZILT_INSTALLER_ICON` 覆盖）。
+- **运行时身份**：`src/main.zig` 设 `.app_id = app_meta.app_id`、
+  `.single_instance_key = app_meta.single_instance_key`、`.update.channel = app_meta.channel`；
+  数据目录 / 单实例互斥体 / Toast AUMID / Linux desktop entry / macOS Keychain 服务名
+  全部由 `app_id` 派生——flavor 切 `app_id` 即切全套命名空间。`update_channel` 作为
+  `channel` 的别名被接受。
+- **顺带修复**：Windows 第二实例密封载荷分支的 `std.crypto.random`（Zig 0.17 已移除）
+  此前因 `single_instance_key` 默认 null 从未被分析；flavor 接线后暴露，改用
+  `std.Io.random`（分支专用 Threaded Io）。
+- **验证**：`zig build test` **444/446（2 skip）** 全绿；`zig build` 全绿；临时 `zilt.beta.json` 实测
+  `zilt build/info` 输出 beta 身份与 `0.6.0-beta.1`、产物 `zilt-beta.exe`、headless
+  `/zilt/info` 返回 `app_id=app.zilt.beta`、窗口标题为 overlay 值、`capabilities.json`
+  随 security overlay 变化；vanilla 模板脚手架重新生成并 `zig build` 通过。
+
+**0.6.0c 已落地（2026-11-28）**
+
+- **flavors 表 `extends`**：`zilt.config.json` 的 `flavors.<name>` 可声明
+  `"extends": "dev"`；父条目先合并、子条目覆盖（RFC 7396），`extends` 本身不进入 patch。
+  循环、缺失父级、非法类型、继承后重复 app_id 均在配置期明确报错。
+- **表模式 / 文件模式**：有 `flavors` 表且 `-Dflavor=<name>` 命中时，无需
+  `zilt.<name>.json`（表即 effective overlay）；文件存在时在其后再覆盖（表提供身份继承，
+  文件补充 window/security 等细节）。无表时保持 0.6.0a 行为（必须存在 flavor 文件）。
+- **模板 flavor 示例**：`templates/_common/` 新增 `zilt.config.json`（dev/beta/prod +
+  beta/prod `extends dev`）与 `zilt.dev.json` / `zilt.beta.json` / `zilt.prod.json`
+  （window/security overlay 示例）；占位符随项目名/APP_ID 替换。
+- **模板 build.zig 接入 flavor**：仓库与模板共用新增的 `src/tools/flavor_build.zig`
+  （解析顺序、身份/前端投影、`flavor_gen` 模块生成、exe 名归一），模板 app_meta /
+  app_config / main 全部改为 options + overlay 驱动；默认无 flavor 时行为与 base 一致。
+- **验证**：仓库 `zig build -Dflavor=beta`（表模式 + 文件覆盖 + extends）实测身份/渠道/
+  window patch；vanilla 模板脚手架默认构建通过，`-Dflavor=beta` 实测
+  `app_id=app.<name>.beta`、窗口标题与 headless `/zilt/info` 一致；`-Dflavor=dev/prod`
+  身份正确。
+
+**仍未做 / 后续**
+
+- `flavors` 表不生成磁盘 `zilt.<name>.json`（表模式在 build 期直接投影；如需落盘导出，
+  后续可加 `zilt flavors export`）。
+- CSP 嵌套对象之外的深层数组元素级合并不做（保持 RFC 7396 数组整体替换）。

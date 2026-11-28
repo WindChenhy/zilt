@@ -1,0 +1,21 @@
+{
+  "flavors": {
+    "dev": {
+      "app_name": "{{APP_NAME}} Dev",
+      "app_id": "{{APP_ID}}.dev",
+      "update_channel": "dev"
+    },
+    "beta": {
+      "extends": "dev",
+      "app_name": "{{APP_NAME}} Beta",
+      "app_id": "{{APP_ID}}.beta",
+      "update_channel": "beta"
+    },
+    "prod": {
+      "extends": "dev",
+      "app_name": "{{APP_NAME}}",
+      "app_id": "{{APP_ID}}",
+      "update_channel": "stable"
+    }
+  }
+}

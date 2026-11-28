@@ -1,21 +1,13 @@
 const std = @import("std");
 const project = @import("src/project.zig");
 const codegen = @import("src/tools/frontend_codegen.zig");
-
-// 版本号一致性：project.zig（打包/PE 资源）与 zilt/version.zig（运行时 window.zilt.version
-// / MCP / zilt --version）是同一版本的两处落点——模块边界决定无法共享同一份声明，
-// 因此在这里做编译期断言：任一处漏改直接编译失败。
-comptime {
-    const rt = @import("src/zilt/version.zig").version;
-    if (!std.mem.eql(u8, project.version, rt)) {
-        @compileError("版本号不一致：src/project.zig = " ++ project.version ++ "，src/zilt/version.zig = " ++ rt);
-    }
-}
+// v0.6.0c：与框架仓库共用 flavor 解析实现（随项目 vendored）
+const flavor_build = @import("src/tools/flavor_build.zig");
 
 /// 应用 exe 图标与 VERSIONINFO（Windows PE 资源，v0.1.15）：
-/// 资源脚本在 build 期由 project.zig 插值生成（版本号不会漂移），
-/// manifest 固定在 src/zilt/assets/app.manifest；project.icon 非空时 icon 指向自定义 .ico。
-fn addAppIconResource(b: *std.Build, module: *std.Build.Module, icon_path: ?[]const u8) void {
+/// 资源脚本在 build 期由 flavor 身份插值生成（版本号不会漂移），
+/// manifest 固定在 src/zilt/assets/app.manifest；icon 非空时指向自定义 .ico。
+fn addAppIconResource(b: *std.Build, module: *std.Build.Module, icon_path: ?[]const u8, id: flavor_build.Identity) void {
     const res = @import("src/tools/win_res.zig");
     const assets_dir = "src/zilt/assets";
 
@@ -33,10 +25,10 @@ fn addAppIconResource(b: *std.Build, module: *std.Build.Module, icon_path: ?[]co
     // 否则 resinator 不把 include 的 manifest 当依赖，改了 manifest 仍会命中旧缓存
     // （实测：改 manifest 后 exe 内嵌的仍是旧内容）。
     const manifest_text = res.renderManifest(b.allocator, .{
-        .app_name = project.app_name,
-        .publisher = project.publisher,
-        .version = project.version,
-        .exe_name = project.exe_name,
+        .app_name = id.app_name,
+        .publisher = id.publisher,
+        .version = id.version,
+        .exe_name = id.exe_name,
     }) catch @panic("OOM");
 
     const hash_comment = std.fmt.allocPrint(
@@ -46,10 +38,10 @@ fn addAppIconResource(b: *std.Build, module: *std.Build.Module, icon_path: ?[]co
     ) catch "manifest";
 
     const rc_text = res.renderRc(b.allocator, .{
-        .app_name = project.app_name,
-        .publisher = project.publisher,
-        .version = project.version,
-        .exe_name = project.exe_name,
+        .app_name = id.app_name,
+        .publisher = id.publisher,
+        .version = id.version,
+        .exe_name = id.exe_name,
         .icon_file = icon_file,
         .manifest_file = "app.manifest",
         .extra_comment = hash_comment,
@@ -243,20 +235,81 @@ pub fn build(b: *std.Build) void {
         break :blk tc.createModule();
     } else null;
 
+    // v0.6.0c：flavor overlay（RFC 7396）——身份/前端/defaults 在配置期解析一次。
+    const flavor_name = b.option([]const u8, "flavor", "Flavor overlay: loads zilt.<flavor>.json or zilt.config.json flavors table (e.g. dev|beta|prod)");
+    const config_path = b.option([]const u8, "config", "Extra JSON merge-patch file (highest priority)");
+    const resolved = flavor_build.resolve(b, target_os, flavor_name, config_path, .{
+        .app_name = project.app_name,
+        .app_id = project.app_id,
+        .version = project.version,
+        .publisher = project.publisher,
+        .channel = "stable",
+        .exe_name = project.exe_name,
+        .icon = project.icon,
+        .single_instance_key = null,
+    }, .{
+        .dir = project.frontend.dir,
+        .dist = project.frontend.dist,
+        .dev_command = project.frontend.dev_command,
+        .dev_url = project.frontend.dev_url,
+        .build_command = project.frontend.build_command,
+        .dev_proxy = project.frontend.dev_proxy,
+        .wait_timeout_secs = project.frontend.wait_timeout_secs,
+    });
+    var identity = resolved.identity;
+    if (is_windows and !std.mem.endsWith(u8, identity.exe_name, ".exe")) {
+        identity.exe_name = b.fmt("{s}.exe", .{identity.exe_name});
+    }
+    const frontend = resolved.frontend;
+
+    const meta_opts_step = b.addOptions();
+    meta_opts_step.addOption([]const u8, "flavor", flavor_name orelse "");
+    meta_opts_step.addOption([]const u8, "app_name", identity.app_name);
+    meta_opts_step.addOption([]const u8, "app_id", identity.app_id);
+    meta_opts_step.addOption([]const u8, "publisher", identity.publisher);
+    meta_opts_step.addOption([]const u8, "channel", identity.channel);
+    meta_opts_step.addOption([]const u8, "version", identity.version);
+    meta_opts_step.addOption([]const u8, "exe_name", identity.exe_name);
+    meta_opts_step.addOption(?[]const u8, "icon", identity.icon);
+    meta_opts_step.addOption(?[]const u8, "single_instance_key", identity.single_instance_key);
+    meta_opts_step.addOption([]const u8, "frontend_dir", frontend.dir);
+    meta_opts_step.addOption([]const u8, "frontend_dist", frontend.dist);
+    meta_opts_step.addOption(?[]const u8, "frontend_dev_command", frontend.dev_command);
+    meta_opts_step.addOption(?[]const u8, "frontend_dev_url", frontend.dev_url);
+    meta_opts_step.addOption(?[]const u8, "frontend_build_command", frontend.build_command);
+    meta_opts_step.addOption(bool, "frontend_dev_proxy", frontend.dev_proxy);
+    meta_opts_step.addOption(u32, "frontend_wait_timeout_secs", frontend.wait_timeout_secs);
+    const meta_opts = meta_opts_step.createModule();
+
+    // 打包器元数据（应用入口也用它取运行时身份）
+    const app_meta_mod = b.createModule(.{
+        .root_source_file = b.path("src/app_meta.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "app_meta_opts", .module = meta_opts },
+        },
+    });
+
     // zilt 库模块
     const zilt_mod = b.addModule("zilt", .{
         .root_source_file = b.path("src/zilt/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = if (gtk_mod) |m|
-            &.{std.Build.Module.Import{ .name = "gtk", .module = m }}
+            &.{
+                std.Build.Module.Import{ .name = "app_meta_opts", .module = meta_opts },
+                std.Build.Module.Import{ .name = "gtk", .module = m },
+            }
         else
-            &.{},
+            &.{std.Build.Module.Import{ .name = "app_meta_opts", .module = meta_opts }},
     });
+
+    // v0.6.0b/c：window/security overlay → 内容寻址的 flavor 模块
+    const flavor_mod = flavor_build.addFlavorModule(b, zilt_mod, resolved.merged, target, optimize);
 
     // ---- 前端资产 codegen：遍历 dist → 生成 zilt-assets 模块 ----
     // （eager 执行：每次 zig build 都重新枚举，排序保证生成内容稳定 → 缓存友好）
-    const frontend = project.frontend;
     const dist = frontend.dist;
     // build runner 的 cwd 不保证是项目根——统一绝对路径（joinString）
     const dist_abs = b.root.joinString(b.allocator, dist) catch dist;
@@ -353,6 +406,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zilt", .module = zilt_mod },
             .{ .name = "zilt_assets", .module = assets_mod },
+            .{ .name = "flavor_gen", .module = flavor_mod },
         },
     });
 
@@ -364,11 +418,13 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zilt", .module = zilt_mod },
             .{ .name = "app_config", .module = app_config_mod },
+            .{ .name = "app_meta", .module = app_meta_mod },
+            .{ .name = "flavor_gen", .module = flavor_mod },
         },
     });
 
     const exe = b.addExecutable(.{
-        .name = "zilt-app",
+        .name = flavor_build.exeStem(identity.exe_name),
         .root_module = exe_mod,
     });
     // libgmodule 的 dlopen/dlerror 等符号由 libc 提供（glibc 2.34+ 并入）；
@@ -379,7 +435,7 @@ pub fn build(b: *std.Build) void {
         exe.subsystem = .windows;
         // Windows 系统库（Win32 extern 声明所需的导入库）
         linkWindowsLibs(exe_mod);
-        addAppIconResource(b, exe_mod, project.icon);
+        addAppIconResource(b, exe_mod, identity.icon, identity);
     } else if (is_linux) {
         linkLinuxWebviewLibs(b, exe_mod);
     }
@@ -521,10 +577,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tools_tests.step);
 
     // ---- 打包器（exe → dist/ 便携 zip + NSIS 安装器） ----
-    const app_meta_mod = b.createModule(.{
-        .root_source_file = b.path("src/app_meta.zig"),
-    });
-
     const rel_app_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -532,17 +584,19 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zilt", .module = zilt_mod },
             .{ .name = "app_config", .module = app_config_mod },
+            .{ .name = "app_meta", .module = app_meta_mod },
+            .{ .name = "flavor_gen", .module = flavor_mod },
         },
     });
     const rel_app = b.addExecutable(.{
-        .name = "zilt-app",
+        .name = flavor_build.exeStem(identity.exe_name),
         .root_module = rel_app_mod,
     });
     rel_app.linker_allow_shlib_undefined = true; // 同上（libgmodule 的 dl* 在 libc）
     if (is_windows) {
         rel_app.subsystem = .windows; // 分发产物无控制台窗口
         linkWindowsLibs(rel_app_mod);
-        addAppIconResource(b, rel_app_mod, project.icon);
+        addAppIconResource(b, rel_app_mod, identity.icon, identity);
     } else if (is_linux) {
         linkLinuxWebviewLibs(b, rel_app_mod);
     }

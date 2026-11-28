@@ -6,7 +6,12 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.5.11（2026-11-27，桌面三平台对等收口）** —— macOS 分发/安全/更新器
+**当前状态：v0.6.0（2026-11-28，配置 flavors）** —— 0.6.0a–c：RFC 7396 合并引擎 +
+`-Dflavor/-Dconfig` + `flavors` 表 `extends`（表/文件模式可组合）+ 版本/身份/exe_name/icon
+单源投影 + `frontend` / `security`（CSP/capabilities）/ `window` overlay + 运行时身份
+（`app_id` / 单实例键 / 更新通道）；仓库与模板共用 `flavor_build` 解析，模板自带
+dev/beta/prod 示例（`zig build -Dflavor=beta` 或 `zilt build --flavor beta`）。
+v0.5.11（2026-11-27，桌面三平台对等收口）—— macOS 分发/安全/更新器
 （v0.5.1–v0.5.8：`.app`/DMG/codesign/公证/Universal/Keychain/ed25519 更新器 + 系统信息/Shell/电源/主题）、
 Linux GTK4 变体双栈 CI + ARM64 实跑（v0.5.9–v0.5.10）、CI 稳定性收口（v0.5.11：Tray/GTK4 v04/冒烟 partition
 去 flake）。**L1b（GTK4 转默认）与 Linux WebDriver 自动化（`create-web-view`）排入 v0.6.x**；详见
@@ -26,8 +31,8 @@ v0.4.0（H6–H11 / H20 / L2 / L7 / L8 双平台小项收尾）。
 
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
-| Windows | ✅ 全栈（v0.1.0–v0.5.11） | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
-| Linux | ✅ 全栈（v0.2.0–v0.5.11，冒烟 95 项） | GTK3 默认 + WebKit2GTK 4.1；`-Dgtk=gtk4` 变体（GTK4 + WebKitGTK 6.0，v0.5.9 起双栈 CI 同跑单测 + 冒烟） |
+| Windows | ✅ 全栈（v0.1.0–v0.6.0） | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
+| Linux | ✅ 全栈（v0.2.0–v0.6.0，冒烟 95 项） | GTK3 默认 + WebKit2GTK 4.1；`-Dgtk=gtk4` 变体（GTK4 + WebKitGTK 6.0，v0.5.9 起双栈 CI 同跑单测 + 冒烟） |
 | macOS | ✅ 对等收口（v0.4.4–v0.5.8）：主链 + 菜单/托盘/对话框/剪贴板/通知/深链/单实例/热键 + 分发（.app/DMG/codesign/公证/Universal）+ Keychain + 更新器 + 系统信息/Shell/电源/主题 | WKWebView（手写 ObjC 消息，无 `@cImport`） |
 
 **Linux GTK4 变体能力面（v0.5.11 双栈 CI 实测）**
@@ -54,7 +59,7 @@ fs（scope/watch/流式）、SQL、store（可选 DPAPI 加密）、http（WinHT
 Linux 复用同一 JS API 面，差异逐版本以「文档化」条目记录（无 SharedBuffer → evaluate 通道、无 PDF 导出 →
 `PdfNotSupported` 等）。
 
-## 能力索引（v0.5.11）
+## 能力索引（v0.6.0）
 
 > 本表聚焦 Windows / Linux（GTK3 默认）共有的 JS API 面；macOS 能力面见上表平台行与
 > v0.4.4–v0.5.8 版本记录，GTK4 变体的降级项见上方「Linux GTK4 变体能力面」。
@@ -681,6 +686,23 @@ ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=my-app zig build init
 # → my-app/（vendored 框架源码，项目自包含；npm install → zig build dev 即可开发）
 ```
 
+### 一份代码，三种产物（v0.6.0c flavors）
+
+模板自带 `zilt.config.json`（dev / beta / prod + `extends`）与 `zilt.<flavor>.json` 示例：
+
+```sh
+zig build -Dflavor=dev        # app_id=…dev、窗口标题 … — Dev
+zig build -Dflavor=beta       # beta extends dev；再加 zilt.beta.json 的 window/security
+zig build -Dflavor=prod       # 回到正式身份
+# 或经 CLI：zilt build --flavor beta --config ci.json
+```
+
+合并语义为 RFC 7396（对象递归、数组整体替换、`null` 删除）；flavor 可覆盖
+`app_name` / `app_id` / `version` / `exe_name` / `icon` / `publisher` / `channel`
+（别名 `update_channel`）/ `single_instance_key`，以及 `frontend`、`security`（含 CSP /
+capabilities）、`window` 默认值。`app_id` 同时决定数据目录、单实例、Toast AUMID 等运行时
+命名空间。
+
 ## 快速开始（本仓库示例）
 
 要求：Zig 0.17.1+。
@@ -694,10 +716,10 @@ ZILT_INIT_TEMPLATE=vue ZILT_INIT_NAME=my-app zig build init
 ```sh
 zig build gen      # 生成前端 TS 绑定（frontend/bindings/zilt.ts）
 zig build run      # 启动示例应用（embedded 模式）
-zig build test    # 单元测试：Windows 375 项 / Linux 291 项（各 1 skip，均为对端专用用例）
+zig build test    # 单元测试：Windows 444 项（442 通过 + 2 skip）；Linux 计数以 CI 为准
                   # 覆盖：IPC/绑定 codegen/更新器与差分补丁/打包（NSIS/WiX/MSIX/deb/AppImage）/
                   # ACL 与 isolation/fs/store/SQL/http/ws/托盘与任务栏/对话框/深链/单实例密封/
-                  # 图标与 PNG 编解码/窗口模型/WebView2 ABI/加速键/系统信息/自启/...
+                  # 图标与 PNG 编解码/窗口模型/WebView2 ABI/加速键/系统信息/自启/flavors...
 ```
 
 dev 模式：

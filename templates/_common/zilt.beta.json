@@ -1,0 +1,8 @@
+{
+  "window": {
+    "title": "{{APP_NAME}} — Beta"
+  },
+  "security": {
+    "freeze_prototype": true
+  }
+}

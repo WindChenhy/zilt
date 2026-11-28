@@ -3,20 +3,26 @@
 const std = @import("std");
 const zilt = @import("zilt");
 const app = @import("app_config");
-const project = @import("project.zig");
+const meta = @import("app_meta");
+// v0.6.0c：flavor overlay 的 window 默认值
+const flavor = @import("flavor_gen");
 
 pub fn main() !void {
-    try zilt.run(.{
+    const config: zilt.Config = .{
         .commands = app.commands,
         .events = app.events,
         .assets = &app.assets,
         .security = app.security,
-        .title = project.app_name,
+        // v0.6.0b/c：运行时身份与打包元数据同源（数据目录/单实例均由此派生）
+        .app_id = meta.app_id,
+        .single_instance_key = meta.single_instance_key,
+        .title = comptime std.fmt.comptimePrint("{s}", .{meta.app_name}),
         .width = 1000,
         .height = 700,
         .url = "https://zilt.app/index.html",
-        .tray = .{ .tooltip = project.app_name },
+        .tray = .{ .tooltip = comptime std.fmt.comptimePrint("{s}", .{meta.app_name}) },
         .close_to_tray = true,
         .single_instance = true,
-    });
+    };
+    try zilt.run(comptime flavor.window.apply(config));
 }

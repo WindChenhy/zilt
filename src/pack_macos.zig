@@ -105,9 +105,10 @@ pub fn main(init: std.process.Init) !u8 {
     mkDirs(alloc, try pathJoin(alloc, app_dir, pf.macos_macos_rel));
     mkDirs(alloc, try pathJoin(alloc, app_dir, pf.macos_resources_rel));
 
-    // 图标 best-effort：zilt.ico 的 PNG 帧 → .icns（16/32/256 可映射，48 跳过）。
+    // 图标 best-effort：flavor 覆盖的 app_meta.icon（否则内置 zilt.ico）→ PNG 帧 → .icns
+    //（16/32/256 可映射，48 跳过）。
     var icon_file: ?[]const u8 = null;
-    if (readFileAlloc(alloc, "src/zilt/assets/zilt.ico", 16 * 1024 * 1024)) |ico| {
+    if (readFileAlloc(alloc, app_meta.icon orelse "src/zilt/assets/zilt.ico", 16 * 1024 * 1024)) |ico| {
         if (msix.extractPngFrames(alloc, ico)) |frames| {
             var imgs: std.ArrayList(pf.IcnsImage) = .empty;
             for (frames) |f| try imgs.append(alloc, .{ .width = f.width, .png = f.png });

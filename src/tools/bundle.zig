@@ -103,7 +103,8 @@ pub fn main() !void {
 
     const env_icon = win32.getEnvUtf8(alloc, "ZILT_INSTALLER_ICON");
     defer if (env_icon) |v| alloc.free(v);
-    const setup_icon: ?[]const u8 = if (env_icon) |v| (if (v.len > 0) v else null) else null;
+    // v0.6.0b：未显式指定安装器图标时跟随 flavor 身份的 icon
+    const setup_icon: ?[]const u8 = if (env_icon) |v| (if (v.len > 0) v else null) else meta.icon;
 
     const env_scheme = win32.getEnvUtf8(alloc, "ZILT_INSTALLER_SCHEME");
     defer if (env_scheme) |v| alloc.free(v);

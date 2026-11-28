@@ -1,12 +1,29 @@
-//! 打包器元数据（从 project.zig 派生——单一配置源）。
-pub const app_name = @import("project.zig").app_name;
-pub const publisher = @import("project.zig").publisher;
-pub const version = @import("project.zig").version;
-pub const app_id = @import("project.zig").app_id;
-pub const exe_name = @import("project.zig").exe_name;
-pub const external_bin = @import("project.zig").external_bin;
-// v0.6.0a：CLI `zilt info` 会打印 channel；模板暂不接 flavor options，固定 stable。
-pub const channel = "stable";
+//! 打包器元数据（v0.6.0c：身份/前端来自 build graph 的 flavor 解析结果）。
+//! `src/project.zig` 是 base；`zilt.config.json` 的 flavors 表（支持 extends）/
+//! `zilt.<platform>.json` / `zilt.<flavor>.json` / `-Dconfig` 逐层覆盖（RFC 7396）。
+const opts = @import("app_meta_opts");
 
-pub const icon = @import("project.zig").icon;
-pub const frontend = @import("project.zig").frontend;
+pub const app_name = opts.app_name;
+/// 当前构建选中的 flavor 名（空串 = 未指定）。
+pub const flavor = opts.flavor;
+pub const app_id = opts.app_id;
+pub const publisher = opts.publisher;
+pub const channel = opts.channel;
+pub const version = opts.version;
+pub const exe_name = opts.exe_name;
+pub const icon = opts.icon;
+/// 运行时单实例密封密钥（null = 明文）。
+pub const single_instance_key = opts.single_instance_key;
+
+pub const frontend = .{
+    .dir = opts.frontend_dir,
+    .dist = opts.frontend_dist,
+    .dev_command = opts.frontend_dev_command,
+    .dev_url = opts.frontend_dev_url,
+    .build_command = opts.frontend_build_command,
+    .dev_proxy = opts.frontend_dev_proxy,
+    .wait_timeout_secs = opts.frontend_wait_timeout_secs,
+};
+
+pub const external_bin = @import("project.zig").external_bin;
+pub const resources = @import("project.zig").resources;

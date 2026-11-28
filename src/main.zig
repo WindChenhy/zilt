@@ -3,6 +3,9 @@
 const std = @import("std");
 const zilt = @import("zilt");
 const app = @import("app_config");
+const meta = @import("app_meta");
+/// v0.6.0b：flavor overlay 的 window 默认值（构建期生成 patch）。
+const flavor = @import("flavor_gen");
 
 // v0.1.16：示例服务 —— 验证「Config 声明 → 框架驱动生命周期 → JS 可查状态」这条链路。
 // 框架不解释 state 的含义，只负责 init/start 与逆序 stop/deinit 的时序。
@@ -18,12 +21,15 @@ fn demoServiceDeinit(state: *anyopaque) void {
 }
 
 pub fn main() !void {
-    try zilt.run(.{
+    const config: zilt.Config = .{
         .commands = app.commands,
         .events = app.events,
         .assets = &app.assets,
         .security = app.security,
-        .title = "Zilt — v" ++ zilt.version ++ " 示例",
+        // v0.6.0b：运行时身份跟随 flavor（数据目录/单实例/Toast AUMID 均由此派生）
+        .app_id = meta.app_id,
+        .single_instance_key = meta.single_instance_key,
+        .title = comptime std.fmt.comptimePrint("{s} — v{s} 示例", .{ meta.app_name, meta.version }),
         .width = 960,
         .height = 700,
         .url = "https://zilt.app/index.html",
@@ -124,6 +130,10 @@ pub fn main() !void {
             .manifest_url = "https://updates.invalid/manifest.json",
             .public_key_hex = "0000000000000000000000000000000000000000000000000000000000000000",
             .current_version = "0.1.1",
+            // v0.6.0b：更新通道跟随 flavor 身份（stable/beta/dev…）
+            .channel = meta.channel,
         },
-    });
+    };
+    // v0.6.0b：window overlay 在编译期叠加到上面的基础窗口默认值
+    try zilt.run(comptime flavor.window.apply(config));
 }

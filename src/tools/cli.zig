@@ -367,6 +367,7 @@ fn runBuild(init: std.process.Init, alloc: std.mem.Allocator, args: []const []u8
 fn runInfo() u8 {
     const project = meta;
     print("app_name   {s}\n", .{project.app_name});
+    print("flavor     {s}\n", .{if (project.flavor.len > 0) project.flavor else "(none)"});
     print("publisher  {s}\n", .{project.publisher});
     print("version    {s}\n", .{project.version});
     print("app_id     {s}\n", .{project.app_id});

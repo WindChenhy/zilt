@@ -3,6 +3,8 @@
 
 const std = @import("std");
 const zilt = @import("zilt");
+/// v0.6.0b：flavor overlay 的 window/security patch（构建期生成）。
+const flavor = @import("flavor_gen");
 
 /// v0.3.10 C2：isolation 演示密钥（64 字符 hex = 32 字节；生产应用应自行生成并保守）
 pub const iso_key_hex = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
@@ -14,7 +16,9 @@ pub const assets = @import("zilt_assets").assets;
 
 /// v0.1.8/v0.1.11：CSP/导航白名单/capability ACL。构建时生成
 /// frontend/bindings/capabilities.json，运行时按同一份声明强制。
-pub const security: zilt.security.Options = .{    .capabilities = &.{.{
+/// v0.6.0b：flavor overlay 的 `security` 对象在编译期叠加（数组整体替换，
+/// 缺省键保留本文件的声明）。
+const base_security: zilt.security.Options = .{    .capabilities = &.{.{
         .name = "demo-local",
         .windows = &.{"*"},
         .commands = &.{"*"},
@@ -41,6 +45,8 @@ pub const security: zilt.security.Options = .{    .capabilities = &.{.{
     .navigation_origins = &.{"https://zilt.app"},
     .external_links = .system_browser,
 };
+
+pub const security: zilt.security.Options = flavor.security.apply(base_security);
 
 // ---------------------------------------------------------------------------
 // v0.1.24：应用自定义协议（`https://zilt.app/__proto/<name>/…`）

@@ -257,7 +257,7 @@ pub fn main() !void {
         // v0.5.2：图标 best-effort——zilt.ico 的 PNG 帧 → .icns（16/32/256 可映射，48 跳过）。
         // 图标缺失/解析失败不阻断 .app 产出（CFBundleIconFile 可选）。
         var icon_file: ?[]const u8 = null;
-        if (readFileAlloc(alloc, "src/zilt/assets/zilt.ico")) |ico| {
+        if (readFileAlloc(alloc, app_meta.icon orelse "src/zilt/assets/zilt.ico")) |ico| {
             const frames = zilt.msix.extractPngFrames(alloc, ico) catch null;
             if (frames) |fs| {
                 var imgs: std.ArrayList(pf.IcnsImage) = .empty;

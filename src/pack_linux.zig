@@ -10,7 +10,7 @@
 //!   - `flatpak/<pkg>.json` —— Flatpak manifest（org.gnome.Platform runtime）
 //!   - `<pkg>.spec` —— rpm spec（rpmbuild -bb 可构建）
 //!
-//! argv[1] = 应用 exe（build.zig 注入）；图标取 `project.icon` 或内置 zilt.ico
+//! argv[1] = 应用 exe（build.zig 注入）；图标取 `app_meta.icon` 或内置 zilt.ico
 //!（ico 帧即 PNG，msix.extractPngFrames 提取）。
 const std = @import("std");
 // 直接按路径引用纯模块（避免把 zilt 根模块——含 GTK 绑定——拖进打包工具）
@@ -402,8 +402,8 @@ pub fn main() !void {
     const desktop_name = try desktopFileName(alloc, pkg);
     const exe_base = try exeBaseName(alloc, meta);
 
-    // 图标：project.icon 或内置 zilt.ico（帧即 PNG）
-    const icon_path = getEnv(alloc, "ZILT_ICON") orelse "src/zilt/assets/zilt.ico";
+    // 图标：flavor 覆盖的 app_meta.icon，否则内置 zilt.ico（帧即 PNG）
+    const icon_path = getEnv(alloc, "ZILT_ICON") orelse (app_meta.icon orelse "src/zilt/assets/zilt.ico");
     var icon_png: ?[]const u8 = null;
     if (readFileAlloc(alloc, icon_path, 4 * 1024 * 1024)) |ico_bytes| {
         const frames = msix.extractPngFrames(alloc, ico_bytes) catch null;
