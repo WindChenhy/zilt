@@ -5022,6 +5022,12 @@ fn Backend(comptime config: Config) type {
         fn chooseSavePath(self: *Self, suggested: []const u8) !?[]u8 {
             const title_z = try dupeZ(self.allocator, "Save File");
             defer self.allocator.free(title_z);
+            if (comptime gtk_compat.isGtk4()) {
+                // v0.6.1：GTK4 下载保存对话框走 GtkFileDialog（异步 → SyncWait）
+                const name_z = try dupeZ(self.allocator, suggested);
+                defer self.allocator.free(name_z);
+                return gtk_compat.fileDialogSaveSync(null, title_z.ptr, name_z.ptr, &.{}, self.allocator);
+            }
             const dlg = c.gtk_file_chooser_dialog_new(
                 title_z.ptr,
                 null,
