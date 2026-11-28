@@ -75,7 +75,8 @@ fn pkgConfigIncludeDirs(b: *std.Build, packages: []const []const u8) []const []c
         .cwd = .inherit,
     }) catch {
         @panic("需要 pkg-config 才能构建 Linux 后端：sudo apt install pkg-config " ++
-            "libgtk-4-dev libwebkitgtk-6.0-dev（GTK3 legacy：-Dgtk=gtk3 + libgtk-3-dev libwebkit2gtk-4.1-dev）");
+            "libgtk-4-dev libwebkitgtk-6.0-dev libx11-dev libxext-dev" ++
+            "（GTK3 legacy：-Dgtk=gtk3 + libgtk-3-dev libwebkit2gtk-4.1-dev）");
     };
     defer {
         alloc.free(result.stdout);
@@ -86,7 +87,7 @@ fn pkgConfigIncludeDirs(b: *std.Build, packages: []const []const u8) []const []c
             std.mem.join(alloc, " ", packages) catch "?",
             std.mem.trim(u8, result.stderr, " \r\n"),
         });
-        @panic("缺少 GTK/WebKitGTK 开发包：sudo apt install libgtk-4-dev libwebkitgtk-6.0-dev" ++
+        @panic("缺少 GTK/WebKitGTK 开发包：sudo apt install libgtk-4-dev libwebkitgtk-6.0-dev libx11-dev libxext-dev" ++
             "（GTK3 legacy：-Dgtk=gtk3 + libgtk-3-dev libwebkit2gtk-4.1-dev）");
     }
 
@@ -115,6 +116,7 @@ fn linkLinuxWebviewLibs(b: *std.Build, module: *std.Build.Module) void {
     module.linkSystemLibrary(webkit_pkg_name, .{});
     module.linkSystemLibrary("libsoup-3.0", .{}); // scheme 响应头（CSP/security.headers）
     module.linkSystemLibrary("x11", .{}); // 全局快捷键 XGrabKey（v0.2.6）
+    module.linkSystemLibrary("xext", .{}); // GTK4 窗口形状/穿透（XShape，v0.4.3 L1b）
 }
 
 /// pkg-config 的库搜索目录：`--libs-only-L` 的 `-L` 加上 `--variable=libdir`。
