@@ -233,7 +233,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgtk-4-dev libwebkitgtk-6.0-dev pkg-config xvfb openbox \
-            xdg-utils libsqlite3-0 libx11-dev libxext-dev
+            xdg-utils libsqlite3-0 libx11-dev libxext-dev \
+            dbus xdotool
 
       - name: Build
         run: zig build
@@ -289,6 +290,13 @@ jobs:
             fi
             echo "smoke failed with exit $code"; exit 1
           fi
+
+      # v0.6.2：GTK4 SNI 的 headless 契约探针（不需要桌面宿主）：
+      # 总线名 → IconName/Status/Menu → dbusmenu GetLayout → Activate 挂窗 toggle。
+      # 图标像素渲染仍需真实宿主（GNOME AppIndicator / KDE 面板），记人工项。
+      - name: SNI tray E2E (headless D-Bus contract)
+        timeout-minutes: 4
+        run: bash scripts/linux/dev-sni-e2e.sh ./zig-out/bin/zilt-app
 
       - name: Headless / MCP E2E
         run: bash scripts/linux/dev-headless.sh

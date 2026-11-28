@@ -123,6 +123,8 @@ flavors 落地三片：
   `app_meta.gtk4` 驱动 deb/rpm/AUR/AppImage 依赖与 helper 目录名；doctor/bootstrap/
   arm64 脚本/CI（默认 24.04 GTK4 + legacy 22.04 GTK3）同步。
 - **验证**：Windows `zig build test` + `zig build` 全绿（Linux 编译由 CI 双作业验证）。
+  > v0.6.2 复验注记：当时「SNI 注册成功」只来自应用日志，未验证总线归属；
+  > WSL 真机探针发现实际注册在系统总线且存在悬空指针，详见 v0.6.2 修正表。
   CI 协作修三处：Linux 模板 E2E 产物名改 `app`、Tray E2E 转 advisory（openbox 放置覆盖
   attach 定位，双次复现）、Package job 补 NSIS PATH（choco 安装后当前 shell 未刷新）。
   详见 [DESIGN_v0.6.0_flavors.md](DESIGN_v0.6.0_flavors.md) §9–§11。
@@ -151,6 +153,23 @@ flavors 落地三片：
   两个 Node 门禁通过。CI **run 46152449424** 全绿（GTK4 / GTK3 legacy / Windows / arm64 /
   NSIS；Linux 冒烟 95/96，仅 `deeplink.startup` 已知环境差异；`wml.bind PASS` 实测
   `n=1 got={id,value}`）；macOS run **46152449467** x86_64 + arm64 全绿。
+
+### v0.6.2 修正：GTK4 SNI 托盘（WSL 真机验证抓出 4 个缺陷）
+
+WSL2 + Ubuntu 24.04 上跑 headless 契约探针，发现 v0.6.1 的「SNI 注册成功」是**假绿**——
+CI 只断言了日志行，没验证总线归属。四个叠加缺陷：
+
+| # | 根因 | 修复 |
+|---|---|---|
+| 1 | `g_bus_get_sync(1)`：GLib 的 `GBusType` 是 STARTER=-1 / NONE=0 / **SYSTEM=1** / **SESSION=2**，名字请求打到系统总线（被策略拒绝） | 改传 2；常量注释写明枚举序 |
+| 2 | `RequestName` 回复被丢弃 → 失败也打印「registered」 | 读回复码，非 `PRIMARY_OWNER(1)` 记错并放弃注册 |
+| 3 | `Tray.init` **按值返回**，`connect()` 把栈上 `&tray` 注册给 GDBus；返回后指针悬空（实测属性长度读到 `0xAAAA…`） | 改为 `init(self: *Tray, …)` 就地初始化，`create` 的堆指针保持稳定 |
+| 4 | 属性 GET 对未声明属性返回 null 却不设 `*error`，GDBus 断言失败 → **进程 abort**（宿主读 `XAyatanaLabel` 即触发） | 返回 null 时填 `InvalidArgs` GError |
+
+新增 `scripts/linux/dev-sni-e2e.sh`（CI GTK4 作业 `SNI tray E2E`）：会话总线名 →
+`IconName/Status/Menu` → `dbusmenu.GetLayout` → `Activate` 挂窗 toggle（实测可见窗口
+2 → 0 → 2）。**残余人工项**：图标像素由宿主绘制，开发态未安装 `zilt-app` 主题图标时
+宿主可能显示占位（`IconPixmap` 回退记 v0.6.3 候选）。
 
 ## 0. 差距分析结论
 

@@ -11,6 +11,10 @@
 规格见 [docs/WML.md](docs/WML.md)）＋ 绑定 codegen：`ZiltWmlApi` / 窗口动作联合 /
 `ZiltCommandName` / `ZiltEventName`，并修掉生成物在 `tsc --strict` 下的
 `await … as Promise<T>` 断言错误（TS2352）；runtime JS 增加 `node --check` 等价的语法门禁。
+同版本经 WSL 真机复验抓出并修复 GTK4 SNI 托盘的 4 个叠加缺陷（`GBusType` 误传 1 →
+系统总线、`RequestName` 回复未校验、`Tray.init` 按值返回导致 GDBus 悬空指针、
+未声明属性未设 GError 致宿主查询 abort），新增 `scripts/linux/dev-sni-e2e.sh`
+headless 契约探针（总线名/属性/菜单树/Activate 挂窗）接入 CI GTK4 作业。
 v0.6.1（2026-11-28，GTK4 转默认）—— L1b 收口：GTK4 五面补齐
 （自实现 D-Bus SNI 托盘 + DBusMenu、GtkPopoverMenuBar 菜单栏、`gdk_drag_begin` 拖出、
 按域 cookie 过滤删除、X11 截图回退 + 指针抓取），Linux 默认栈切到 GTK4 + WebKitGTK 6.0，

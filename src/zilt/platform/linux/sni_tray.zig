@@ -164,8 +164,13 @@ pub const Tray = struct {
     revision: u32 = 1,
     ready: bool = false,
 
-    /// 创建并注册 D-Bus 对象。失败（无总线）→ 返回仍可 close 的实例（降级）。
-    pub fn init(allocator: Allocator, opts: Options) !Tray {
+    /// 就地初始化并注册 D-Bus 对象。
+    ///
+    /// **必须**在稳定地址上调用（`create` 里 allocator.create 的堆指针）：
+    /// connect() 把 `self` 作为 GDBus vtable 的 user_data 注册，若按值返回
+    /// （v0.6.1 的写法）指针指向 init 的栈帧，返回后即悬空——宿主读属性会拿到
+    /// 0xAA 填充的垃圾长度（实测 `newString len=12297829382473034410`）。
+    pub fn init(self: *Tray, allocator: Allocator, opts: Options) !void {
         if (!gtk_compat.isGtk4()) return error.Unsupported;
         const app_id = try allocator.dupe(u8, opts.app_id);
         errdefer allocator.free(app_id);
@@ -176,7 +181,7 @@ pub const Tray = struct {
         const icon_dir = try allocator.dupe(u8, opts.icon_dir orelse "");
         errdefer allocator.free(icon_dir);
 
-        var tray = Tray{
+        self.* = .{
             .allocator = allocator,
             .app_id = app_id,
             .title = title,
@@ -187,8 +192,7 @@ pub const Tray = struct {
             .on_menu = opts.on_menu,
             .ctx = opts.ctx,
         };
-        tray.connect();
-        return tray;
+        self.connect();
     }
 
     fn freeStrings(self: *Tray) void {
@@ -288,8 +292,12 @@ pub const Tray = struct {
     // ------------------------------------------------------------------
 
     fn connect(self: *Tray) void {
-        // G_BUS_TYPE_SESSION = 1
-        const conn = c.g_bus_get_sync(1, null, null) orelse {
+        // GBusType 的枚举序是 STARTER=-1 / NONE=0 / **SYSTEM=1** / **SESSION=2**。
+        // v0.6.1 误把 1 当 session：名字请求打到系统总线（被策略拒绝），回复又
+        // 被丢弃，于是日志显示「registered」但任何宿主都看不到图标。v0.6.2 修正
+        // 并**校验 RequestName 的回复码**，避免再次静默成功。
+        const g_bus_type_session = 2;
+        const conn = c.g_bus_get_sync(g_bus_type_session, null, null) orelse {
             log.print("[tray] no session bus — SNI tray disabled", .{});
             return;
         };
@@ -302,6 +310,8 @@ pub const Tray = struct {
         // 同步占用总线名（避免异步竞态：紧接着的 watcher 注册需要它已生效）
         const name_z = dupeZ(self.allocator, name) catch return;
         defer self.allocator.free(name_z);
+        var acquired = false;
+        var err: ?*c.GError = null;
         if (c.g_variant_new("(su)", name_z.ptr, @as(c_uint, 4))) |params| {
             const reply = c.g_dbus_connection_call_sync(
                 @ptrCast(@alignCast(conn)),
@@ -314,10 +324,24 @@ pub const Tray = struct {
                 0,
                 -1,
                 null,
-                null,
+                &err,
             );
-            if (reply) |r| c.g_variant_unref(@ptrCast(@alignCast(r)));
+            if (reply) |r| {
+                // DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER = 1
+                var code: c_uint = 0;
+                c.g_variant_get(@ptrCast(@alignCast(r)), "(u)", &code);
+                c.g_variant_unref(@ptrCast(@alignCast(r)));
+                acquired = code == 1;
+                if (!acquired) log.print("[tray] RequestName('{s}') not primary (code {d}) — SNI disabled", .{ name, code });
+            } else {
+                log.print("[tray] RequestName('{s}') failed: {s}", .{
+                    name,
+                    if (err) |e| std.mem.span(e.*.message) else "unknown error",
+                });
+            }
         }
+        if (err) |e| c.g_error_free(e);
+        if (!acquired) return;
 
         const item_ctx = self.allocator.create(Ctx) catch return;
         item_ctx.* = .{ .tray = self, .kind = .item };
@@ -582,21 +606,41 @@ pub const Tray = struct {
         _: [*c]const u8,
         interface_name: [*c]const u8,
         property_name: [*c]const u8,
-        _: ?*?*c.GError,
+        error_out: ?*?*c.GError,
         user_data: ?*anyopaque,
     ) callconv(.c) ?*c.GVariant {
         const ctx: *Ctx = @ptrCast(@alignCast(user_data orelse return null));
         const iface = if (interface_name != null) std.mem.span(interface_name) else "";
         const prop = if (property_name != null) std.mem.span(property_name) else "";
-        if (std.mem.eql(u8, iface, item_iface)) return ctx.tray.itemProperty(prop);
-        if (std.mem.eql(u8, iface, menu_iface)) return ctx.tray.menuProperty(prop);
-        return null;
+        const out = if (std.mem.eql(u8, iface, item_iface))
+            ctx.tray.itemProperty(prop)
+        else if (std.mem.eql(u8, iface, menu_iface))
+            ctx.tray.menuProperty(prop)
+        else
+            null;
+        // GDBus 的硬约束：返回 null 时必须设置 *error，否则
+        // invoke_get_property_in_idle_cb 断言失败直接 abort 整个进程
+        //（宿主要求未声明的属性，如 ayatana 的 XAyatanaLabel，就会踩到）。
+        if (out == null) {
+            if (error_out) |slot| {
+                slot.* = c.g_dbus_error_new_for_dbus_error(
+                    "org.freedesktop.DBus.Error.InvalidArgs",
+                    "unknown property",
+                );
+            }
+        }
+        return out;
     }
 
     fn newString(s: []const u8) ?*c.GVariant {
-        const z = dupeZ(std.heap.c_allocator, s) catch return null;
+        const z = dupeZ(std.heap.c_allocator, s) catch {
+            log.print("[tray] newString: dupeZ failed len={d}", .{s.len});
+            return null;
+        };
         defer std.heap.c_allocator.free(z);
-        return c.g_variant_new_string(z.ptr);
+        const v: ?*c.GVariant = c.g_variant_new_string(z.ptr);
+        if (v == null) log.print("[tray] newString: g_variant_new_string null len={d}", .{s.len});
+        return v;
     }
 
     fn itemProperty(self: *Tray, prop: []const u8) ?*c.GVariant {
@@ -719,7 +763,7 @@ pub const Tray = struct {
 pub fn create(allocator: Allocator, opts: Options) ?*Tray {
     if (!gtk_compat.isGtk4()) return null;
     const t = allocator.create(Tray) catch return null;
-    t.* = Tray.init(allocator, opts) catch |err| {
+    t.init(allocator, opts) catch |err| {
         log.print("[tray] SNI init failed: {s}", .{@errorName(err)});
         allocator.destroy(t);
         return null;
