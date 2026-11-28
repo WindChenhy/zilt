@@ -117,8 +117,8 @@
 | 子项 | 工程量 | 实施路径 | 对标/出处 |
 |---|---|---|---|
 | **配置 flavors + 平台 merge-patch** | 中 | `zilt build --config <file>` JSON merge-patch（RFC 7396，数组替换不合并）；dev/beta/prod 身份分离（bundle id/名称/图标）；平台特定配置合并（`config.windows/macos/linux`）；与现有 comptime `Config` 衔接（`src/zilt/config.zig`） | Tauri configuration-files / `--config`；Zilt 无（grep 确认） |
-| 绑定 codegen 打磨 | 小-中 | 事件载荷类型化（现 `generateTs(commands, events)`，`gen_bindings.zig:25`）；错误类型联合；为 0.7 插件绑定预留扩展点；输出确定性回归 | Zilt 已领先，打磨；Tauri 社区 tauri-specta |
-| **WML 声明式 HTML 绑定（H18）** | 中 | runtime JS 扩 `wml` 属性解释器（纯前端，不依赖后端新面）；`data-zilt-*` 语义对齐；默认 opt-in | Wails WML；`ROADMAP.md:56`（原默认不排期 → 本轮排期，§6 Q4） |
+| 绑定 codegen 打磨 ✅ v0.6.2 | 小-中 | 事件载荷类型化（现 `generateTs(commands, events)`，`gen_bindings.zig:25`）；错误类型联合；为 0.7 插件绑定预留扩展点；输出确定性回归 | Zilt 已领先，打磨；Tauri 社区 tauri-specta |
+| **WML 声明式 HTML 绑定（H18）** ✅ v0.6.2 | 中 | runtime JS 扩 `wml` 属性解释器（纯前端，不依赖后端新面）；`data-zilt-*` 语义对齐；默认 opt-in | Wails WML；`ROADMAP.md:56`（原默认不排期 → 本轮排期，§6 Q4） |
 | 性能/安全加固基准 | 中 | 启动时间/内存/IPC 吞吐基准脚本 + 回归门禁；威胁模型文档 + 安全自查清单（对标 Tauri 外部审计项：iframe 加固/fs·http scope/CSP nonce）；可选外部审计（§6 Q6） | Tauri security/审计；Zilt 有 CSP（`security.zig:204`） |
 | 模板/doctor/docs | 小-中 | `create-zilt-app` 深化（`npm/create-zilt-app`）；12 模板维护 + 框架升级路径；`zilt doctor` 增强（环境/依赖/平台诊断）；能力矩阵/快速开始文档刷新 | Tauri create-tauri-app / CLI；`src/tools/cli.zig:61` |
 | 浏览器扩展（H19，**实验弹性位**） | 大（实验） | WebView2 WebExtensions COM（上游实验 API）；默认不排期，跟随上游稳定度，可弹性插队/移出 | `ROADMAP.md:57`；Tauri/wry 实验 |

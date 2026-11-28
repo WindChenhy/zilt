@@ -55,6 +55,14 @@ jobs:
       - name: Unit tests
         run: zig build test
 
+      # v0.6.2：runtime 是 ipc.zig 里的巨型字符串，语法错只在页面启动时暴露。
+      # 用 Node 按同一拼接规则还原并只做语法编译（不执行、不需要 DOM）。
+      # test-wml.mjs 把 WML 段抽出来跑最小 DOM 桩，覆盖启用/载荷/confirm/停用。
+      - name: Runtime JS syntax + WML behavior
+        run: |
+          node scripts/check-runtime-js.mjs
+          node scripts/test-wml.mjs
+
       - name: Smoke test (GUI checks)
         run: |
           # 冒烟有 5 项依赖本机 echo 服务（ws/wss/上传/断点续传）；此前 Windows
@@ -241,7 +249,7 @@ jobs:
           echo "== direct rerun: $TB =="
           "$TB" 2>&1 | tail -60 || true
 
-      - name: Smoke test (95 checks under Xvfb + openbox)
+      - name: Smoke test (96 checks under Xvfb + openbox)
         env:
           ZILT_LINUX_SMOKE: "1"
           ZILT_LINUX_SMOKE_DEEPLINK: "zilt://startup?demo=1"
@@ -264,7 +272,7 @@ jobs:
           ' || code=$?
           grep -a "\[linux-smoke\]" zilt.log | tail -2
           if [ $code -ne 0 ]; then
-            # 已知 CI 环境差异（本机 WSL 95/95；CI runner 无桌面会话/xdg-open 处理器）：
+            # 已知 CI 环境差异（本机 WSL 96/96；CI runner 无桌面会话/xdg-open 处理器）：
             # deeplink.startup —— pending_launch 未送达前端（CI 45025651776 取证：
             #   "[command-line] 1 args" 与 "[deep-link] launch" 都有，前端 got=null）
             # 只认 [linux-smoke] 汇总行括号里的 failed 列表。

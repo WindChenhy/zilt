@@ -1267,6 +1267,106 @@ const runtime_js_head =
     \\  let evalId = 1;
     \\  const builtin = (method, args) => window.zilt.invoke(method, args ?? {});
     \\  const winApi = (action, extra) => builtin('__zilt.window', Object.assign({ action }, extra ?? {}));
+    \\  // ---- v0.6.2 WML：声明式 HTML 绑定（opt-in；规格见 docs/WML.md）----
+    \\  // 语义对齐 Wails WML（wml-event / wml-window / wml-target-window / wml-openurl /
+    \\  // wml-confirm），属性名统一走框架既有的 data-zilt-* 前缀。与 Wails 的差别是
+    \\  // **委托分发**：enable() 只挂一个 document 级 click，动态插入的元素无需 reload
+    \\  //（reload 保留为 API 对齐，通常不必调用）。不做 if/for/双向绑定——那是前端框架
+    \\  // 的职责，WML 只把「点击 → 原生动作」这条样板消掉。
+    \\  const WML_SEL = '[data-zilt-event],[data-zilt-window],[data-zilt-openurl]';
+    \\  const WML_ACTIONS = {
+    \\    close: (id) => winApi('close', { window_id: id }),
+    \\    minimize: (id) => winApi('minimize', { window_id: id }),
+    \\    maximize: (id) => winApi('maximize', { window_id: id }),
+    \\    unmaximize: (id) => winApi('restore', { window_id: id }),
+    \\    restore: (id) => winApi('restore', { window_id: id }),
+    \\    toggleMaximize: (id) => winApi('toggleMaximize', { window_id: id }),
+    \\    fullscreen: (id) => winApi('fullscreen', { enabled: true, window_id: id }),
+    \\    unfullscreen: (id) => winApi('fullscreen', { enabled: false, window_id: id }),
+    \\    center: (id) => winApi('center', { window_id: id }),
+    \\    hide: (id) => winApi('hide', { window_id: id }),
+    \\    show: (id) => winApi('show', { window_id: id }),
+    \\    focus: (id) => winApi('focus', { window_id: id }),
+    \\  };
+    \\  let wmlEnabled = false;
+    \\  let wmlHandler = null;
+    \\  const wmlTarget = (el) => {
+    \\    const raw = el.getAttribute('data-zilt-target-window');
+    \\    if (raw === null || raw === '') return undefined;
+    \\    const n = Number(raw);
+    \\    return Number.isFinite(n) ? n : undefined;
+    \\  };
+    \\  const wmlDetail = (el) => ({
+    \\    id: el.id || null,
+    \\    value: typeof el.value === 'string' ? el.value : null,
+    \\    checked: typeof el.checked === 'boolean' ? el.checked : undefined,
+    \\  });
+    \\  const wmlRun = async (el) => {
+    \\    const ask = el.getAttribute('data-zilt-confirm');
+    \\    if (ask !== null) {
+    \\      const r = await window.zilt.dialog.messageBox({
+    \\        action: 'messageBox', kind: 'question', buttons: 'ok_cancel', text: ask, caption: '确认',
+    \\      }).catch(() => 'cancel');
+    \\      if (r !== 'ok' && r !== 'yes') return false;
+    \\    }
+    \\    const ev = el.getAttribute('data-zilt-event');
+    \\    if (ev) window.zilt.emit(ev, wmlDetail(el));
+    \\    const url = el.getAttribute('data-zilt-openurl');
+    \\    if (url) await window.zilt.shell.openUrl(url);
+    \\    const act = el.getAttribute('data-zilt-window');
+    \\    if (act) {
+    \\      const fn = WML_ACTIONS[act];
+    \\      if (!fn) throw new Error('unknown data-zilt-window action: ' + act);
+    \\      await fn(wmlTarget(el));
+    \\    }
+    \\    return true;
+    \\  };
+    \\  const wmlClick = (e) => {
+    \\    if (e.button !== 0 || e.defaultPrevented) return;
+    \\    const t = e.target;
+    \\    const el = t && t.closest ? t.closest(WML_SEL) : null;
+    \\    if (!el) return;
+    \\    // 链接/按钮默认行为让位给绑定；busy 标记防重复点击（confirm 是模态异步）
+    \\    e.preventDefault();
+    \\    if (el.getAttribute('data-zilt-busy') === '1') return;
+    \\    el.setAttribute('data-zilt-busy', '1');
+    \\    Promise.resolve()
+    \\      .then(() => wmlRun(el))
+    \\      .catch((err) => {
+    \\        try { console.warn('[zilt:wml]', err && err.message ? err.message : err); } catch (_) {}
+    \\      })
+    \\      .then(() => { try { el.removeAttribute('data-zilt-busy'); } catch (_) {} });
+    \\  };
+    \\  const wmlApi = {
+    \\    get enabled() { return wmlEnabled; },
+    \\    // 返回当前命中的元素数（信息性；委托分发不依赖它）
+    \\    enable: () => {
+    \\      if (wmlEnabled) return 0;
+    \\      wmlEnabled = true;
+    \\      wmlHandler = wmlClick;
+    \\      document.addEventListener('click', wmlHandler);
+    \\      try { return document.querySelectorAll(WML_SEL).length; } catch (_) { return 0; }
+    \\    },
+    \\    reload: () => {
+    \\      wmlApi.disable();
+    \\      return wmlApi.enable();
+    \\    },
+    \\    disable: () => {
+    \\      if (!wmlEnabled) return;
+    \\      wmlEnabled = false;
+    \\      try { document.removeEventListener('click', wmlHandler); } catch (_) {}
+    \\      wmlHandler = null;
+    \\    },
+    \\  };
+    \\  // opt-in 二式：<html data-zilt-wml> 在 DOM 就绪后自动启用；否则显式
+    \\  // window.zilt.wml.enable()。默认关闭——不改变既有页面的点击语义。
+    \\  try {
+    \\    const html = document.documentElement;
+    \\    if (html && html.hasAttribute('data-zilt-wml')) {
+    \\      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => wmlApi.enable(), { once: true });
+    \\      else wmlApi.enable();
+    \\    }
+    \\  } catch (_) {}
     \\  window.zilt = {
     \\    invoke: (method, args) => new Promise((resolve, reject) => {
     \\      const id = nextId++;
@@ -1295,6 +1395,8 @@ const runtime_js_head =
     \\      };
     \\    },
     \\    startDragging: () => builtin('__zilt.startDragging', {}),
+    \\    // v0.6.2 WML：声明式 HTML 绑定（opt-in）
+    \\    wml: wmlApi,
     \\    // v0.1.11: window.zilt.window
     \\    window: {
     \\      create: (opts) => {

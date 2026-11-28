@@ -6,7 +6,12 @@
 - 后端：Zig 核心（窗口、IPC、资产服务、绑定 codegen、dev 工具链）
 - WebView：系统自带引擎（Windows: WebView2 / macOS: WKWebView / Linux: WebKitGTK），不自研浏览器引擎
 
-**当前状态：v0.6.1（2026-11-28，GTK4 转默认）** —— L1b 收口：GTK4 五面补齐
+**当前状态：v0.6.2（2026-11-28，WML + codegen 类型化）** —— 声明式 HTML 绑定
+（`data-zilt-event/window/target-window/openurl/confirm`，委托 click、默认 opt-in，
+规格见 [docs/WML.md](docs/WML.md)）＋ 绑定 codegen：`ZiltWmlApi` / 窗口动作联合 /
+`ZiltCommandName` / `ZiltEventName`，并修掉生成物在 `tsc --strict` 下的
+`await … as Promise<T>` 断言错误（TS2352）；runtime JS 增加 `node --check` 等价的语法门禁。
+v0.6.1（2026-11-28，GTK4 转默认）—— L1b 收口：GTK4 五面补齐
 （自实现 D-Bus SNI 托盘 + DBusMenu、GtkPopoverMenuBar 菜单栏、`gdk_drag_begin` 拖出、
 按域 cookie 过滤删除、X11 截图回退 + 指针抓取），Linux 默认栈切到 GTK4 + WebKitGTK 6.0，
 GTK3 保留为 `-Dgtk=gtk3` legacy 一周期；打包依赖/CI/模板随变体投影。
@@ -37,7 +42,7 @@ v0.4.0（H6–H11 / H20 / L2 / L7 / L8 双平台小项收尾）。
 | 平台 | 状态 | 技术栈 |
 |---|---|---|
 | Windows | ✅ 全栈（v0.1.0–v0.6.1） | Win32 + WebView2（纯 Zig 手写 COM 绑定） |
-| Linux | ✅ 全栈（v0.2.0–v0.6.1，冒烟 95 项） | **GTK4 默认 + WebKitGTK 6.0**（v0.6.1）；GTK3 + WebKit2GTK 4.1 legacy 变体 `-Dgtk=gtk3` 一周期 |
+| Linux | ✅ 全栈（v0.2.0–v0.6.2，冒烟 96 项） | **GTK4 默认 + WebKitGTK 6.0**（v0.6.1）；GTK3 + WebKit2GTK 4.1 legacy 变体 `-Dgtk=gtk3` 一周期 |
 | macOS | ✅ 对等收口（v0.4.4–v0.5.8）：主链 + 菜单/托盘/对话框/剪贴板/通知/深链/单实例/热键 + 分发（.app/DMG/codesign/公证/Universal）+ Keychain + 更新器 + 系统信息/Shell/电源/主题 | WKWebView（手写 ObjC 消息，无 `@cImport`） |
 
 **Linux GTK4 能力面（v0.6.1 收口）**
@@ -65,7 +70,7 @@ fs（scope/watch/流式）、SQL、store（可选 DPAPI 加密）、http（WinHT
 Linux 复用同一 JS API 面，差异逐版本以「文档化」条目记录（无 SharedBuffer → evaluate 通道、无 PDF 导出 →
 `PdfNotSupported` 等）。
 
-## 能力索引（v0.6.1）
+## 能力索引（v0.6.2）
 
 > 本表聚焦 Windows / Linux（GTK4 默认）共有的 JS API 面；macOS 能力面见上表平台行与
 > v0.4.4–v0.5.8 版本记录；GTK3 legacy 与 Wayland 的差异见上方「Linux GTK4 能力面」。
@@ -75,7 +80,7 @@ Linux 复用同一 JS API 面，差异逐版本以「文档化」条目记录（
 | 窗口/多窗口 | `window.create/center/maximize/setResizable/setDecorations/destroy/list/setScreen/startDragging`、`app.quit/restart` | ✅ | ✅ |
 | WebView | `eval/reload/zoom/print/cookies/history/find/captureScreenshot/loadHTML/devtools` | ✅ | ✅ |
 | WebView 扩展 | `cdp`、`printToPdf` | ✅ | ⚠️ `cdp` 仅 `Page.captureScreenshot`；无 PDF 导出 |
-| IPC/事件 | `invoke`/`emit`/`on`、`channel`（二进制帧）、`binary.request` | ✅ | ✅（evaluate 通道） |
+| IPC/事件 | `invoke`/`emit`/`on`、`channel`（二进制帧）、`binary.request`；WML 声明式绑定（v0.6.2） | ✅ | ✅（evaluate 通道） |
 | 安全 | capability ACL + scope、运行时授权、isolation HMAC 密封、原型冻结、导航白名单 | ✅ | ✅ |
 | 数据 | `store`（DPAPI 可选）、`fs`（scope/watch/流式）、`sql`（sqlite3） | ✅ | ✅ |
 | 网络 | `http`（https/代理/multipart/流式/上传进度）、`ws`/`wss` | ✅ | ✅ |

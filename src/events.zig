@@ -81,6 +81,16 @@ pub fn secondWindowProbe(ctx: Context, payload: struct { ok: bool = false, win_i
     ctx.emitTo(1, "secondWindowProbe", payload);
 }
 
+/// v0.6.2：WML 冒烟——`data-zilt-event` 发出的载荷原样回送窗口 1。
+/// 只用于验证「点击 → emit」链路（Linux smoke.js 的 wml.bind），不是业务事件。
+pub fn wmlProbe(ctx: Context, payload: struct {
+    id: ?[]const u8 = null,
+    value: ?[]const u8 = null,
+    checked: bool = false,
+}) void {
+    ctx.emitTo(1, "wmlProbe", payload);
+}
+
 pub fn updaterFailed(_: Context, payload: struct { stage: []const u8, err: []const u8 }) void {
     zilt.log.print("[updater] failed at '{s}': {s}", .{ payload.stage, payload.err });
 }

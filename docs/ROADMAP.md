@@ -2,7 +2,7 @@
 
 > 制定日期：2026-11-20。修订：2026-11-21（Linux 专项复核：L1–L8 入图，macOS 顺延）。
 > 基线：**v0.3.19**（git 31b3109，测试体系收口）。
-> 当前：**v0.6.1**（L1b：GTK4 对等补齐并转 Linux 默认；2026-11-28）。
+> 当前：**v0.6.2**（WML 声明式绑定 + 绑定 codegen 类型化；2026-11-28，未打 tag）。
 > 上一 tag：v0.6.0 → 370cf39（CI run **46120751655** 全绿；GitHub Release 已发布 zip + setup.exe）。
 > 上一版：v0.5.11（tag v0.5.11 → a20483c，2026-11-27；CI run **46032448049** 全绿）。
 > v0.4.5–v0.4.9 是 macOS 能力面切片；v0.5.x 交付台账与收口判定见下节「版本状态」。
@@ -127,6 +127,29 @@ flavors 落地三片：
   attach 定位，双次复现）、Package job 补 NSIS PATH（choco 安装后当前 shell 未刷新）。
   详见 [DESIGN_v0.6.0_flavors.md](DESIGN_v0.6.0_flavors.md) §9–§11。
 
+### v0.6.2（2026-11-28，WML + codegen 类型化）
+
+- **WML（H18）**：runtime 新增 `zilt.wml`——`enable()/reload()/disable()/enabled`；
+  属性 `data-zilt-event` / `data-zilt-window` / `data-zilt-target-window` /
+  `data-zilt-openurl` / `data-zilt-confirm`。**委托 click**（动态 DOM 无需 reload）、
+  **默认 opt-in**（`<html data-zilt-wml>` 或显式 `enable()`）、动作名对齐 Wails
+  （`unmaximize`→`restore`，`unfullscreen`→`fullscreen(false)`），
+  `busy` 标记防重复点击；不做 if/for/双向绑定。规格：[WML.md](WML.md)。
+- **codegen**：生成 `ZiltWmlApi` / `ZiltWmlWindowAction` / `ZiltWmlEventDetail`
+  （`ZiltGlobal.wml`）、`ZiltCommandName`（字面量联合）与 `ZiltEventName`；
+  新增「声明顺序无关」确定性测试。
+- **修真实缺陷**：生成物 `return await invoke(...) as Promise<T>` 把已解包值断言成
+  Promise，`tsc --strict` 报 TS2352（全部命令命中）；改为断言到结果类型，
+  `npx tsc --noEmit --strict` 通过。
+- **runtime 门禁**：`scripts/check-runtime-js.mjs` 按同一拼接规则还原 runtime JS，
+  用 `vm.Script` 只编译不执行；`scripts/test-wml.mjs` 把 WML 段抽出跑最小 DOM 桩
+  （启用/载荷/confirm 取消/unmaximize 归一/未知动作/停用）。CI Windows 作业新增
+  `Runtime JS syntax + WML behavior` 步骤。
+- **冒烟**：Linux `wml.bind`（96 项）——`enable()` 命中数 / 点击载荷
+  （`id`+`value`）/ `disable()` 后不再触发；配 `events.zig` 的 `wmlProbe` 回环。
+- **验证**：`zig build test` 447/449（2 skip）；`zig build gen` + `tsc --strict` 0 错；
+  `node scripts/check-runtime-js.mjs` 通过。
+
 ## 0. 差距分析结论
 
 ### 0.1 已持平/领先维度（不动作）
@@ -170,7 +193,7 @@ flavors 落地三片：
 | H15 | 计划通知 | Tauri notification schedule | 双 | 小-中 | Windows：WinRT ScheduledToastNotification（动态加载 RoGetActivationFactory，失败降级进程内 timer）；Linux：GNotification 无调度 → 进程内 timer（语义弱，文档化） |
 | H16 | reparent | Tauri unstable set_parent/reparent | 双 | 中 | `window.reparent(id)`：Win SetParent + style/owner 调整；GTK 容器重挂（gtk_widget_reparent deprecated 但可用） |
 | H17 | 拖出常驻 drag source（opt-in） | —（反转 v0.1.12「不做常驻」决策，默认仍关） | 双 | 小-中 | `window.create({dragSource:true})`：Win 常驻 IDropSource 注册；GTK 常驻 drag source——默认关，保持不抢文本选择 |
-| H18 | WML 声明式 HTML 绑定 | Wails WML | 双 | 中（可选） | runtime JS 扩展 wml 属性解释器（纯前端，不依赖后端新面）；**默认不排期**（弹性位） |
+| H18 | WML 声明式 HTML 绑定 ✅ v0.6.2 | Wails WML | 双 | 中（可选） | runtime JS 扩展 wml 属性解释器（纯前端，不依赖后端新面）；**默认 opt-in**；规格 [WML.md](WML.md) |
 | H19 | 浏览器扩展加载 | Tauri/wry WebExtensions（实验） | Win | 大（实验） | WebView2 WebExtensions COM 面（上游实验 API，随 Runtime 演进）；**实验位，默认不排期** |
 | H20 | 深链/CLI 参数解析面 | Tauri cli 插件 | 双 | 小 | 第二实例/首启参数统一解析：子命令+flag 语法，`deepLink` 事件载荷增 `parsed` 字段（现只有原始串分类） |
 | H21 | WinHTTP 等响应头看门狗 | —（v0.1.20 已知限制自愈） | Win | 小-中 | 「已建连未回响应头」超时：watchdog 线程 + WinHttpCloseHandle 中止（flags 实测无效的自愈路径）；Linux libsoup 已有超时面，对齐语义 |
@@ -650,7 +673,7 @@ DMG 挂载安装；更新器端到端（旧版→新版）；Keychain 单测。
 
 ### v0.5+ — 弹性/实验位（已分配）
 
-- **H18** WML（可选，默认不排期）→ 已排入 **v0.6**（DESIGN §2.2）
+- **H18** WML（可选，默认不排期）→ 已排入 **v0.6**（DESIGN §2.2）→ ✅ v0.6.2 落地（[WML.md](WML.md)）
 - **H19** 浏览器扩展（实验，跟随上游 WebView2 API 稳定度）→ v0.6 弹性位
 - **H2** 移动端立项调研（Phase 5 开题，不实施）→ 移出 0.5–0.7，留 1.x
 

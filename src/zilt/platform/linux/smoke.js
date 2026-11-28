@@ -1442,6 +1442,37 @@ function runSecondWindowProbe() {
     check('secret', got === 'keyring-value', `got=${got} marker=${marker}（无 keyring → 明文降级，也算 PASS）`);
   } catch (e) { check('secret', false, String(e.message || e)); }
 
+  // ---- v0.6.2：WML 声明式绑定（opt-in / 委托 click / 载荷 / 停用）----
+  try {
+    const host = document.createElement('div');
+    host.innerHTML =
+      '<button id="wml-probe" data-zilt-event="wmlProbe" data-zilt-window="center">wml</button>';
+    document.body.appendChild(host);
+    const btn = host.querySelector('#wml-probe');
+    btn.value = 'probe-value';
+    let got = null;
+    const off = Z().on('wmlProbe', (p) => { got = p; });
+    const n = Z().wml.enable();
+    const on = Z().wml.enabled === true;
+    btn.click();
+    for (let t = 0; t < 30 && !got; t++) await wait(50);
+    Z().wml.disable();
+    const offOk = Z().wml.enabled === false;
+    // 停用后同一元素不应再触发（监听已摘）
+    let after = null;
+    const off2 = Z().on('wmlProbe', (p) => { after = p; });
+    btn.click();
+    await wait(150);
+    off2();
+    off();
+    host.remove();
+    check(
+      'wml.bind',
+      on && offOk && n >= 1 && !!got && got.id === 'wml-probe' && got.value === 'probe-value' && !after,
+      `n=${n} on=${on} off=${offOk} got=${JSON.stringify(got)} after=${JSON.stringify(after)}`,
+    );
+  } catch (e) { check('wml.bind', false, String(e.message || e)); }
+
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   try {
     await Z().invoke('__zilt.linuxSmoke', {

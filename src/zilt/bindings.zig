@@ -41,6 +41,39 @@ pub fn generateTs(comptime Commands: type, comptime Events: type) []const u8 {
             \\  return "UnknownError";
             \\}
             \\
+            \\// ---- v0.6.2 WML：声明式 HTML 绑定（opt-in；规格见 docs/WML.md）----
+            \\// 属性值 → 窗口动作。`unmaximize` 归一到 restore，`unfullscreen` 归一到
+            \\// fullscreen(false)，与 Wails WML 的动作名对齐而不用重复枚举。
+            \\export type ZiltWmlWindowAction =
+            \\  | "close"
+            \\  | "minimize"
+            \\  | "maximize"
+            \\  | "unmaximize"
+            \\  | "restore"
+            \\  | "toggleMaximize"
+            \\  | "fullscreen"
+            \\  | "unfullscreen"
+            \\  | "center"
+            \\  | "hide"
+            \\  | "show"
+            \\  | "focus";
+            \\
+            \\// data-zilt-event 发出的载荷（checked 仅表单控件存在）
+            \\export interface ZiltWmlEventDetail {
+            \\  id: string | null;
+            \\  value: string | null;
+            \\  checked?: boolean;
+            \\}
+            \\
+            \\export interface ZiltWmlApi {
+            \\  readonly enabled: boolean;
+            \\  /** 挂载委托监听；返回当前命中 data-zilt-* 触发器的元素数（重复调用返回 0） */
+            \\  enable(): number;
+            \\  /** API 对齐 Wails WML；委托分发下通常不需要，动态 DOM 也会自动命中 */
+            \\  reload(): number;
+            \\  disable(): void;
+            \\}
+            \\
             \\export interface ZiltGlobal {
             \\  invoke<K extends keyof ZiltCommandMap>(method: K, args?: ZiltCommandMap[K]["args"]): Promise<ZiltCommandMap[K]["result"]>;
             \\  invoke(method: string, args?: unknown): Promise<unknown>;
@@ -49,6 +82,7 @@ pub fn generateTs(comptime Commands: type, comptime Events: type) []const u8 {
             \\  on<K extends keyof ZiltEventPayloads>(name: K, cb: (payload: ZiltEventPayloads[K]) => void): void;
             \\  on(name: string, cb: (payload: any) => void): void;
             \\  version: string;
+            \\  wml: ZiltWmlApi;
             \\}
             \\
             \\declare global {
@@ -77,7 +111,18 @@ pub fn generateTs(comptime Commands: type, comptime Events: type) []const u8 {
         }
         out = out ++ "}\n\n";
 
-        // ---- 命令函数 ----
+        // v0.6.2：命令名字面量联合——泛型工具（路由表、日志、插件注册）不用再
+        // 从 keyof ZiltCommandMap 反推，且顺序稳定（与映射表同源排序）。
+        out = out ++ "export type ZiltCommandName =";
+        if (cmds.len == 0) {
+            out = out ++ " never;\n\n";
+        } else {
+            out = out ++ "\n";
+            for (cmds) |m| {
+                out = out ++ "  | \"" ++ m.name ++ "\"\n";
+            }
+            out = out ++ ";\n\n";
+        }
         // v0.3.8 C3：参数名保留——args 结构体的字段升级为 TS 形参
         // （`greet(name: string)` 而非 `greet(args: { name: string })`），
         // 调用侧 `invoke("greet", { name })`。无参数命令直接 `ping()`。
@@ -102,7 +147,7 @@ pub fn generateTs(comptime Commands: type, comptime Events: type) []const u8 {
             if (m.result == void) {
                 out = out ++ "    await window.zilt.invoke(\"" ++ m.name ++ "\", " ++ call ++ ");\n";
             } else {
-                out = out ++ "    return await window.zilt.invoke(\"" ++ m.name ++ "\", " ++ call ++ ") as Promise<" ++ ret_t ++ ">;\n";
+                out = out ++ "    return await window.zilt.invoke(\"" ++ m.name ++ "\", " ++ call ++ ") as " ++ ret_t ++ ";\n";
             }
             out = out ++ "  } catch (e) {\n";
             out = out ++ "    throw new ZiltCommandError<ZiltCommandErrors[\"" ++ m.name ++ "\"]>(\"" ++ m.name ++
@@ -141,6 +186,8 @@ pub fn generateTs(comptime Commands: type, comptime Events: type) []const u8 {
         out = out ++ "  \"__reload\": null,\n";
         out = out ++ "}\n\n";
         out = out ++ "export type ZiltEventPayloads = ZiltEventMap & Omit<ZiltBuiltinEventMap, keyof ZiltEventMap>;\n\n";
+        // v0.6.2：事件名联合（含内置事件；用户事件优先的同一套 Omit 规则）
+        out = out ++ "export type ZiltEventName = keyof ZiltEventPayloads;\n\n";
         out = out ++
             \\export function onEvent<K extends keyof ZiltEventPayloads>(
             \\  name: K,
@@ -446,7 +493,7 @@ test "v0.3.8 C3: generateTs 命名参数形态 + 事件表" {
 
     // 单必填参数 → 命名形参（v0.3.8 C3：参数名保留）
     try testing.expect(std.mem.indexOf(u8, ts, "export async function greet(name: string): Promise<{ message: string; length: number }> {") != null);
-    try testing.expect(std.mem.indexOf(u8, ts, "window.zilt.invoke(\"greet\", { name }) as Promise<{ message: string; length: number }>;") != null);
+    try testing.expect(std.mem.indexOf(u8, ts, "window.zilt.invoke(\"greet\", { name }) as { message: string; length: number };") != null);
     // 无参数命令 → 零形参
     try testing.expect(std.mem.indexOf(u8, ts, "export async function ping(): Promise<void> {") != null);
     try testing.expect(std.mem.indexOf(u8, ts, "window.zilt.invoke(\"ping\", {});") != null);
@@ -501,7 +548,7 @@ test "v0.3.8 C3: 命名形态边界（可选全在尾部 / jsonName 映射 / 空
     };
     const ts3 = comptime generateTs(Empty, struct {});
     try testing.expect(std.mem.indexOf(u8, ts3, "pingEmpty(): Promise<number>") != null);
-    try testing.expect(std.mem.indexOf(u8, ts3, "invoke(\"pingEmpty\", {}) as Promise<number>;") != null);
+    try testing.expect(std.mem.indexOf(u8, ts3, "invoke(\"pingEmpty\", {}) as number;") != null);
 }
 
 test "v0.3.8 C3: 非法标识符/必填跟在可选后 → 回退对象形态" {
@@ -557,4 +604,36 @@ test "v0.6.0 codegen: 错误联合 / 命令映射 / 事件扩展点 / 输出排�
     const aa = std.mem.indexOf(u8, ts, "\"aa\": { a: number }").?;
     const zz = std.mem.indexOf(u8, ts, "\"zz\": { z: number }").?;
     try testing.expect(aa < zz);
+}
+
+test "v0.6.2: WML 类型 + 命令/事件名联合" {
+    const ts = comptime generateTs(SampleCommands, SampleEvents);
+
+    // WML：窗口动作联合、事件载荷、API 面
+    try testing.expect(std.mem.indexOf(u8, ts, "export type ZiltWmlWindowAction =") != null);
+    try testing.expect(std.mem.indexOf(u8, ts, "| \"unmaximize\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ts, "| \"unfullscreen\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ts, "export interface ZiltWmlEventDetail {") != null);
+    try testing.expect(std.mem.indexOf(u8, ts, "export interface ZiltWmlApi {") != null);
+    try testing.expect(std.mem.indexOf(u8, ts, "  wml: ZiltWmlApi;") != null);
+
+    // 命令名联合：排序后逐项（"greet" < "ping" < "query"）
+    try testing.expect(std.mem.indexOf(u8, ts, "export type ZiltCommandName =\n  | \"greet\"\n  | \"ping\"\n  | \"query\"\n;") != null);
+    // 事件名联合走 keyof（含内置事件，避免重复枚举）
+    try testing.expect(std.mem.indexOf(u8, ts, "export type ZiltEventName = keyof ZiltEventPayloads;") != null);
+    // v0.6.2：`await invoke(...)` 已解包，不能再断言成 Promise<T>（strict 下 TS2352）
+    try testing.expect(std.mem.indexOf(u8, ts, "as Promise<") == null);
+}
+
+test "v0.6.2: 生成物与声明顺序无关（确定性）" {
+    const OrderA = struct {
+        pub fn alpha(_: ipc.Context) !void {}
+        pub fn beta(_: ipc.Context) !void {}
+    };
+    const OrderB = struct {
+        pub fn beta(_: ipc.Context) !void {}
+        pub fn alpha(_: ipc.Context) !void {}
+    };
+    // 同一组命令、不同 decl 顺序 → 逐字节相同（缓存/产物 diff 不因重排而抖）
+    try testing.expectEqualStrings(comptime generateTs(OrderA, struct {}), comptime generateTs(OrderB, struct {}));
 }
