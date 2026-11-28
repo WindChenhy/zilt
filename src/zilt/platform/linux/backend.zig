@@ -2822,7 +2822,6 @@ fn Backend(comptime config: Config) type {
                         // GDK4 无 gdk_seat_grab；X11 直连在无真实按键序列的合成
                         // 场景会与 begin_move_drag 的隐式抓取冲突 → 明确降级
                         //（真实桌面需要指针抓取的场景少；文档化，caps 仍按 GTK3）。
-                        _ = grab;
                         log.print("[window] cursor grab unsupported under GTK4", .{});
                         return false;
                     }
