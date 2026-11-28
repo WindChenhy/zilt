@@ -322,7 +322,8 @@ jobs:
           ZILT_INIT_TEMPLATE=vanilla ZILT_INIT_NAME=ci-probe ZILT_INIT_DEST=/tmp/zilt-init-e2e zig build init
           cd /tmp/zilt-init-e2e
           zig build
-          test -x zig-out/bin/zilt-app
+          # v0.6.0：产物名跟随 template project.zig 的 exe_name（"app.exe" → app）
+          test -x zig-out/bin/app
 
       - name: Packaging (deb / AppDir / squashfs / flatpak / rpm spec)
         run: |
