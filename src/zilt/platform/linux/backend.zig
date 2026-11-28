@@ -3383,7 +3383,7 @@ fn Backend(comptime config: Config) type {
                     // 顶层叶子：包成单子项子菜单（PopoverMenuBar 顶层只收子菜单）
                     self.appendGtk4Leaf(sub, item, st, group, &next_action);
                 }
-                c.g_menu_append_submenu(menu, label_z.ptr, @ptrCast(sub));
+                c.g_menu_append_submenu(menu, label_z.ptr, @ptrCast(@alignCast(sub)));
                 c.g_object_unref(@ptrCast(sub)); // append_submenu 持有引用
             }
 
@@ -3412,7 +3412,7 @@ fn Backend(comptime config: Config) type {
             for (items) |item| {
                 if (std.mem.eql(u8, item.label, "-")) {
                     if (section_items > 0) {
-                        c.g_menu_append_section(menu, null, @ptrCast(section));
+                        c.g_menu_append_section(menu, null, @ptrCast(@alignCast(section)));
                         c.g_object_unref(@ptrCast(section));
                         section = c.g_menu_new() orelse return;
                         section_items = 0;
@@ -3424,7 +3424,7 @@ fn Backend(comptime config: Config) type {
                 if (item.items) |sub_items| {
                     const sub = c.g_menu_new() orelse continue;
                     self.appendGtk4MenuItems(sub, sub_items, st, group, next_action);
-                    c.g_menu_append_submenu(section, label_z.ptr, @ptrCast(sub));
+                    c.g_menu_append_submenu(section, label_z.ptr, @ptrCast(@alignCast(sub)));
                     c.g_object_unref(@ptrCast(sub));
                 } else {
                     self.appendGtk4Leaf(section, item, st, group, next_action);
@@ -3432,7 +3432,7 @@ fn Backend(comptime config: Config) type {
                 section_items += 1;
             }
             if (section_items > 0) {
-                c.g_menu_append_section(menu, null, @ptrCast(section));
+                c.g_menu_append_section(menu, null, @ptrCast(@alignCast(section)));
                 c.g_object_unref(@ptrCast(section));
             } else {
                 c.g_object_unref(@ptrCast(section));
