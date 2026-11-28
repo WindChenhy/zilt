@@ -292,8 +292,18 @@ jobs:
         run: echo "SNI tray needs a desktop StatusNotifierWatcher; covered by manual verification (GTK3 XEmbed path runs in linux-gtk3)"
 
       # v0.4.3 L3：AppImage 自包含（WebKit 随包；bwrap/docker 无宿主 WebKit 验证）
+      # 脚本约定：0 PASS / 1 FAIL / 3 SKIP（缺 docker 镜像且 bwrap 不可用——
+      # Ubuntu 24.04 runner 限制非特权 userns，bwrap 无法建命名空间）。
       - name: AppImage self-contained E2E (no host WebKit)
-        run: bash scripts/linux/dev-appimage-e2e.sh
+        run: |
+          set +e
+          bash scripts/linux/dev-appimage-e2e.sh
+          code=$?
+          if [ $code -eq 3 ]; then
+            echo "::warning::AppImage sandbox E2E skipped (docker image / bwrap unavailable on runner)"
+            exit 0
+          fi
+          exit $code
 
       - name: Differential update E2E (patch + rollback/health)
         run: bash scripts/linux/dev-update-e2e.sh
