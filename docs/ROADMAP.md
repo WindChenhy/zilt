@@ -2,7 +2,8 @@
 
 > 制定日期：2026-11-20。修订：2026-11-21（Linux 专项复核：L1–L8 入图，macOS 顺延）。
 > 基线：**v0.3.19**（git 31b3109，测试体系收口）。
-> 当前：**v0.6.2**（WML 声明式绑定 + 绑定 codegen 类型化；2026-11-28，未打 tag）。
+> 当前：**v0.6.2**（WML + codegen 类型化 + GTK4 SNI 托盘修复；tag v0.6.2 → c9f6908，GitHub Release 已发布 `Zilt-0.6.2-x64-setup.exe` + `Zilt-0.6.2-x64.zip`）。
+> v0.6.1：tag → b1aea06；**Release 已撤下**（GTK4 SNI 托盘 4 缺陷，Linux 产物请用 0.6.2），tag 仅作历史标记。
 > 上一 tag：v0.6.0 → 370cf39（CI run **46120751655** 全绿；GitHub Release 已发布 zip + setup.exe）。
 > 上一版：v0.5.11（tag v0.5.11 → a20483c，2026-11-27；CI run **46032448049** 全绿）。
 > v0.4.5–v0.4.9 是 macOS 能力面切片；v0.5.x 交付台账与收口判定见下节「版本状态」。
@@ -172,8 +173,11 @@ CI 只断言了日志行，没验证总线归属。四个叠加缺陷：
 （用应用日志的 `hidden/shown` 断言，避免冒烟套件建窗干扰）。
 
 **视觉验证（WSLg / Xvfb + snixembed + stalonetray）**：宿主按 `IconPixmap` 画出
-蓝底白 Z 图标；截图存证于本地验证记录。真实 GNOME（AppIndicator 扩展）/ KDE 面板
+蓝底白 Z 图标（截图存证于本地验证记录）。真实 GNOME（AppIndicator 扩展）/ KDE 面板
 的观感（HiDPI、主题底色）仍建议在目标发行版上人工确认一次。
+
+**发版（2026-11-28）**：tag `v0.6.2` → `c9f6908`，Release 已发布（Windows setup + zip）。
+v0.6.1 的 tag 指向 `b1aea06`（交付原状），其自动 Release 已撤下，避免分发托盘不可用的 Linux 包。
 
 ## 0. 差距分析结论
 
