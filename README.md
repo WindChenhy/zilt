@@ -716,7 +716,7 @@ capabilities）、`window` 默认值。`app_id` 同时决定数据目录、单�
 ```sh
 zig build gen      # 生成前端 TS 绑定（frontend/bindings/zilt.ts）
 zig build run      # 启动示例应用（embedded 模式）
-zig build test    # 单元测试：Windows 444 项（442 通过 + 2 skip）；Linux 计数以 CI 为准
+zig build test    # 单元测试：Windows 445 项（443 通过 + 2 skip）；Linux 计数以 CI 为准
                   # 覆盖：IPC/绑定 codegen/更新器与差分补丁/打包（NSIS/WiX/MSIX/deb/AppImage）/
                   # ACL 与 isolation/fs/store/SQL/http/ws/托盘与任务栏/对话框/深链/单实例密封/
                   # 图标与 PNG 编解码/窗口模型/WebView2 ABI/加速键/系统信息/自启/flavors...

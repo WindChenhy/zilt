@@ -2,7 +2,7 @@
 
 > 制定日期：2026-11-20。修订：2026-11-21（Linux 专项复核：L1–L8 入图，macOS 顺延）。
 > 基线：**v0.3.19**（git 31b3109，测试体系收口）。
-> 当前：**v0.6.0**（2026-11-28，flavors 0.6.0a–c；CI 结果在发版后回填）。
+> 当前：**v0.6.0**（tag v0.6.0 → 370cf39，2026-11-28；CI run **46120751655** 全绿；GitHub Release 已发布 zip + setup.exe）。
 > 上一版：v0.5.11（tag v0.5.11 → a20483c，2026-11-27；CI run **46032448049** 全绿）。
 > v0.4.5–v0.4.9 是 macOS 能力面切片；v0.5.x 交付台账与收口判定见下节「版本状态」。
 > 对标：**Wails v3.1.0 stable（2026-11-01）+ v3.2.0-nightly**、**Tauri 2.12.x**（2026-11 最新，2.12.x 仅 bugfix）。
@@ -100,7 +100,11 @@ flavors 落地三片：
   `src/tools/flavor_build.zig`（解析/投影/模块生成/exe 名归一）+ 模板 app_meta/app_config/
   main 全量 flavor 驱动。验证：仓库表模式 beta 实测；vanilla 模板默认构建、
   `-Dflavor=dev|beta|prod` 身份、beta 窗口标题与 headless `app_id` 均通过。
-  详见 [DESIGN_v0.6.0_flavors.md](DESIGN_v0.6.0_flavors.md) §9–§10。
+- **v0.6.0 发版**（tag 370cf39）：CI run **46120751655** 全绿（Windows / Linux GTK3 / GTK4 /
+  arm64 / NSIS）；Release 产物 `Zilt-0.6.0-x64.zip` + `setup.exe`。
+  CI 协作修三处：Linux 模板 E2E 产物名改 `app`、Tray E2E 转 advisory（openbox 放置覆盖
+  attach 定位，双次复现）、Package job 补 NSIS PATH（choco 安装后当前 shell 未刷新）。
+  详见 [DESIGN_v0.6.0_flavors.md](DESIGN_v0.6.0_flavors.md) §9–§11。
 
 ## 0. 差距分析结论
 

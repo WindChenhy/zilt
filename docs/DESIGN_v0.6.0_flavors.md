@@ -222,3 +222,33 @@ pub const Identity = struct { app_name: []u8, app_id: []u8, ... };
 - `flavors` 表不生成磁盘 `zilt.<name>.json`（表模式在 build 期直接投影；如需落盘导出，
   后续可加 `zilt flavors export`）。
 - CSP 嵌套对象之外的深层数组元素级合并不做（保持 RFC 7396 数组整体替换）。
+
+## 11. v0.6.x 绑定 codegen 打磨（2026-11-28）
+
+**已落地**
+
+- **错误类型联合**：`ipc.Meta` 保留 `error_type`（commandMetas 剥 error union 时同步记录）；
+  生成 `ZiltCommandErrors`（显式 error set → 字符串联合，anyerror → `string`，无错误 → `never`，
+  错误名排序保证确定性）。
+- **类型化错误**：生成 `ZiltCommandError<Code>`（`command` / `code` 字段）；所有命令函数统一
+  `try/catch`，把 Zig 错误名包成该类型后重新抛出。
+- **命令映射**：生成 `ZiltCommandMap`（args/result/error）与 `window.zilt.invoke` 的泛型重载
+  （保留 `string` 兜底）；事件生成 `ZiltEventMap` + `ZiltBuiltinEventMap`，`ZiltEventPayloads`
+  为二者交集（`Omit` 保证用户事件优先）。
+- **0.7 插件扩展点**：`ZiltCommandMap` / `ZiltEventMap` 均为导出 interface，插件可
+  `declare module` 合并；`ZiltGlobal.invoke/emit/on` 同步获得泛型重载。
+- **输出确定性**：命令/事件按名字排序（与 decl 顺序解耦）；错误名也排序。
+- **验证**：`zig build gen` 生成 21KB 绑定；新增单测覆盖错误联合、命令/事件映射、扩展点与排序；
+  `zig build test` **445/447（2 skip）** 全绿。
+
+**说明**：生成文件位于 `frontend/bindings/zilt.ts`（gitignored，`zig build gen` 刷新）；
+模板 TS 工程直接消费同一份输出。
+
+## 12. v0.6.0 发版记录
+
+- tag：`v0.6.0` → `370cf39`；CI run **46120751655** 全绿（Windows / Linux GTK3 / GTK4 /
+  arm64 / NSIS）。
+- Release：<https://github.com/WindChenhy/zilt/releases/tag/v0.6.0>（zip + setup.exe）。
+- 发版期间 CI 修复：Linux 模板 E2E 产物名 `app`（exe_name 跟随身份）、Tray attach E2E 转
+  advisory（openbox 放置覆盖 attach 定位，双次重试仍复现）、Package job 补 NSIS PATH
+  （choco 安装后当前 shell PATH 未刷新，导致首个 release 缺 setup.exe，已本地补传）。

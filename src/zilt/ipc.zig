@@ -889,7 +889,9 @@ pub const ContextType = Context;
 pub const Meta = struct {
     name: []const u8,
     args: ?type, // null = 无参数
-    result: type, // void 表示无返回
+    result: type, // void 表示无返回（已剥掉 error union）
+    /// v0.6.0：原始返回的错误集（null = 非 error union；anyerror 保持 anyerror）
+    error_type: ?type = null,
 };
 
 fn fnMeta(comptime f: anytype) Meta {
@@ -927,8 +929,12 @@ pub fn commandMetas(comptime Commands: type) []const Meta {
         if (comptime !isCommandFn(f)) continue;
         var m = fnMeta(f);
         m.name = name;
-        // 剥掉 error union：result 存 payload 类型
+        // 剥掉 error union：result 存 payload 类型；error_type 保留错误集供绑定生成
         const r = m.result;
+        m.error_type = switch (@typeInfo(r)) {
+            .error_union => |eu| eu.error_set,
+            else => null,
+        };
         m.result = switch (@typeInfo(r)) {
             .error_union => |eu| eu.payload,
             else => r,

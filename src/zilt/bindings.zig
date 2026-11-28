@@ -16,14 +16,37 @@ const ipc = @import("ipc.zig");
 /// 生成 TS 绑定源码（comptime 字符串）。
 pub fn generateTs(comptime Commands: type, comptime Events: type) []const u8 {
     comptime {
+        @setEvalBranchQuota(100000);
         var out: []const u8 = "";
         out = out ++
             \\// 由 Zilt 自动生成（Zig comptime 反射）—— DO NOT EDIT.
             \\// 重新生成：zig build gen
             \\
+            \\export type ZiltErrorCode = string;
+            \\
+            \\export class ZiltCommandError<Code extends ZiltErrorCode = ZiltErrorCode> extends Error {
+            \\  readonly command: string;
+            \\  readonly code: Code;
+            \\  constructor(command: string, code: Code) {
+            \\    super(`${command}: ${code}`);
+            \\    this.name = "ZiltCommandError";
+            \\    this.command = command;
+            \\    this.code = code;
+            \\  }
+            \\}
+            \\
+            \\function __ziltErrorCode(e: unknown): ZiltErrorCode {
+            \\  if (e instanceof Error) return e.message || "UnknownError";
+            \\  if (typeof e === "string") return e;
+            \\  return "UnknownError";
+            \\}
+            \\
             \\export interface ZiltGlobal {
+            \\  invoke<K extends keyof ZiltCommandMap>(method: K, args?: ZiltCommandMap[K]["args"]): Promise<ZiltCommandMap[K]["result"]>;
             \\  invoke(method: string, args?: unknown): Promise<unknown>;
+            \\  emit<K extends keyof ZiltEventPayloads>(name: K, payload: ZiltEventPayloads[K]): void;
             \\  emit(name: string, payload?: unknown): void;
+            \\  on<K extends keyof ZiltEventPayloads>(name: K, cb: (payload: ZiltEventPayloads[K]) => void): void;
             \\  on(name: string, cb: (payload: any) => void): void;
             \\  version: string;
             \\}
@@ -35,47 +58,66 @@ pub fn generateTs(comptime Commands: type, comptime Events: type) []const u8 {
             \\
         ;
 
+        // ---- 错误类型联合 + 命令映射（v0.6.0 d 打磨）----
+        // 命令错误集可由 Zig error set 反射（anyerror → string）；映射表同时是
+        // 0.7 插件绑定的扩展点（declare module 合并）。
+        const cmds = sortedCommandMetas(Commands);
+        out = out ++ "export type ZiltCommandErrors = {\n";
+        for (cmds) |m| {
+            out = out ++ "  \"" ++ m.name ++ "\": " ++ errorTs(m.error_type) ++ ",\n";
+        }
+        out = out ++ "};\n\n";
+
+        out = out ++ "export interface ZiltCommandMap {\n";
+        for (cmds) |m| {
+            const args_t = if (m.args) |A| tsType(A) else "void";
+            const ret_t = if (m.result == void) "void" else tsType(m.result);
+            out = out ++ "  \"" ++ m.name ++ "\": { args: " ++ args_t ++ "; result: " ++ ret_t ++
+                "; error: ZiltCommandErrors[\"" ++ m.name ++ "\"] };\n";
+        }
+        out = out ++ "}\n\n";
+
         // ---- 命令函数 ----
         // v0.3.8 C3：参数名保留——args 结构体的字段升级为 TS 形参
         // （`greet(name: string)` 而非 `greet(args: { name: string })`），
         // 调用侧 `invoke("greet", { name })`。无参数命令直接 `ping()`。
         // 不满足命名形态（非 struct / 可选字段出现在必填字段之前 / TS 属性名
         // 非法标识符）的命令保留 v0.1.3 的 args 对象形态。
-        for (ipc.commandMetas(Commands)) |m| {
+        // v0.6.0：统一 try/catch，把 Zig 错误名包成 ZiltCommandError。
+        for (cmds) |m| {
             const ret_t = if (m.result == void) "void" else tsType(m.result);
-            if (m.args == null) {
-                // v0.3.8 C3：无参数命令 → 零形参
-                out = out ++ "export async function " ++ m.name ++ "(): Promise<" ++ ret_t ++ "> {\n";
-                if (m.result == void) {
-                    out = out ++ "  await window.zilt.invoke(\"" ++ m.name ++ "\", {});\n}\n\n";
-                } else {
-                    out = out ++ "  return window.zilt.invoke(\"" ++ m.name ++ "\", {}) as Promise<" ++ ret_t ++ ">;\n}\n\n";
+            const params = if (m.args) |A| blk: {
+                if (paramSig(A)) |ps| break :blk ps.params;
+                break :blk "args: " ++ tsType(A);
+            } else "";
+            const call = if (m.args) |A| blk: {
+                if (paramSig(A)) |ps| {
+                    break :blk if (ps.call_args.len == 0) "{}" else "{ " ++ ps.call_args ++ " }";
                 }
-            } else if (paramSig(m.args)) |ps| {
-                const call = if (ps.call_args.len == 0) "{}" else "{ " ++ ps.call_args ++ " }";
-                out = out ++ "export async function " ++ m.name ++ "(" ++ ps.params ++ "): Promise<" ++ ret_t ++ "> {\n";
-                if (m.result == void) {
-                    out = out ++ "  await window.zilt.invoke(\"" ++ m.name ++ "\", " ++ call ++ ");\n}\n\n";
-                } else {
-                    out = out ++ "  return window.zilt.invoke(\"" ++ m.name ++ "\", " ++ call ++ ") as Promise<" ++ ret_t ++ ">;\n}\n\n";
-                }
+                break :blk "args ?? {}";
+            } else "{}";
+
+            out = out ++ "export async function " ++ m.name ++ "(" ++ params ++ "): Promise<" ++ ret_t ++ "> {\n";
+            out = out ++ "  try {\n";
+            if (m.result == void) {
+                out = out ++ "    await window.zilt.invoke(\"" ++ m.name ++ "\", " ++ call ++ ");\n";
             } else {
-                const args_t = if (m.args) |A| tsType(A) else "void";
-                out = out ++ "export async function " ++ m.name ++ "(args: " ++ args_t ++ "): Promise<" ++ ret_t ++ "> {\n";
-                if (m.result == void) {
-                    out = out ++ "  await window.zilt.invoke(\"" ++ m.name ++ "\", args ?? {});\n}\n\n";
-                } else {
-                    out = out ++ "  return window.zilt.invoke(\"" ++ m.name ++ "\", args ?? {}) as Promise<" ++ ret_t ++ ">;\n}\n\n";
-                }
+                out = out ++ "    return await window.zilt.invoke(\"" ++ m.name ++ "\", " ++ call ++ ") as Promise<" ++ ret_t ++ ">;\n";
             }
+            out = out ++ "  } catch (e) {\n";
+            out = out ++ "    throw new ZiltCommandError<ZiltCommandErrors[\"" ++ m.name ++ "\"]>(\"" ++ m.name ++
+                "\", __ziltErrorCode(e) as ZiltCommandErrors[\"" ++ m.name ++ "\"]);\n";
+            out = out ++ "  }\n}\n\n";
         }
 
-        // ---- 事件类型表 ----
-        out = out ++ "export type ZiltEventPayloads = {\n";
-        for (eventMetas(Events)) |e| {
+        // ---- 事件类型表（扩展点：declare module 合并 ZiltEventMap）----
+        out = out ++ "export interface ZiltEventMap {\n";
+        for (sortedEventMetas(Events)) |e| {
             const p_t = if (e.payload) |P| tsType(P) else "null";
             out = out ++ "  \"" ++ e.name ++ "\": " ++ p_t ++ ",\n";
         }
+        out = out ++ "}\n\n";
+        out = out ++ "export interface ZiltBuiltinEventMap {\n";
         // 框架内置事件（v0.1.6）：与用户事件同名时以用户定义为准
         const builtins = [_]struct { name: []const u8, ts: []const u8 }{
             .{ .name = "menu", .ts = "{ id: string }" },
@@ -97,9 +139,9 @@ pub fn generateTs(comptime Commands: type, comptime Events: type) []const u8 {
             out = out ++ "  \"" ++ b.name ++ "\": " ++ b.ts ++ ",\n";
         }
         out = out ++ "  \"__reload\": null,\n";
+        out = out ++ "}\n\n";
+        out = out ++ "export type ZiltEventPayloads = ZiltEventMap & Omit<ZiltBuiltinEventMap, keyof ZiltEventMap>;\n\n";
         out = out ++
-            \\};
-            \\
             \\export function onEvent<K extends keyof ZiltEventPayloads>(
             \\  name: K,
             \\  cb: (payload: ZiltEventPayloads[K]) => void,
@@ -150,6 +192,73 @@ fn hasEvent(comptime Events: type, comptime name: []const u8) bool {
             if (std.mem.eql(u8, decl, name)) return true;
         }
         return false;
+    }
+}
+
+/// v0.6.0：命令按名字排序——生成物与 decl 顺序解耦，输出确定。
+fn sortedCommandMetas(comptime Commands: type) []const ipc.Meta {
+    comptime {
+        const raw = ipc.commandMetas(Commands);
+        var out: [raw.len]ipc.Meta = undefined;
+        for (raw, 0..) |m, i| out[i] = m;
+        var i: usize = 1;
+        while (i < out.len) : (i += 1) {
+            const key = out[i];
+            var j = i;
+            while (j > 0 and std.mem.lessThan(u8, key.name, out[j - 1].name)) : (j -= 1) {
+                out[j] = out[j - 1];
+            }
+            out[j] = key;
+        }
+        const frozen = out;
+        return &frozen;
+    }
+}
+
+/// v0.6.0：事件按名字排序（同一理由）。
+fn sortedEventMetas(comptime Events: type) []const EventMeta {
+    comptime {
+        const raw = eventMetas(Events);
+        var out: [raw.len]EventMeta = undefined;
+        for (raw, 0..) |m, i| out[i] = m;
+        var i: usize = 1;
+        while (i < out.len) : (i += 1) {
+            const key = out[i];
+            var j = i;
+            while (j > 0 and std.mem.lessThan(u8, key.name, out[j - 1].name)) : (j -= 1) {
+                out[j] = out[j - 1];
+            }
+            out[j] = key;
+        }
+        const frozen = out;
+        return &frozen;
+    }
+}
+
+/// 命令错误集 → TS 联合：显式 error set 逐项；anyerror → string；无错误 → never。
+fn errorTs(comptime error_type: ?type) []const u8 {
+    comptime {
+        const E = error_type orelse return "never";
+        const einfo = @typeInfo(E).error_set;
+        const names = einfo.error_names orelse return "string";
+        if (names.len == 0) return "never";
+        var sorted: [names.len][]const u8 = undefined;
+        for (names, 0..) |n, i| sorted[i] = n;
+        var si: usize = 1;
+        while (si < sorted.len) : (si += 1) {
+            const key = sorted[si];
+            var sj = si;
+            while (sj > 0 and std.mem.lessThan(u8, key, sorted[sj - 1])) : (sj -= 1) {
+                sorted[sj] = sorted[sj - 1];
+            }
+            sorted[sj] = key;
+        }
+        var out: []const u8 = "";
+        for (sorted, 0..) |n, i| {
+            if (i > 0) out = out ++ " | ";
+            out = out ++ "\"" ++ n ++ "\"";
+        }
+        return out;
     }
 }
 
@@ -411,4 +520,41 @@ test "v0.3.8 C3: 非法标识符/必填跟在可选后 → 回退对象形态" {
     };
     const ts2 = comptime generateTs(Order, struct {});
     try testing.expect(std.mem.indexOf(u8, ts2, "g(args: { a?: string; b: number })") != null);
+}
+
+test "v0.6.0 codegen: 错误联合 / 命令映射 / 事件扩展点 / 输出排序" {
+    const Cmds = struct {
+        pub fn zeta(_: ipc.Context) void {}
+        pub fn alpha(_: ipc.Context) void {}
+        pub fn fail(_: ipc.Context) error{ Denied, Timeout }!void {
+            return error.Denied;
+        }
+    };
+    const Events = struct {
+        pub fn zz(_: ipc.Context, payload: struct { z: u8 }) void {
+            _ = payload;
+        }
+        pub fn aa(_: ipc.Context, payload: struct { a: u8 }) void {
+            _ = payload;
+        }
+    };
+    const ts = comptime generateTs(Cmds, Events);
+
+    // 显式 error set → 联合
+    try testing.expect(std.mem.indexOf(u8, ts, "\"fail\": \"Denied\" | \"Timeout\"") != null);
+    // 无 error union → never
+    try testing.expect(std.mem.indexOf(u8, ts, "\"alpha\": never") != null);
+    // 命令映射（0.7 插件扩展点）与错误包装
+    try testing.expect(std.mem.indexOf(u8, ts, "export interface ZiltCommandMap {") != null);
+    try testing.expect(std.mem.indexOf(u8, ts, "throw new ZiltCommandError<ZiltCommandErrors[\"fail\"]>") != null);
+    // 事件扩展点
+    try testing.expect(std.mem.indexOf(u8, ts, "export interface ZiltEventMap {") != null);
+    try testing.expect(std.mem.indexOf(u8, ts, "export type ZiltEventPayloads = ZiltEventMap & Omit<ZiltBuiltinEventMap, keyof ZiltEventMap>;") != null);
+    // 输出按名字排序（decl 顺序 zeta/alpha 反转）
+    const ai = std.mem.indexOf(u8, ts, "export async function alpha").?;
+    const zi = std.mem.indexOf(u8, ts, "export async function zeta").?;
+    try testing.expect(ai < zi);
+    const aa = std.mem.indexOf(u8, ts, "\"aa\": { a: number }").?;
+    const zz = std.mem.indexOf(u8, ts, "\"zz\": { z: number }").?;
+    try testing.expect(aa < zz);
 }
