@@ -148,7 +148,9 @@ flavors 落地三片：
 - **冒烟**：Linux `wml.bind`（96 项）——`enable()` 命中数 / 点击载荷
   （`id`+`value`）/ `disable()` 后不再触发；配 `events.zig` 的 `wmlProbe` 回环。
 - **验证**：`zig build test` 447/449（2 skip）；`zig build gen` + `tsc --strict` 0 错；
-  `node scripts/check-runtime-js.mjs` 通过。
+  两个 Node 门禁通过。CI **run 46152449424** 全绿（GTK4 / GTK3 legacy / Windows / arm64 /
+  NSIS；Linux 冒烟 95/96，仅 `deeplink.startup` 已知环境差异；`wml.bind PASS` 实测
+  `n=1 got={id,value}`）；macOS run **46152449467** x86_64 + arm64 全绿。
 
 ## 0. 差距分析结论
 
