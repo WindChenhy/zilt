@@ -306,7 +306,15 @@ jobs:
           exit $code
 
       - name: Differential update E2E (patch + rollback/health)
-        run: bash scripts/linux/dev-update-e2e.sh
+        run: |
+          set +e
+          bash scripts/linux/dev-update-e2e.sh
+          code=$?
+          if [ $code -ne 0 ]; then
+            echo "== update-e2e log =="
+            cat .zilt-probe/update-e2e.log 2>/dev/null || true
+          fi
+          exit $code
 
       # v0.5.11：显式起 Xvfb + openbox 并 export DISPLAY。
       # 运行链路已修通（DISPLAY/空环境/能力匹配），但 Linux 侧还差

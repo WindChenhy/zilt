@@ -109,13 +109,22 @@ EOF
   wait "$APP_PID" 2>/dev/null || true
   APP_PID=""
 
-  # 健康确认：不带 auto 再启动新 exe，10s 后 .zilt-old 应被清理
+  # 健康确认：不带 auto 再启动新 exe，10s 定时器后 .zilt-old 应被清理。
+  # v0.6.1：CI（24.04 + GTK4）启动更慢/单实例时序更紧——改为轮询最多 25s。
   "$RUN" >/tmp/zilt-update-app2.log 2>&1 &
   APP2=$!
-  sleep 12
   HEALTH=0
-  [ ! -f "$RUN.zilt-old" ] && HEALTH=1
+  for _ in $(seq 1 50); do
+    if [ ! -f "$RUN.zilt-old" ]; then HEALTH=1; break; fi
+    sleep 0.5
+  done
   echo "HEALTH_CLEANUP=$HEALTH"
+  if [ "$HEALTH" != "1" ]; then
+    echo "== app2 log tail =="
+    tail -40 /tmp/zilt-update-app2.log 2>/dev/null || true
+    echo "== zilt.log tail =="
+    tail -40 zilt.log 2>/dev/null || true
+  fi
   kill "$APP2" 2>/dev/null || true
   wait "$APP2" 2>/dev/null || true
   APP2=""
