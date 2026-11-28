@@ -44,6 +44,7 @@ const item_xml =
     \\    <property name="Title" type="s" access="read"/>
     \\    <property name="Status" type="s" access="read"/>
     \\    <property name="IconName" type="s" access="read"/>
+    \\    <property name="IconPixmap" type="a(iiay)" access="read"/>
     \\    <property name="IconThemePath" type="s" access="read"/>
     \\    <property name="Menu" type="o" access="read"/>
     \\    <property name="ItemIsMenu" type="b" access="read"/>
@@ -135,6 +136,9 @@ pub const Options = struct {
     icon_name: []const u8,
     /// 图标所在目录（可选；SNI IconThemePath，宿主据此找文件图标）
     icon_dir: ?[]const u8 = null,
+    /// 图标文件路径（可选；v0.6.3 IconPixmap —— 直接随属性发像素，
+    /// 不依赖宿主安装主题图标；缺失/加载失败时回退到内置绘制的默认图标）
+    icon_path: ?[]const u8 = null,
     /// 左键 Activate / SecondaryActivate（挂窗 toggle）
     on_activate: *const fn (ctx: ?*anyopaque) callconv(.c) void,
     /// DBusMenu 菜单项 clicked
@@ -155,6 +159,11 @@ pub const Tray = struct {
     icon_dir: []u8 = &.{},
     /// 字符串是否由 dupe 分配（空串也可能来自 dupe；close 只释放一次）
     strings_owned: bool = false,
+    /// v0.6.3 IconPixmap：ARGB32 **network byte order**（A,R,G,B），行紧密排列。
+    /// 宿主据此绘制图标，不依赖 IconName 在主题里是否存在。
+    pixmap: []u8 = &.{},
+    pixmap_w: u32 = 0,
+    pixmap_h: u32 = 0,
     on_activate: *const fn (ctx: ?*anyopaque) callconv(.c) void,
     on_menu: *const fn (ctx: ?*anyopaque, node: ?*anyopaque) callconv(.c) void,
     ctx: ?*anyopaque = null,
@@ -192,10 +201,15 @@ pub const Tray = struct {
             .on_menu = opts.on_menu,
             .ctx = opts.ctx,
         };
+        self.loadPixmap(allocator, opts.icon_path);
         self.connect();
     }
 
     fn freeStrings(self: *Tray) void {
+        if (self.pixmap.len > 0) self.allocator.free(self.pixmap);
+        self.pixmap = &.{};
+        self.pixmap_w = 0;
+        self.pixmap_h = 0;
         if (!self.strings_owned) return;
         self.strings_owned = false;
         self.allocator.free(self.app_id);
@@ -650,9 +664,132 @@ pub const Tray = struct {
         if (std.mem.eql(u8, prop, "Status")) return c.g_variant_new_string("Active");
         if (std.mem.eql(u8, prop, "IconName")) return newString(self.icon_name);
         if (std.mem.eql(u8, prop, "IconThemePath")) return newString(self.icon_dir);
+        if (std.mem.eql(u8, prop, "IconPixmap")) return self.iconPixmapVariant();
         if (std.mem.eql(u8, prop, "Menu")) return c.g_variant_new_object_path(menu_path);
         if (std.mem.eql(u8, prop, "ItemIsMenu")) return c.g_variant_new_boolean(0);
         return null;
+    }
+
+    // ------------------------------------------------------------------
+    // v0.6.3：IconPixmap（a(iiay)，ARGB32 network byte order）
+    //
+    // IconName 依赖宿主在图标主题里找到同名文件；开发态/未安装主题图标时，
+    // GNOME/KDE 都只画占位。IconPixmap 直接把像素随属性发过去，是 spec 里
+    // 唯一不依赖宿主环境的路径。无 icon_path 或加载失败 → 内置绘制默认图标
+    //（品牌蓝圆角方块 + 白色 Z），保证任何宿主都能画出可辨识的图标。
+    // ------------------------------------------------------------------
+
+    fn loadPixmap(self: *Tray, allocator: Allocator, path: ?[]const u8) void {
+        if (path) |p| {
+            if (p.len > 0 and self.pixmapFromFile(allocator, p)) return;
+        }
+        self.drawDefaultPixmap(allocator);
+    }
+
+    fn pixmapFromFile(self: *Tray, allocator: Allocator, path: []const u8) bool {
+        const pz = dupeZ(std.heap.c_allocator, path) catch return false;
+        defer std.heap.c_allocator.free(pz);
+        var err: ?*c.GError = null;
+        const tex = c.gdk_texture_new_from_filename(pz.ptr, &err) orelse {
+            if (err) |e| {
+                log.print("[tray] icon '{s}' load failed (fallback to builtin): {s}", .{ path, std.mem.span(e.*.message) });
+                c.g_error_free(e);
+            }
+            return false;
+        };
+        defer c.g_object_unref(@ptrCast(@alignCast(tex)));
+        const w: u32 = @intCast(c.gdk_texture_get_width(tex));
+        const h: u32 = @intCast(c.gdk_texture_get_height(tex));
+        if (w == 0 or h == 0) return false;
+        const buf = allocator.alloc(u8, @as(usize, w) * @as(usize, h) * 4) catch return false;
+        c.gdk_texture_download(tex, buf.ptr, @as(usize, w) * 4);
+        // GDK 给原生端序 ARGB32（LE 内存序 B,G,R,A）→ network order（A,R,G,B）
+        var i: usize = 0;
+        while (i < buf.len) : (i += 4) {
+            const b = buf[i];
+            const g = buf[i + 1];
+            const r = buf[i + 2];
+            const a = buf[i + 3];
+            buf[i] = a;
+            buf[i + 1] = r;
+            buf[i + 2] = g;
+            buf[i + 3] = b;
+        }
+        self.pixmap = buf;
+        self.pixmap_w = w;
+        self.pixmap_h = h;
+        log.print("[tray] IconPixmap from '{s}' ({d}x{d})", .{ path, w, h });
+        return true;
+    }
+
+    fn drawDefaultPixmap(self: *Tray, allocator: Allocator) void {
+        const size: usize = 64;
+        // CAIRO_FORMAT_ARGB32 = 0
+        const surface = c.cairo_image_surface_create(0, @intCast(size), @intCast(size));
+        if (surface == null) return;
+        defer c.cairo_surface_destroy(surface);
+        const cr = c.cairo_create(surface);
+        if (cr == null) return;
+        defer c.cairo_destroy(cr);
+
+        const pi: f64 = std.math.pi;
+        const half_pi: f64 = pi / 2;
+        const pad: f64 = 2;
+        const edge: f64 = 60;
+        const r: f64 = 14;
+        // 背景：品牌蓝圆角方块
+        c.cairo_set_source_rgba(cr, 0.12, 0.44, 0.92, 1);
+        c.cairo_new_sub_path(cr);
+        c.cairo_arc(cr, pad + edge - r, pad + r, r, -half_pi, 0);
+        c.cairo_arc(cr, pad + edge - r, pad + edge - r, r, 0, half_pi);
+        c.cairo_arc(cr, pad + r, pad + edge - r, r, half_pi, pi);
+        c.cairo_arc(cr, pad + r, pad + r, r, pi, 3 * half_pi);
+        c.cairo_close_path(cr);
+        c.cairo_fill(cr);
+        // 前景：白色 Z（三段折线；不依赖字体）
+        c.cairo_set_source_rgba(cr, 1, 1, 1, 1);
+        c.cairo_set_line_width(cr, 7);
+        c.cairo_set_line_cap(cr, 1); // CAIRO_LINE_CAP_ROUND
+        c.cairo_set_line_join(cr, 1); // CAIRO_LINE_JOIN_ROUND
+        c.cairo_move_to(cr, 18, 20);
+        c.cairo_line_to(cr, 46, 20);
+        c.cairo_line_to(cr, 18, 44);
+        c.cairo_line_to(cr, 46, 44);
+        c.cairo_stroke(cr);
+
+        c.cairo_surface_flush(surface);
+        const data = c.cairo_image_surface_get_data(surface);
+        if (data == null) return;
+        const stride: usize = @intCast(c.cairo_image_surface_get_stride(surface));
+        const buf = allocator.alloc(u8, size * size * 4) catch return;
+        var y: usize = 0;
+        while (y < size) : (y += 1) {
+            var x: usize = 0;
+            while (x < size) : (x += 1) {
+                const src = data + y * stride + x * 4;
+                const dst = (y * size + x) * 4;
+                buf[dst] = src[3]; // A
+                buf[dst + 1] = src[2]; // R
+                buf[dst + 2] = src[1]; // G
+                buf[dst + 3] = src[0]; // B
+            }
+        }
+        self.pixmap = buf;
+        self.pixmap_w = @intCast(size);
+        self.pixmap_h = @intCast(size);
+        log.print("[tray] IconPixmap builtin {d}x{d}", .{ size, size });
+    }
+
+    fn iconPixmapVariant(self: *Tray) ?*c.GVariant {
+        if (self.pixmap.len == 0 or self.pixmap_w == 0 or self.pixmap_h == 0) return null;
+        const byte_t = c.g_variant_type_new("y") orelse return null;
+        defer c.g_variant_type_free(byte_t);
+        const bytes = c.g_variant_new_fixed_array(byte_t, self.pixmap.ptr, self.pixmap.len, 1);
+        const entry = c.g_variant_new("(ii@ay)", @as(c_int, @intCast(self.pixmap_w)), @as(c_int, @intCast(self.pixmap_h)), bytes);
+        const arr_t = c.g_variant_type_new("(iiay)") orelse return null;
+        defer c.g_variant_type_free(arr_t);
+        var kids = [_]?*c.GVariant{entry};
+        return c.g_variant_new_array(arr_t, &kids, 1);
     }
 
     fn menuProperty(self: *Tray, prop: []const u8) ?*c.GVariant {

@@ -3907,6 +3907,11 @@ fn Backend(comptime config: Config) type {
                     .title = tray_cfg.tooltip,
                     .icon_name = trayIconName(icon_src),
                     .icon_dir = trayIconDir(icon_src),
+                    // v0.6.3：只有真路径才尝试读像素（纯名字交给主题解析）
+                    .icon_path = if (icon_src) |p|
+                        (if (std.mem.indexOfScalar(u8, p, '/') != null) p else null)
+                    else
+                        null,
                     .on_activate = &Self.onSniActivate,
                     .on_menu = &Self.onSniMenu,
                     .ctx = self,

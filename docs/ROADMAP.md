@@ -165,11 +165,15 @@ CI 只断言了日志行，没验证总线归属。四个叠加缺陷：
 | 2 | `RequestName` 回复被丢弃 → 失败也打印「registered」 | 读回复码，非 `PRIMARY_OWNER(1)` 记错并放弃注册 |
 | 3 | `Tray.init` **按值返回**，`connect()` 把栈上 `&tray` 注册给 GDBus；返回后指针悬空（实测属性长度读到 `0xAAAA…`） | 改为 `init(self: *Tray, …)` 就地初始化，`create` 的堆指针保持稳定 |
 | 4 | 属性 GET 对未声明属性返回 null 却不设 `*error`，GDBus 断言失败 → **进程 abort**（宿主读 `XAyatanaLabel` 即触发） | 返回 null 时填 `InvalidArgs` GError |
+| 5 | 只靠 `IconName`：开发态/未装主题图标时宿主只能画占位 | 新增 **`IconPixmap`**（`a(iiay)`，ARGB32 network order）：有 `icon_path` 走 GdkTexture 解码，否则 Cairo 画内置图标（品牌蓝圆角方块 + 白 Z）；`icon_path` 由 `Config.icon` 传入 |
 
 新增 `scripts/linux/dev-sni-e2e.sh`（CI GTK4 作业 `SNI tray E2E`）：会话总线名 →
-`IconName/Status/Menu` → `dbusmenu.GetLayout` → `Activate` 挂窗 toggle（实测可见窗口
-2 → 0 → 2）。**残余人工项**：图标像素由宿主绘制，开发态未安装 `zilt-app` 主题图标时
-宿主可能显示占位（`IconPixmap` 回退记 v0.6.3 候选）。
+`IconName/Status/Menu/IconPixmap` → `dbusmenu.GetLayout` → `Activate` 挂窗 toggle
+（用应用日志的 `hidden/shown` 断言，避免冒烟套件建窗干扰）。
+
+**视觉验证（WSLg / Xvfb + snixembed + stalonetray）**：宿主按 `IconPixmap` 画出
+蓝底白 Z 图标；截图存证于本地验证记录。真实 GNOME（AppIndicator 扩展）/ KDE 面板
+的观感（HiDPI、主题底色）仍建议在目标发行版上人工确认一次。
 
 ## 0. 差距分析结论
 

@@ -7,13 +7,14 @@
 #   3. /MenuBar 的 com.canonical.dbusmenu.GetLayout 能返回菜单树
 #   4. Activate（左键语义）→ 挂窗 toggle：窗口从可见变隐藏，再点回可见
 #
-# 显式不做：图标像素是否被宿主正确绘制（需要真实 StatusNotifierHost，
-# 如 GNOME AppIndicator 扩展 / KDE 面板；见 docs/ROADMAP.md 的人工验证项）。
+# 显式不做：宿主把像素画到面板上的**观感**（需要真实 StatusNotifierHost，
+# 如 GNOME AppIndicator 扩展 / KDE 面板）；像素本身由 IconPixmap 随属性发出，
+# 已在 Xvfb + snixembed + stalonetray 下实测渲染（见 docs/ROADMAP.md）。
 #
 # 用法：
 #   scripts/linux/dev-sni-e2e.sh [app 可执行文件]
 #   默认 ./zig-out/bin/zilt-app；无 DISPLAY 时自起 Xvfb + openbox。
-# 退出码：0 通过 / 1 失败 / 3 跳过（缺 gdbus/xdotool/Xvfb）
+# 退出码：0 通过 / 1 失败 / 3 跳过（缺 gdbus/Xvfb）
 set -uo pipefail
 
 APP="${1:-./zig-out/bin/zilt-app}"
@@ -21,7 +22,6 @@ DISPLAY_NUM="${ZILT_SNI_DISPLAY:-:99}"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "SKIP: 缺少 $1"; exit 3; }; }
 need gdbus
-need xdotool
 need Xvfb
 need openbox
 
@@ -102,6 +102,13 @@ if printf '%s' "$icon" | grep -qE "'[^']+'"; then
 else
   echo "FAIL: IconName 为空: $icon"; exit 1
 fi
+# IconPixmap（v0.6.3）：a(iiay) 里必须真的有像素——这是不依赖宿主图标主题的路径
+pixmap=$(prop IconPixmap)
+if printf '%s' "$pixmap" | grep -q "byte" && printf '%s' "$pixmap" | grep -qE '\(64, 64|\(32, 32'; then
+  echo "PASS IconPixmap 携带像素（$(printf '%s' "$pixmap" | head -c 60)…）"
+else
+  echo "FAIL: IconPixmap 为空或尺寸异常: $(printf '%s' "$pixmap" | head -c 120)"; exit 1
+fi
 
 # 3) 菜单树
 # `-1` 会被 gdbus 当成选项解析 → 必须用 `--` 结束选项
@@ -114,32 +121,38 @@ else
 fi
 
 # 4) Activate → 挂窗 toggle
-visible_count() { xdotool search --pid "$APP_PID" --onlyvisible 2>/dev/null | wc -l; }
+# 不能用「可见窗口数」判断：演示应用启动即跑 96 项冒烟，会不断建/销窗口。
+# 改用应用自己的日志（hidden/shown 各一行），与窗口 churn 无关。
+LOG=/tmp/zilt-sni-app.log
+count_log() { grep -a -c "$1" "$LOG" 2>/dev/null || true; }
+hidden0=$(count_log "attach window .* hidden")
+shown0=$(count_log "attach window .* shown")
+
 activate() {
   gdbus call --session --dest "$BUS" --object-path "$ITEM_PATH" \
     --method org.kde.StatusNotifierItem.Activate 0 0 >/dev/null 2>&1
 }
-before=$(visible_count)
+wait_log() {
+  local pat="$1" base="$2" i
+  for i in $(seq 1 80); do
+    [ "$(count_log "$pat")" -gt "$base" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 activate
-toggled=0
-for _ in $(seq 1 100); do
-  now=$(visible_count)
-  # 挂窗 toggle 只对 attach 窗口生效；没有 attach 配置时窗口保持可见（合法）
-  if [ "$now" -ne "$before" ]; then toggled=1; break; fi
-  sleep 0.05
-done
-after=$(visible_count)
-activate
-for _ in $(seq 1 100); do [ "$(visible_count)" -eq "$before" ] && break; sleep 0.05; done
-back=$(visible_count)
-echo "  可见窗口数: before=$before after_activate=$after after_second=$back"
-if [ "$toggled" -eq 1 ] && [ "$back" -eq "$before" ]; then
-  echo "PASS Activate 切换挂窗并可复原"
-elif [ "$toggled" -eq 0 ]; then
-  echo "WARN Activate 未改变可见性（未配置 tray.attach_window 时属预期）"
-  echo "PASS SNI 契约（Activate 调用未报错）"
+if wait_log "attach window .* hidden" "$hidden0"; then
+  echo "PASS Activate 隐藏挂窗（hidden $hidden0 → $(count_log "attach window .* hidden")）"
 else
-  echo "FAIL: Activate 后无法复原（before=$before after=$after back=$back）"; exit 1
+  echo "FAIL: Activate 后未出现 hidden 日志"; tail -5 "$LOG"; exit 1
+fi
+sleep 0.35  # 越过 toggle 的 200ms 去抖
+activate
+if wait_log "attach window .* shown" "$shown0"; then
+  echo "PASS Activate 再次显示挂窗（shown $shown0 → $(count_log "attach window .* shown")）"
+else
+  echo "FAIL: 第二次 Activate 后未出现 shown 日志"; tail -5 "$LOG"; exit 1
 fi
 
-echo "== SNI 探针通过（图标像素渲染仍需真实宿主，见 ROADMAP 人工项）=="
+echo "== SNI 探针通过（像素由 IconPixmap 提供；宿主侧渲染见 ROADMAP 视觉验证记录）=="
