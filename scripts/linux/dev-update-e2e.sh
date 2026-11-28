@@ -111,7 +111,10 @@ EOF
 
   # 健康确认：不带 auto 再启动新 exe，10s 定时器后 .zilt-old 应被清理。
   # v0.6.1：CI（24.04 + GTK4）启动更慢/单实例时序更紧——改为轮询最多 25s。
-  "$RUN" >/tmp/zilt-update-app2.log 2>&1 &
+  # 注意：24.04 runner 的 bwrap 存在但非特权 userns 受限——WebKit 若尝试沙箱会
+  # 直接 abort（Connection: failed to receive credentials），与首启同样禁用沙箱。
+  GDK_BACKEND=x11 WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 LIBGL_ALWAYS_SOFTWARE=1 \
+    "$RUN" >/tmp/zilt-update-app2.log 2>&1 &
   APP2=$!
   HEALTH=0
   for _ in $(seq 1 50); do
