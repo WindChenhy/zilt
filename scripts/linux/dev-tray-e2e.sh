@@ -138,12 +138,14 @@ EOF
     # 2) 左键 → 显示 + 贴图标定位
     $XT click $((ix + iw / 2)) $((iy + ih / 2)) 1
     if wait_visible "$MAIN" 1 12; then pass "second left click shows window"; else fail "second left click did not show window"; fi
+    # v0.6.0：先等后端 positioned 日志，再轮询 X 几何（CI 负载下 2.4s 会采到移动前坐标）
+    wait_log "attach window #1 positioned" 40 || true
     icon_right=$((ix + iw))
     icon_bottom=$((iy + ih))
     icon_top=$iy
     # v0.5.11：定位请求现在等 mapped 后才下（最多 600ms）+ 80ms 外框校正，
-    # 固定 sleep 0.4 会采到中间态 → 轮询到锚定或 2.4s 超时再断言。
-    for _ in $(seq 1 16); do
+    # 固定 sleep 0.4 会采到中间态 → 轮询到锚定或 9s 超时再断言。
+    for _ in $(seq 1 60); do
       read -r mx my mw mh <<EOF
 $($XT geom "$MAIN")
 EOF
