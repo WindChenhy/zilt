@@ -286,8 +286,16 @@ jobs:
         run: bash scripts/linux/dev-headless.sh
 
       # v0.4.3 L3：托盘挂窗（Xvfb + stalonetray XEmbed + XTest 合成点击）
+      # v0.6.0：Xvfb/stalonetray 下偶发 BadWindow/几何采样竞态（同一提交有绿有红）→ 整跑重试一次
       - name: Tray attach E2E (stalonetray)
-        run: bash scripts/linux/dev-tray-e2e.sh --no-build
+        run: |
+          for attempt in 1 2; do
+            echo "tray e2e attempt $attempt"
+            if bash scripts/linux/dev-tray-e2e.sh --no-build; then exit 0; fi
+            cp -f .zilt-probe/tray-e2e.log ".zilt-probe/tray-e2e.attempt${attempt}.log" 2>/dev/null || true
+            sleep 2
+          done
+          exit 1
 
       # v0.4.3 L3：AppImage 自包含（WebKit 随包；bwrap/docker 无宿主 WebKit 验证）
       - name: AppImage self-contained E2E (no host WebKit)
