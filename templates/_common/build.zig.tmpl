@@ -745,7 +745,11 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/pack_linux.zig"),
             .target = target,
             .optimize = optimize,
-            // 直接路径引用 pack_formats/msix/app_meta（纯模块，不带 GTK 绑定）
+            // 直接路径引用 pack_formats/msix/app_meta（纯模块，不带 GTK 绑定）；
+            // v0.6.0c：app_meta 读 flavor options，需显式挂 app_meta_opts。
+            .imports = &.{
+                .{ .name = "app_meta_opts", .module = meta_opts },
+            },
         });
         pack_linux_mod.link_libc = true;
         const pack_linux_exe = b.addExecutable(.{ .name = "zilt-pack", .root_module = pack_linux_mod });
