@@ -21,9 +21,10 @@ if [ "$GTK_VARIANT" = "gtk3" ]; then
   JSC_SONAME="libjavascriptcoregtk-4.1.so.0"
   DK_IMAGE="${ZILT_APPIMAGE_DOCKER_IMAGE:-ubuntu:22.04}"
 else
-  WK_SONAME="libwebkitgtk-6.0.so.0"
+  # WebKitGTK 6.0 的 ABI soname 是 .so.4（JavaScriptCore .so.1）
+  WK_SONAME="libwebkitgtk-6.0.so.4"
   WK_HELPERS="webkitgtk-6.0"
-  JSC_SONAME="libjavascriptcoregtk-6.0.so.0"
+  JSC_SONAME="libjavascriptcoregtk-6.0.so.1"
   DK_IMAGE="${ZILT_APPIMAGE_DOCKER_IMAGE:-ubuntu:24.04}"
 fi
 
