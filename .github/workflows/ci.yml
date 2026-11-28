@@ -512,6 +512,9 @@ jobs:
       - name: Bundle (NSIS + zip)
         run: |
           choco install nsis -y --no-progress
+          # choco 已安装但当前 shell 的 PATH 未刷新 → bundle 的 `makensis` 查找会 FileNotFound
+          # （v0.6.0 首个 release 因此缺 setup.exe，已补传；显式补 PATH 防止再发）
+          $env:Path += ";C:\Program Files (x86)\NSIS"
           zig build -Doptimize=ReleaseFast bundle
 
       - name: Collect artifacts
